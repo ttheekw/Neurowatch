@@ -74,4 +74,4 @@ begin
     MsgBox('NeuroWatch could not stop or remove its startup entry. Stop it from the tray and retry.', mbError, MB_OK);
 end;
 
-; User configuration and recordings live outside {app} and are preserved.
+// User configuration and recordings live outside {app} and are preserved.

@@ -386,6 +386,14 @@ def test_every_linux_package_format_has_native_install_coverage(workflow: str) -
     assert not any(fmt == "arch" and arch == "arm64" for _i, fmt, arch, _r in entries)
 
 
+def test_windows_installer_code_section_has_no_ini_style_comments() -> None:
+    # Inside [Code] (Pascal), a line starting with ";" is a syntax error
+    # ("'BEGIN' expected"); comments there are // or { }.
+    script = (ROOT / "scripts/installer/windows.iss").read_text()
+    code = script[script.index("[Code]") :]
+    assert not [line for line in code.splitlines() if line.lstrip().startswith(";")]
+
+
 def test_windows_installer_stops_service_and_preserves_user_data():
     script = (ROOT / "scripts/installer/windows.iss").read_text()
     assert "PrivilegesRequired=lowest" in script
