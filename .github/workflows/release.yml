@@ -175,7 +175,10 @@ jobs:
             'NW_UI_EXTENSION_DIST=neurowatch-cloud',
             'NW_UI_EXTENSION_MODULE=neurowatch_cloud',
             "NW_CLOUD_ENDPOINT=$env:CLOUD_URL",
-            "NW_EXTRA_LICENSE_FILE=$(Join-Path $cloud 'LICENSE')"
+            "NW_EXTRA_LICENSE_FILE=$(Join-Path $cloud 'LICENSE')",
+            # LiveKit's prebuilt libwebrtc uses the static C runtime (/MT);
+            # the whole binary must too, or linking fails (LNK2038).
+            'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-C target-feature=+crt-static'
           ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: ilammy/msvc-dev-cmd@v1
       - name: Install GStreamer (MSVC)
