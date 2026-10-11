@@ -84,9 +84,28 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: AppConfig, config_path: PathBuf, hwaccel: HwAccelKind) -> Self {
-        let db = Arc::new(Mutex::new(
-            crate::db::connection::open_db().expect("Failed to open SQLite database"),
-        ));
+        // This crate's tests never touch the user's real recording index.
+        #[cfg(test)]
+        let db = crate::db::connection::open_in_memory();
+        #[cfg(not(test))]
+        let db = crate::db::connection::open_db();
+        Self::with_database(
+            config,
+            config_path,
+            hwaccel,
+            db.expect("Failed to open SQLite database"),
+        )
+    }
+
+    /// Like [`Self::new`], with the given recording index (tests of other
+    /// crates pass [`crate::db::connection::open_in_memory`]).
+    pub fn with_database(
+        config: AppConfig,
+        config_path: PathBuf,
+        hwaccel: HwAccelKind,
+        db: rusqlite::Connection,
+    ) -> Self {
+        let db = Arc::new(Mutex::new(db));
         Self {
             config,
             config_path,
