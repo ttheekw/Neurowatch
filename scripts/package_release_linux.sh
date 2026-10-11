@@ -30,8 +30,6 @@ DEB_DEPENDS=(
     libgudev-1.0-0
     libsoup-3.0-0
     libgnutls30
-    libnettle8
-    libhogweed6
     libgmp10
     libstdc++6
     glib-networking
@@ -48,7 +46,7 @@ DEB_DEPENDS=(
 DEB_RECOMMENDS=(mesa-va-drivers)
 RPM_REQUIRES=(
     glib2 orc opus pulseaudio-libs alsa-lib libva libdrm libgudev
-    libsoup3 gnutls nettle gmp libstdc++ glib-networking libXv libX11-xcb
+    libsoup3 gnutls gmp libstdc++ glib-networking libXv libX11-xcb
     mesa-libEGL
     libglvnd-glx libglvnd-gles
     fontconfig
@@ -59,7 +57,7 @@ RPM_REQUIRES=(
 RPM_RECOMMENDS=(mesa-va-drivers)
 ARCH_DEPENDS=(
     glib2 orc opus libpulse alsa-lib libva libdrm libgudev
-    libsoup3 gnutls nettle gmp gcc-libs glib-networking libxv
+    libsoup3 gnutls gmp gcc-libs glib-networking libxv
     libglvnd
     fontconfig
     libxkbcommon-x11

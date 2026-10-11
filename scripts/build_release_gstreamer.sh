@@ -90,6 +90,14 @@ cp -L "$jpeg" "$PREFIX/lib/$(basename "$jpeg")"
 rtmp="$(ldd "$PREFIX/lib/gstreamer-1.0/libgstrtmp.so" | awk '/librtmp.so/ {print $3}')"
 [[ -f "$rtmp" ]] || { echo 'RTMP runtime dependency missing' >&2; exit 1; }
 cp -L "$rtmp" "$PREFIX/lib/$(basename "$rtmp")"
+# librtmp calls nettle 3 directly (libnettle.so.8, libhogweed.so.6). Arch,
+# and in time other distributions, ship only nettle 4 (.so.9, .so.7), so RTMP
+# would not load there. The two versions load side by side: ship nettle 3.
+for lib in libnettle.so libhogweed.so; do
+    dep="$(ldd "$rtmp" | awk -v lib="$lib" 'index($1, lib) == 1 {print $3}')"
+    [[ -f "$dep" ]] || { echo "RTMP runtime dependency $lib missing" >&2; exit 1; }
+    cp -L "$dep" "$PREFIX/lib/$(basename "$dep")"
+done
 mkdir -p "$PREFIX/share/licenses/neurowatch-media"
 for project in gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav; do
     cp "$WORK/$project-$GST_VERSION/COPYING" "$PREFIX/share/licenses/neurowatch-media/$project.txt"
@@ -97,6 +105,9 @@ done
 cp "$WORK/ffmpeg-$FFMPEG_VERSION/COPYING.LGPLv2.1" "$PREFIX/share/licenses/neurowatch-media/ffmpeg.txt"
 cp /usr/share/doc/libjpeg-turbo8/copyright "$PREFIX/share/licenses/neurowatch-media/libjpeg-turbo.txt"
 cp /usr/share/doc/librtmp1/copyright "$PREFIX/share/licenses/neurowatch-media/librtmp.txt"
+# libnettle8 on Ubuntu 22.04, libnettle8t64 on 24.04.
+nettle_copyright="$(ls /usr/share/doc/libnettle8*/copyright | head -n 1)"
+cp "$nettle_copyright" "$PREFIX/share/licenses/neurowatch-media/nettle.txt"
 cp "$ROOT/scripts/packaging/media-sources.sha256" "$PREFIX/share/licenses/neurowatch-media/"
 printf 'GStreamer %s\nFFmpeg %s (LGPL, no external codecs)\n' "$GST_VERSION" "$FFMPEG_VERSION" > "$PREFIX/VERSIONS.txt"
 

@@ -54,7 +54,7 @@ manager installs them. With the portable `.tar.gz`, install them yourself.
 |---|---|---|
 | Base | glibc, GLib/GIO, `glib-networking` (TLS), libstdc++, dbus | Yes |
 | Window (Qt) | libEGL, libGL, GLES, fontconfig, xkbcommon-x11, xcb-cursor, X11/xcb | Yes; X11 or Wayland session |
-| Media | libva, libdrm, libgudev, libsoup3, gnutls, nettle, gmp, orc, opus | Yes |
+| Media | libva, libdrm, libgudev, libsoup3, gnutls, gmp, orc, opus | Yes |
 | Sound | PulseAudio or PipeWire client, ALSA | For live and playback audio |
 | Hardware decoding, Intel | `intel-media-driver` (VA-API) | Optional; without it decoding uses the CPU |
 | Hardware decoding, AMD | Mesa VA drivers (`mesa-va-drivers`) | Optional; recommended by the `.deb` and `.rpm` |
