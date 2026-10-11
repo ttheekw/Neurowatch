@@ -269,7 +269,8 @@ def test_linux_packages_install_launcher_desktop_file_and_backend() -> None:
     assert 'ln -s "$INSTALL_PREFIX/neurowatch" "$STAGE/usr/bin/neurowatch"' in text
     assert "/usr/share/applications/neurowatch.desktop" in text
     assert "[Desktop Entry]" in text and "Exec=neurowatch" in text
-    assert 'install -m 0755 "$BACKEND_TARGET/release/nw-backend" "$BUNDLE_DIR/bin/nw-backend"' in text
+    install = 'install -m 0755 "$BACKEND_TARGET/release/nw-backend" "$BUNDLE_DIR/bin/nw-backend"'
+    assert install in text
 
 
 def test_linux_launcher_opens_the_ui_and_leaves_the_service_running() -> None:
@@ -419,3 +420,12 @@ def test_windows_script_parses() -> None:
         "[ref]$null, [ref]$errors); if ($errors) { $errors; exit 1 }"
     )
     subprocess.run(["pwsh", "-NoProfile", "-Command", command], check=True)
+
+
+def test_the_bundled_nettle_3_reaches_the_package() -> None:
+    # librtmp's nettle 3 is built into lib/nettle3, off the default library
+    # path; the package must carry that folder, or RTMP fails on Arch.
+    build = (ROOT / "scripts/build_release_gstreamer.sh").read_text()
+    package = (ROOT / "scripts/package_release_linux.sh").read_text()
+    assert 'cp -L "$dep" "$PREFIX/lib/nettle3/$(basename "$dep")"' in build
+    assert 'cp -a "$WORK_DIR/gstreamer-sdk/lib/nettle3" "$BUNDLE_DIR/gstreamer/lib/"' in package

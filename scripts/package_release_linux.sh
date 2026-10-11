@@ -206,6 +206,8 @@ mkdir -p "$BUNDLE_DIR/gstreamer/lib"
 cp -a "$WORK_DIR/gstreamer-sdk/"{bin,libexec,share,VERSIONS.txt} "$BUNDLE_DIR/gstreamer/"
 cp -a "$WORK_DIR/gstreamer-sdk/lib/"*.so* "$BUNDLE_DIR/gstreamer/lib/"
 cp -a "$WORK_DIR/gstreamer-sdk/lib/gstreamer-1.0" "$BUNDLE_DIR/gstreamer/lib/"
+# librtmp's nettle 3, used only where the system has none (service manager).
+cp -a "$WORK_DIR/gstreamer-sdk/lib/nettle3" "$BUNDLE_DIR/gstreamer/lib/"
 
 echo "[2/5] Building backend (release)"
 # NW_BACKEND_MANIFEST / NW_BACKEND_PACKAGE: build the `nw-backend` binary from
