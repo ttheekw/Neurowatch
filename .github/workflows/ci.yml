@@ -1,0 +1,138 @@
+name: CI
+
+# Every merge (push) to main or develop, every pull request to them, and manual
+# runs: lint, type checks and all tests. Each job writes a "tests" table to the
+# run's summary page and uploads its reports.
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # A newer push to the same pull request replaces its run; main keeps every run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust:
+    name: Rust — fmt + clippy + test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # Development files, and the elements the tests use (x264enc, x265enc,
+      # h264parse, mp4mux, avenc_aac and so on).
+      - name: Install GStreamer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-features -- -D warnings
+      # Tests run once, instrumented; reports are rendered from the same profile data.
+      - name: test (with coverage)
+        shell: bash
+        run: |
+          mkdir -p reports
+          cargo llvm-cov --workspace --all-features --no-report 2>&1 | tee reports/cargo-test.txt
+      - name: Test summary
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci_test_summary.py --title Rust --cargo reports/cargo-test.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Generate coverage reports
+        run: |
+          mkdir -p target/llvm-cov
+          cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
+          cargo llvm-cov report --html --output-dir target/llvm-cov
+          cargo llvm-cov report --summary-only > target/llvm-cov/summary.txt
+      - name: Coverage summary
+        run: |
+          {
+            echo "## Rust coverage (cargo-llvm-cov, workspace, all features)"
+            echo
+            echo '```text'
+            cat target/llvm-cov/summary.txt
+            echo '```'
+            echo
+            echo "Full HTML and LCOV reports: download the \`rust-coverage\` artifact from this run."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload test output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-test-output
+          path: reports/
+          retention-days: 30
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage
+          path: |
+            target/llvm-cov/html/
+            target/llvm-cov/lcov.info
+          retention-days: 30
+          if-no-files-found: error
+      # Runs after the upload so reports stay available when the gate fails.
+      # --fail-under-lines is ignored with --no-report, so enforce it on `report`.
+      - name: Enforce workspace line coverage (>= 80%)
+        run: cargo llvm-cov report --summary-only --fail-under-lines 80
+
+  python:
+    name: Python — ruff + mypy + pytest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      # Qt's offscreen platform still loads these.
+      - name: Install Qt runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
+            libfontconfig1 libdbus-1-3 libxcb-cursor0
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: ruff lint
+        run: uv run ruff check ui/
+      - name: ruff format
+        run: uv run ruff format --check ui/
+      - name: mypy
+        run: uv run mypy ui/neurowatch/
+      - name: pytest (app)
+        run: uv run pytest --tb=short -q --junitxml=reports/app.xml
+        env:
+          QT_QPA_PLATFORM: offscreen
+      # Also when the app tests failed, so every result is reported.
+      - name: pytest (release packaging and CI contracts)
+        if: ${{ !cancelled() }}
+        run: uv run pytest tests/test_release_packaging.py tests/test_ci_workflow.py --tb=short -q --junitxml=reports/contracts.xml
+      - name: Test summary
+        if: ${{ !cancelled() }}
+        run: uv run python scripts/ci_test_summary.py --title Python reports/app.xml reports/contracts.xml >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload test reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-test-reports
+          path: reports/
+          retention-days: 30

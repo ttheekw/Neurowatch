@@ -1,0 +1,60 @@
+[package]
+name        = "nw-backend"
+description = "Neurowatch backend service — GStreamer pipelines, IPC server, config"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["v1"]
+v1      = []
+# In-memory metric sources for tests of crates built on this one.
+test-support = []
+
+[dependencies]
+nw-core            = { path = "../nw-core" }
+
+tokio              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid               = { workspace = true }
+gstreamer          = { workspace = true }
+gstreamer-app      = { workspace = true }
+gstreamer-video    = { workspace = true }
+memmap2            = { workspace = true }
+dirs               = { workspace = true }
+image              = { version = "0.25", default-features = false, features = ["jpeg"] }
+base64             = "0.22"
+rusqlite           = { workspace = true }
+time               = { version = "0.3", features = ["local-offset", "formatting", "parsing"] }
+getrandom          = "0.2"
+libc               = "0.2"
+reqwest            = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+# Camera discovery: SOAP/WS-Discovery replies, multicast on a chosen interface,
+# and WS-Security UsernameToken digests.
+roxmltree          = "0.20"
+socket2            = { version = "0.5", features = ["all"] }
+sha1               = "0.10"
+
+# Windows frame rings use named pagefile-backed sections (no /dev/shm).
+[target.'cfg(windows)'.dependencies]
+windows-sys        = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Memory"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+time = { workspace = true, features = ["formatting"] }
+
+[[test]]
+name = "test_runtime_mode"
+path = "../../tests/rust/test_runtime_mode.rs"
+
+[[test]]
+name = "test_camera_assignment"
+path = "../../tests/rust/test_camera_assignment.rs"

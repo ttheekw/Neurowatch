@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members  = [
+    "crates/nw-core",
+    "crates/nw-backend",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+authors      = ["Neurowatch Contributors"]
+license      = "AGPL-3.0-or-later"
+repository   = "https://github.com/ttheekw/Neurowatch"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Async
+tokio               = { version = "1",    features = ["full"] }
+# Serialization
+serde               = { version = "1",    features = ["derive"] }
+serde_json          = "1"
+# Error handling
+thiserror           = "2"
+anyhow              = "1"
+# Logging
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3",  features = ["env-filter", "json"] }
+# IDs
+uuid                = { version = "1",    features = ["v4", "serde"] }
+# Pinned for the workspace Rust 1.75 MSRV; newer 0.3 releases require a newer compiler.
+time                = { version = "=0.3.36", features = ["parsing"] }
+# GStreamer (0.24 targets GStreamer >= 1.24; system has 1.24.2)
+gstreamer           = "0.24"
+gstreamer-app       = "0.24"
+gstreamer-video     = "0.24"
+# Shared memory
+memmap2             = "0.9"
+# Platform dirs
+dirs                = "5"
+# Database (V3+)
+rusqlite            = { version = "0.32", features = ["bundled"] }
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+panic         = "abort"
+
+[profile.dev]
+opt-level = 1
