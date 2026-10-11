@@ -217,8 +217,30 @@ def bundled_gstreamer_env(base: Path) -> dict[str, str]:
     else:
         # Do not inherit PyInstaller's LD_LIBRARY_PATH: it belongs to the UI's
         # Python/Qt bundle and can substitute incompatible backend libraries.
-        env["LD_LIBRARY_PATH"] = str(gst / "lib")
+        env["LD_LIBRARY_PATH"] = bundled_library_path(gst)
     return env
+
+
+def bundled_library_path(gst: Path, has_library: Callable[[str], bool] | None = None) -> str:
+    """The bundled GStreamer's libraries, plus its nettle 3 (for librtmp) only
+    on a system without nettle 3 of its own (Arch: nettle 4 only). A system
+    with nettle 3 keeps its own: its TLS library may need a newer one."""
+    has_library = has_library or _system_has_library
+    paths = [str(gst / "lib")]
+    fallback = gst / "lib" / "nettle3"
+    if fallback.is_dir() and not has_library("libnettle.so.8"):
+        paths.append(str(fallback))
+    return os.pathsep.join(paths)
+
+
+def _system_has_library(soname: str) -> bool:
+    import ctypes
+
+    try:
+        ctypes.CDLL(soname)
+    except OSError:
+        return False
+    return True
 
 
 def systemd_unit(command: ServiceCommand) -> str:

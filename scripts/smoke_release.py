@@ -30,6 +30,16 @@ def rpc(port: int, method: str) -> dict:
     return reply["result"]
 
 
+def _system_has(soname: str) -> bool:
+    import ctypes
+
+    try:
+        ctypes.CDLL(soname)
+    except OSError:
+        return False
+    return True
+
+
 def smoke(bundle: Path) -> None:
     # Rust's Windows directory provider uses Known Folders rather than the
     # overridden APPDATA variables. Never run against a developer's user data.
@@ -107,7 +117,12 @@ def smoke(bundle: Path) -> None:
             media_env["PATH"] = os.pathsep.join(
                 [str(gst / "bin"), str(bundle / "bin"), env["PATH"]]
             )
-            media_env["LD_LIBRARY_PATH"] = str(gst / "lib")
+            # As the service manager does: the bundle's nettle 3 (for
+            # librtmp) only on a system without nettle 3 of its own.
+            library_path = [str(gst / "lib")]
+            if (gst / "lib/nettle3").is_dir() and not _system_has("libnettle.so.8"):
+                library_path.append(str(gst / "lib/nettle3"))
+            media_env["LD_LIBRARY_PATH"] = os.pathsep.join(library_path)
             media_env["GST_PLUGIN_SYSTEM_PATH_1_0"] = str(gst / "lib/gstreamer-1.0")
             media_env["GST_PLUGIN_PATH_1_0"] = str(gst / "lib/gstreamer-1.0")
             media_env["GST_PLUGIN_SCANNER_1_0"] = str(
