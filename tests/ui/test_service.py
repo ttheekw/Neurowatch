@@ -690,3 +690,16 @@ def test_cli_status_and_start(tmp_path, packaged, capsys) -> None:
     assert cli.main(["status", "--json"], controller=controller) == 0
     info = json.loads(capsys.readouterr().out.split("\n", 1)[1])
     assert info["running"] and not info["starts_at_login"]
+
+
+def test_the_bundled_nettle_3_is_used_only_without_the_systems_own(tmp_path) -> None:
+    from neurowatch.service.manager import bundled_library_path
+
+    gst = tmp_path / "gstreamer"
+    (gst / "lib" / "nettle3").mkdir(parents=True)
+    # Arch: nettle 4 only, so librtmp needs the bundled nettle 3.
+    arch = bundled_library_path(gst, has_library=lambda _soname: False)
+    assert arch.split(os.pathsep) == [str(gst / "lib"), str(gst / "lib" / "nettle3")]
+    # Debian, Fedora, Ubuntu: their own nettle 3, which their TLS library needs.
+    debian = bundled_library_path(gst, has_library=lambda soname: soname == "libnettle.so.8")
+    assert debian == str(gst / "lib")

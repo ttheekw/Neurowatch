@@ -92,11 +92,14 @@ rtmp="$(ldd "$PREFIX/lib/gstreamer-1.0/libgstrtmp.so" | awk '/librtmp.so/ {print
 cp -L "$rtmp" "$PREFIX/lib/$(basename "$rtmp")"
 # librtmp calls nettle 3 directly (libnettle.so.8, libhogweed.so.6). Arch,
 # and in time other distributions, ship only nettle 4 (.so.9, .so.7), so RTMP
-# would not load there. The two versions load side by side: ship nettle 3.
+# would not load there. Ship nettle 3 in lib/nettle3, which the app adds to
+# the library path only when the system has no nettle 3: a system with a
+# newer nettle 3 must keep its own, which its TLS library needs.
+mkdir -p "$PREFIX/lib/nettle3"
 for lib in libnettle.so libhogweed.so; do
     dep="$(ldd "$rtmp" | awk -v lib="$lib" 'index($1, lib) == 1 {print $3}')"
     [[ -f "$dep" ]] || { echo "RTMP runtime dependency $lib missing" >&2; exit 1; }
-    cp -L "$dep" "$PREFIX/lib/$(basename "$dep")"
+    cp -L "$dep" "$PREFIX/lib/nettle3/$(basename "$dep")"
 done
 mkdir -p "$PREFIX/share/licenses/neurowatch-media"
 for project in gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav; do
