@@ -1,0 +1,29 @@
+[package]
+name        = "nw-core"
+description = "Neurowatch shared types, traits, and error definitions"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+uuid        = { workspace = true }
+tracing     = { workspace = true }
+time        = { workspace = true }
+
+[dev-dependencies]
+serde_json  = { workspace = true }
+time        = { workspace = true }
+
+[[test]]
+name = "test_control_plane_contract"
+path = "../../tests/rust/test_control_plane_contract.rs"
+
+[[test]]
+name = "test_stats_contract"
+path = "../../tests/rust/test_stats_contract.rs"

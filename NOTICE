@@ -1,0 +1,21 @@
+NeuroWatch
+Copyright (C) 2026 NeuroWatch Project
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version (see LICENSE).
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+Trademarks (AGPL-3.0 section 7(e)): this License grants no rights to use the
+name "NeuroWatch" or its logo. A modified version must not be presented as the
+official NeuroWatch.
+
+NeuroWatch Cloud is a separate, proprietary online service. It is not part of
+this program, and this License grants no rights to it.
+
+Third-party software (GStreamer, Qt/PySide6, FFmpeg and the Rust and Python
+libraries this program uses) is under its own licences.

@@ -1,0 +1,113 @@
+# Rust
+/target/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local toolchains and caches (./neurowatch.sh)
+.cache/
+
+# Release builds (scripts/package_release_linux.sh, scripts/package_windows.ps1)
+/build/
+/dist/
+*.deb
+*.rpm
+*.pkg.tar.zst
+*.tar.gz
+*.AppImage
+*-setup.exe
+
+# Runtime data: never commit camera configs, licences, recordings or logs
+config.json
+license.json
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.mkv
+*.part
+*.sock
+/run/neurowatch/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Personal AI assistant settings
+CLAUDE.local.md
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Internal design docs and AI agent notes (kept locally, not published)
+/CLAUDE.md
+/AGENTS.md
+/GEMINI.md
+/SPEC.md
+/docs/architecture.md
+/docs/plans/
+/docs/adr/
+/docs/v1part*.md
+/docs/web-integration-enterprise-features.md
+/docs/distributed-media-platform.md
+/docs/media-delivery-foundation.md
+/v1.missing.md
+/v2.plan.md
+/.claude/
+/scripts/sync_agent_docs.sh
+/tests/ui/test_agent_docs.py
+
+# Mock cameras for local testing (kept locally, not published)
+/cctv-mock
+/scripts/cctv_mock.py
+/docs/mock-cctv.md
+/tests/test_cctv_mock_streams.py
+/tests/test_cctv_performance.py
+/tests/ui/test_cctv_mock.py
+/tests/ui/test_cctv_performance_harness.py
+
+# Kept locally, not published: legacy helpers and samples, roadmap
+# placeholders, out-of-date launcher tests and internal notes
+/config/default_config.json
+/models/
+/crates/nw-agent/
+/crates/nw-ai/
+/crates/nw-recorder/
+/scripts/build.sh
+/scripts/bootstrap.sh
+/scripts/run_dev.sh
+/tests/test_launcher.sh
+/tests/test_launcher_lifecycle.py
+/tests/test_launcher_readiness.sh
+/tests/helpers/launcher_tool.py
+/tests/rust/ipc_integration_test.rs
+/docs/performance-investigation.md
+/docs/release-builders.md
+/ui/neurowatch/analytics/
+/ui/neurowatch/multisite/
+/ui/neurowatch/widgets/dialogs/
+/ui/neurowatch/widgets/top_menu.py
+/ui/neurowatch/ipc/client.py
+/ui/neurowatch/ipc/protocol.py
+/ui/neurowatch/ipc/v2_methods.py
+/ui/neurowatch/resources/themes/
+/ui/neurowatch/resources/icons/.gitkeep
+/docs/changelog/
