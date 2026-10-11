@@ -249,8 +249,8 @@ mod tests {
             Some(super::VA_UPDATE_REQUIRED)
         );
 
+        // Tests use an in-memory recording index: no data directory is touched.
         let test_root = std::env::temp_dir().join(format!("nw-strict-va-{}", uuid::Uuid::new_v4()));
-        std::env::set_var("XDG_DATA_HOME", &test_root);
         let mut config = crate::config::AppConfig::default();
         let camera = nw_core::camera::CameraConfig::new("Blocked", "rtsp://example.invalid/live");
         let camera_id = camera.id.clone();
@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(status["kind"], "blocked");
         assert_eq!(status["available"], false);
         drop(state);
-        std::fs::remove_dir_all(test_root).unwrap();
+        assert!(!test_root.exists(), "nothing is written for a blocked view");
     }
 
     /// Run alone on each release GPU/driver/runtime combination. Uses generated
