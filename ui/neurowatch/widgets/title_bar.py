@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neurowatch.theme import themed_menu
+from neurowatch.theme import themed_menu, ui_font
 
 _HEIGHT = 38
 _BG = "#0e0e18"
@@ -98,7 +98,7 @@ class TitleBar(QWidget):
 
         # Logo
         logo = QLabel("⬡ NeuroWatch")
-        logo.setFont(QFont("Sans", 12, QFont.Weight.Bold))
+        logo.setFont(ui_font(12, QFont.Weight.Bold))
         logo.setStyleSheet(f"color: {_ACCENT}; padding-right: 20px;")
         layout.addWidget(logo)
 

@@ -20,7 +20,6 @@ import logging
 from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
-    QFont,
     QMouseEvent,
     QPainter,
     QPaintEvent,
@@ -36,6 +35,8 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QWidget,
 )
+
+from neurowatch.theme import mono_font, ui_font
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +197,8 @@ class PlaybackTimeline(QWidget):
         ctrl_layout.addStretch()
 
         self._time_label = QLabel("--:--:--")
-        self._time_label.setStyleSheet("color: #a0a0c0; font-family: monospace; font-size: 11px;")
+        self._time_label.setStyleSheet("color: #a0a0c0; font-size: 11px;")
+        self._time_label.setFont(mono_font(8))
         ctrl_layout.addWidget(self._time_label)
 
         # Ticker that advances the playhead while playing
@@ -437,7 +439,7 @@ class PlaybackTimeline(QWidget):
         track_left, _, track_w = self._track_bounds(w)
         step, ticks = ruler_ticks(self._view_start_ms, self._view_end_ms, track_w)
 
-        painter.setFont(QFont("Mono", 8))
+        painter.setFont(mono_font(8))
         painter.setPen(_RULER_TEXT)
 
         for tick in ticks:
@@ -474,7 +476,7 @@ class PlaybackTimeline(QWidget):
             painter.setPen(_GRID_LINE)
             painter.drawLine(track_left - 2, _RULER_H, track_left - 2, track_h)
 
-        painter.setFont(QFont("Sans Serif", 8))
+        painter.setFont(ui_font(8))
         for row in rows:
             label = str(row.get("label", "Camera"))
             segments = row.get("segments") or []

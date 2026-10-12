@@ -36,6 +36,7 @@ from neurowatch.theme import (
     set_label_role,
     style_button_box,
 )
+from neurowatch.utils.threads import retire
 from neurowatch.widgets.window_chrome import install_dialog_chrome
 
 #: Disk threshold shown when it is off or not set (the backend's default).
@@ -400,6 +401,7 @@ class SettingsDialog(QDialog):
             pass
         if worker.isRunning():
             worker.wait(2000)
+        retire(worker)  # still running: kept until it finishes, never destroyed running
         self._scan_worker = None
 
     def done(self, result: int) -> None:

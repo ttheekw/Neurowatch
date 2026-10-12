@@ -28,6 +28,7 @@ import ctypes
 import ctypes.util
 import logging
 import os
+import sys
 import time
 from functools import cache
 
@@ -75,7 +76,10 @@ def window_effects_supported() -> bool:
 
 @cache
 def _platform_composites(platform: str) -> bool:
-    if platform.startswith("wayland") or platform in ("windows", "cocoa"):
+    # Not Windows: a translucent (layered) window there loses ClearType and
+    # its text looks blurred. Windows 11 rounds opaque dialogs itself
+    # (``round_native_corners``).
+    if platform.startswith("wayland") or platform == "cocoa":
         return True
     if platform == "xcb":
         running = _x11_compositor_running()
@@ -112,6 +116,33 @@ def _x11_compositor_running() -> bool:
 
 _MAXIMIZE_GLYPH = "□"
 _RESTORE_GLYPH = "❐"
+
+
+#: DwmSetWindowAttribute: DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND.
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33
+_DWMWCP_ROUND = 2
+
+
+def round_native_corners(window: QWidget) -> bool:
+    """Ask Windows 11 to round ``window``'s corners (with its border and
+    shadow), as the desktop does for its own windows; Windows 10 and other
+    systems are left as they are. True when Windows accepted it."""
+    if sys.platform != "win32":
+        return False
+    try:
+        hwnd = int(window.winId())
+        preference = ctypes.c_int(_DWMWCP_ROUND)
+        # 64-bit Windows has one calling convention, so CDLL fits dwmapi.
+        dwmapi = ctypes.CDLL("dwmapi")
+        result = dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd),
+            _DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(preference),
+            ctypes.sizeof(preference),
+        )
+    except (AttributeError, OSError, ValueError):
+        return False
+    return result == 0
 
 
 def positions_windows() -> bool:
@@ -500,6 +531,29 @@ class WindowSizeGuard(QObject):
         return None
 
 
+class _NativeCorners(QObject):
+    """Rounds a dialog's corners the native way once its window exists."""
+
+    def __init__(self, dialog: QWidget) -> None:
+        super().__init__(dialog)
+        dialog.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Show and isinstance(watched, QWidget):
+            round_native_corners(watched)
+            watched.removeEventFilter(self)
+        return False
+
+
+def chrome_size_hint(dialog: QWidget) -> QSize:
+    """The size a chrome dialog's content asks for: its card's on Wayland
+    (``CardOverlay``; the window itself covers the screen), else the window's."""
+    overlay = card_overlay(dialog)
+    if overlay is not None:
+        return overlay._shell.sizeHint()
+    return dialog.sizeHint()
+
+
 def card_overlay(window: QWidget) -> CardOverlay | None:
     """The card overlay ``window`` is shown as, if any."""
     return window.findChild(CardOverlay, options=Qt.FindChildOption.FindDirectChildrenOnly)
@@ -743,6 +797,9 @@ def install_dialog_chrome(dialog: QDialog, title: str, *, resizable: bool = Fals
         outer.setSpacing(0)
         outer.setSizeConstraint(constraint)
         guard_window_size(dialog)
+        if not effects:
+            # Windows 11: native rounded corners instead of a translucent window.
+            _NativeCorners(dialog)
         outer.addWidget(shell)
         if resizable:
             EdgeResizer(dialog, surface=shell, grip=margin)

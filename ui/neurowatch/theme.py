@@ -8,12 +8,13 @@ custom-painted surfaces keep their existing look.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QIcon, QTextCharFormat
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QTextCharFormat
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
@@ -146,9 +147,49 @@ def _icon(name: str) -> str:
     return (_ICONS / name).as_posix()
 
 
+def ui_font(point_size: float, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
+    """The system's interface font (Segoe UI on Windows, the desktop's font on
+    Linux) at ``point_size``. Never name a family such as "Sans": Windows has
+    none by that name and substitutes a poorer one."""
+    font = QFont(QApplication.font())
+    font.setPointSizeF(point_size)
+    font.setWeight(weight)
+    return font
+
+
+def mono_font(point_size: float, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
+    """The system's fixed-width font (Consolas on Windows)."""
+    font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+    font.setPointSizeF(point_size)
+    font.setWeight(weight)
+    return font
+
+
+#: Sizes of the logo rendered for window and taskbar icons.
+_APP_ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
+
+
+@cache
 def app_icon() -> QIcon:
-    """The NeuroWatch logo, for window title bars and the taskbar."""
-    return QIcon(_icon("neurowatch.svg"))
+    """The NeuroWatch logo, for window title bars and the taskbar.
+
+    Rendered from the SVG into pixmaps here (QtSvg) rather than ``QIcon(path)``,
+    which needs Qt's SVG icon plugin: a bundle without it would show the
+    desktop's generic icon on the taskbar."""
+    from PySide6.QtGui import QPainter, QPixmap
+    from PySide6.QtSvg import QSvgRenderer
+
+    renderer = QSvgRenderer(_icon("neurowatch.svg"))
+    icon = QIcon()
+    for size in _APP_ICON_SIZES:
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        renderer.render(painter)
+        painter.end()
+        icon.addPixmap(pixmap)
+    return icon
 
 
 def icon_path(name: str) -> str:
@@ -1093,6 +1134,12 @@ def apply_app_theme(app: QApplication, theme_name: str = "dark") -> None:
     _active_theme = normalize_theme(theme_name)
     colors = active_colors()
     app.setStyle("Fusion")
+    if sys.platform == "win32":
+        # Crisp text like native Windows apps: Qt's DirectWrite engine hints
+        # only lightly by default, which looks soft at 125% / 150% scaling.
+        font = app.font()
+        font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        app.setFont(font)
     palette = app.palette()
     from PySide6.QtGui import QPalette
 

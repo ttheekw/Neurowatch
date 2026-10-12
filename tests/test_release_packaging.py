@@ -439,6 +439,11 @@ def test_windows_exe_and_installer_carry_the_app_logo() -> None:
     installer = (ROOT / "scripts/installer/windows.iss").read_text()
     assert "SetupIconFile={#AppIcon}" in installer
     assert "UninstallDisplayIcon={app}\\app\\neurowatch-ui\\neurowatch-ui.exe" in installer
+    # The taskbar groups the running app under its shortcut (main.WINDOWS_APP_ID).
+    shortcuts = [line for line in installer.splitlines() if "neurowatch-ui.exe\"; WorkingDir" in line]
+    assert shortcuts and all('AppUserModelID: "NeuroWatch.NeuroWatch"' in s for s in shortcuts)
+    main = (ROOT / "ui/neurowatch/main.py").read_text()
+    assert 'WINDOWS_APP_ID = "NeuroWatch.NeuroWatch"' in main
 
 
 def test_windows_installer_stops_service_and_preserves_user_data():
@@ -485,3 +490,17 @@ def test_smoke_check_requires_a_working_cloud_in_official_builds() -> None:
     assert "check_cloud(port, data_dirs)" in smoke
     assert 'rpc(port, "cloud.status", auth=ipc_token(port, data_dirs))' in smoke
     assert 'assert status.get("cloud_configured") is True, status' in smoke
+
+
+def test_readme_download_links_name_files_every_release_publishes(workflow: str) -> None:
+    # The buttons use /releases/latest/download/<name>: the publish job must
+    # make each <name>, and mark the release Latest (GitHub's "latest" skips
+    # pre-releases).
+    readme = (ROOT / "README.md").read_text()
+    linked = set(re.findall(r"releases/latest/download/([A-Za-z0-9_.\-]+)", readme))
+    published = set(re.findall(r"\]=(neurowatch[A-Za-z0-9_.\-]+)$", workflow, re.MULTILINE))
+    assert linked and linked <= published, linked - published
+    assert "neurowatch-windows-x86_64-setup.exe" in linked and "neurowatch_amd64.deb" in linked
+    job = workflow[workflow.index("  publish:") :]
+    assert "--latest" in job and "--prerelease" not in job
+    assert job.index("Add version-free download names") < job.index("Generate SHA256SUMS")
