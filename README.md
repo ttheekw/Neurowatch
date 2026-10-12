@@ -20,6 +20,7 @@ NeuroWatch is **free and open source** ([AGPL-3.0-or-later](LICENSE)), with **no
 - [Running without a screen](#running-without-a-screen)
 - [Troubleshooting](#troubleshooting)
 - [Privacy and responsible use](#privacy-and-responsible-use)
+- [Disclaimer](#disclaimer)
 - [Licensing](#licensing)
 - [For developers](#for-developers)
 
@@ -83,20 +84,20 @@ Motion detection and events, recording schedules, AI object detection, multi-sit
 
 **[Download NeuroWatch from the Releases page](https://github.com/ttheekw/Neurowatch/releases)**. The newest release is at the top, with its files under **Assets**. Early versions are marked *Pre-release*: they work, but haven't been tested on many computers yet, so please [report problems](https://github.com/ttheekw/Neurowatch/issues).
 
-Pick the file for your system, then run the install command in the folder you downloaded it to (usually `~/Downloads`):
+Pick the file for your system. On Ubuntu, Debian, Linux Mint and Fedora you can **double-click** the downloaded package and choose **Install**; the terminal command next to it does the same, run in the folder you downloaded it to (usually `~/Downloads`):
 
 | System | File ending in | Install |
 |---|---|---|
-| Ubuntu, Debian, Linux Mint (64-bit PC) | `_amd64.deb` | `sudo apt install ./neurowatch_*_amd64.deb` |
-| Ubuntu, Debian, Raspberry Pi OS 64-bit (ARM) | `_arm64.deb` | `sudo apt install ./neurowatch_*_arm64.deb` |
-| Fedora (64-bit PC) | `.x86_64.rpm` | `sudo dnf install ./neurowatch-*.x86_64.rpm` |
-| Fedora (ARM) | `.aarch64.rpm` | `sudo dnf install ./neurowatch-*.aarch64.rpm` |
+| Ubuntu, Debian, Linux Mint (64-bit PC) | `_amd64.deb` | Double-click → **Install**, or `sudo apt install ./neurowatch_*_amd64.deb` |
+| Ubuntu, Debian, Raspberry Pi OS 64-bit (ARM) | `_arm64.deb` | Double-click → **Install**, or `sudo apt install ./neurowatch_*_arm64.deb` |
+| Fedora (64-bit PC) | `.x86_64.rpm` | Double-click → **Install**, or `sudo dnf install ./neurowatch-*.x86_64.rpm` |
+| Fedora (ARM) | `.aarch64.rpm` | Double-click → **Install**, or `sudo dnf install ./neurowatch-*.aarch64.rpm` |
 | Arch Linux (64-bit PC) | `-x86_64.pkg.tar.zst` | `sudo pacman -U ./neurowatch-*-x86_64.pkg.tar.zst` |
 | Other Linux (portable) | `-linux-x86_64.tar.gz` or `-linux-arm64.tar.gz` | `tar xzf neurowatch-*-linux-*.tar.gz && ./neurowatch/neurowatch` (needs the system's desktop and audio libraries) |
 | Windows 10/11 (64-bit) | `-windows-x86_64-setup.exe` | Run the installer, then open NeuroWatch from Start. Windows may warn that the installer is unrecognised: choose **More info → Run anyway**. |
 | Windows 10/11 (portable) | `-windows-x86_64.zip` | Extract it, then run `neurowatch.cmd` |
 
-Use `apt install ./…` (with the `./`) so the required system libraries are installed too. Downloads include the video components NeuroWatch needs; you don't have to install any yourself.
+Double-clicking opens the package in your software centre (App Center on Ubuntu 24.04 and later, Software on Fedora), which asks for your password and installs the system libraries NeuroWatch needs as well; then open **NeuroWatch** from your applications. If double-clicking opens another program (for example on Ubuntu 22.04), use the terminal command instead, with the `./` so the required libraries are installed too. Downloads include the video components NeuroWatch needs; you don't have to install any yourself.
 
 The Windows installer installs for your account and adds a Start Menu shortcut. Uninstalling stops the service and removes its startup entry; your configuration and recordings are preserved. Before removing a Linux package, run `neurowatch service stop` and `neurowatch service uninstall` from your own account.
 
@@ -200,6 +201,12 @@ With NeuroWatch Cloud (official downloads):
 - Your cameras, recordings and settings stay on your computer. Nothing is sent anywhere unless you link NeuroWatch Cloud, and then only what you choose to watch from the browser.
 - Camera addresses can contain passwords. NeuroWatch stores them in its settings file (`~/.config/neurowatch/config.json` on Linux), so keep your computer account secure and don't share that file.
 - **Use NeuroWatch lawfully.** Video surveillance is regulated in many places. You are responsible for following the rules that apply to you, for example privacy and data-protection law, notices and signage, consent, and how long you keep footage. Don't record people where they expect privacy, and don't use NeuroWatch for anything unlawful. The NeuroWatch authors don't operate your installation and never receive your footage.
+
+---
+
+## Disclaimer
+
+NeuroWatch is free, open-source software provided **as is, without any warranty**, and used at your own risk. To the extent the law allows, its authors and contributors are **not liable** for any loss or damage from using it, including missed, lost or corrupted recordings. It is not a guaranteed security, safety or alarm system: test that it works for you and keep backups of footage you need. The full disclaimer is in [`NOTICE`](NOTICE); the [licence](LICENSE) (sections 15 and 16) governs.
 
 ---
 

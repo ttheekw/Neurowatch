@@ -273,6 +273,40 @@ def test_linux_packages_install_launcher_desktop_file_and_backend() -> None:
     assert install in text
 
 
+def test_deb_prefers_the_real_alsa_library() -> None:
+    # Ubuntu 24.04+ / Debian 13 satisfy a bare "libasound2" with a stub
+    # (liboss4-salsa-asound2) that GStreamer's ALSA plugin cannot load.
+    text = LINUX_SCRIPT.read_text()
+    assert "'libasound2t64 | libasound2'" in text
+    assert "'libasound2 | libasound2t64'" not in text
+
+
+def test_linux_packages_carry_the_logo_and_software_centre_description() -> None:
+    """Every Linux package (deb, rpm, Arch) installs the NeuroWatch logo and the
+    AppStream file software centres show when the package is double-clicked."""
+    text = LINUX_SCRIPT.read_text()
+    assert "Icon=neurowatch\n" in text and "Name=NeuroWatch\n" in text
+    linux = ROOT / "scripts/installer/linux"
+    sizes = (48, 64, 128, 256)
+    for size in sizes:
+        assert (linux / f"icons/neurowatch-{size}.png").read_bytes()[:4] == b"\x89PNG"
+    assert "for size in 48 64 128 256; do" in text
+    assert '"$STAGE$ICON_DIR/scalable/apps/neurowatch.svg"' in text
+    assert 'APP_ID="io.github.ttheekw.neurowatch"' in text
+    metainfo = (linux / "neurowatch.metainfo.xml").read_text()
+    assert "<id>io.github.ttheekw.neurowatch</id>" in metainfo
+    assert "<launchable type=\"desktop-id\">neurowatch.desktop</launchable>" in metainfo
+    assert '<icon type="stock">neurowatch</icon>' in metainfo
+    # The build fills in its own licence and release.
+    assert "<project_license>$PKG_LICENSE</project_license>" in text
+    assert '<release version=\\"$VERSION\\" date=\\"$RELEASE_DATE\\"/>' in text
+    # The rpm lists its files; deb and Arch package the whole stage.
+    rpm = text[text.index("%files") : text.index("SPEC\n", text.index("%files"))]
+    for size in sizes:
+        assert f"$ICON_DIR/{size}x{size}/apps/neurowatch.png" in rpm
+    assert "$ICON_DIR/scalable/apps/neurowatch.svg" in rpm and "$METAINFO" in rpm
+
+
 def test_linux_launcher_opens_the_ui_and_leaves_the_service_running() -> None:
     # The backend is a background service the UI starts (neurowatch.service):
     # it keeps recording after the UI closes, so the launcher never stops it.
@@ -395,6 +429,18 @@ def test_windows_installer_code_section_has_no_ini_style_comments() -> None:
     assert not [line for line in code.splitlines() if line.lstrip().startswith(";")]
 
 
+def test_windows_exe_and_installer_carry_the_app_logo() -> None:
+    icon = ROOT / "ui/neurowatch/resources/icons/neurowatch.ico"
+    assert icon.read_bytes()[:4] == b"\x00\x00\x01\x00", "an ICO file"
+    script = WINDOWS_SCRIPT.read_text()
+    assert "$AppIcon = Join-Path $Root 'ui/neurowatch/resources/icons/neurowatch.ico'" in script
+    assert "'--icon', $AppIcon," in script  # the .exe: shortcuts, Add/Remove Programs
+    assert '"/DAppIcon=$AppIcon",' in script
+    installer = (ROOT / "scripts/installer/windows.iss").read_text()
+    assert "SetupIconFile={#AppIcon}" in installer
+    assert "UninstallDisplayIcon={app}\\app\\neurowatch-ui\\neurowatch-ui.exe" in installer
+
+
 def test_windows_installer_stops_service_and_preserves_user_data():
     script = (ROOT / "scripts/installer/windows.iss").read_text()
     assert "PrivilegesRequired=lowest" in script
@@ -429,3 +475,13 @@ def test_the_bundled_nettle_3_reaches_the_package() -> None:
     package = (ROOT / "scripts/package_release_linux.sh").read_text()
     assert 'cp -L "$dep" "$PREFIX/lib/nettle3/$(basename "$dep")"' in build
     assert 'cp -a "$WORK_DIR/gstreamer-sdk/lib/nettle3" "$BUNDLE_DIR/gstreamer/lib/"' in package
+
+
+def test_smoke_check_requires_a_working_cloud_in_official_builds() -> None:
+    # A fresh install once switched the cloud off, and Windows (TCP) never
+    # served it: official bundles must answer cloud.status with the user's token.
+    smoke = (ROOT / "scripts/smoke_release.py").read_text()
+    assert 'if (bundle / "LICENSE-EXTENSIONS").is_file():' in smoke
+    assert "check_cloud(port, data_dirs)" in smoke
+    assert 'rpc(port, "cloud.status", auth=ipc_token(port, data_dirs))' in smoke
+    assert 'assert status.get("cloud_configured") is True, status' in smoke

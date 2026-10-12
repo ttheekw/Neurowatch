@@ -1,7 +1,7 @@
 """Subprocess probe: an OS signal arrives while the pre-exec startup error popup is open.
 
 Runs the real ``main()`` with a backend that is reachable but fails the camera
-load, so the deferred startup-load-error QMessageBox runs its nested event loop
+load, so the deferred startup-load-error message runs its nested event loop
 before ``app.exec()``. The signal is sent from inside that popup.
 """
 import os
@@ -27,14 +27,14 @@ class Client:
         raise IpcError(-32000, "config unavailable")
 
 
-real_warning = ui.QMessageBox.warning
+real_show_message = ui.show_message
 
 
-def warning(*args, **kwargs):
+def show_message(*args, **kwargs):
     print("POPUP OPEN", flush=True)
     assert QApplication.instance().thread().loopLevel() == 0, "popup must precede app.exec()"
     QTimer.singleShot(200, lambda: os.kill(os.getpid(), SIGNAL))
-    result = real_warning(*args, **kwargs)
+    result = real_show_message(*args, **kwargs)
     print("POPUP RETURNED", flush=True)
     return result
 
@@ -57,7 +57,7 @@ def shutdown(self):
 
 
 ui.SyncIpcClient = Client
-ui.QMessageBox.warning = staticmethod(warning)
+ui.show_message = show_message
 ui.MainWindow.shutdown = shutdown
 QApplication.exec = staticmethod(app_exec)
 try:

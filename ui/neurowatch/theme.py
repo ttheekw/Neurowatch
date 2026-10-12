@@ -13,7 +13,7 @@ from functools import cache
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QTextCharFormat
+from PySide6.QtGui import QColor, QIcon, QTextCharFormat
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
@@ -144,6 +144,11 @@ def contrast_ratio(fg: str, bg: str) -> float:
 
 def _icon(name: str) -> str:
     return (_ICONS / name).as_posix()
+
+
+def app_icon() -> QIcon:
+    """The NeuroWatch logo, for window title bars and the taskbar."""
+    return QIcon(_icon("neurowatch.svg"))
 
 
 def icon_path(name: str) -> str:

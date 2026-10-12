@@ -12,6 +12,14 @@ compositing manager runs). Without one, transparent corners would show black,
 so they fall back to a square frame. ``NW_WINDOW_EFFECTS=0`` forces that.
 Extra video windows stay opaque and square on purpose: a translucent window
 costs compositing on every video frame and breaks X11 native video overlays.
+
+Wayland lets no application place its windows, and GNOME opens these
+frameless dialogs off-centre (often top-left). There a dialog is a
+transparent window covering its parent's screen with the card centred in it
+(``CardOverlay``): clicks outside the card reach whatever is underneath, the
+header drags the card, and a resizable dialog's edges resize it. Where the
+application may place windows (X11, Windows) dialogs stay normal windows,
+which Qt centres over their parent.
 """
 
 from __future__ import annotations
@@ -23,8 +31,17 @@ import os
 import time
 from functools import cache
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QGuiApplication, QMouseEvent, QPainter, QPaintEvent, QWindow
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QGuiApplication,
+    QMouseEvent,
+    QPainter,
+    QPaintEvent,
+    QRegion,
+    QWindow,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -95,6 +112,12 @@ def _x11_compositor_running() -> bool:
 
 _MAXIMIZE_GLYPH = "□"
 _RESTORE_GLYPH = "❐"
+
+
+def positions_windows() -> bool:
+    """Whether the application may place its windows: Wayland compositors
+    ignore client window positions."""
+    return not QGuiApplication.platformName().startswith("wayland")
 
 
 def start_system_move(widget: QWidget) -> bool:
@@ -201,14 +224,21 @@ class ChromeTitleBar(QWidget):
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = event.globalPosition().toPoint()
-            self._native_drag = start_system_move(self)
+            # A card overlay's window covers the screen: the card moves instead.
+            overlay = card_overlay(self.window())
+            self._native_drag = overlay is None and start_system_move(self)
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            if not self._native_drag:
+            overlay = card_overlay(self.window())
+            if overlay is not None:
+                pos = event.globalPosition().toPoint()
+                overlay.move_card(pos - self._drag_pos)
+                self._drag_pos = pos
+            elif not self._native_drag:
                 win = self.window()
                 if win.isMaximized():
                     win.showNormal()
@@ -363,7 +393,12 @@ def allow_resize(window: QWidget, seconds: float = RESIZE_SESSION_S) -> None:
 
 
 def resize_window(window: QWidget, size: QSize) -> None:
-    """Resize ``window`` from code, also when it is strictly guarded."""
+    """Resize ``window`` from code, also when it is strictly guarded; a card
+    overlay's card takes the size instead."""
+    overlay = card_overlay(window)
+    if overlay is not None:
+        overlay.resize_card(size)
+        return
     allow_resize(window)
     window.resize(size)
 
@@ -465,6 +500,176 @@ class WindowSizeGuard(QObject):
         return None
 
 
+def card_overlay(window: QWidget) -> CardOverlay | None:
+    """The card overlay ``window`` is shown as, if any."""
+    return window.findChild(CardOverlay, options=Qt.FindChildOption.FindDirectChildrenOnly)
+
+
+class CardOverlay(QObject):
+    """Shows a chrome dialog as a card centred over its parent's screen, where
+    windows cannot be placed (Wayland; see the module notes).
+
+    The dialog becomes a transparent window covering that screen (maximized),
+    masked to the card, so clicks outside the card reach the windows below
+    (a modal dialog still blocks its own application). The card (``shell``)
+    keeps the size its content asks for (or, ``resizable``, the size dragged
+    from its ``grip``-wide edge band or set with ``resize_window``) and is
+    centred, offset by however far its header was dragged.
+    """
+
+    def __init__(
+        self, dialog: QDialog, shell: QWidget, *, resizable: bool = False, grip: int = GRIP_WIDTH
+    ) -> None:
+        super().__init__(dialog)
+        self._dialog = dialog
+        self._shell = shell
+        self._resizable = resizable
+        self._grip = max(1, grip)
+        self._offset = QPoint()
+        self._sized = False  # a resizable card's size was set (resize_card)
+        self._resize_edges = Qt.Edge(0)
+        self._resize_from: tuple[QPoint, QRect] | None = None
+        dialog.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # Its size is the screen's: no size guard (see WindowSizeGuard).
+        dialog.setProperty(_GUARDED, True)
+        dialog.installEventFilter(self)
+        shell.installEventFilter(self)
+        if resizable:
+            shell.setMouseTracking(True)
+
+    # -- placement ---------------------------------------------------------
+
+    def card_rect(self) -> QRect:
+        return self._shell.geometry()
+
+    def move_card(self, delta: QPoint) -> None:
+        """Drag the card; it stops where its header would leave the screen."""
+        self._offset += delta
+        self._offset = self._card_at(self._offset).center() - self._dialog.rect().center()
+        self._place()
+
+    def resize_card(self, size: QSize) -> None:
+        bounded = size.expandedTo(self._shell.minimumSizeHint()).expandedTo(
+            self._shell.minimumSize()
+        )
+        self._shell.resize(bounded)
+        self._sized = True
+        self._place()
+
+    def _cover_screen(self) -> None:
+        parent = self._dialog.parentWidget()
+        screen = parent.window().screen() if parent is not None else None
+        screen = (
+            screen or QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+        )
+        if screen is not None:
+            self._dialog.setScreen(screen)
+            self._dialog.setGeometry(screen.availableGeometry())
+        if not self._resizable:
+            self._shell.adjustSize()
+        elif not self._sized:
+            self._shell.resize(self._shell.sizeHint())
+        self._dialog.setWindowState(Qt.WindowState.WindowMaximized)
+        self._place()
+
+    def _card_at(self, offset: QPoint) -> QRect:
+        """The card centred, moved by ``offset``, kept on the screen (its
+        header first, when the card is larger than the screen)."""
+        area = self._dialog.rect()
+        card = QRect(QPoint(0, 0), self._shell.size())
+        card.moveCenter(area.center() + offset)
+        card.moveLeft(max(area.left(), min(card.left(), area.right() - card.width() + 1)))
+        card.moveTop(max(area.top(), min(card.top(), area.bottom() - card.height() + 1)))
+        return card
+
+    def _place(self) -> None:
+        # Only a drag changes the offset: the window may still be growing to
+        # the screen's size here, and keeping the card inside an older, smaller
+        # window must not stick.
+        card = self._card_at(self._offset)
+        if self._shell.pos() != card.topLeft():
+            self._shell.move(card.topLeft())
+        self._dialog.setMask(QRegion(card))
+
+    # -- events ------------------------------------------------------------
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        kind = event.type()
+        if watched is self._dialog:
+            if kind == QEvent.Type.Show:
+                self._cover_screen()
+            elif kind == QEvent.Type.Resize:
+                self._place()
+            return False
+        if watched is not self._shell:
+            return False
+        if kind == QEvent.Type.Resize:
+            self._place()
+        elif self._resizable and isinstance(event, QMouseEvent):
+            return self._edge_resize(event)
+        elif kind == QEvent.Type.Leave and self._resize_from is None:
+            self._shell.unsetCursor()
+        return False
+
+    def _edges_at(self, pos: QPoint) -> Qt.Edge:
+        edges = Qt.Edge(0)
+        width, height, grip = self._shell.width(), self._shell.height(), self._grip
+        if pos.x() < grip:
+            edges |= Qt.Edge.LeftEdge
+        elif pos.x() >= width - grip:
+            edges |= Qt.Edge.RightEdge
+        if pos.y() < grip:
+            edges |= Qt.Edge.TopEdge
+        elif pos.y() >= height - grip:
+            edges |= Qt.Edge.BottomEdge
+        return edges
+
+    def _edge_resize(self, event: QMouseEvent) -> bool:
+        pos = event.position().toPoint()
+        kind = event.type()
+        if kind == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            edges = self._edges_at(pos)
+            if not edges:
+                return False
+            self._resize_edges = edges
+            self._resize_from = (event.globalPosition().toPoint(), self.card_rect())
+            return True
+        if kind == QEvent.Type.MouseMove:
+            if self._resize_from is None:
+                cursor = EdgeResizer.cursor_for(self._edges_at(pos))
+                if cursor is None:
+                    self._shell.unsetCursor()
+                else:
+                    self._shell.setCursor(cursor)
+                return False
+            start, rect = self._resize_from
+            delta = event.globalPosition().toPoint() - start
+            self._drag_edges(QRect(rect), delta)
+            return True
+        if kind == QEvent.Type.MouseButtonRelease and self._resize_from is not None:
+            self._resize_from = None
+            return True
+        return False
+
+    def _drag_edges(self, rect: QRect, delta: QPoint) -> None:
+        """The card with its dragged edges moved by ``delta``; the opposite
+        edges stay where they are."""
+        minimum = self._shell.minimumSizeHint().expandedTo(self._shell.minimumSize())
+        edges = self._resize_edges
+        if edges & Qt.Edge.LeftEdge:
+            rect.setLeft(min(rect.left() + delta.x(), rect.right() - minimum.width() + 1))
+        if edges & Qt.Edge.RightEdge:
+            rect.setRight(max(rect.right() + delta.x(), rect.left() + minimum.width() - 1))
+        if edges & Qt.Edge.TopEdge:
+            rect.setTop(min(rect.top() + delta.y(), rect.bottom() - minimum.height() + 1))
+        if edges & Qt.Edge.BottomEdge:
+            rect.setBottom(max(rect.bottom() + delta.y(), rect.top() + minimum.height() - 1))
+        rect = rect.intersected(self._dialog.rect())
+        self._shell.resize(rect.size())
+        self._offset = rect.center() - self._dialog.rect().center()
+        self._place()
+
+
 _GUARDED = "nwSizeGuarded"
 
 
@@ -505,6 +710,7 @@ def install_dialog_chrome(dialog: QDialog, title: str, *, resizable: bool = Fals
     ``GRIP_WIDTH`` band without window effects), down to its content's
     minimum size; give the content stretch so it uses the space."""
     effects = window_effects_supported()
+    overlay = not positions_windows()
     dialog.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
     if effects:
         dialog.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -514,27 +720,33 @@ def install_dialog_chrome(dialog: QDialog, title: str, *, resizable: bool = Fals
     style.unpolish(dialog)
     style.polish(dialog)
 
-    outer = QVBoxLayout(dialog)
-    outer.setContentsMargins(0, 0, 0, 0)
-    outer.setSpacing(0)
-    outer.setSizeConstraint(
-        QLayout.SizeConstraint.SetMinimumSize if resizable else QLayout.SizeConstraint.SetFixedSize
-    )
     margin = SHADOW_MARGIN if effects else 0
     if resizable:
         # The band around the frame is where it is resized from.
         margin = max(margin, GRIP_WIDTH)
     shell = _ShadowShell(dialog, margin if effects else 0)
-    # The fixed size replaces the dialog's own minimum; the shell carries it.
+    # The dialog's minimum size is its content's: the shell carries it.
     shell.setMinimumSize(dialog.minimumSize())
     dialog.setMinimumSize(0, 0)
-    guard_window_size(dialog)
-    outer.addWidget(shell)
     shell_layout = QVBoxLayout(shell)
     shell_layout.setContentsMargins(margin, margin, margin, margin)
-    if resizable:
-        EdgeResizer(dialog, surface=shell, grip=margin)
-        dialog.setProperty(_STRICT_SIZE, True)
+    constraint = (
+        QLayout.SizeConstraint.SetMinimumSize if resizable else QLayout.SizeConstraint.SetFixedSize
+    )
+    if overlay:
+        # Wayland: a transparent window over the screen, the card centred.
+        shell_layout.setSizeConstraint(constraint)
+        CardOverlay(dialog, shell, resizable=resizable, grip=margin)
+    else:
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.setSizeConstraint(constraint)
+        guard_window_size(dialog)
+        outer.addWidget(shell)
+        if resizable:
+            EdgeResizer(dialog, surface=shell, grip=margin)
+            dialog.setProperty(_STRICT_SIZE, True)
     frame = QFrame(shell)
     frame.setObjectName("chromeFrame")
     frame.setProperty("rounded", effects)

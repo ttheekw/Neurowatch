@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QBuffer, QByteArray, Qt
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QListWidgetItem, QMessageBox
+from PySide6.QtWidgets import QListWidgetItem
 
 from neurowatch.dialogs.camera_dialog import AddEditCameraDialog
 from neurowatch.main import MainWindow
@@ -25,9 +25,8 @@ def test_dialog_allows_file_protocol_path(monkeypatch, qtbot):
 
     def _warn(*_args, **_kwargs):
         warned["called"] = True
-        return QMessageBox.StandardButton.Ok
 
-    monkeypatch.setattr(QMessageBox, "warning", _warn)
+    monkeypatch.setattr("neurowatch.dialogs.camera_dialog.show_message", _warn)
 
     dlg._on_accept()
 

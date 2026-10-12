@@ -29,7 +29,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QMainWindow,
-    QMessageBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -51,6 +50,7 @@ from neurowatch.dialogs.camera_dialog import AddEditCameraDialog
 from neurowatch.dialogs.confirm import confirm_action
 from neurowatch.dialogs.custom_grid_dialog import CustomGridDialog
 from neurowatch.dialogs.export_video_dialog import ExportVideoDialog
+from neurowatch.dialogs.message import ask, show_message
 from neurowatch.dialogs.new_window_dialog import NewWindowDialog, PageSummary, WindowSummary
 from neurowatch.dialogs.settings_dialog import SettingsDialog
 from neurowatch.ipc.quality_dispatcher import CameraQualityDispatcher
@@ -60,7 +60,7 @@ from neurowatch.ipc.viewer_client import NativeViewerClient
 from neurowatch.models.camera import CameraConfig, WallPosition
 from neurowatch.models.wall_layout import Placement
 from neurowatch.models.window_session import saved_windows
-from neurowatch.theme import apply_app_theme
+from neurowatch.theme import app_icon, apply_app_theme
 from neurowatch.widgets.camera_panel import CameraPanel
 from neurowatch.widgets.compact_bar import CompactTitleBar
 from neurowatch.widgets.detached_wall import DEFAULT_CYCLE_INTERVAL, DetachedWallWindow
@@ -485,9 +485,9 @@ class MainWindow(QMainWindow):
     def _show_load_error(self, error: tuple[bool, str, str]) -> None:
         critical, title, message = error
         if critical:
-            QMessageBox.critical(self, title, message)
+            show_message(self, title, message, kind="error")
         else:
-            QMessageBox.warning(self, title, message)
+            show_message(self, title, message, kind="warning")
 
     def report_startup_error(self) -> None:
         """Show a load error deferred from construction, once startup is done."""
@@ -525,7 +525,7 @@ class MainWindow(QMainWindow):
             return
         cam = dlg.get_config()
         if self._add_worker and self._add_worker.isRunning():
-            QMessageBox.information(self, "Add Camera", "A camera is already being added.")
+            show_message(self, "Add Camera", "A camera is already being added.")
             return
 
         logger.info("Requesting supervisor start for new camera '%s'", cam.name)
@@ -541,17 +541,18 @@ class MainWindow(QMainWindow):
 
     def _on_add_camera_result(self, result: object, submitted: CameraConfig) -> None:
         if isinstance(result, BackendOfflineError):
-            QMessageBox.critical(
+            show_message(
                 self,
                 "Backend Offline",
                 "Lost connection to nw-backend. Please restart the backend.",
+                kind="error",
             )
             return
         if isinstance(result, IpcError):
-            QMessageBox.warning(self, "Backend Error", result.message)
+            show_message(self, "Backend Error", result.message, kind="warning")
             return
         if isinstance(result, Exception):
-            QMessageBox.warning(self, "Backend Error", str(result))
+            show_message(self, "Backend Error", str(result), kind="warning")
             return
 
         added_cam = CameraConfig.from_dict(result) if isinstance(result, dict) else submitted
@@ -649,14 +650,15 @@ class MainWindow(QMainWindow):
             raw = self._ipc.call("camera.list")
             self._cameras = [CameraConfig.from_dict(c) for c in raw]
         except BackendOfflineError:
-            QMessageBox.critical(
+            show_message(
                 self,
                 "Backend Offline",
                 "Lost connection to nw-backend. Please restart the backend.",
+                kind="error",
             )
             return
         except IpcError as e:
-            QMessageBox.warning(self, "Backend Error", e.message)
+            show_message(self, "Backend Error", e.message, kind="warning")
             return
         self._refresh_all()
 
@@ -682,14 +684,15 @@ class MainWindow(QMainWindow):
             raw = self._ipc.call("camera.list")
             self._cameras = [CameraConfig.from_dict(c) for c in raw]
         except BackendOfflineError:
-            QMessageBox.critical(
+            show_message(
                 self,
                 "Backend Offline",
                 "Lost connection to nw-backend. Please restart the backend.",
+                kind="error",
             )
             return
         except IpcError as e:
-            QMessageBox.warning(self, "Backend Error", e.message)
+            show_message(self, "Backend Error", e.message, kind="warning")
             return
         if self._selected_cam_id == cam_id:
             self._selected_cam_id = None
@@ -1456,7 +1459,7 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self) -> None:
         if self._settings_worker is not None and self._settings_worker.isRunning():
-            QMessageBox.information(self, "Settings", "Settings are still being saved.")
+            show_message(self, "Settings", "Settings are still being saved.")
             return
         dlg = SettingsDialog(self._config, self, ipc_endpoint=self._ipc_endpoint() or None)
         if dlg.exec() == SettingsDialog.DialogCode.Accepted:
@@ -1480,27 +1483,29 @@ class MainWindow(QMainWindow):
         # A save that restarted cameras can outlast the window set when it began.
         self._ignore_config_changes_until = time.monotonic() + 2.0
         if isinstance(result, BackendOfflineError):
-            QMessageBox.critical(
+            show_message(
                 self,
                 "Backend Offline",
                 "Settings could not be saved because the backend is offline.",
+                kind="error",
             )
             return
         if isinstance(result, IpcError):
-            QMessageBox.warning(self, "Backend Error", result.message)
+            show_message(self, "Backend Error", result.message, kind="warning")
             return
         if isinstance(result, Exception):
-            QMessageBox.warning(self, "Settings Error", str(result))
+            show_message(self, "Settings Error", str(result), kind="warning")
             return
         if isinstance(result, dict):
             self._config = result
             self._apply_settings()
 
     def _on_settings_drive_failed(self, reason: str) -> None:
-        QMessageBox.warning(
+        show_message(
             self,
             "Recording Drive",
             f"Recordings stay where they were: the chosen drive could not be used.\n\n{reason}",
+            kind="warning",
         )
 
     def _clear_settings_worker(self) -> None:
@@ -1516,10 +1521,11 @@ class MainWindow(QMainWindow):
         if os.path.exists(config_path):
             shutil.copy(config_path, path)
         else:
-            QMessageBox.warning(
+            show_message(
                 self,
                 "Export Failed",
                 f"Config file not found at {config_path}.\nIs the backend running?",
+                kind="warning",
             )
 
     def _on_export_video(self) -> None:
@@ -1541,7 +1547,7 @@ class MainWindow(QMainWindow):
             os.makedirs(os.path.dirname(config_path), exist_ok=True)
             shutil.copy(path, config_path)
         except OSError as e:
-            QMessageBox.warning(self, "Import Failed", str(e))
+            show_message(self, "Import Failed", str(e), kind="warning")
             return
         self._load_from_backend()
 
@@ -1703,14 +1709,13 @@ class MainWindow(QMainWindow):
         self._config_reload_timer.start()  # restarts if already running (debounce)
 
     def _reload_config_after_change(self) -> None:
-        answer = QMessageBox.question(
+        if not ask(
             self,
             "Configuration Changed",
             "The configuration file changed on disk. Reload cameras and settings now?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+            yes_text="Reload",
+            no_text="Not now",
+        ):
             logger.info("Config file changed on disk — user declined reload")
             return
         logger.info("Config file changed on disk — applying update")
@@ -1854,11 +1859,12 @@ def _start_main_window(
         )
         if not running:
             welcome.dismiss()
-            QMessageBox.critical(
+            show_message(
                 None,
                 "NeuroWatch Service Not Running",
                 "The NeuroWatch background service could not be started.\n\n"
                 f"{error}\n\nStart it with `neurowatch service start` and open NeuroWatch again.",
+                kind="error",
             )
             sys.exit(1)
         if not follows_ui:
@@ -1867,11 +1873,12 @@ def _start_main_window(
         window = MainWindow(progress=welcome.set_stage)
     except BackendUnavailableError as exc:
         welcome.dismiss()
-        QMessageBox.critical(
+        show_message(
             None,
             "Backend Not Running",
             f"Cannot connect to nw-backend.\nEndpoint: {exc.endpoint}\n\n"
             "Please start the backend and relaunch.",
+            kind="error",
         )
         sys.exit(1)
     except BaseException:
@@ -1916,7 +1923,11 @@ def main() -> None:
             _socket_path = f"unix:{_runtime_dir}/neurowatch/control.sock"
         else:
             _socket_path = _configured_socket
-    logger.info(
+    launch = parse_launch_args(sys.argv)
+    # Terminal commands print only their own output; the line stays in debug logs.
+    terminal = launch.mode in ("service", "command", "headless")
+    logger.log(
+        logging.DEBUG if terminal else logging.INFO,
         "Neurowatch starting — build %s (%s), package %s, config %s, socket %s",
         _version,
         _build.source.value,
@@ -1924,7 +1935,6 @@ def main() -> None:
         _config_path,
         _socket_path,
     )
-    launch = parse_launch_args(sys.argv)
     if launch.mode == "service":
         from neurowatch.service.cli import main as service_main
 
@@ -1947,6 +1957,9 @@ def main() -> None:
     app = QApplication([sys.argv[0], *launch.rest])
     app.setApplicationName("NeuroWatch")
     app.setOrganizationName("Neurowatch")
+    app.setWindowIcon(app_icon())
+    # Linux docks match windows to the installed neurowatch.desktop (its logo).
+    app.setDesktopFileName("neurowatch")
     if activate_running_instance():
         logger.info("NeuroWatch is already open; brought it to the front")
         sys.exit(0)

@@ -17,17 +17,41 @@ import time
 from pathlib import Path
 
 
-def rpc(port: int, method: str) -> dict:
+def rpc(port: int, method: str, auth: str | None = None) -> dict:
+    request: dict = {"jsonrpc": "2.0", "id": 1, "method": method, "params": {}}
+    if auth:
+        request["auth"] = auth
     with socket.create_connection(("127.0.0.1", port), timeout=2) as connection:
-        connection.sendall(
-            (
-                json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": {}}) + "\n"
-            ).encode()
-        )
+        connection.sendall((json.dumps(request) + "\n").encode())
         reply = json.loads(connection.makefile("rb").readline())
     if "error" in reply:
         raise RuntimeError(f"{method}: {reply['error']}")
     return reply["result"]
+
+
+def ipc_token(port: int, data_dirs: list[Path]) -> str:
+    """The token the backend wrote for this user's TCP clients (ipc/token.rs)."""
+    name = f"ipc-token-127.0.0.1-{port}"
+    for directory in data_dirs:
+        path = directory / "neurowatch" / name
+        if path.is_file():
+            return path.read_text(encoding="ascii").strip()
+    raise RuntimeError(f"the backend wrote no IPC token ({name}) in {data_dirs}")
+
+
+def check_cloud(port: int, data_dirs: list[Path]) -> None:
+    """An official build's cloud must be on, and reachable over TCP with this
+    user's token (Windows always uses TCP): a fresh install once had it off."""
+    status = rpc(port, "cloud.status", auth=ipc_token(port, data_dirs))
+    assert status.get("cloud_configured") is True, status
+    assert status.get("cloud_endpoint"), status
+    try:
+        rpc(port, "cloud.status")
+    except RuntimeError:
+        pass  # without the token: refused, as for any other local process
+    else:
+        raise AssertionError("cloud.status answered over TCP without the token")
+    print("Cloud:", json.dumps(status), flush=True)
 
 
 def _system_has(soname: str) -> bool:
@@ -111,6 +135,16 @@ def smoke(bundle: Path) -> None:
             assert status["site_name"] == "Release smoke check", status
             assert status["pid"] > 0, status
             print("Packaged backend:", json.dumps(status), flush=True)
+            # Official builds carry the cloud (and its terms, LICENSE-EXTENSIONS).
+            if (bundle / "LICENSE-EXTENSIONS").is_file():
+                # Rust finds Windows' local app data through Known Folders,
+                # not the LOCALAPPDATA override above.
+                data_dirs = [Path(env["XDG_DATA_HOME"]), Path(env["LOCALAPPDATA"])]
+                if os.environ.get("LOCALAPPDATA"):
+                    data_dirs.append(Path(os.environ["LOCALAPPDATA"]))
+                check_cloud(port, data_dirs)
+            else:
+                print("Open-source build: no cloud to check", flush=True)
             ui_command("service", "status", "--json")
 
             media_env = env.copy()

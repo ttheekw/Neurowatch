@@ -41,6 +41,7 @@ _STATE_ORDER = ("streaming", "connecting", "reconnecting", "error", "offline")
 _DECODERS = {
     "vaapi": "VA-API hardware",
     "nvdec": "NVIDIA NVDEC hardware",
+    "d3d11": "Direct3D 11 hardware",
     "v4l2_m2m": "V4L2 hardware",
     "software": "CPU (software)",
     "blocked": "blocked (GStreamer update required)",
@@ -275,10 +276,19 @@ def monitor(
     return 0
 
 
+#: Shown when the terminal monitor starts and in ``--help``, as the licence
+#: asks of interactive programs (the full text: NOTICE).
+NO_WARRANTY = (
+    "NeuroWatch comes with ABSOLUTELY NO WARRANTY and is used at your own risk;"
+    " it is free software under the GNU AGPL v3 or later (see NOTICE and LICENSE)."
+)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="neurowatch-headless",
         description="NeuroWatch without the desktop UI: status.",
+        epilog=NO_WARRANTY,
     )
     parser.add_argument(
         "--endpoint",
@@ -375,6 +385,7 @@ def main(argv: list[str] | None = None, out: TextIO = sys.stdout) -> int:
     say = _Printer(out)
     try:
         if args.command == "monitor":
+            say(NO_WARRANTY)
             if args.service:
                 started = _start_headless_service(say, autostart=not args.no_autostart)
                 if started:

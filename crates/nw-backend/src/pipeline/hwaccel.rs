@@ -14,6 +14,8 @@ static LIVE_VIEW_BLOCK_REASON: OnceLock<&'static str> = OnceLock::new();
 pub enum HwAccelKind {
     VaApi,
     NvDec,
+    /// Direct3D 11 (Windows): Intel, AMD and NVIDIA GPUs. VA-API is Linux only.
+    D3d11,
     V4l2M2m,
     Software,
 }
@@ -23,6 +25,7 @@ impl std::fmt::Display for HwAccelKind {
         match self {
             Self::VaApi => write!(f, "VA-API"),
             Self::NvDec => write!(f, "NVDEC"),
+            Self::D3d11 => write!(f, "Direct3D 11"),
             Self::V4l2M2m => write!(f, "V4L2 M2M"),
             Self::Software => write!(f, "Software (avdec)"),
         }
@@ -35,6 +38,7 @@ impl HwAccelKind {
         match self {
             Self::VaApi => "vaapi",
             Self::NvDec => "nvdec",
+            Self::D3d11 => "d3d11",
             Self::V4l2M2m => "v4l2_m2m",
             Self::Software => "software",
         }
@@ -55,6 +59,12 @@ pub fn probe() -> HwAccelKind {
     if factory_usable("nvh264dec") {
         tracing::info!("Hardware acceleration: NVDEC");
         return HwAccelKind::NvDec;
+    }
+    // Registered only for a GPU whose driver can decode H.264.
+    if factory_usable("d3d11h264dec") {
+        prefer_over_software(&["d3d11h264dec", "d3d11h265dec"]);
+        tracing::info!("Hardware acceleration: Direct3D 11");
+        return HwAccelKind::D3d11;
     }
     if factory_usable("v4l2h264dec") {
         tracing::info!("Hardware acceleration: V4L2 M2M");
@@ -135,6 +145,21 @@ fn exclude_plugin_features(registry: &gstreamer::Registry, name: &str) -> usize 
     count
 }
 
+/// Rank `factories` above the software decoders (`avdec_*`, primary), so the
+/// `decodebin` of live view and playback picks them too, not only the explicit
+/// `h264_decoder` choice.
+fn prefer_over_software(factories: &[&str]) {
+    use gstreamer::prelude::PluginFeatureExtManual;
+    let rank = gstreamer::Rank::PRIMARY + 1;
+    for name in factories {
+        if let Some(factory) = gstreamer::ElementFactory::find(name) {
+            if factory.rank() < rank {
+                factory.set_rank(rank);
+            }
+        }
+    }
+}
+
 fn factory_usable(element_name: &str) -> bool {
     gstreamer::ElementFactory::find(element_name).is_some()
 }
@@ -144,6 +169,7 @@ pub fn h264_decoder(kind: HwAccelKind) -> &'static str {
     match kind {
         HwAccelKind::VaApi => "vah264dec",
         HwAccelKind::NvDec => "nvh264dec",
+        HwAccelKind::D3d11 => "d3d11h264dec",
         HwAccelKind::V4l2M2m => "v4l2h264dec",
         HwAccelKind::Software => "avdec_h264",
     }
@@ -168,7 +194,7 @@ pub fn color_converter(kind: HwAccelKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{h264_decoder, HwAccelKind};
+    use super::{h264_decoder, prefer_over_software, HwAccelKind};
 
     #[test]
     fn va_leak_version_boundaries() {
@@ -349,14 +375,27 @@ mod tests {
     fn decoder_mapping_includes_v4l2() {
         assert_eq!(h264_decoder(HwAccelKind::VaApi), "vah264dec");
         assert_eq!(h264_decoder(HwAccelKind::NvDec), "nvh264dec");
+        assert_eq!(h264_decoder(HwAccelKind::D3d11), "d3d11h264dec");
         assert_eq!(h264_decoder(HwAccelKind::V4l2M2m), "v4l2h264dec");
         assert_eq!(h264_decoder(HwAccelKind::Software), "avdec_h264");
+    }
+
+    #[test]
+    fn preferred_decoders_outrank_software_and_missing_ones_are_skipped() {
+        use gstreamer::prelude::PluginFeatureExtManual;
+        gstreamer::init().unwrap();
+        // `identity` (rank none) stands in for a hardware decoder.
+        prefer_over_software(&["identity", "no-such-decoder"]);
+        let identity = gstreamer::ElementFactory::find("identity").unwrap();
+        assert_eq!(identity.rank(), gstreamer::Rank::PRIMARY + 1);
     }
 
     #[test]
     fn acceleration_kinds_have_stable_wire_names() {
         assert_eq!(HwAccelKind::VaApi.wire_kind(), "vaapi");
         assert_eq!(HwAccelKind::NvDec.wire_kind(), "nvdec");
+        assert_eq!(HwAccelKind::D3d11.wire_kind(), "d3d11");
+        assert!(HwAccelKind::D3d11.is_hardware());
         assert_eq!(HwAccelKind::V4l2M2m.wire_kind(), "v4l2_m2m");
         assert_eq!(HwAccelKind::Software.wire_kind(), "software");
         assert!(HwAccelKind::VaApi.is_hardware());

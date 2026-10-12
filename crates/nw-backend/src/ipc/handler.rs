@@ -52,9 +52,12 @@ pub struct RpcHandler {
 /// How long `system.shutdown` waits before stopping, so its answer is sent.
 const SHUTDOWN_REPLY_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// Who can reach a request's connection. Extension methods (the cloud) are
+/// served only to `Protected` callers: the Unix socket (owner-only, peer uid
+/// checked), or TCP with this user's token (`ipc::token`; Windows uses TCP).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpcTransport {
-    ProtectedUnix,
+    Protected,
     Tcp,
 }
 
@@ -106,7 +109,7 @@ impl RpcHandler {
     }
 
     pub async fn dispatch(&self, req: &Value) -> Value {
-        self.dispatch_from(req, IpcTransport::ProtectedUnix).await
+        self.dispatch_from(req, IpcTransport::Protected).await
     }
 
     pub async fn dispatch_from(&self, req: &Value, transport: IpcTransport) -> Value {
@@ -151,7 +154,7 @@ impl RpcHandler {
                 .find(|e| m.starts_with(e.namespace()))
             {
                 // Extension methods are for local callers on the protected socket only.
-                Some(_) if transport != IpcTransport::ProtectedUnix => {
+                Some(_) if transport != IpcTransport::Protected => {
                     Err(RpcError::method_not_found())
                 }
                 Some(extension) => extension.dispatch(m, params).await,
@@ -1760,7 +1763,7 @@ mod tests {
         let request = json!({"jsonrpc":"2.0","id":1,"method":"example.echo","params":{"a":1}});
 
         let local = handler
-            .dispatch_from(&request, IpcTransport::ProtectedUnix)
+            .dispatch_from(&request, IpcTransport::Protected)
             .await;
         let tcp = handler.dispatch_from(&request, IpcTransport::Tcp).await;
         let unknown = dispatch(&handler, "other.method", json!({})).await;

@@ -28,7 +28,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QRadioButton,
@@ -42,6 +41,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from neurowatch.dialogs.message import show_message
 from neurowatch.ipc.sync_client import BackendOfflineError, IpcError, SyncIpcClient
 from neurowatch.models.camera import (
     CameraConfig,
@@ -1284,7 +1284,7 @@ class AddEditCameraDialog(QDialog):
 
     def _on_accept(self) -> None:
         if self._search_tab is not None and self._tabs.currentWidget() is self._search_tab:
-            QMessageBox.information(
+            show_message(
                 self,
                 "Choose a Camera",
                 "Select a camera in the search results and click Use Selected Camera, "
@@ -1294,19 +1294,20 @@ class AddEditCameraDialog(QDialog):
         is_simple = self._tabs.currentWidget() is self._simple_tab
         if is_simple:
             if not self._discovered:
-                QMessageBox.warning(
+                show_message(
                     self,
                     "No Streams Discovered",
                     "Run ONVIF discovery first, or switch to the Advanced tab "
                     "and enter the RTSP URL manually.",
+                    kind="warning",
                 )
                 return
             if self._s_main_combo.currentData() is None:
-                QMessageBox.warning(self, "Select Stream", "Select a main stream.")
+                show_message(self, "Select Stream", "Select a main stream.", kind="warning")
                 return
         else:
             if not self._a_url.text().strip():
-                QMessageBox.warning(self, "Validation", "Stream URL is required.")
+                show_message(self, "Validation", "Stream URL is required.", kind="warning")
                 return
         self.accept()
 

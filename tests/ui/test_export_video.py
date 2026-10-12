@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 from PySide6.QtCore import QPointF, QSize, Qt
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtWidgets import QFileDialog
 
 from neurowatch.dialogs import export_video_dialog
 from neurowatch.dialogs.export_video_dialog import ExportVideoDialog
@@ -398,8 +398,8 @@ def test_closing_during_an_export_asks_and_cancels_it(dialog, monkeypatch, tmp_p
     _, handler = dialog.calls.last("export.start")
     handler([{"job_id": "j1", "state": "running", "progress": 0.1}])
 
-    answers = [QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes]
-    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: answers.pop(0))
+    answers = [False, True]
+    monkeypatch.setattr(export_video_dialog, "ask", lambda *a, **k: answers.pop(0))
     dialog.reject()
     assert "export.cancel" not in dialog.calls.methods(), "kept running on No"
     dialog.reject()

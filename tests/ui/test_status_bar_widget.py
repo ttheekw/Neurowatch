@@ -35,6 +35,10 @@ def test_acceleration_badge_distinguishes_hardware_and_software(qtbot):
     bar.set_video_acceleration({"kind": "nvdec", "hardware": True})
     assert bar._accel_lbl.text() == "◆ NVIDIA NVDEC"
 
+    bar.set_video_acceleration({"kind": "d3d11", "hardware": True})
+    assert bar._accel_lbl.text() == "▣ Direct3D 11"
+    assert "hardware" in bar._accel_lbl.toolTip().lower()
+
     bar.set_video_acceleration({"kind": "software", "hardware": False})
     assert bar._accel_lbl.text() == "◌ CPU Decode"
 

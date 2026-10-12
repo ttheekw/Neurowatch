@@ -32,7 +32,7 @@ from neurowatch.service import probe
 from neurowatch.service.lock import InstanceLock
 from neurowatch.service.manager import ServiceController
 from neurowatch.service.paths import IS_WINDOWS, lock_path, log_path, service_endpoint, ui_command
-from neurowatch.theme import apply_app_theme, menu_stylesheet
+from neurowatch.theme import app_icon, apply_app_theme, menu_stylesheet
 from neurowatch.widgets.centered_prompt import CenteredPrompt
 
 logger = logging.getLogger(__name__)
@@ -530,6 +530,8 @@ def run(argv: list[str] | None = None) -> int:
     assert isinstance(app, QApplication)
     app.setApplicationName("NeuroWatch")
     app.setQuitOnLastWindowClosed(False)  # dialogs closing must not end the tray
+    app.setWindowIcon(app_icon())
+    app.setDesktopFileName("neurowatch")
     apply_app_theme(app)
 
     waited = 0

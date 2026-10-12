@@ -43,9 +43,10 @@ roxmltree          = "0.20"
 socket2            = { version = "0.5", features = ["all"] }
 sha1               = "0.10"
 
-# Windows frame rings use named pagefile-backed sections (no /dev/shm).
+# Windows frame rings use named pagefile-backed sections (no /dev/shm); the
+# performance readings use the CPU time, memory and network adapter counters.
 [target.'cfg(windows)'.dependencies]
-windows-sys        = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Memory"] }
+windows-sys        = { version = "0.60", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

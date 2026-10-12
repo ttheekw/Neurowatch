@@ -6,6 +6,13 @@ from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QVBoxLayout, QW
 from neurowatch import build_info
 from neurowatch.theme import apply_dialog_theme, set_label_role, style_button_box
 
+#: The licence's "Appropriate Legal Notices" (AGPL section 5(d)), in short.
+NO_WARRANTY = (
+    "Free software under the GNU AGPL v3 or later. Provided as is, WITHOUT ANY"
+    " WARRANTY, at your own risk; the authors are not liable for any loss,"
+    " including missed or lost recordings. See NOTICE and LICENSE."
+)
+
 
 class AboutDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -42,6 +49,12 @@ class AboutDialog(QDialog):
         )
         set_label_role(stack, "hint")
         layout.addWidget(stack)
+        layout.addSpacing(10)
+        legal = QLabel(NO_WARRANTY, alignment=Qt.AlignmentFlag.AlignCenter)
+        legal.setWordWrap(True)
+        legal.setAccessibleName("Licence and warranty")
+        set_label_role(legal, "hint")
+        layout.addWidget(legal)
         layout.addSpacing(14)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
