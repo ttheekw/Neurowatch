@@ -106,3 +106,20 @@ def test_the_summary_counts_pytest_and_cargo_results(tmp_path: Path, monkeypatch
     passing = tmp_path / "ok.txt"
     passing.write_text("     Running x\ntest result: ok. 2 passed; 0 failed; 0 ignored;\n")
     assert "✅ passed" in summary.markdown("Rust", [summary.read_cargo(passing)])
+
+
+def test_workflows_use_actions_that_run_on_node_24() -> None:
+    # GitHub retired Node 20 for actions; these majors were its last users here.
+    retired = {
+        "actions/checkout": 7,
+        "actions/setup-python": 7,
+        "actions/upload-artifact": 7,
+        "actions/download-artifact": 8,
+        "astral-sh/setup-uv": 10,
+    }
+    for workflow in (ROOT / ".github/workflows").glob("*.yml"):
+        text = workflow.read_text()
+        assert "uses: ilammy/msvc-dev-cmd" not in text, workflow.name  # still Node 20
+        for action, minimum in retired.items():
+            for major in re.findall(rf"uses: {re.escape(action)}@v(\d+)", text):
+                assert int(major) >= minimum, f"{workflow.name}: {action}@v{major}"

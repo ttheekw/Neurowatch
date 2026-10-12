@@ -43,8 +43,8 @@ Name: desktopicon; Description: "Create a desktop shortcut"; Flags: unchecked
 Source: "{#BundleDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\NeuroWatch"; Filename: "{app}\app\neurowatch-ui\neurowatch-ui.exe"; WorkingDir: "{app}"
-Name: "{autodesktop}\NeuroWatch"; Filename: "{app}\app\neurowatch-ui\neurowatch-ui.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{group}\NeuroWatch"; Filename: "{app}\app\neurowatch-ui\neurowatch-ui.exe"; WorkingDir: "{app}"; AppUserModelID: "NeuroWatch.NeuroWatch"
+Name: "{autodesktop}\NeuroWatch"; Filename: "{app}\app\neurowatch-ui\neurowatch-ui.exe"; WorkingDir: "{app}"; AppUserModelID: "NeuroWatch.NeuroWatch"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\app\neurowatch-ui\neurowatch-ui.exe"; Description: "Open NeuroWatch"; Flags: nowait postinstall skipifsilent

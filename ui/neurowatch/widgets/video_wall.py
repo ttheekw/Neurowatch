@@ -38,6 +38,7 @@ from neurowatch.models.wall_layout import (
     restore,
     swap,
 )
+from neurowatch.theme import ui_font
 from neurowatch.widgets.cell_widget import (
     AUDIO_AVAILABLE,
     AUDIO_NONE,
@@ -182,8 +183,8 @@ class _LayoutPreviewOverlay(QWidget):
         for rect in preview.empty:
             painter.drawRoundedRect(rect.adjusted(4, 4, -4, -4), 6, 6)
 
-        name_font = QFont("Sans", 10, QFont.Weight.DemiBold)
-        size_font = QFont("Sans", 9)
+        name_font = ui_font(10, QFont.Weight.DemiBold)
+        size_font = ui_font(9)
         for tile in preview.tiles:
             line, fill, width = {
                 "active": (self._ACCENT, self._ACCENT_FILL, 2),
@@ -227,17 +228,17 @@ class _LayoutPreviewOverlay(QWidget):
         painter.setBrush(self._ACCENT_FILL if edge.active else self._OTHER_FILL)
         painter.drawRoundedRect(band, 6, 6)
         painter.setPen(self._TEXT if edge.active else self._MUTED)
-        painter.setFont(QFont("Sans", 18, QFont.Weight.DemiBold))
+        painter.setFont(ui_font(18, QFont.Weight.DemiBold))
         arrow = band.adjusted(0, 0, 0, -24)
         glyph = "\u2039" if edge.side < 0 else "\u203a"
         painter.drawText(arrow, Qt.AlignmentFlag.AlignCenter, glyph)
-        painter.setFont(QFont("Sans", 8, QFont.Weight.DemiBold))
+        painter.setFont(ui_font(8, QFont.Weight.DemiBold))
         painter.drawText(band.adjusted(0, 24, 0, 0), Qt.AlignmentFlag.AlignCenter, edge.label)
 
     def _draw_pill(
         self, painter: QPainter, text: str, at: QPoint, border: QColor | None, *, anchor: str
     ) -> None:
-        font = QFont("Sans", 9, QFont.Weight.DemiBold)
+        font = ui_font(9, QFont.Weight.DemiBold)
         fm = QFontMetrics(font)
         max_w = max(80, self.width() - 32)
         text = fm.elidedText(text, Qt.TextElideMode.ElideRight, max_w - 24)

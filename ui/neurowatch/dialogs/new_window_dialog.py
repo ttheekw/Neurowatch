@@ -25,7 +25,13 @@ from PySide6.QtWidgets import (
 )
 
 from neurowatch.models.wall_layout import GRID_PRESETS, Slot, grid_label, pack, page_count
-from neurowatch.theme import active_colors, apply_dialog_theme, set_label_role, style_button_box
+from neurowatch.theme import (
+    active_colors,
+    apply_dialog_theme,
+    set_label_role,
+    style_button_box,
+    ui_font,
+)
 from neurowatch.widgets.window_chrome import install_dialog_chrome
 
 _CARDS_PER_ROW = 4
@@ -85,14 +91,14 @@ class _PageCard(QAbstractButton):
         painter.drawRoundedRect(frame, 8, 8)
 
         painter.setPen(QColor(colors.text))
-        painter.setFont(QFont("Sans", 10, QFont.Weight.DemiBold))
+        painter.setFont(ui_font(10, QFont.Weight.DemiBold))
         painter.drawText(
             QRect(12, 8, self.width() - 24, 20),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             f"Page {self.page.index + 1}",
         )
         painter.setPen(QColor(colors.text_muted))
-        painter.setFont(QFont("Sans", 9))
+        painter.setFont(ui_font(9))
         painter.drawText(
             QRect(12, self.height() - 28, self.width() - 24, 20),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
@@ -110,7 +116,7 @@ class _PageCard(QAbstractButton):
         painter.drawRoundedRect(QRectF(area), 4, 4)
         tile_fill = QColor(colors.accent if selected else colors.border_control)
         tile_fill.setAlpha(150 if selected else 110)
-        name_font = QFont("Sans", 7)
+        name_font = ui_font(7)
         metrics = QFontMetrics(name_font)
         painter.setFont(name_font)
         for (row, col, row_span, col_span), name in self.page.tiles:
@@ -185,20 +191,20 @@ class _DestinationCard(QAbstractButton):
         painter.setBrush(QColor(colors.accent if selected else colors.surface_sunken))
         painter.drawRoundedRect(badge, 8, 8)
         painter.setPen(QColor(colors.on_accent if selected else colors.text_muted))
-        painter.setFont(QFont("Sans", 11, QFont.Weight.Bold))
+        painter.setFont(ui_font(11, QFont.Weight.Bold))
         painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, self._glyph)
 
         text_x = int(badge.right()) + 10
         width = self.width() - text_x - 10
         painter.setPen(QColor(colors.text))
-        painter.setFont(QFont("Sans", 10, QFont.Weight.DemiBold))
+        painter.setFont(ui_font(10, QFont.Weight.DemiBold))
         painter.drawText(
             QRect(text_x, 9, width, 20),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             self._title,
         )
         painter.setPen(QColor(colors.text_muted))
-        small = QFont("Sans", 9)
+        small = ui_font(9)
         painter.setFont(small)
         caption = QFontMetrics(small).elidedText(self._caption, Qt.TextElideMode.ElideRight, width)
         painter.drawText(

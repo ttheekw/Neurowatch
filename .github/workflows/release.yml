@@ -62,10 +62,10 @@ jobs:
             runner: ubuntu-24.04-arm
             formats: portable,deb,rpm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check out NeuroWatch Cloud (official builds)
         if: env.OFFICIAL_BUILD == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.NEUROWATCH_CLOUD_REPOSITORY || 'ttheekw/Neurowatch-cloud' }}
           # A release uses the cloud repository's tag of the same version;
@@ -110,7 +110,7 @@ jobs:
           curl -fsSL https://apt.llvm.org/llvm.sh -o llvm.sh
           sudo bash llvm.sh 21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
@@ -126,7 +126,7 @@ jobs:
             --out-dir dist/release
       - name: Smoke check portable bundle
         run: python scripts/smoke_release.py build/release-linux-${{ matrix.arch }}/bundle/neurowatch
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-linux-${{ matrix.arch }}
           path: dist/release/*
@@ -144,10 +144,10 @@ jobs:
       # the open-source app.
       OFFICIAL_BUILD: ${{ secrets.NEUROWATCH_CLOUD_TOKEN != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check out NeuroWatch Cloud (official builds)
         if: env.OFFICIAL_BUILD == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.NEUROWATCH_CLOUD_REPOSITORY || 'ttheekw/Neurowatch-cloud' }}
           # A release uses the cloud repository's tag of the same version;
@@ -180,7 +180,27 @@ jobs:
             # the whole binary must too, or linking fails (LNK2038).
             'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-C target-feature=+crt-static'
           ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - uses: ilammy/msvc-dev-cmd@v1
+      # The Visual Studio developer environment (cl, link, INCLUDE, LIB) for
+      # x64, as ilammy/msvc-dev-cmd did (it still runs on the retired Node 20):
+      # only the variables VsDevCmd changes are exported.
+      - name: Set up MSVC (x64)
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio with the x64 C++ tools was not found' }
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $after = cmd /c "`"$devcmd`" -no_logo -arch=amd64 -host_arch=amd64 && set"
+          if ($LASTEXITCODE -ne 0) { throw "VsDevCmd failed: $LASTEXITCODE" }
+          foreach ($line in $after) {
+            if ($line -notmatch '^([^=]+)=(.*)$') { continue }
+            $name, $value = $Matches[1], $Matches[2]
+            if ($name -like 'GITHUB_*' -or $name -like 'RUNNER_*') { continue }
+            if ([Environment]::GetEnvironmentVariable($name) -ne $value) {
+              "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+          where.exe cl link
       - name: Install GStreamer (MSVC)
         shell: pwsh
         run: |
@@ -211,7 +231,7 @@ jobs:
           echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" >> $env:GITHUB_ENV
           echo "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" >> $env:GITHUB_ENV
           echo "$gstRoot\bin" >> $env:GITHUB_PATH
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
@@ -223,7 +243,7 @@ jobs:
       - name: Test silent install, packaged service and uninstall
         shell: pwsh
         run: ./scripts/smoke_windows_installer.ps1 -OutDir dist/release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-windows-x86_64
           path: |
@@ -250,8 +270,8 @@ jobs:
           - {image: 'debian:13', format: deb, arch: arm64, runner: ubuntu-24.04-arm}
           - {image: 'fedora:43', format: rpm, arch: arm64, runner: ubuntu-24.04-arm}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: release-linux-${{ matrix.arch }}
           path: dist/release
@@ -272,11 +292,37 @@ jobs:
       contents: write
     steps:
       - name: Gather artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: dist/release
           merge-multiple: true
+      # Version-free copies for the README's download buttons, which use
+      # https://github.com/<repo>/releases/latest/download/<name>.
+      - name: Add version-free download names
+        working-directory: dist/release
+        run: |
+          set -euo pipefail
+          declare -A latest=(
+            ['neurowatch-*-windows-x86_64-setup.exe']=neurowatch-windows-x86_64-setup.exe
+            ['neurowatch-*-windows-x86_64.zip']=neurowatch-windows-x86_64.zip
+            ['neurowatch_*_amd64.deb']=neurowatch_amd64.deb
+            ['neurowatch_*_arm64.deb']=neurowatch_arm64.deb
+            ['neurowatch-*.x86_64.rpm']=neurowatch.x86_64.rpm
+            ['neurowatch-*.aarch64.rpm']=neurowatch.aarch64.rpm
+            ['neurowatch-*-x86_64.pkg.tar.zst']=neurowatch-x86_64.pkg.tar.zst
+            ['neurowatch-*-linux-x86_64.tar.gz']=neurowatch-linux-x86_64.tar.gz
+            ['neurowatch-*-linux-arm64.tar.gz']=neurowatch-linux-arm64.tar.gz
+          )
+          for pattern in "${!latest[@]}"; do
+            matches=($pattern)
+            if [[ ${#matches[@]} -ne 1 || ! -f "${matches[0]}" ]]; then
+              echo "expected one file for $pattern, found: ${matches[*]}" >&2
+              exit 1
+            fi
+            cp "${matches[0]}" "${latest[$pattern]}"
+          done
+          ls -la
       - name: Generate SHA256SUMS
         working-directory: dist/release
         run: |
@@ -287,10 +333,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.version.outputs.tag }}
         run: |
-          prerelease=()
-          if [[ "$RELEASE_TAG" == *-* ]]; then
-            prerelease=(--prerelease)
-          fi
+          # Every release, betas included, is marked Latest: the README's
+          # download buttons follow GitHub's latest release, which skips
+          # pre-releases. The version and title still say beta.
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" dist/release/*
             exit 0
@@ -298,7 +343,7 @@ jobs:
           gh release create "$RELEASE_TAG" \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
-            --title "Neurowatch $RELEASE_TAG" \
+            --title "NeuroWatch $RELEASE_TAG" \
             --generate-notes \
-            "${prerelease[@]}" \
+            --latest \
             dist/release/*

@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from neurowatch import extensions
@@ -32,7 +32,7 @@ from neurowatch.service import probe
 from neurowatch.service.lock import InstanceLock
 from neurowatch.service.manager import ServiceController
 from neurowatch.service.paths import IS_WINDOWS, lock_path, log_path, service_endpoint, ui_command
-from neurowatch.theme import app_icon, apply_app_theme, menu_stylesheet
+from neurowatch.theme import app_icon, apply_app_theme, icon_path, menu_stylesheet
 from neurowatch.widgets.centered_prompt import CenteredPrompt
 
 logger = logging.getLogger(__name__)
@@ -234,23 +234,18 @@ def read_status(
 
 
 def tray_icon(state: str, alert: bool = False, size: int = 64) -> QIcon:
-    """A camera lens on a dark tile; a health dot at the bottom right (see
+    """The NeuroWatch logo; a health dot at the bottom right (see
     ``ServiceStatus.state``), and a small red badge at the top right while
     something needs attention."""
+    from PySide6.QtSvg import QSvgRenderer
+
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     s = size / 64.0
-    tile = QPainterPath()
-    tile.addRoundedRect(QRectF(4 * s, 4 * s, 56 * s, 56 * s), 14 * s, 14 * s)
-    painter.fillPath(tile, QColor("#1d3a6e"))
-    painter.setPen(QPen(QColor("#e2e8f0"), 5 * s))
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-    painter.drawEllipse(QPointF(30 * s, 32 * s), 15 * s, 15 * s)
+    QSvgRenderer(icon_path("neurowatch.svg")).render(painter, QRectF(2 * s, 2 * s, 56 * s, 56 * s))
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#e2e8f0"))
-    painter.drawEllipse(QPointF(30 * s, 32 * s), 6 * s, 6 * s)
     painter.setBrush(QColor("#0b1220"))
     painter.drawEllipse(QPointF(48 * s, 48 * s), 13 * s, 13 * s)
     painter.setBrush(QColor(_STATE_COLORS.get(state, _STATE_COLORS[BUSY])))

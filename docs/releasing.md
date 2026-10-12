@@ -9,6 +9,11 @@ The [release workflow](../.github/workflows/release.yml) produces these download
 | Windows x86_64 | Inno Setup `-setup.exe`, portable `.zip` |
 | All | `SHA256SUMS` |
 
+Each download is also published under a version-free name (for example
+`neurowatch-windows-x86_64-setup.exe`, `neurowatch_amd64.deb`), which the
+README's download buttons link through
+`https://github.com/ttheekw/Neurowatch/releases/latest/download/<name>`.
+
 Ordinary branch pushes run CI. A `vMAJOR.MINOR.PATCH` tag, optionally followed
 by `-rc.1`, runs the release build. No self-hosted runner is required. GitHub
 Actions must be enabled, with repository policy allowing the publish job's
@@ -57,7 +62,9 @@ optional for a prerelease and recommended before a stable release:
 | Prerelease (beta, release candidate) | `v0.1.0-beta.1`, `v0.1.0-rc.1` | Optional. Users test it; say so in the release notes, e.g. "Not yet tested on real hardware: please report problems in Issues." |
 | Stable | `v0.1.0` | Recommended: the [release qualification record](release-qualification.md), on the downloaded artifacts of this exact commit |
 
-GitHub marks a tag with a suffix as a prerelease.
+Every published release, betas included, is marked **Latest** (not
+pre-release): GitHub's "latest" link, which the README's download buttons
+use, skips pre-releases. The version and release title still say beta.
 
 The pipeline builds GStreamer and the Rust backend, so allow time for a full
 native build on all three hosted runners. The media source downloads are pinned
@@ -81,8 +88,8 @@ by SHA-256; Python runtime dependencies come from `uv.lock` and Cargo uses
    ```
 
 3. The workflow builds and checks all packages, generates checksums and creates
-   the GitHub Release with the downloads attached. A tag with a suffix such as
-   `v0.1.0-rc.1` creates a prerelease.
+   the GitHub Release with the downloads attached (and their version-free
+   copies), marked Latest.
 
 Alternatively, publish a release for a `v*` tag through GitHub's Releases UI.
 The `release: published` event builds and attaches the same files to that

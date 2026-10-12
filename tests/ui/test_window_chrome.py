@@ -103,7 +103,14 @@ class _ResizeLog(QObject):
 
 @pytest.mark.parametrize(
     ("platform", "expected"),
-    [("wayland", True), ("wayland-egl", True), ("offscreen", False), ("minimal", False)],
+    [
+        ("wayland", True),
+        ("wayland-egl", True),
+        # Translucent windows lose ClearType on Windows: opaque, natively rounded.
+        ("windows", False),
+        ("offscreen", False),
+        ("minimal", False),
+    ],
 )
 def test_platforms_that_composite(monkeypatch, platform: str, expected: bool) -> None:
     window_chrome._platform_composites.cache_clear()

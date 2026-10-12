@@ -61,6 +61,7 @@ from neurowatch.models.camera import CameraConfig, WallPosition
 from neurowatch.models.wall_layout import Placement
 from neurowatch.models.window_session import saved_windows
 from neurowatch.theme import app_icon, apply_app_theme
+from neurowatch.utils.threads import wait_for_retired
 from neurowatch.widgets.camera_panel import CameraPanel
 from neurowatch.widgets.compact_bar import CompactTitleBar
 from neurowatch.widgets.detached_wall import DEFAULT_CYCLE_INTERVAL, DetachedWallWindow
@@ -618,6 +619,9 @@ class MainWindow(QMainWindow):
         self._wall.shutdown()
         self._performance_page.close()
         self._playback_view.close()
+        # Workers dialogs let go of while they still ran (utils.threads.retire):
+        # destroying one still running at exit would abort the application.
+        wait_for_retired(8000)
 
     def _on_edit_camera_selected(self) -> None:
         if self._selected_cam_id:
@@ -1758,6 +1762,61 @@ def _configure_logging() -> None:
         logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")
     )
     root.addHandler(file_handler)
+    _capture_crashes(log_dir)
+
+
+#: Windows taskbar identity, shared with the installer's shortcuts (windows.iss),
+#: so the running app groups under the shortcut and shows the NeuroWatch logo.
+WINDOWS_APP_ID = "NeuroWatch.NeuroWatch"
+
+
+def _set_windows_app_id() -> None:
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        shell32 = ctypes.CDLL("shell32")  # 64-bit Windows: one calling convention
+        shell32.SetCurrentProcessExplicitAppUserModelID(ctypes.c_wchar_p(WINDOWS_APP_ID))
+    except (AttributeError, OSError) as e:
+        logger.warning("Could not set the Windows taskbar identity: %s", e)
+
+
+#: Kept open for the life of the process: faulthandler writes to it on a crash.
+_crash_log = None
+
+
+def _capture_crashes(log_dir: str) -> None:
+    """Leave a trace of crashes that end the process without a Python error:
+    native faults go to ``crash.log`` (every thread's stack), and Qt's own
+    warnings and fatal errors (such as a thread destroyed while running) to
+    the log. A windowed Windows build has no console to show either."""
+    global _crash_log
+    import faulthandler
+
+    from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+
+    try:
+        _crash_log = open(os.path.join(log_dir, "crash.log"), "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_log, all_threads=True)
+    except OSError as e:
+        logger.warning("Crash log unavailable: %s", e)
+    qt_logger = logging.getLogger("qt")
+    levels = {
+        QtMsgType.QtDebugMsg: logging.DEBUG,
+        QtMsgType.QtInfoMsg: logging.INFO,
+        QtMsgType.QtWarningMsg: logging.WARNING,
+        QtMsgType.QtCriticalMsg: logging.ERROR,
+        QtMsgType.QtFatalMsg: logging.CRITICAL,
+    }
+
+    def to_log(kind: QtMsgType, _context: object, message: str) -> None:
+        qt_logger.log(levels.get(kind, logging.WARNING), "%s", message)
+        if kind == QtMsgType.QtFatalMsg:
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+
+    qInstallMessageHandler(to_log)
 
 
 class _ShutdownRequest:
@@ -1954,6 +2013,7 @@ def main() -> None:
         from neurowatch.tray import run as run_tray
 
         sys.exit(run_tray([sys.argv[0], *launch.rest]))
+    _set_windows_app_id()
     app = QApplication([sys.argv[0], *launch.rest])
     app.setApplicationName("NeuroWatch")
     app.setOrganizationName("Neurowatch")

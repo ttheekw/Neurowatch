@@ -1,15 +1,53 @@
-# NeuroWatch
+<p align="center">
+  <img src="ui/neurowatch/resources/icons/neurowatch.svg" width="96" height="96" alt="NeuroWatch logo">
+</p>
 
-> A video recorder (NVR) for your own computer: watch your cameras, record them to your own drive, and play the footage back, with optional viewing from a browser.
+<h1 align="center">NeuroWatch</h1>
 
-[![Latest release](https://img.shields.io/github/v/release/ttheekw/Neurowatch?include_prereleases&label=download)](https://github.com/ttheekw/Neurowatch/releases)
-[![Tests](https://github.com/ttheekw/Neurowatch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ttheekw/Neurowatch/actions/workflows/ci.yml?query=branch%3Amain)
-[![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-informational)](#installing)
-[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
+<p align="center">
+  <b>Turn the computer you already have into a security camera recorder.</b><br>
+  Watch every camera live, record around the clock to your own drive, and find any moment in seconds.<br>
+  Free and open source. No camera limit. No account. No subscription.
+</p>
 
-NeuroWatch turns a Linux or Windows computer into a security camera recorder. Add your IP cameras, watch them on a video wall, and record around the clock. Recordings stay on your own drive. It keeps recording in the background after you close the window, and it can run on a computer without a screen.
+<p align="center">
+  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-windows-x86_64-setup.exe"><img src="https://img.shields.io/badge/Download_for_Windows-10_%26_11,_64--bit-2563eb?style=for-the-badge" alt="Download NeuroWatch for Windows 10 and 11"></a>
+  &nbsp;
+  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch_amd64.deb"><img src="https://img.shields.io/badge/Download_for_Ubuntu_%2F_Debian-.deb,_64--bit-E95420?style=for-the-badge" alt="Download NeuroWatch for Ubuntu and Debian"></a>
+</p>
 
-NeuroWatch is **free and open source** ([AGPL-3.0-or-later](LICENSE)), with **no camera limit**. The optional NeuroWatch Cloud, for watching from a browser, is a separate service in the official downloads (see [Licensing](#licensing)).
+<p align="center">
+  Also for
+  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch.x86_64.rpm">Fedora (.rpm)</a> ·
+  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-x86_64.pkg.tar.zst">Arch Linux</a> ·
+  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch_arm64.deb">Raspberry Pi &amp; ARM (.deb)</a> ·
+  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch.aarch64.rpm">Fedora ARM</a> ·
+  portable <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-windows-x86_64.zip">Windows .zip</a>,
+  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-linux-x86_64.tar.gz">Linux .tar.gz</a>,
+  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-linux-arm64.tar.gz">ARM .tar.gz</a><br>
+  <a href="https://github.com/ttheekw/Neurowatch/releases/latest">Release notes and checksums</a> ·
+  <a href="#installing">Installation help</a> ·
+  <a href="docs/system-requirements.md">System requirements</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/ttheekw/Neurowatch/releases/latest"><img src="https://img.shields.io/github/v/release/ttheekw/Neurowatch?include_prereleases&label=latest" alt="Latest version"></a>
+  <a href="https://github.com/ttheekw/Neurowatch/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/ttheekw/Neurowatch/actions/workflows/ci.yml/badge.svg?branch=main" alt="Tests"></a>
+  <a href="#installing"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-informational" alt="Linux and Windows"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue" alt="License: AGPL-3.0-or-later"></a>
+</p>
+
+### Why NeuroWatch
+
+- **Your footage stays yours.** Everything is recorded to your own drive. Nothing leaves your computer unless you choose to turn on the cloud.
+- **No limits, no fees.** Add as many cameras as your computer can handle. The app is free and open source, for home and business use.
+- **Works with the cameras you already own.** Any RTSP or ONVIF IP camera; **Search Network** finds them for you in a click.
+- **Never misses a moment.** Recording carries on in the background after you close the window, starts with your computer, and reconnects cameras by itself when they drop.
+- **Watch from anywhere, if you want to.** The optional NeuroWatch Cloud shows your cameras in a browser, free for up to 16 cameras.
+
+> **Beta:** every release is install-tested on Windows, Ubuntu 22.04 and 24.04, Debian 12 and 13, Fedora 43 and Arch Linux before it is published. Found a problem? [Tell us](https://github.com/ttheekw/Neurowatch/issues), it makes the next release better.
+
+NeuroWatch is **free and open source** ([AGPL-3.0-or-later](LICENSE)). The optional NeuroWatch Cloud, for watching from a browser, is a separate service in the official downloads (see [Licensing](#licensing)).
 
 ## Contents
 
@@ -82,20 +120,20 @@ Motion detection and events, recording schedules, AI object detection, multi-sit
 
 ## Installing
 
-**[Download NeuroWatch from the Releases page](https://github.com/ttheekw/Neurowatch/releases)**. The newest release is at the top, with its files under **Assets**. Early versions are marked *Pre-release*: they work, but haven't been tested on many computers yet, so please [report problems](https://github.com/ttheekw/Neurowatch/issues).
+Each link below downloads the newest version. Older versions, release notes and checksums are on the [Releases page](https://github.com/ttheekw/Neurowatch/releases). NeuroWatch is in beta: it works, but hasn't been tested on many computers yet, so please [report problems](https://github.com/ttheekw/Neurowatch/issues).
 
-Pick the file for your system. On Ubuntu, Debian, Linux Mint and Fedora you can **double-click** the downloaded package and choose **Install**; the terminal command next to it does the same, run in the folder you downloaded it to (usually `~/Downloads`):
+On Ubuntu, Debian, Linux Mint and Fedora you can **double-click** the downloaded package and choose **Install**; the terminal command next to it does the same, run in the folder you downloaded it to (usually `~/Downloads`):
 
-| System | File ending in | Install |
+| System | Download | Install |
 |---|---|---|
-| Ubuntu, Debian, Linux Mint (64-bit PC) | `_amd64.deb` | Double-click → **Install**, or `sudo apt install ./neurowatch_*_amd64.deb` |
-| Ubuntu, Debian, Raspberry Pi OS 64-bit (ARM) | `_arm64.deb` | Double-click → **Install**, or `sudo apt install ./neurowatch_*_arm64.deb` |
-| Fedora (64-bit PC) | `.x86_64.rpm` | Double-click → **Install**, or `sudo dnf install ./neurowatch-*.x86_64.rpm` |
-| Fedora (ARM) | `.aarch64.rpm` | Double-click → **Install**, or `sudo dnf install ./neurowatch-*.aarch64.rpm` |
-| Arch Linux (64-bit PC) | `-x86_64.pkg.tar.zst` | `sudo pacman -U ./neurowatch-*-x86_64.pkg.tar.zst` |
-| Other Linux (portable) | `-linux-x86_64.tar.gz` or `-linux-arm64.tar.gz` | `tar xzf neurowatch-*-linux-*.tar.gz && ./neurowatch/neurowatch` (needs the system's desktop and audio libraries) |
-| Windows 10/11 (64-bit) | `-windows-x86_64-setup.exe` | Run the installer, then open NeuroWatch from Start. Windows may warn that the installer is unrecognised: choose **More info → Run anyway**. |
-| Windows 10/11 (portable) | `-windows-x86_64.zip` | Extract it, then run `neurowatch.cmd` |
+| Windows 10/11 (64-bit) | [Installer (.exe)](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-windows-x86_64-setup.exe) | Run the installer, then open NeuroWatch from Start. Windows may warn that the installer is unrecognised: choose **More info → Run anyway**. |
+| Windows 10/11 (portable) | [.zip](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-windows-x86_64.zip) | Extract it, then run `neurowatch.cmd` |
+| Ubuntu, Debian, Linux Mint (64-bit PC) | [.deb](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch_amd64.deb) | Double-click → **Install**, or `sudo apt install ./neurowatch*_amd64.deb` |
+| Ubuntu, Debian, Raspberry Pi OS 64-bit (ARM) | [.deb](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch_arm64.deb) | Double-click → **Install**, or `sudo apt install ./neurowatch*_arm64.deb` |
+| Fedora (64-bit PC) | [.rpm](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch.x86_64.rpm) | Double-click → **Install**, or `sudo dnf install ./neurowatch*.x86_64.rpm` |
+| Fedora (ARM) | [.rpm](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch.aarch64.rpm) | Double-click → **Install**, or `sudo dnf install ./neurowatch*.aarch64.rpm` |
+| Arch Linux (64-bit PC) | [.pkg.tar.zst](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-x86_64.pkg.tar.zst) | `sudo pacman -U ./neurowatch*-x86_64.pkg.tar.zst` |
+| Other Linux (portable) | [x86_64](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-linux-x86_64.tar.gz) or [ARM](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-linux-arm64.tar.gz) .tar.gz | `tar xzf neurowatch*-linux-*.tar.gz && ./neurowatch/neurowatch` (needs the system's desktop and audio libraries) |
 
 Double-clicking opens the package in your software centre (App Center on Ubuntu 24.04 and later, Software on Fedora), which asks for your password and installs the system libraries NeuroWatch needs as well; then open **NeuroWatch** from your applications. If double-clicking opens another program (for example on Ubuntu 22.04), use the terminal command instead, with the `./` so the required libraries are installed too. Downloads include the video components NeuroWatch needs; you don't have to install any yourself.
 

@@ -13,6 +13,7 @@ from urllib.parse import quote as url_quote
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QPainter, QPaintEvent, QPen, QPixmap, QShowEvent
 from PySide6.QtWidgets import (
+    QBoxLayout,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -59,7 +60,8 @@ from neurowatch.theme import (
     set_status_tone,
     style_button_box,
 )
-from neurowatch.widgets.window_chrome import install_dialog_chrome
+from neurowatch.utils.threads import retire
+from neurowatch.widgets.window_chrome import chrome_size_hint, install_dialog_chrome
 
 logger = logging.getLogger(__name__)
 
@@ -376,24 +378,34 @@ class AddEditCameraDialog(QDialog):
         self._advanced_tab = self._build_advanced_tab()
         self._tabs.addTab(self._advanced_tab, "Advanced")
         self._tabs.addTab(self._build_recording_tab(), "Recording")
-        layout.addWidget(self._tabs)
 
-        # ── Shared bottom section ───────────────────────────────────────────
+        # ── Connection test: below the tabs, or beside them on a short screen ──
+        self._test_panel = QWidget()
+        test_layout = QVBoxLayout(self._test_panel)
+        test_layout.setContentsMargins(0, 0, 0, 0)
+        test_layout.setSpacing(10)
         self._preview = QLabel("No preview")
         self._preview.setFixedSize(320, 180)
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview.setObjectName("previewSurface")
         self._preview.setAccessibleName("Connection test preview")
-        layout.addWidget(self._preview, alignment=Qt.AlignmentFlag.AlignHCenter)
+        test_layout.addWidget(self._preview, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         self._status_label = QLabel()
         self._status_label.setWordWrap(True)
-        layout.addWidget(self._status_label)
+        test_layout.addWidget(self._status_label)
 
         self._test_btn = QPushButton("Test Connection")
         set_button_variant(self._test_btn, "secondary")
         self._test_btn.clicked.connect(self._on_test)
-        layout.addWidget(self._test_btn)
+        test_layout.addWidget(self._test_btn)
+        test_layout.addStretch(1)
+
+        self._body = QBoxLayout(QBoxLayout.Direction.TopToBottom)
+        self._body.setSpacing(16)
+        self._body.addWidget(self._tabs, stretch=1)
+        self._body.addWidget(self._test_panel)
+        layout.addLayout(self._body)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -411,6 +423,46 @@ class AddEditCameraDialog(QDialog):
             self._fill(camera)
             self._tabs.setCurrentWidget(self._advanced_tab)
         self._interfaces_loaded = False
+
+    #: Share of the screen's height the stacked layout may use before the
+    #: connection test moves beside the tabs.
+    STACKED_SCREEN_SHARE = 0.85
+
+    def setVisible(self, visible: bool) -> None:  # noqa: N802
+        # Decided before showing, so the dialog opens at its final size and
+        # is centred with it.
+        if visible and not self.isVisible():
+            self.fit_to_screen()
+        super().setVisible(visible)
+
+    def fit_to_screen(self) -> None:
+        """Stack the connection test under the tabs when that fits the
+        screen's height, else put it beside them."""
+        self._set_direction(QBoxLayout.Direction.TopToBottom)
+        stacked = chrome_size_hint(self).height()
+        wide = stacked > self._available_height() * self.STACKED_SCREEN_SHARE
+        if wide:
+            self._set_direction(QBoxLayout.Direction.LeftToRight)
+        self.setProperty("columns", 2 if wide else 1)
+
+    def _set_direction(self, direction: QBoxLayout.Direction) -> None:
+        self._body.setDirection(direction)
+        # Every enclosing layout caches its size: measure the new arrangement.
+        widget: QWidget | None = self._test_panel
+        while widget is not None:
+            layout = widget.layout()
+            if layout is not None:
+                layout.invalidate()
+            widget.updateGeometry()  # its parent layout caches its size too
+            if widget is self:
+                break
+            widget = widget.parentWidget()
+        self._body.invalidate()
+
+    def _available_height(self) -> int:
+        parent = self.parentWidget()
+        screen = (parent.window().screen() if parent is not None else None) or self.screen()
+        return screen.availableGeometry().height() if screen is not None else 10_000
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
@@ -1157,6 +1209,7 @@ class AddEditCameraDialog(QDialog):
             pass
         if w.isRunning():
             w.wait(2000)
+        retire(w)  # still running: kept until it finishes, never destroyed running
         self._streams_worker = None
 
     def _stop_background_work(self) -> None:
@@ -1171,6 +1224,7 @@ class AddEditCameraDialog(QDialog):
             scan.stop()
             if scan.isRunning():
                 scan.wait(3000)
+            retire(scan)
             self._scan_worker = None
         interfaces = self._interfaces_worker
         if interfaces is not None:
@@ -1180,6 +1234,7 @@ class AddEditCameraDialog(QDialog):
                 pass
             if interfaces.isRunning():
                 interfaces.wait(2000)
+            retire(interfaces)
             self._interfaces_worker = None
 
     # ------------------------------------------------------------------
@@ -1276,6 +1331,7 @@ class AddEditCameraDialog(QDialog):
             pass
         if wait and w.isRunning():
             w.wait(5500)
+        retire(w)
         self._test_worker = None
 
     # ------------------------------------------------------------------

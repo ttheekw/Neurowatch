@@ -38,7 +38,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from neurowatch.models.camera import CameraConfig
-from neurowatch.theme import themed_menu
+from neurowatch.theme import mono_font, themed_menu, ui_font
 from neurowatch.widgets.native_viewer_surface import NativeViewerSurface
 
 if TYPE_CHECKING:
@@ -51,10 +51,10 @@ def _overlay_fonts() -> dict[str, QFont]:
     """Tile overlay fonts, created once (a QGuiApplication must exist)."""
     if not _FONTS:
         _FONTS.update(
-            name=QFont("Sans", 8, QFont.Weight.DemiBold),
-            dot=QFont("Sans", 10, QFont.Weight.Bold),
-            badge=QFont("Sans", 7, QFont.Weight.Bold),
-            info=QFont("Mono", 8),
+            name=ui_font(8, QFont.Weight.DemiBold),
+            dot=ui_font(10, QFont.Weight.Bold),
+            badge=ui_font(7, QFont.Weight.Bold),
+            info=mono_font(8),
         )
     return _FONTS
 
@@ -469,19 +469,19 @@ class CellWidget(QWidget):
             elif self._status == CellStatus.RECONNECTING:
                 painter.fillRect(rect, QColor(0, 0, 0, 80))
                 painter.setPen(QColor(250, 180, 30))
-                painter.setFont(QFont("Sans", 11, QFont.Weight.Bold))
+                painter.setFont(ui_font(11, QFont.Weight.Bold))
                 painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "Reconnecting…")
             elif self._status == CellStatus.NO_SUB:
                 painter.fillRect(rect, QColor(0, 0, 0, 140))
                 painter.setPen(QColor(220, 110, 30))
-                painter.setFont(QFont("Sans", 11, QFont.Weight.Bold))
+                painter.setFont(ui_font(11, QFont.Weight.Bold))
                 painter.drawText(
                     rect.adjusted(0, -14, 0, 0),
                     Qt.AlignmentFlag.AlignCenter,
                     "No Sub Stream",
                 )
                 painter.setPen(QColor(160, 80, 20))
-                painter.setFont(QFont("Sans", 8))
+                painter.setFont(ui_font(8))
                 painter.drawText(
                     rect.adjusted(0, 14, 0, 0),
                     Qt.AlignmentFlag.AlignCenter,
@@ -810,14 +810,14 @@ class CellWidget(QWidget):
     def _draw_empty(self, painter: QPainter, rect: QRect) -> None:
         self._draw_grid_placeholder(painter, rect)
         painter.setPen(_EMPTY_TEXT)
-        painter.setFont(QFont("Sans", 10))
+        painter.setFont(ui_font(10))
         painter.drawText(
             rect.adjusted(0, -16, 0, 0),
             Qt.AlignmentFlag.AlignCenter,
             "Empty Slot",
         )
         painter.setPen(_ASSIGN_TEXT)
-        painter.setFont(QFont("Sans", 8))
+        painter.setFont(ui_font(8))
         painter.drawText(
             rect.adjusted(0, 10, 0, 0),
             Qt.AlignmentFlag.AlignCenter,
@@ -826,7 +826,7 @@ class CellWidget(QWidget):
 
     def _draw_offline_text(self, painter: QPainter, rect: QRect) -> None:
         painter.setPen(_OFFLINE_TEXT)
-        painter.setFont(QFont("Sans", 14, QFont.Weight.Bold))
+        painter.setFont(ui_font(14, QFont.Weight.Bold))
         text = "ERROR" if self._status == CellStatus.ERROR else "OFFLINE"
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
@@ -968,7 +968,7 @@ class CellWidget(QWidget):
 
     def _draw_zoom_badge(self, painter: QPainter, rect: QRect) -> None:
         text = f"{self._zoom:.1f}×"
-        font = QFont("Mono", 8, QFont.Weight.Bold)
+        font = mono_font(8, QFont.Weight.Bold)
         painter.setFont(font)
         fm = painter.fontMetrics()
         tw = fm.horizontalAdvance(text) + 8
@@ -981,7 +981,7 @@ class CellWidget(QWidget):
 
     def _draw_zoom_reset_btn(self, painter: QPainter, rect: QRect) -> QRect:
         text = "↺ 1×"
-        font = QFont("Sans", 8, QFont.Weight.Bold)
+        font = ui_font(8, QFont.Weight.Bold)
         painter.setFont(font)
         fm = painter.fontMetrics()
         tw = fm.horizontalAdvance(text) + 10
