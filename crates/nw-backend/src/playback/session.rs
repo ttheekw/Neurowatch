@@ -38,6 +38,91 @@ pub struct PlaybackSegment {
     pub end_ts: i64,
 }
 
+/// What one pipeline plays: a single segment file, or several consecutive
+/// segments of one recording run played as one stream (`splitmuxsrc`), so
+/// the picture and sound run on across segment boundaries instead of the
+/// player being rebuilt at every one (a visible hitch and a sound glitch).
+/// Browser playback (the cloud extension) groups its playlist the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayUnit {
+    /// The files, in order; more than one only for one run's consecutive,
+    /// finished segments, whose stream time then runs across them all.
+    pub paths: Vec<String>,
+    /// Recording time (ms since the epoch) where the first file starts.
+    pub start_ts: i64,
+    pub end_ts: i64,
+}
+
+/// Segments of one run whose indexed times meet within this are played as
+/// one stream (`segment_tracker` indexes a run's segments back to back).
+const JOIN_TOLERANCE_MS: i64 = 100;
+/// At most this many segments per stream: opening the stream measures each
+/// one, and a seek further away reopens the session anyway.
+const MAX_JOINED: usize = 30;
+/// A file modified this recently may still be being written: played alone.
+const OPEN_FILE_MS: u128 = 10_000;
+
+/// `{camera}_{run_epoch_ms}_{sequence}` of a recording segment's file name
+/// (`{camera}_{run_epoch_ms}_{sequence}_{fragment}.mkv`), with its folder;
+/// None for other names.
+fn run_of(path: &str) -> Option<(std::path::PathBuf, String)> {
+    let path = std::path::Path::new(path);
+    let stem = path.file_name()?.to_str()?.strip_suffix(".mkv")?;
+    let mut parts = stem.rsplitn(4, '_');
+    let fragment = parts.next()?;
+    let sequence = parts.next()?;
+    let epoch = parts.next()?;
+    let camera = parts.next()?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !(digits(fragment) && digits(sequence) && digits(epoch)) || camera.is_empty() {
+        return None;
+    }
+    Some((
+        path.parent()?.to_path_buf(),
+        format!("{camera}_{epoch}_{sequence}"),
+    ))
+}
+
+fn recently_modified(path: &str) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map_or(true, |age| age.as_millis() < OPEN_FILE_MS)
+}
+
+/// The playlist as pipelines: each run's consecutive, finished segments
+/// together (up to `MAX_JOINED`), everything else on its own.
+pub fn play_units(segments: &[PlaybackSegment]) -> Vec<PlayUnit> {
+    let mut units: Vec<PlayUnit> = Vec::new();
+    let mut last_run: Option<(std::path::PathBuf, String)> = None;
+    for segment in segments {
+        let run = run_of(&segment.path).filter(|_| !recently_modified(&segment.path));
+        let joins = match (units.last(), &run, &last_run) {
+            (Some(unit), Some(run), Some(previous)) => {
+                run == previous
+                    && unit.paths.len() < MAX_JOINED
+                    && (segment.start_ts - unit.end_ts).abs() <= JOIN_TOLERANCE_MS
+            }
+            _ => false,
+        };
+        if joins {
+            if let Some(unit) = units.last_mut() {
+                unit.paths.push(segment.path.clone());
+                unit.end_ts = segment.end_ts;
+            }
+        } else {
+            units.push(PlayUnit {
+                paths: vec![segment.path.clone()],
+                start_ts: segment.start_ts,
+                end_ts: segment.end_ts,
+            });
+        }
+        last_run = run;
+    }
+    units
+}
+
 /// Live handle returned to the IPC handler for controlling the pipeline.
 pub struct PlaybackSession {
     pub session_id: String,
@@ -270,18 +355,19 @@ fn run_pipeline(
         },
     };
 
-    for (index, segment) in segments.iter().enumerate() {
+    let units = play_units(&segments);
+    for (index, unit) in units.iter().enumerate() {
         if *stop_rx.borrow() {
             break;
         }
         if let Ok(mut range) = current_segment.lock() {
-            *range = (segment.start_ts, segment.end_ts);
+            *range = (unit.start_ts, unit.end_ts);
         }
         let seek_ms = if index == 0 { initial_seek_ms } else { 0 };
-        let has_next = index + 1 < segments.len();
+        let has_next = index + 1 < units.len();
         match run_segment(
             &shm_key,
-            segment,
+            unit,
             seek_ms,
             has_next,
             &writer,
@@ -295,7 +381,7 @@ fn run_pipeline(
             // An unreadable file (e.g. cut short when recording stopped
             // abruptly) is skipped rather than ending the whole playback.
             SegmentExit::Error if has_next => {
-                tracing::warn!(shm_key = %shm_key, path = %segment.path, "Skipping unreadable recording");
+                tracing::warn!(shm_key = %shm_key, paths = ?unit.paths, "Skipping unreadable recording");
                 continue;
             }
             SegmentExit::Eos | SegmentExit::Stop | SegmentExit::Error => break,
@@ -315,7 +401,7 @@ enum SegmentExit {
 #[allow(clippy::too_many_arguments)]
 fn run_segment(
     shm_key: &str,
-    segment: &PlaybackSegment,
+    unit: &PlayUnit,
     initial_seek_ms: i64,
     advance_on_eos: bool,
     writer: &SegmentSink,
@@ -327,13 +413,16 @@ fn run_segment(
 ) -> SegmentExit {
     tracing::debug!(
         shm_key,
-        path = %segment.path,
-        start_ts = segment.start_ts,
-        end_ts = segment.end_ts,
+        paths = ?unit.paths,
+        start_ts = unit.start_ts,
+        end_ts = unit.end_ts,
         "Opening playback segment"
     );
 
-    let pipeline_str = build_pipeline_str(&segment.path);
+    let pipeline_str = match unit.paths.as_slice() {
+        [single] => build_pipeline_str(single),
+        _ => build_run_pipeline_str(),
+    };
     let pipeline = match gstreamer::parse::launch(&pipeline_str)
         .ok()
         .and_then(|e| e.downcast::<gstreamer::Pipeline>().ok())
@@ -346,6 +435,10 @@ fn run_segment(
     };
 
     attach_audio(&pipeline, shm_key, audio);
+    if unit.paths.len() > 1 && !wire_run_source(&pipeline, shm_key, &unit.paths, audio) {
+        let _ = pipeline.set_state(gstreamer::State::Null);
+        return SegmentExit::Error;
+    }
 
     // The frame held when first paused is the file's start; with a seek to
     // come it is not shown, so the view never flashes the wrong moment.
@@ -481,6 +574,94 @@ fn build_pipeline_str(path: &str) -> String {
     )
 }
 
+/// Several segments of one recording run as one stream: `splitmuxsrc`
+/// reads the files the run's timeline spans (`wire_run_source` gives it the
+/// list and links its video and audio streams).
+fn build_run_pipeline_str() -> String {
+    format!(
+        "splitmuxsrc name={RUN_SOURCE} decodebin name={PLAYBACK_DECODE} ! videoconvert \
+         ! video/x-raw,format=RGB \
+         ! appsink name=frame_sink sync=true max-buffers=2 drop=true emit-signals=true"
+    )
+}
+
+/// The run's source in `build_run_pipeline_str`.
+const RUN_SOURCE: &str = "playback_src";
+/// The decoder of a run's audio stream.
+const PLAYBACK_AUDIO_DECODE: &str = "playback_audio_decode";
+
+/// Give `splitmuxsrc` the files of a run, in order (its `format-location`).
+pub fn give_run_files(source: &gstreamer::Element, paths: &[String]) {
+    let files: Vec<String> = paths.to_vec();
+    source.connect("format-location", false, move |_| Some(files.to_value()));
+}
+
+/// Give the run's source its files, in order, and link its streams: video
+/// to the playback decoder, audio to a decoder of its own whose output gets
+/// the audio branch (see `attach_audio_to`).
+fn wire_run_source(
+    pipeline: &gstreamer::Pipeline,
+    shm_key: &str,
+    paths: &[String],
+    audio: &Arc<AudioState>,
+) -> bool {
+    let (Some(source), Some(decode)) = (
+        pipeline.by_name(RUN_SOURCE),
+        pipeline.by_name(PLAYBACK_DECODE),
+    ) else {
+        tracing::error!(shm_key, "Playback run pipeline is incomplete");
+        return false;
+    };
+    give_run_files(&source, paths);
+    let weak = pipeline.downgrade();
+    let (audio, key) = (Arc::clone(audio), shm_key.to_owned());
+    source.connect_pad_added(move |_source, pad| {
+        let Some(pipeline) = weak.upgrade() else {
+            return;
+        };
+        let name = pad.name();
+        let target = if name.starts_with("video") {
+            decode.static_pad("sink").filter(|sink| !sink.is_linked())
+        } else if name.starts_with("audio") && !audio_output_available() {
+            // Nowhere to play it: drained, so the run's source never stops
+            // on an unlinked stream.
+            audio.present.store(true, AtomicOrdering::Relaxed);
+            let Ok(drain) = gstreamer::ElementFactory::make("fakesink")
+                .property("sync", false)
+                .build()
+            else {
+                return;
+            };
+            if pipeline.add(&drain).is_err() {
+                return;
+            }
+            let _ = drain.sync_state_with_parent();
+            drain.static_pad("sink")
+        } else if name.starts_with("audio") {
+            let Ok(audio_decode) = gstreamer::ElementFactory::make("decodebin")
+                .name(PLAYBACK_AUDIO_DECODE)
+                .build()
+            else {
+                return;
+            };
+            if pipeline.add(&audio_decode).is_err() {
+                return;
+            }
+            attach_audio_to(&pipeline, &audio_decode, &key, &audio);
+            let _ = audio_decode.sync_state_with_parent();
+            audio_decode.static_pad("sink")
+        } else {
+            None
+        };
+        if let Some(sink) = target {
+            if pad.link(&sink).is_err() {
+                tracing::warn!(shm_key = %key, pad = %name, "Could not link the run's stream");
+            }
+        }
+    });
+    true
+}
+
 /// The segment's decoder; its audio pad (if the recording has audio) gets
 /// the audio branch.
 const PLAYBACK_DECODE: &str = "playback_decode";
@@ -515,9 +696,18 @@ fn audio_output_available() -> bool {
 /// branch (muted unless the session's audio is on). A recording without
 /// audio, or a computer without an audio output, plays video only.
 fn attach_audio(pipeline: &gstreamer::Pipeline, shm_key: &str, audio: &Arc<AudioState>) {
-    let Some(decode) = pipeline.by_name(PLAYBACK_DECODE) else {
-        return;
-    };
+    if let Some(decode) = pipeline.by_name(PLAYBACK_DECODE) {
+        attach_audio_to(pipeline, &decode, shm_key, audio);
+    }
+}
+
+/// Play the audio pad `decode` adds through the audio branch.
+fn attach_audio_to(
+    pipeline: &gstreamer::Pipeline,
+    decode: &gstreamer::Element,
+    shm_key: &str,
+    audio: &Arc<AudioState>,
+) {
     let weak = pipeline.downgrade();
     let (audio, shm_key) = (Arc::clone(audio), shm_key.to_owned());
     decode.connect_pad_added(move |_decode, pad| {
@@ -912,6 +1102,202 @@ mod tests {
                 .store(f64::to_bits(rate), std::sync::atomic::Ordering::Relaxed);
             assert_eq!(audio.muted(), muted, "at {rate}x");
         }
+    }
+
+    /// A recording run as the recorder writes it: 10 s of video (and
+    /// audio) split by `splitmuxsink` at keyframes into ~3 s segments, with
+    /// the recorder's file names, indexed as the backend indexes them.
+    fn recorded_run(name: &str) -> (std::path::PathBuf, Vec<PlaybackSegment>) {
+        gstreamer::init().expect("initialize GStreamer");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nw-run-{name}-{nonce}"));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let cam = "cam-run";
+        let run: i64 = 1_789_659_000_000;
+        let location = dir.join(format!("{cam}_{run}_1_%05d.mkv"));
+        let pipeline = gstreamer::parse::launch(&format!(
+            "videotestsrc num-buffers=100 ! video/x-raw,width=64,height=36,framerate=10/1 \
+             ! videoconvert ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=8 \
+             ! h264parse ! splitmuxsink name=mux location=\"{}\" max-size-time=3000000000 \
+               muxer-factory=matroskamux \
+             audiotestsrc num-buffers=100 samplesperbuffer=4800 \
+             ! audio/x-raw,rate=48000,channels=1 ! audioconvert ! opusenc ! mux.audio_0",
+            location.display()
+        ))
+        .expect("build recording pipeline")
+        .downcast::<gstreamer::Pipeline>()
+        .expect("pipeline");
+        pipeline
+            .set_state(gstreamer::State::Playing)
+            .expect("record");
+        let done = pipeline.bus().expect("bus").timed_pop_filtered(
+            gstreamer::ClockTime::from_seconds(30),
+            &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+        );
+        assert!(done.is_some_and(|m| m.type_() == gstreamer::MessageType::Eos));
+        let _ = pipeline.set_state(gstreamer::State::Null);
+        // Finished files, as recordings older than a few seconds are.
+        let old = SystemTime::now() - Duration::from_secs(600);
+        for entry in std::fs::read_dir(&dir).expect("read dir").flatten() {
+            std::fs::File::options()
+                .write(true)
+                .open(entry.path())
+                .and_then(|f| f.set_modified(old))
+                .expect("age segment");
+        }
+        let db = Arc::new(Mutex::new(
+            crate::db::connection::open_in_memory().expect("db"),
+        ));
+        crate::recording::segment_tracker::scan_and_record(&db, &cam.to_owned(), &dir, 3_000);
+        let conn = db.lock().expect("db lock");
+        let mut stmt = conn
+            .prepare("SELECT path, start_ts, end_ts FROM segments ORDER BY start_ts")
+            .expect("prepare");
+        let segments = stmt
+            .query_map([], |r| {
+                Ok(PlaybackSegment {
+                    path: r.get(0)?,
+                    start_ts: r.get(1)?,
+                    end_ts: r.get(2)?,
+                })
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        assert!(segments.len() >= 3, "{segments:?}");
+        (dir, segments)
+    }
+
+    /// Plays `paths` as one run, seeking first to `seek_ms` (if any), and
+    /// returns the stream times (ms) of the video frames that reach the view.
+    fn play_run(paths: &[String], seek_ms: Option<i64>) -> Vec<i64> {
+        use super::{apply_seek, build_run_pipeline_str, wire_run_source};
+        let pipeline = gstreamer::parse::launch(&build_run_pipeline_str())
+            .expect("build run pipeline")
+            .downcast::<gstreamer::Pipeline>()
+            .expect("pipeline");
+        assert!(wire_run_source(
+            &pipeline,
+            "pb_test_run",
+            paths,
+            &Arc::new(AudioState::default())
+        ));
+        let sink = pipeline.by_name("frame_sink").expect("frame sink");
+        sink.set_property("sync", false);
+        sink.set_property("drop", false);
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&times);
+        sink.static_pad("sink").expect("sink pad").add_probe(
+            gstreamer::PadProbeType::BUFFER,
+            move |pad, info| {
+                if let (Some(buffer), Some(segment)) = (
+                    info.buffer(),
+                    pad.sticky_event::<gstreamer::event::Segment>(0),
+                ) {
+                    let segment = segment.segment().clone();
+                    if let (Ok(segment), Some(pts)) =
+                        (segment.downcast::<gstreamer::ClockTime>(), buffer.pts())
+                    {
+                        if let Some(at) = segment.to_stream_time(pts) {
+                            seen.lock().unwrap().push(at.mseconds() as i64);
+                        }
+                    }
+                }
+                gstreamer::PadProbeReturn::Ok
+            },
+        );
+        // Drain the frames (no SHM in this test).
+        let appsink = sink.downcast::<gstreamer_app::AppSink>().expect("appsink");
+        appsink.set_callbacks(
+            gstreamer_app::AppSinkCallbacks::builder()
+                .new_sample(|sink| {
+                    let _ = sink.pull_sample();
+                    Ok(gstreamer::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+        pipeline.set_state(gstreamer::State::Paused).expect("pause");
+        let _ = pipeline.state(gstreamer::ClockTime::from_seconds(10));
+        if let Some(offset) = seek_ms {
+            times.lock().unwrap().clear();
+            apply_seek(&pipeline, offset);
+            let _ = pipeline.state(gstreamer::ClockTime::from_seconds(10));
+        }
+        pipeline.set_state(gstreamer::State::Playing).expect("play");
+        let end = pipeline.bus().expect("bus").timed_pop_filtered(
+            gstreamer::ClockTime::from_seconds(30),
+            &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+        );
+        let ok = end.is_some_and(|m| m.type_() == gstreamer::MessageType::Eos);
+        let _ = pipeline.set_state(gstreamer::State::Null);
+        assert!(ok, "the run plays to its end");
+        let mut times = times.lock().unwrap().clone();
+        times.dedup();
+        times
+    }
+
+    #[test]
+    fn a_recordings_segments_play_as_one_stream_without_a_hitch() {
+        let (dir, segments) = recorded_run("continuous");
+        let units = super::play_units(&segments);
+        assert_eq!(units.len(), 1, "one run, one stream: {units:?}");
+        assert_eq!(units[0].paths.len(), segments.len());
+        assert_eq!(units[0].start_ts, segments[0].start_ts);
+        assert_eq!(units[0].end_ts, segments.last().expect("last").end_ts);
+
+        let times = play_run(&units[0].paths, None);
+        // Every frame of the 10 s, 100 ms apart, across the segment
+        // boundaries: none skipped, none repeated.
+        // splitmuxsrc lays the listed files back to back, so a lost file
+        // would not show as a jump: the frame count catches it.
+        assert!(times.len() >= 99, "{} frames", times.len());
+        let worst = times.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+        assert!(worst <= 110, "a {worst} ms jump: {times:?}");
+        assert!(times.last().copied().unwrap_or(0) >= 9_800);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_seek_into_a_later_segment_lands_on_the_asked_moment() {
+        let (dir, segments) = recorded_run("seek");
+        let units = super::play_units(&segments);
+        // 6.5 s: past the first two ~3 s segments.
+        let times = play_run(&units[0].paths, Some(6_500));
+        let first = times.first().copied().expect("frames after the seek");
+        assert!(
+            (6_400..=6_600).contains(&first),
+            "first frame at {first} ms"
+        );
+        assert!(times.windows(2).all(|w| w[1] - w[0] <= 110), "{times:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn other_files_and_other_runs_are_played_on_their_own() {
+        use super::{play_units, run_of};
+        assert_eq!(
+            run_of("/rec/cam_1_1789659000000_2_00004.mkv"),
+            Some((
+                std::path::PathBuf::from("/rec"),
+                "cam_1_1789659000000_2".to_owned()
+            ))
+        );
+        assert_eq!(run_of("/rec/cam-test_00000.mkv"), None, "older names");
+        assert_eq!(run_of("/rec/nw-playlist-1-a.mkv"), None);
+        // Files that do not exist count as still being written: alone.
+        let segment = |path: &str, start, end| PlaybackSegment {
+            path: path.to_owned(),
+            start_ts: start,
+            end_ts: end,
+        };
+        let units = play_units(&[
+            segment("/missing/cam_1_1_00000.mkv", 0, 1_000),
+            segment("/missing/cam_1_1_00001.mkv", 1_000, 2_000),
+        ]);
+        assert_eq!(units.len(), 2);
     }
 
     #[test]

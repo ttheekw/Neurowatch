@@ -83,6 +83,60 @@ fn run_continues_at(
         .then(|| run_epoch_ms.saturating_add(next.saturating_mul(segment_duration_ms)))
 }
 
+/// `timing_exact` values (see the v6 migration).
+const TIMING_PENDING: i64 = 0;
+const TIMING_FROM_FILE: i64 = 1;
+const TIMING_SETTLED: i64 = 2;
+/// A segment untouched this long is no longer being written.
+const SETTLE_MS: i64 = 60_000;
+
+/// `(start_ts, end_ts, timing_exact)` of a segment file.
+///
+/// A recording run's segments carry one timeline (`mkv_timing`): the run's
+/// start (in the filename) plus the segment's first timestamp is exactly
+/// where it starts, and plus its length where it ends, so a run's segments
+/// meet without gaps or overlaps and the timeline does not drift. A segment
+/// still being written ends at its modification time until it is finished.
+/// Files without that timing (older names, unreadable files) keep the
+/// estimate from the name and modification time.
+fn segment_times(
+    path: &Path,
+    fname: &str,
+    cam_id: &str,
+    modified_ms: i64,
+    segment_duration_ms: i64,
+    present: &HashSet<(i64, u64, i64)>,
+) -> (i64, i64, i64) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(modified_ms);
+    let settled = now_ms.saturating_sub(modified_ms) >= SETTLE_MS;
+    if let (Some((run_epoch_ms, _, _)), Some(timing)) =
+        (splitmux_parts(fname, cam_id), super::mkv_timing::read(path))
+    {
+        let start = run_epoch_ms.saturating_add(timing.start_ms);
+        return match timing.duration_ms {
+            Some(duration) => (start, start.saturating_add(duration), TIMING_FROM_FILE),
+            None => (start, modified_ms.max(start), TIMING_PENDING),
+        };
+    }
+    let start = segment_start_ts(fname, cam_id, modified_ms, segment_duration_ms);
+    let end = match run_continues_at(fname, cam_id, segment_duration_ms, present) {
+        Some(next_start) if next_start > start => next_start,
+        _ => modified_ms,
+    };
+    (
+        start,
+        end,
+        if settled {
+            TIMING_SETTLED
+        } else {
+            TIMING_PENDING
+        },
+    )
+}
+
 /// Scan `storage_dir` for `.mkv` files belonging to `cam_id` (named
 /// `{cam_id}_*.mkv`) and ensure each has a row in the `segments` table.
 ///
@@ -139,8 +193,25 @@ pub fn scan_and_record(
 
     for path in files {
         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
         let path_str = path.to_string_lossy().to_string();
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let size_bytes = meta.len() as i64;
+
+        // A finished segment whose timing was read from the file is not
+        // read again while it is unchanged: a pass covers days of files.
+        let known: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT COALESCE(size_bytes, -1), timing_exact FROM segments WHERE path = ?1",
+                [&path_str],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        if matches!(known, Some((size, exact)) if size == size_bytes && exact != TIMING_PENDING) {
+            continue;
+        }
+
         if !is_matroska_segment(&path) {
             let removed = conn
                 .execute("DELETE FROM segments WHERE path = ?1", [&path_str])
@@ -160,11 +231,7 @@ pub fn scan_and_record(
             }
             continue;
         }
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
-        };
-        let size_bytes = meta.len() as i64;
-        let end_ts: i64 = meta
+        let modified_ms: i64 = meta
             .modified()
             .map(|t| {
                 t.duration_since(std::time::UNIX_EPOCH)
@@ -172,34 +239,34 @@ pub fn scan_and_record(
                     .as_millis() as i64
             })
             .unwrap_or(0);
-        let start_ts = segment_start_ts(fname, cam_id, end_ts, segment_duration_ms);
-        let end_ts = match run_continues_at(fname, cam_id, segment_duration_ms, &present) {
-            Some(next_start) if next_start > start_ts => next_start,
-            _ => end_ts,
-        };
+        let (start_ts, end_ts, timing_exact) = segment_times(
+            &path,
+            fname,
+            cam_id,
+            modified_ms,
+            segment_duration_ms,
+            &present,
+        );
 
-        // Refresh an existing row only if the file changed (a segment still
-        // being written grows between scans); insert otherwise.
-        let known = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM segments WHERE path = ?1)",
-                [&path_str],
-                |r| r.get::<_, bool>(0),
-            )
-            .unwrap_or(false);
-        if known {
+        if known.is_some() {
             let _ = conn.execute(
-                "UPDATE segments SET size_bytes = ?1, start_ts = ?2, end_ts = ?3 \
-                 WHERE path = ?4 \
-                 AND (size_bytes IS NOT ?1 OR start_ts IS NOT ?2 OR end_ts IS NOT ?3)",
-                rusqlite::params![size_bytes, start_ts, end_ts, &path_str],
+                "UPDATE segments SET size_bytes = ?1, start_ts = ?2, end_ts = ?3, \
+                 timing_exact = ?4 WHERE path = ?5",
+                rusqlite::params![size_bytes, start_ts, end_ts, timing_exact, &path_str],
             );
         } else {
             let _ = conn.execute(
                 "INSERT INTO segments \
-                 (camera_id, start_ts, end_ts, path, size_bytes) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![cam_id.as_str(), start_ts, end_ts, &path_str, size_bytes],
+                 (camera_id, start_ts, end_ts, path, size_bytes, timing_exact) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    cam_id.as_str(),
+                    start_ts,
+                    end_ts,
+                    &path_str,
+                    size_bytes,
+                    timing_exact
+                ],
             );
             tracing::info!(cam_id = %cam_id, path = %path_str, size_bytes, "Segment registered");
         }
@@ -325,7 +392,8 @@ mod tests {
                 end_ts INTEGER,
                 path TEXT NOT NULL,
                 size_bytes INTEGER DEFAULT 0,
-                local_deleted INTEGER NOT NULL DEFAULT 0
+                local_deleted INTEGER NOT NULL DEFAULT 0,
+                timing_exact INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("schema");
@@ -351,6 +419,96 @@ mod tests {
                 (later, later + 30_000),                       // another run
             ]
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A real recording run, as the recorder writes it: `splitmuxsink`
+    /// cutting at keyframes, so segments are not exactly the configured
+    /// length (here 3 s asked, keyframes every 0.8 s).
+    fn record_run(dir: &std::path::Path, cam: &str, run_epoch_ms: i64) {
+        use gstreamer::prelude::*;
+        gstreamer::init().expect("gstreamer");
+        let location = dir.join(format!("{cam}_{run_epoch_ms}_1_%05d.mkv"));
+        let pipeline = gstreamer::parse::launch(&format!(
+            "videotestsrc num-buffers=100 ! video/x-raw,width=64,height=36,framerate=10/1 \
+             ! videoconvert ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=8 \
+             ! h264parse ! splitmuxsink location=\"{}\" max-size-time=3000000000 \
+               muxer-factory=matroskamux",
+            location.display()
+        ))
+        .expect("build recording pipeline")
+        .downcast::<gstreamer::Pipeline>()
+        .expect("pipeline");
+        pipeline
+            .set_state(gstreamer::State::Playing)
+            .expect("record");
+        let done = pipeline.bus().expect("bus").timed_pop_filtered(
+            gstreamer::ClockTime::from_seconds(20),
+            &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+        );
+        assert!(done.is_some_and(|m| m.type_() == gstreamer::MessageType::Eos));
+        let _ = pipeline.set_state(gstreamer::State::Null);
+    }
+
+    #[test]
+    fn a_run_is_indexed_from_its_own_timestamps_without_gaps_or_drift() {
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nw-segtiming-{now_ns}"));
+        fs::create_dir_all(&dir).expect("create dir");
+        let cam = "cam-timing";
+        let run: i64 = 1_789_659_000_000;
+        record_run(&dir, cam, run);
+        // Finished and settled, as recordings older than a minute are.
+        for entry in fs::read_dir(&dir).expect("read dir").flatten() {
+            let old = SystemTime::now() - std::time::Duration::from_secs(600);
+            File::options()
+                .write(true)
+                .open(entry.path())
+                .and_then(|f| f.set_modified(old))
+                .expect("age segment");
+        }
+
+        let db = Arc::new(Mutex::new(
+            crate::db::connection::open_in_memory().expect("db"),
+        ));
+        scan_and_record(&db, &cam.to_owned(), &dir, 3_000);
+        let rows: Vec<(i64, i64, i64)> = {
+            let conn = db.lock().expect("db lock");
+            let mut stmt = conn
+                .prepare("SELECT start_ts, end_ts, timing_exact FROM segments ORDER BY start_ts")
+                .expect("prepare");
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("rows")
+        };
+        assert!(rows.len() >= 3, "{rows:?}");
+        assert_eq!(rows[0].0, run, "the run starts at its epoch");
+        for pair in rows.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "back to back: {rows:?}");
+        }
+        assert!(rows.iter().all(|r| r.2 == 1), "timing read from the files");
+        // Cut at keyframes: no segment is exactly the 3 s asked for, and
+        // the run ends where the 10 s of video end (not 3 s × segments).
+        assert!(rows.iter().any(|r| r.1 - r.0 != 3_000), "{rows:?}");
+        let end = rows.last().expect("last").1;
+        assert!(
+            (end - run - 10_000).abs() <= 150,
+            "run length {}",
+            end - run
+        );
+
+        // A second pass reads nothing again and changes nothing.
+        scan_and_record(&db, &cam.to_owned(), &dir, 3_000);
+        let count: i64 = db
+            .lock()
+            .expect("db lock")
+            .query_row("SELECT COUNT(*) FROM segments", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count as usize, rows.len());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -389,7 +547,8 @@ mod tests {
                 end_ts INTEGER,
                 path TEXT NOT NULL,
                 size_bytes INTEGER DEFAULT 0,
-                local_deleted INTEGER NOT NULL DEFAULT 0
+                local_deleted INTEGER NOT NULL DEFAULT 0,
+                timing_exact INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("create schema");
@@ -435,7 +594,8 @@ mod tests {
                 end_ts INTEGER,
                 path TEXT NOT NULL,
                 size_bytes INTEGER DEFAULT 0,
-                local_deleted INTEGER NOT NULL DEFAULT 0
+                local_deleted INTEGER NOT NULL DEFAULT 0,
+                timing_exact INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("create schema");
@@ -484,7 +644,8 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE segments (id INTEGER PRIMARY KEY, camera_id TEXT NOT NULL,
              start_ts INTEGER NOT NULL, end_ts INTEGER, path TEXT NOT NULL UNIQUE,
-             size_bytes INTEGER DEFAULT 0, local_deleted INTEGER NOT NULL DEFAULT 0);",
+             size_bytes INTEGER DEFAULT 0, local_deleted INTEGER NOT NULL DEFAULT 0,
+             timing_exact INTEGER NOT NULL DEFAULT 0);",
         )
         .expect("schema");
         let db = Arc::new(Mutex::new(conn));
