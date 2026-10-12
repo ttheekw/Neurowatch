@@ -63,6 +63,27 @@ pub fn apply_migrations(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     )
     .context("Failed to apply DB migrations v5")?;
 
+    // ── Schema version 6 — segment timing read from the file ─────────
+    // 1: start and end come from the segment's own timestamps and length
+    // (`recording::mkv_timing`) and the file is finished; 2: settled but
+    // unreadable that way (kept as indexed). 0 (older rows, a segment still
+    // being written): read again on the next pass.
+    let has_timing: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('segments') WHERE name = 'timing_exact'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_timing {
+        conn.execute_batch(
+            "ALTER TABLE segments ADD COLUMN timing_exact INTEGER NOT NULL DEFAULT 0;
+             INSERT OR REPLACE INTO schema_version VALUES (6);",
+        )
+        .context("Failed to apply DB migrations v6")?;
+    }
+
     Ok(())
 }
 
@@ -88,6 +109,7 @@ mod tests {
 
         assert!(!has_column(&conn, "segments", "s3_key"));
         assert!(has_column(&conn, "segments", "local_deleted"));
+        assert!(has_column(&conn, "segments", "timing_exact"));
     }
 
     #[test]

@@ -1694,7 +1694,8 @@ mod tests {
                 start_ts INTEGER NOT NULL,
                 end_ts INTEGER,
                 path TEXT NOT NULL,
-                local_deleted INTEGER NOT NULL DEFAULT 0
+                local_deleted INTEGER NOT NULL DEFAULT 0,
+                timing_exact INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("create schema");
@@ -1736,7 +1737,8 @@ mod tests {
                 start_ts INTEGER NOT NULL,
                 end_ts INTEGER,
                 path TEXT NOT NULL,
-                local_deleted INTEGER NOT NULL DEFAULT 0
+                local_deleted INTEGER NOT NULL DEFAULT 0,
+                timing_exact INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("create schema");
@@ -1785,7 +1787,8 @@ mod tests {
                 start_ts INTEGER NOT NULL,
                 end_ts INTEGER,
                 path TEXT NOT NULL,
-                local_deleted INTEGER NOT NULL DEFAULT 0
+                local_deleted INTEGER NOT NULL DEFAULT 0,
+                timing_exact INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("create schema");
