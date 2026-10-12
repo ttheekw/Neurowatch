@@ -123,3 +123,6 @@ def test_workflows_use_actions_that_run_on_node_24() -> None:
         for action, minimum in retired.items():
             for major in re.findall(rf"uses: {re.escape(action)}@v(\d+)", text):
                 assert int(major) >= minimum, f"{workflow.name}: {action}@v{major}"
+        # setup-uv publishes no moving major tags (no "v10"): only exact versions.
+        for ref in re.findall(r"uses: astral-sh/setup-uv@(\S+)", text):
+            assert re.fullmatch(r"v\d+\.\d+\.\d+", ref), f"{workflow.name}: setup-uv@{ref}"
