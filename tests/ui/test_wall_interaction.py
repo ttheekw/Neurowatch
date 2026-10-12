@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 import pytest
-from PySide6.QtCore import QObject, QPoint, QPointF, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QWheelEvent
 from PySide6.QtWidgets import QApplication
 
@@ -462,9 +462,80 @@ def test_manual_navigation_to_the_warmed_page_keeps_it_decoding(qtbot, monkeypat
 
         assert window._wall.page == 1
         assert sent and all("nav-1" in ids for ids in sent), "warm decoder never dropped"
-        assert sent[-1] == {"nav-1"}
+        # Browsing by hand: the page left and the next one stay warm a while.
+        assert sent[-1] == {"nav-0", "nav-1", "nav-2"}
+        window._browse_warm_timer.timeout.emit()
+        assert sent[-1] == {"nav-1"}, "then only the visible page decodes"
     finally:
         window.close()
+
+
+def test_browsing_by_hand_keeps_the_pages_around_warm_for_a_while(qtbot, monkeypatch):
+    from neurowatch import main
+
+    window = _window(qtbot, monkeypatch, cams=5)
+    try:
+        window._on_page_strip_clicked(2)  # a dot click
+        assert window._wall.page == 2
+        # The page left (0) and both neighbours (1, 3): back or on is instant.
+        assert set(window._view_lease.cameras) == {"nav-0", "nav-1", "nav-2", "nav-3"}
+        assert window._browse_warm_timer.isActive()
+        assert abs(window._browse_warm_timer.interval() - main._BROWSE_WARM_MS) < 1
+        window._on_next_page()  # stepping on: still warm around the new page
+        assert set(window._view_lease.cameras) == {"nav-2", "nav-3", "nav-4"}
+        window._browse_warm_timer.timeout.emit()
+        assert set(window._view_lease.cameras) == {"nav-3"}
+    finally:
+        window.close()
+
+
+def test_pointing_at_a_page_dot_starts_its_video_before_the_click(qtbot, monkeypatch):
+    window = _window(qtbot, monkeypatch, cams=5)
+    try:
+        window._page_strip.page_hovered.emit(4)
+        assert set(window._view_lease.cameras) == {"nav-0", "nav-4"}
+        window._page_strip.page_hovered.emit(-1)  # pointer left the dot
+        assert window._hover_warm_timer.isActive(), "lingers briefly"
+        assert "nav-4" in window._view_lease.cameras
+        window._hover_warm_timer.timeout.emit()
+        assert set(window._view_lease.cameras) == {"nav-0"}
+        window._page_strip.page_hovered.emit(0)  # the page already shown
+        assert set(window._view_lease.cameras) == {"nav-0"}
+    finally:
+        window.close()
+
+
+def test_the_page_strip_reports_the_page_under_the_pointer(qtbot):
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from neurowatch.widgets.page_strip import PageStripWidget
+
+    strip = PageStripWidget()
+    qtbot.addWidget(strip)
+    strip.resize(400, strip.height())
+    strip.set_state(4, 1)
+    strip.show()
+    seen: list[int] = []
+    strip.page_hovered.connect(seen.append)
+    canvas = strip._canvas
+    for page in range(4):
+        x = next(px for px in range(canvas.width()) if canvas.page_at(px) == page)
+        move = QMouseEvent(
+            QMouseEvent.Type.MouseMove,
+            QPointF(x, canvas.height() / 2),
+            QPointF(canvas.mapToGlobal(canvas.rect().center())),
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(canvas, move)
+    assert seen == [0, 1, 2, 3]
+    QApplication.sendEvent(canvas, QEvent(QEvent.Type.Leave))
+    assert seen[-1] == -1
+    QApplication.sendEvent(strip._next_btn, QEvent(QEvent.Type.Enter))
+    assert seen[-1] == 2, "the next arrow points at the next page"
 
 
 def test_no_warm_up_without_auto_scroll(qtbot, monkeypatch):

@@ -274,6 +274,7 @@ def test_title_bar_file_menu_is_themed_and_accessible(qtbot):
         "Export Video…",
         "Import Config…",
         "Settings",
+        "Diagnostics",
         "Example…",
         "About Neurowatch",
     ]

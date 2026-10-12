@@ -1,5 +1,10 @@
 """Bottom status bar — disk, CPU, MEM, network, decoder, backend, extensions, version.
 
+CPU, memory and network are the backend's readings (``stats.get_performance``,
+polled by the main window and passed to ``set_performance``), the same the
+Diagnostics page shows, on every platform; only the free disk space is read
+here.
+
 In compact view ("Hide panels") the main window shows the same bar in its
 title strip (``set_inline``), without the version, and in fullscreen over
 the video while that strip is hidden (``set_overlay``), laid out as at the
@@ -9,13 +14,13 @@ bottom.
 from __future__ import annotations
 
 import shutil
-from importlib.util import find_spec
+from collections.abc import Mapping
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QWidget
 
 from neurowatch import build_info
-from neurowatch.utils.network import NetworkMeter, format_bitrate
+from neurowatch.utils.network import format_bitrate
 
 _HEIGHT = 24
 _BG = "#0a0a14"
@@ -24,45 +29,6 @@ BAR_RGB = (0x0A, 0x0A, 0x14)
 _TEXT = "#7878a0"
 _TEXT_BRIGHT = "#a0a0c0"
 _SEP_COLOR = "#1a1a30"
-
-_HAS_PSUTIL = find_spec("psutil") is not None
-
-
-def _read_proc_cpu_sample() -> tuple[int, int] | None:
-    """Return Linux aggregate (idle ticks, total ticks), if procfs is available."""
-    try:
-        with open("/proc/stat", encoding="utf-8") as stat_file:
-            first_line = stat_file.readline()
-        fields = [int(value) for value in first_line.split()[1:]]
-    except (OSError, ValueError):
-        return None
-    if len(fields) < 4:
-        return None
-    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
-    return idle, sum(fields)
-
-
-def _read_proc_memory_used_mb() -> float | None:
-    """Return used system memory from Linux MemAvailable, in MiB."""
-    try:
-        lines = open("/proc/meminfo", encoding="utf-8")
-    except OSError:
-        return None
-    total_kb: int | None = None
-    available_kb: int | None = None
-    try:
-        for line in lines:
-            if line.startswith("MemTotal:"):
-                total_kb = int(line.split()[1])
-            elif line.startswith("MemAvailable:"):
-                available_kb = int(line.split()[1])
-    except (IndexError, ValueError):
-        return None
-    finally:
-        lines.close()
-    if total_kb is None or available_kb is None:
-        return None
-    return max(0, total_kb - available_kb) / 1024
 
 
 def _stat(text: str, bright: bool = False) -> QLabel:
@@ -88,8 +54,6 @@ class StatusBarWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.setStyleSheet(f"background-color: {_BG}; border-top: 1px solid {_SEP_COLOR};")
 
-        self._last_cpu_sample: tuple[int, int] | None = None
-
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 0, 8, 0)
         layout.setSpacing(0)
@@ -107,7 +71,6 @@ class StatusBarWidget(QWidget):
         layout.addWidget(_sep())
 
         # Download and upload over the host's network interfaces.
-        self._network = NetworkMeter()
         self._net_lbl = _stat("NET: --")
         self._net_lbl.setToolTip("Network traffic of this computer: download ↓ and upload ↑")
         # Room for wide readings, so the bar does not shift as the rates change.
@@ -144,13 +107,13 @@ class StatusBarWidget(QWidget):
         self._version_lbl.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self._version_lbl)
 
-        # Start update timer. The first procfs sample primes the CPU delta;
-        # subsequent samples contain a real utilization percentage.
+        # Free disk space is read here; the other readings come from the backend.
         self._timer = QTimer(self)
         self._timer.setInterval(2000)
-        self._timer.timeout.connect(self._update_stats)
+        self._timer.timeout.connect(self._update_disk)
         self._timer.start()
-        self._update_stats()
+        self._update_disk()
+        self.set_performance(None)
 
     def set_inline(self, inline: bool) -> None:
         """Shown in a title strip (compact view) rather than at the bottom:
@@ -223,54 +186,30 @@ class StatusBarWidget(QWidget):
             "font-size: 10px; font-weight: 600; padding: 1px 7px;"
         )
 
-    def _update_stats(self) -> None:
-        rate = self._network.sample()
-        if rate is None:
-            self._net_lbl.setText("NET: --")
-        else:
-            self._net_lbl.setText(
-                f"NET ↓ {format_bitrate(rate.rx_bits_per_second)}"
-                f"  ↑ {format_bitrate(rate.tx_bits_per_second)}"
-            )
-
-        # Disk
+    def _update_disk(self) -> None:
         try:
             usage = shutil.disk_usage("/")
             gb_free = usage.free / (1024**3)
             self._disk_lbl.setText(f"Disk: {gb_free:.0f} GB Free")
-        except Exception:
+        except OSError:
             self._disk_lbl.setText("Disk: --")
 
-        # CPU and MEM via psutil (optional dependency)
-        if _HAS_PSUTIL:
-            import psutil
-
-            try:
-                cpu = psutil.cpu_percent(interval=None)
-                mem = psutil.virtual_memory()
-                mem_mb = mem.used / (1024**2)
-                self._cpu_lbl.setText(f"CPU: {cpu:.0f}%")
-                self._mem_lbl.setText(f"MEM: {mem_mb:.0f} MB")
-            except Exception:
-                pass
+    def set_performance(self, snapshot: object) -> None:
+        """Show the backend's CPU, memory and network readings (the
+        ``stats.get_performance`` result); None while the backend is offline."""
+        process = snapshot.get("process") if isinstance(snapshot, Mapping) else None
+        process = process if isinstance(process, Mapping) else {}
+        cpu = process.get("system_cpu_percent")
+        memory = process.get("system_memory_percent")
+        network = process.get("network")
+        self._cpu_lbl.setText(f"CPU: {cpu:.0f}%" if isinstance(cpu, int | float) else "CPU: --")
+        self._mem_lbl.setText(
+            f"MEM: {memory:.0f}%" if isinstance(memory, int | float) else "MEM: --"
+        )
+        if isinstance(network, Mapping):
+            self._net_lbl.setText(
+                f"NET ↓ {format_bitrate(network.get('rx_bits_per_sec'))}"
+                f"  ↑ {format_bitrate(network.get('tx_bits_per_sec'))}"
+            )
         else:
-            sample = _read_proc_cpu_sample()
-            if sample is not None and self._last_cpu_sample is not None:
-                idle, total = sample
-                last_idle, last_total = self._last_cpu_sample
-                delta_total = total - last_total
-                delta_idle = idle - last_idle
-                if delta_total > 0:
-                    cpu = max(0.0, min(100.0, (delta_total - delta_idle) / delta_total * 100))
-                    self._cpu_lbl.setText(f"CPU: {cpu:.0f}%")
-            elif sample is None:
-                self._cpu_lbl.setText("CPU: --")
-            else:
-                self._cpu_lbl.setText("CPU: …")
-            self._last_cpu_sample = sample
-
-            mem_mb = _read_proc_memory_used_mb()
-            if mem_mb is None:
-                self._mem_lbl.setText("MEM: --")
-            else:
-                self._mem_lbl.setText(f"MEM: {mem_mb:.0f} MB")
+            self._net_lbl.setText("NET: --")

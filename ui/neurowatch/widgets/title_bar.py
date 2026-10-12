@@ -55,13 +55,15 @@ QPushButton {
 QPushButton:hover, QPushButton:focus { background: #2a2a40; color: white; }
 """
 
-TABS = ("live", "playback", "diagnostics", "settings")
+TABS = ("live", "playback", "settings")
+#: Views opened from the ≡ menu rather than a tab of their own.
+MENU_VIEWS = ("diagnostics",)
 
 
 class TitleBar(QWidget):
     """Draggable title bar with tab navigation and window controls."""
 
-    tab_changed = Signal(str)  # "live" | "playback" | "settings"
+    tab_changed = Signal(str)  # "live" | "playback" | "diagnostics" (≡ menu) | "settings"
     export_config_requested = Signal()
     export_video_requested = Signal()
     import_config_requested = Signal()
@@ -283,6 +285,7 @@ class TitleBar(QWidget):
         menu.addAction("Import Config…", lambda: self.import_config_requested.emit())
         menu.addSeparator()
         menu.addAction("Settings", lambda: self.settings_requested.emit())
+        menu.addAction("Diagnostics", lambda: self._activate("diagnostics"))
         for text, callback in self._extra_actions:
             menu.addAction(text, callback)
         menu.addSeparator()
