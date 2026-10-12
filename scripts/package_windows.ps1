@@ -84,9 +84,12 @@ if ($env:NW_UI_EXTENSION_DIR) {
     Invoke-Native $VenvPython @('-m', 'pip', 'install', '--no-deps', $env:NW_UI_EXTENSION_DIR)
     $ExtensionArgs = @('--copy-metadata', $env:NW_UI_EXTENSION_DIST, '--collect-submodules', $env:NW_UI_EXTENSION_MODULE)
 }
+$AppIcon = Join-Path $Root 'ui/neurowatch/resources/icons/neurowatch.ico'
 Invoke-Native (Join-Path $Venv 'Scripts/pyinstaller.exe') (@(
     '--noconfirm', '--clean', '--windowed',
     '--name', 'neurowatch-ui',
+    # The app's logo on the .exe, so shortcuts and Add/Remove Programs show it.
+    '--icon', $AppIcon,
     '--distpath', (Join-Path $WorkDir 'pyinstaller-dist'),
     '--workpath', (Join-Path $WorkDir 'pyinstaller-build'),
     '--specpath', $WorkDir,
@@ -166,6 +169,7 @@ Invoke-Native $ISCC @(
     "/DAppVersion=$Version",
     "/DBundleDir=$BundleDir",
     "/DOutputDir=$OutDir",
+    "/DAppIcon=$AppIcon",
     (Join-Path $Root 'scripts/installer/windows.iss')
 )
 $SetupPath = Join-Path $OutDir "neurowatch-$Version-windows-x86_64-setup.exe"

@@ -5,4 +5,5 @@ pub mod handler;
 pub mod recording_handler;
 pub mod server;
 pub mod storage_handler;
+pub mod token;
 pub mod viewer_handler;

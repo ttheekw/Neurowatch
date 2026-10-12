@@ -30,16 +30,12 @@ from neurowatch.widgets.window_chrome import (
     SHADOW_MARGIN,
     ChromeTitleBar,
     _ShadowShell,
+    positions_windows,
     window_effects_supported,
 )
 
 #: Width of the card's text (the card grows only in height).
 _TEXT_WIDTH = 380
-
-
-def positions_windows() -> bool:
-    """Wayland compositors ignore client window positioning."""
-    return not QGuiApplication.platformName().startswith("wayland")
 
 
 def _wrapped_label(text: str, parent: QWidget) -> QLabel:

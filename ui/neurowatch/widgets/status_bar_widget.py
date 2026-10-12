@@ -197,6 +197,7 @@ class StatusBarWidget(QWidget):
         badges = {
             "vaapi": ("▣", "VA-API", "#67e8f9", "#12303a", "Intel/AMD VA-API hardware decode"),
             "nvdec": ("◆", "NVIDIA NVDEC", "#a3e635", "#243415", "NVIDIA hardware decode"),
+            "d3d11": ("▣", "Direct3D 11", "#67e8f9", "#12303a", "Direct3D 11 hardware decode"),
             "v4l2_m2m": ("▤", "V4L2 M2M", "#c4b5fd", "#29213d", "V4L2 hardware decode"),
             "software": ("◌", "CPU Decode", "#fbbf24", "#3a2b12", "Software video decode"),
             "blocked": (

@@ -1,4 +1,5 @@
 """Modernized dialogs, confirmations and menus use the centralized theme."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -55,6 +56,29 @@ def test_about_dialog_is_themed_with_hierarchy(qtbot):
     assert close.property("variant") == "primary"
 
 
+def test_about_dialog_shows_the_licence_and_no_warranty_notice(qtbot):
+    from neurowatch.dialogs.about_dialog import NO_WARRANTY, AboutDialog
+
+    dlg = AboutDialog()
+    qtbot.addWidget(dlg)
+    texts = [label.text() for label in dlg.findChildren(QLabel)]
+    assert NO_WARRANTY in texts
+    assert "WITHOUT ANY WARRANTY" in NO_WARRANTY and "AGPL" in NO_WARRANTY
+
+
+def test_notice_carries_the_full_disclaimer():
+    from pathlib import Path
+
+    notice = (Path(__file__).resolve().parents[2] / "NOTICE").read_text()
+    for heading in (
+        "Disclaimer and limitation of liability",
+        "Not a guaranteed security",
+        "No liability",
+        "Your installation, your responsibility",
+    ):
+        assert heading in notice
+
+
 # ── Custom grid ──────────────────────────────────────────────────────────
 
 
@@ -72,8 +96,7 @@ def test_custom_grid_dialog_themed_and_previews_cell_count(qtbot):
     assert dlg.rows == 5
     assert _box_button(dlg, QDialogButtonBox.StandardButton.Ok).property("variant") == "primary"
     assert (
-        _box_button(dlg, QDialogButtonBox.StandardButton.Cancel).property("variant")
-        == "secondary"
+        _box_button(dlg, QDialogButtonBox.StandardButton.Cancel).property("variant") == "secondary"
     )
     assert dlg._rows_spin.accessibleName() == "Grid rows"
     assert dlg._cols_spin.accessibleName() == "Grid columns"
@@ -119,8 +142,7 @@ def test_camera_dialog_themed_without_inline_colors(qtbot):
     assert _no_inline_colors(dlg) == []
     assert _box_button(dlg, QDialogButtonBox.StandardButton.Ok).property("variant") == "primary"
     assert (
-        _box_button(dlg, QDialogButtonBox.StandardButton.Cancel).property("variant")
-        == "secondary"
+        _box_button(dlg, QDialogButtonBox.StandardButton.Cancel).property("variant") == "secondary"
     )
     assert dlg._test_btn.property("variant") == "secondary"
     assert dlg._discover_btn.property("variant") == "secondary"
@@ -199,9 +221,9 @@ def test_destructive_confirmation_defaults_to_cancel(qtbot):
     _assert_themed(box)
     assert confirm_btn.text() == "Remove"
     assert confirm_btn.property("variant") == "danger"
-    assert box.defaultButton() is not confirm_btn
-    assert box.defaultButton().property("variant") == "secondary"
-    assert box.icon() == QMessageBox.Icon.Warning
+    assert box.default_button() is not confirm_btn
+    assert box.default_button().property("variant") == "secondary"
+    assert box.kind == "warning"
 
 
 def test_non_destructive_confirmation_defaults_to_primary(qtbot):
@@ -210,7 +232,7 @@ def test_non_destructive_confirmation_defaults_to_primary(qtbot):
     box, confirm_btn = build_confirmation(None, "Apply", "Apply?", confirm_text="Apply")
     qtbot.addWidget(box)
     assert confirm_btn.property("variant") == "primary"
-    assert box.defaultButton() is confirm_btn
+    assert box.default_button() is confirm_btn
 
 
 def test_remove_camera_uses_themed_confirmation(monkeypatch):

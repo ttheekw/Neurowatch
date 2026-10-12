@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtWidgets import QFileDialog
 
 from neurowatch.dialogs.camera_dialog import AddEditCameraDialog
 from neurowatch.dialogs.settings_dialog import SettingsDialog
@@ -34,7 +34,7 @@ class _FakeIpcClient:
 def _make_main_window(monkeypatch, qtbot, shm_prefix: str) -> MainWindow:
     monkeypatch.setattr("neurowatch.main.SyncIpcClient", _FakeIpcClient)
     monkeypatch.setattr("neurowatch.ipc.frame_reader.SHM_PREFIX", shm_prefix)
-    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No)
+    monkeypatch.setattr("neurowatch.main.ask", lambda *a, **k: False)
     win = MainWindow()
     qtbot.addWidget(win)
     return win
@@ -311,7 +311,7 @@ def test_config_file_change_reload_prompts_before_applying(monkeypatch, qtbot):
 
     monkeypatch.setattr("neurowatch.main.SyncIpcClient", _FakeClient)
     monkeypatch.setattr("neurowatch.ipc.frame_reader.SHM_PREFIX", "/nonexistent/nw-test-reload-")
-    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No)
+    monkeypatch.setattr("neurowatch.main.ask", lambda *a, **k: False)
 
     win = MainWindow()
     qtbot.addWidget(win)
@@ -323,18 +323,18 @@ def test_config_file_change_reload_prompts_before_applying(monkeypatch, qtbot):
 
         def _question_no(*args, **kwargs):
             questions.append(args)
-            return QMessageBox.StandardButton.No
+            return False
 
-        monkeypatch.setattr(QMessageBox, "question", _question_no)
+        monkeypatch.setattr("neurowatch.main.ask", _question_no)
         win._reload_config_after_change()
         assert len(questions) == 1
         assert reload_calls == []
 
         def _question_yes(*args, **kwargs):
             questions.append(args)
-            return QMessageBox.StandardButton.Yes
+            return True
 
-        monkeypatch.setattr(QMessageBox, "question", _question_yes)
+        monkeypatch.setattr("neurowatch.main.ask", _question_yes)
         win._reload_config_after_change()
         assert len(questions) == 2
         assert reload_calls == [True]
@@ -367,7 +367,7 @@ def test_main_settings_tab_opens_dialog(monkeypatch, qtbot):
 
     monkeypatch.setattr("neurowatch.main.SyncIpcClient", _FakeClient)
     monkeypatch.setattr("neurowatch.ipc.frame_reader.SHM_PREFIX", "/nonexistent/nw-test-")
-    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No)
+    monkeypatch.setattr("neurowatch.main.ask", lambda *a, **k: False)
 
     win = MainWindow()
     qtbot.addWidget(win)

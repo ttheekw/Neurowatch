@@ -8,6 +8,9 @@
 #ifndef OutputDir
   #error OutputDir must be supplied by package_windows.ps1
 #endif
+#ifndef AppIcon
+  #error AppIcon must be supplied by package_windows.ps1
+#endif
 
 [Setup]
 AppId={{CDAA8C42-A8C6-4F7F-8A44-53B962D38052}
@@ -24,6 +27,7 @@ MinVersion=10.0
 OutputDir={#OutputDir}
 OutputBaseFilename=neurowatch-{#AppVersion}-windows-x86_64-setup
 LicenseFile={#BundleDir}\LICENSE
+SetupIconFile={#AppIcon}
 UninstallDisplayIcon={app}\app\neurowatch-ui\neurowatch-ui.exe
 Compression=lzma2
 SolidCompression=yes

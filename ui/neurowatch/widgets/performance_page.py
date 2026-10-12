@@ -59,6 +59,12 @@ _ACCEL_PRESENTATION = {
         "Hardware video decoding is active on NVIDIA NVDEC.",
         "#a3e635",
     ),
+    "d3d11": (
+        "▣",
+        "Direct3D 11",
+        "Hardware video decoding is active through Direct3D 11.",
+        "#67e8f9",
+    ),
     "v4l2_m2m": (
         "▤",
         "V4L2 M2M",

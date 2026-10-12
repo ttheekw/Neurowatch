@@ -851,7 +851,10 @@ fn probe_socket(multicast_from: Option<Ipv4Addr>) -> std::io::Result<tokio::net:
     if let Some(iface) = multicast_from {
         socket.set_multicast_if_v4(&iface)?;
         socket.set_multicast_ttl_v4(2)?;
-        socket.set_multicast_loop_v4(false)?;
+        // Keep loopback enabled so a camera simulator on this machine can
+        // answer the same multicast search used for physical cameras. Our own
+        // Probe packets are harmless: the receiver accepts only ProbeMatch.
+        socket.set_multicast_loop_v4(true)?;
     }
     tokio::net::UdpSocket::from_std(socket.into())
 }

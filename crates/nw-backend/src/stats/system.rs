@@ -1,11 +1,11 @@
-//! Real backend-process CPU/RAM collector.
+//! Real backend-process CPU/RAM/network collector.
 //!
-//! Uses `/proc` directly rather than a full sysinfo/psutil dependency —
-//! we need only a handful of well-defined fields. Everything falls back
-//! to zero if `/proc` is unavailable (non-Linux) rather than fabricating
-//! plausible numbers.
+//! Reads the operating system directly rather than through a full
+//! sysinfo/psutil dependency — we need only a handful of well-defined
+//! fields: `/proc` on Linux, the Win32 counters on Windows (`os` module).
+//! Anything that cannot be read is reported as missing rather than
+//! fabricated.
 
-use std::fs;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use nw_core::stats::{NetworkThroughput, ProcessBreakdown, ProcessMetrics};
 
 use super::SystemMetricsSource;
 
-/// procfs-backed collector for the current process + system totals.
+/// Collector for the current process + system totals.
 pub struct ProcSystemCollector {
     inner: Mutex<Inner>,
 }
@@ -42,35 +42,181 @@ impl ProcSystemCollector {
     }
 
     fn read_proc_stat_ticks() -> Option<u64> {
-        parse_proc_self_stat(&fs::read_to_string("/proc/self/stat").ok()?)
+        os::process_cpu_ticks()
     }
 
     fn read_system_stat_ticks() -> Option<(u64, u64)> {
-        parse_system_stat(&fs::read_to_string("/proc/stat").ok()?)
+        os::system_cpu_ticks()
     }
 
     fn read_rss_bytes() -> Option<u64> {
-        parse_vm_rss(&fs::read_to_string("/proc/self/status").ok()?)
+        os::resident_bytes()
     }
 
     fn read_meminfo() -> Option<(u64, u64)> {
-        parse_meminfo(&fs::read_to_string("/proc/meminfo").ok()?)
+        os::memory_kib()
     }
 
     /// Received and sent bytes over the host's real network interfaces.
     fn read_network_bytes() -> Option<(u64, u64)> {
+        os::network_bytes()
+    }
+
+    fn ticks_per_second() -> u64 {
+        os::TICKS_PER_SECOND
+    }
+}
+
+#[cfg(not(windows))]
+mod os {
+    use std::fs;
+
+    use super::{parse_meminfo, parse_proc_self_stat, parse_system_stat, parse_vm_rss};
+
+    /// Linux default; sysconf isn't in std.
+    pub const TICKS_PER_SECOND: u64 = 100;
+
+    pub fn process_cpu_ticks() -> Option<u64> {
+        parse_proc_self_stat(&fs::read_to_string("/proc/self/stat").ok()?)
+    }
+
+    pub fn system_cpu_ticks() -> Option<(u64, u64)> {
+        parse_system_stat(&fs::read_to_string("/proc/stat").ok()?)
+    }
+
+    pub fn resident_bytes() -> Option<u64> {
+        parse_vm_rss(&fs::read_to_string("/proc/self/status").ok()?)
+    }
+
+    pub fn memory_kib() -> Option<(u64, u64)> {
+        parse_meminfo(&fs::read_to_string("/proc/meminfo").ok()?)
+    }
+
+    pub fn network_bytes() -> Option<(u64, u64)> {
         let has_device = |name: &str| {
             std::path::Path::new("/sys/class/net")
                 .join(name)
                 .join("device")
                 .exists()
         };
-        sum_network_bytes(&fs::read_to_string("/proc/net/dev").ok()?, has_device)
+        super::sum_network_bytes(&fs::read_to_string("/proc/net/dev").ok()?, has_device)
+    }
+}
+
+#[cfg(windows)]
+mod os {
+    use windows_sys::Win32::Foundation::{FILETIME, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIfTable2, IF_TYPE_SOFTWARE_LOOPBACK, MIB_IF_ROW2, MIB_IF_TABLE2,
+    };
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessTimes, GetSystemTimes,
+    };
+
+    use super::{sum_interfaces, Interface};
+
+    /// Windows reports CPU time in 100 ns units.
+    pub const TICKS_PER_SECOND: u64 = 10_000_000;
+
+    /// `MIB_IF_ROW2.InterfaceAndOperStatusFlags` bits.
+    const HARDWARE_INTERFACE: u8 = 0x01;
+    const FILTER_INTERFACE: u8 = 0x02;
+
+    const fn filetime(time: FILETIME) -> u64 {
+        ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64
     }
 
-    fn ticks_per_second() -> u64 {
-        // Fallback matches Linux default; sysconf isn't in std.
-        100
+    const fn zero_filetime() -> FILETIME {
+        FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        }
+    }
+
+    pub fn process_cpu_ticks() -> Option<u64> {
+        let (mut created, mut exited, mut kernel, mut user) = (
+            zero_filetime(),
+            zero_filetime(),
+            zero_filetime(),
+            zero_filetime(),
+        );
+        // SAFETY: the pseudo handle needs no closing; all four pointers are
+        // valid, writable FILETIMEs.
+        let ok = unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        (ok != 0).then(|| filetime(kernel).saturating_add(filetime(user)))
+    }
+
+    /// `(idle, total)`: kernel time already includes idle time.
+    pub fn system_cpu_ticks() -> Option<(u64, u64)> {
+        let (mut idle, mut kernel, mut user) = (zero_filetime(), zero_filetime(), zero_filetime());
+        // SAFETY: all three pointers are valid, writable FILETIMEs.
+        let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+        (ok != 0).then(|| {
+            (
+                filetime(idle),
+                filetime(kernel).saturating_add(filetime(user)),
+            )
+        })
+    }
+
+    pub fn resident_bytes() -> Option<u64> {
+        let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        // SAFETY: an all-zero PROCESS_MEMORY_COUNTERS is valid; `cb` tells
+        // the call how much it may write.
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        counters.cb = size;
+        // SAFETY: the pseudo handle needs no closing; `counters` is `size` bytes.
+        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) };
+        (ok != 0).then_some(counters.WorkingSetSize as u64)
+    }
+
+    /// `(total, available)` physical memory in KiB, like `/proc/meminfo`.
+    pub fn memory_kib() -> Option<(u64, u64)> {
+        // SAFETY: an all-zero MEMORYSTATUSEX is valid; dwLength is set below.
+        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: `status` is a valid MEMORYSTATUSEX with its length set.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        (ok != 0).then_some((status.ullTotalPhys / 1024, status.ullAvailPhys / 1024))
+    }
+
+    /// Bytes through the network adapters. NDIS filter drivers appear as
+    /// extra rows for the same adapter, so those are left out with loopback.
+    pub fn network_bytes() -> Option<(u64, u64)> {
+        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        // SAFETY: on success the call allocates the table, freed below.
+        if unsafe { GetIfTable2(&mut table) } != NO_ERROR || table.is_null() {
+            return None;
+        }
+        // SAFETY: GetIfTable2 succeeded, so `table` holds NumEntries rows.
+        let rows: &[MIB_IF_ROW2] = unsafe {
+            std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+        };
+        let interfaces: Vec<Interface> = rows
+            .iter()
+            .filter(|row| row.Type != IF_TYPE_SOFTWARE_LOOPBACK)
+            .filter(|row| row.InterfaceAndOperStatusFlags._bitfield & FILTER_INTERFACE == 0)
+            .map(|row| Interface {
+                real: row.InterfaceAndOperStatusFlags._bitfield & HARDWARE_INTERFACE != 0,
+                rx: row.InOctets,
+                tx: row.OutOctets,
+            })
+            .collect();
+        // SAFETY: allocated by GetIfTable2 and not used after this.
+        unsafe { FreeMibTable(table.cast()) };
+        sum_interfaces(&interfaces)
     }
 }
 
@@ -149,12 +295,36 @@ impl SystemMetricsSource for ProcSystemCollector {
     }
 }
 
-/// Total (received, sent) bytes from `/proc/net/dev` contents. Counts the
-/// interfaces backed by a device (`has_device`: Ethernet, Wi-Fi), so traffic
-/// through bridges, veth pairs or VPN tunnels is not counted twice; without
-/// any, every interface but loopback.
+/// One network interface's byte counters; `real` when backed by a device.
+struct Interface {
+    real: bool,
+    rx: u64,
+    tx: u64,
+}
+
+/// Total (received, sent) bytes of the real interfaces (Ethernet, Wi-Fi), so
+/// traffic through bridges, virtual adapters or VPN tunnels is not counted
+/// twice; without any, every interface given (loopback already left out).
+fn sum_interfaces(interfaces: &[Interface]) -> Option<(u64, u64)> {
+    if interfaces.is_empty() {
+        return None;
+    }
+    let any_real = interfaces.iter().any(|i| i.real);
+    Some(
+        interfaces
+            .iter()
+            .filter(|i| i.real || !any_real)
+            .fold((0u64, 0u64), |(rx, tx), i| {
+                (rx.saturating_add(i.rx), tx.saturating_add(i.tx))
+            }),
+    )
+}
+
+/// Total (received, sent) bytes from `/proc/net/dev` contents, counting the
+/// interfaces backed by a device (`has_device`); see `sum_interfaces`.
+#[cfg_attr(windows, allow(dead_code))]
 fn sum_network_bytes(data: &str, has_device: impl Fn(&str) -> bool) -> Option<(u64, u64)> {
-    let interfaces: Vec<(&str, u64, u64)> = data
+    let interfaces: Vec<Interface> = data
         .lines()
         .filter_map(|line| {
             let (name, counters) = line.split_once(':')?;
@@ -168,22 +338,13 @@ fn sum_network_bytes(data: &str, has_device: impl Fn(&str) -> bool) -> Option<(u
             Some((name.trim(), *fields.first()?, *fields.get(8)?))
         })
         .filter(|(name, _, _)| *name != "lo")
+        .map(|(name, rx, tx)| Interface {
+            real: has_device(name),
+            rx,
+            tx,
+        })
         .collect();
-    if interfaces.is_empty() {
-        return None;
-    }
-    let physical: Vec<_> = interfaces
-        .iter()
-        .filter(|(name, _, _)| has_device(name))
-        .collect();
-    let counted: Vec<&(&str, u64, u64)> = if physical.is_empty() {
-        interfaces.iter().collect()
-    } else {
-        physical
-    };
-    Some(counted.iter().fold((0u64, 0u64), |(rx, tx), (_, r, t)| {
-        (rx.saturating_add(*r), tx.saturating_add(*t))
-    }))
+    sum_interfaces(&interfaces)
 }
 
 /// Bits per second between two byte counts. A counter that went back
@@ -203,6 +364,7 @@ fn network_rate(cur: (u64, u64), prev: (u64, u64), elapsed: Duration) -> Network
 }
 
 /// Sum of utime + stime (fields 14 and 15) from `/proc/self/stat` contents.
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_proc_self_stat(data: &str) -> Option<u64> {
     // Fields 14 (utime) and 15 (stime) — but field 2 (comm) may
     // contain spaces & parens. Split on the trailing ')'.
@@ -215,6 +377,7 @@ fn parse_proc_self_stat(data: &str) -> Option<u64> {
 }
 
 /// `(idle, total)` jiffies from the aggregate `cpu` line of `/proc/stat`.
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_system_stat(data: &str) -> Option<(u64, u64)> {
     let first = data.lines().next()?;
     let mut parts = first.split_whitespace();
@@ -232,6 +395,7 @@ fn parse_system_stat(data: &str) -> Option<(u64, u64)> {
 }
 
 /// `VmRSS` in bytes from `/proc/self/status` contents.
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_vm_rss(data: &str) -> Option<u64> {
     for line in data.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
@@ -243,6 +407,7 @@ fn parse_vm_rss(data: &str) -> Option<u64> {
 }
 
 /// `(MemTotal, MemAvailable)` in KiB from `/proc/meminfo` contents.
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_meminfo(data: &str) -> Option<(u64, u64)> {
     let mut total = None;
     let mut available = None;
@@ -323,6 +488,17 @@ docker0: 7000 9 0 0 0 0 0 0 7000 9 0 0 0 0 0 0
         // Nothing backed by a device (a container): all but loopback.
         assert_eq!(sum_network_bytes(NET_DEV, |_| false), Some((8500, 7300)));
         assert_eq!(sum_network_bytes("Inter-|\n face |\n", real), None);
+    }
+
+    #[test]
+    fn interfaces_count_real_adapters_or_else_all_given() {
+        let row = |real, rx, tx| Interface { real, rx, tx };
+        // A virtual adapter (Hyper-V, VPN) beside a real one is left out.
+        let mixed = [row(true, 100, 10), row(false, 900, 90), row(true, 1, 1)];
+        assert_eq!(sum_interfaces(&mixed), Some((101, 11)));
+        let virtual_only = [row(false, 5, 6), row(false, 1, 1)];
+        assert_eq!(sum_interfaces(&virtual_only), Some((6, 7)));
+        assert_eq!(sum_interfaces(&[]), None);
     }
 
     #[test]

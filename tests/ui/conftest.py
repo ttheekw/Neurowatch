@@ -38,3 +38,26 @@ def app(qtbot):
     if instance is None:
         instance = QApplication([])
     return instance
+
+
+class UnexpectedMessage(AssertionError):
+    """A themed message or question opened that the test did not stub."""
+
+
+@pytest.fixture(autouse=True)
+def _no_unexpected_messages():
+    """A modal message waits for a click, so one a test did not expect would
+    hang the run: it fails at once with its title and text instead. Tests
+    that expect one stub ``show_message``/``ask``/``confirm_action`` where
+    they are used (``monkeypatch.setattr(module, "ask", ...)``)."""
+    from neurowatch.dialogs.message import MessageDialog
+
+    def refuse(dialog: MessageDialog) -> int:
+        raise UnexpectedMessage(
+            f"unexpected modal message {dialog.windowTitle()!r}: {dialog.text_label.text()!r}"
+        )
+
+    original = MessageDialog.exec
+    MessageDialog.exec = refuse  # type: ignore[method-assign]
+    yield
+    MessageDialog.exec = original  # type: ignore[method-assign]

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtWidgets import QMessageBox, QPushButton, QWidget
+from PySide6.QtWidgets import QPushButton, QWidget
 
-from neurowatch.theme import apply_dialog_theme, set_button_variant
+from neurowatch.dialogs.message import MessageDialog
 
 
 def build_confirmation(
@@ -16,31 +16,23 @@ def build_confirmation(
     cancel_text: str = "Cancel",
     destructive: bool = False,
     informative_text: str = "",
-) -> tuple[QMessageBox, QPushButton]:
-    """Build (but do not run) a confirmation box and return it with its confirm button.
+) -> tuple[MessageDialog, QPushButton]:
+    """Build (but do not run) a confirmation and return it with its confirm button.
 
     Destructive prompts use a danger-styled confirm button and default to Cancel so
     pressing Enter never deletes anything by accident.
     """
-    box = QMessageBox(parent)
-    box.setWindowTitle(title)
-    box.setText(text)
-    if informative_text:
-        box.setInformativeText(informative_text)
-    box.setIcon(QMessageBox.Icon.Warning if destructive else QMessageBox.Icon.Question)
-    apply_dialog_theme(box)
-
-    confirm_btn = box.addButton(
-        confirm_text,
-        QMessageBox.ButtonRole.DestructiveRole
-        if destructive
-        else QMessageBox.ButtonRole.AcceptRole,
+    box = MessageDialog(
+        parent,
+        title,
+        text,
+        detail=informative_text,
+        kind="warning" if destructive else "question",
     )
-    cancel_btn = box.addButton(cancel_text, QMessageBox.ButtonRole.RejectRole)
-    set_button_variant(confirm_btn, "danger" if destructive else "primary")
-    set_button_variant(cancel_btn, "secondary")
-    box.setEscapeButton(cancel_btn)
-    box.setDefaultButton(cancel_btn if destructive else confirm_btn)
+    cancel_btn = box.add_button(cancel_text, variant="secondary", accepts=False)
+    confirm_btn = box.add_button(confirm_text, variant="danger" if destructive else "primary")
+    box.set_escape_button(cancel_btn)
+    box.set_default_button(cancel_btn if destructive else confirm_btn)
     return box, confirm_btn
 
 
@@ -65,4 +57,6 @@ def confirm_action(
         informative_text=informative_text,
     )
     box.exec()
-    return box.clickedButton() is confirm_btn
+    confirmed = box.clicked_button() is confirm_btn
+    box.deleteLater()
+    return confirmed

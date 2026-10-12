@@ -8,6 +8,7 @@ use tokio::sync::broadcast;
 
 use super::handler::IpcTransport;
 use super::handler::RpcHandler;
+use super::token;
 use crate::stats::IpcMetricsRecorder;
 
 #[cfg(unix)]
@@ -119,7 +120,7 @@ async fn run_unix(
                 let conn_metrics = metrics.handle();
                 tracing::debug!(transport = "unix", "IPC client connected");
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, handler, conn_metrics, IpcTransport::ProtectedUnix).await {
+                    if let Err(e) = handle_connection(stream, handler, conn_metrics, IpcTransport::Protected, None).await {
                         tracing::warn!("IPC connection closed: {e}");
                     } else {
                         tracing::debug!(transport = "unix", "IPC client disconnected");
@@ -145,6 +146,17 @@ async fn run_tcp(
         .await
         .with_context(|| format!("Cannot bind to TCP listener: {addr}"))?;
     tracing::info!(endpoint = %format!("tcp:{addr}"), "IPC server listening");
+    // Any local process can reach a TCP port; this user's token marks its own.
+    let token: Option<Arc<str>> = match token::publish(addr) {
+        Ok((path, token)) => {
+            tracing::info!(path = %path.display(), "IPC token written for this user's clients");
+            Some(token.into())
+        }
+        Err(error) => {
+            tracing::warn!(%error, "IPC token unavailable; extension methods are not served over TCP");
+            None
+        }
+    };
 
     loop {
         tokio::select! {
@@ -152,9 +164,10 @@ async fn run_tcp(
                 let (stream, peer) = accept.context("Accept failed")?;
                 let handler = Arc::clone(&handler);
                 let conn_metrics = metrics.handle();
+                let token = token.clone();
                 tracing::debug!(transport = "tcp", peer = %peer, "IPC client connected");
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, handler, conn_metrics, IpcTransport::Tcp).await {
+                    if let Err(e) = handle_connection(stream, handler, conn_metrics, IpcTransport::Tcp, token).await {
                         tracing::warn!("IPC connection closed: {e}");
                     } else {
                         tracing::debug!(transport = "tcp", peer = %peer, "IPC client disconnected");
@@ -175,6 +188,7 @@ async fn handle_connection<S>(
     handler: Arc<RpcHandler>,
     metrics: crate::stats::IpcMetricsHandle,
     transport: IpcTransport,
+    token: Option<Arc<str>>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -194,6 +208,10 @@ where
                 drop(span);
                 return Err(anyhow::anyhow!("Malformed JSON-RPC request: {e}"));
             }
+        };
+        let transport = match &token {
+            Some(token) if token::presented(&request, token) => IpcTransport::Protected,
+            _ => transport,
         };
         let response = handler.dispatch_from(&request, transport).await;
         let mut out = serde_json::to_string(&response).context("Failed to serialize response")?;

@@ -10,6 +10,7 @@ import json
 import socket
 from typing import Any
 
+from neurowatch.ipc.auth import with_auth
 from neurowatch.service.paths import service_endpoint
 
 
@@ -23,7 +24,8 @@ def request(
     """The result of one JSON-RPC call, or None when the backend is not
     reachable or answers with an error."""
     target = endpoint or service_endpoint()
-    payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}})
+    request = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
+    payload = json.dumps(with_auth(request, target))
     try:
         if target.startswith("unix:"):
             family = getattr(socket, "AF_UNIX", None)

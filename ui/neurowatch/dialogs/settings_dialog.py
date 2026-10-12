@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -42,7 +43,9 @@ DEFAULT_DISK_THRESHOLD_PERCENT = 90
 
 
 class SettingsDialog(QDialog):
-    """Site, wall, recording and debug settings.
+    """Site, wall, recording and debug settings, in two columns: General,
+    Video Wall and Debug on the left; Recording and the Storage Calculator on
+    the right.
 
     With ``ipc_endpoint`` the recording drive can be picked from the
     backend's drive scan (``storage.list``); the choice is applied on save
@@ -58,7 +61,7 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(860)
         self._config = deepcopy(config)
         self._endpoint = ipc_endpoint or None
         self._scan: StorageScan | None = None
@@ -67,6 +70,13 @@ class SettingsDialog(QDialog):
         apply_dialog_theme(self)
 
         layout = install_dialog_chrome(self, "Settings")
+        columns = QHBoxLayout()
+        columns.setSpacing(16)
+        left = QVBoxLayout()
+        right = QVBoxLayout()
+        columns.addLayout(left, stretch=1)
+        columns.addLayout(right, stretch=1)
+        layout.addLayout(columns)
 
         general = QGroupBox("General")
         general_form = QFormLayout(general)
@@ -128,7 +138,7 @@ class SettingsDialog(QDialog):
         self._fullscreen_status.toggled.connect(opacity_row.setEnabled)
         opacity_row.setEnabled(self._fullscreen_status.isChecked())
         general_form.addRow("Overlay opacity:", opacity_row)
-        layout.addWidget(general)
+        left.addWidget(general)
 
         wall_cfg = self._config.get("wall", {})
         wall = QGroupBox("Video Wall")
@@ -154,7 +164,7 @@ class SettingsDialog(QDialog):
         rc.addWidget(QLabel("×"))
         rc.addWidget(self._cols)
         wall_form.addRow("Default Grid:", rc)
-        layout.addWidget(wall)
+        left.addWidget(wall)
 
         # ------------------------------------------------------------------
         # Recording
@@ -191,7 +201,7 @@ class SettingsDialog(QDialog):
         self._choose_drive_btn.clicked.connect(self._choose_drive)
         drive_hl.addWidget(self._choose_drive_btn)
         rec_form.addRow("Drive:", drive_row)
-        drive_row.setVisible(self._endpoint is not None)
+        rec_form.setRowVisible(drive_row, self._endpoint is not None)
         self._rec_storage.textChanged.connect(self._update_drive_label)
 
         self._rec_segment = QSpinBox()
@@ -244,7 +254,7 @@ class SettingsDialog(QDialog):
         self._rec_storage.textChanged.connect(self._update_threshold_hint)
         self._update_threshold_hint()
 
-        layout.addWidget(recording)
+        right.addWidget(recording)
 
         # ------------------------------------------------------------------
         # Storage Calculator
@@ -277,7 +287,7 @@ class SettingsDialog(QDialog):
         set_label_role(self._calc_result, "emphasis")
         calc_form.addRow("Estimated:", self._calc_result)
         self._update_calc()
-        layout.addWidget(calc)
+        right.addWidget(calc)
 
         # ------------------------------------------------------------------
         # Debug
@@ -293,7 +303,9 @@ class SettingsDialog(QDialog):
         if idx >= 0:
             self._gst_log.setCurrentIndex(idx)
         debug_form.addRow("GStreamer Log Level:", self._gst_log)
-        layout.addWidget(debug)
+        left.addWidget(debug)
+        left.addStretch(1)
+        right.addStretch(1)
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel

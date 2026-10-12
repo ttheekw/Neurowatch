@@ -25,7 +25,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QProgressBar,
     QPushButton,
     QSizePolicy,
@@ -33,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from neurowatch.dialogs.message import ask
 from neurowatch.ipc.frame_reader import FrameReaderThread
 from neurowatch.ipc.sync_client import SyncIpcClient
 from neurowatch.models import clip_export
@@ -588,14 +588,14 @@ class ExportVideoDialog(QDialog):
         # The save dialog asked about replacing `path`, not the name with
         # `.mp4` added.
         if final != path and os.path.exists(final):
-            answer = QMessageBox.question(
+            if not ask(
                 self,
                 "Export Video",
                 f"{os.path.basename(final)} already exists. Replace it?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
+                yes_text="Replace",
+                no_text="Cancel",
+                destructive=True,
+            ):
                 return
         ExportVideoDialog.last_folder = os.path.dirname(final)
         # The preview pauses: the export reads the same disk.
@@ -694,14 +694,14 @@ class ExportVideoDialog(QDialog):
 
     def reject(self) -> None:
         if self.export_running():
-            answer = QMessageBox.question(
+            if not ask(
                 self,
                 "Export Video",
                 "An export is still running. Stop it and close?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
+                yes_text="Stop export",
+                no_text="Keep exporting",
+                destructive=True,
+            ):
                 return
             if self._job is not None:
                 self._run([("export.cancel", {"job_id": self._job.job_id})])

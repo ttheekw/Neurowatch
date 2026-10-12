@@ -9,10 +9,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PKG_NAME="neurowatch"
 PKG_RELEASE="1"
-PKG_SUMMARY="Neurowatch NVR - professional video surveillance desktop application"
+PKG_SUMMARY="NeuroWatch - watch and record your security cameras (NVR)"
 # Builds that add proprietary extensions name their terms too (NW_PACKAGE_LICENSE).
 PKG_LICENSE="${NW_PACKAGE_LICENSE:-AGPL-3.0-or-later}"
 PKG_URL="https://github.com/ttheekw/Neurowatch"
+# AppStream id (scripts/installer/linux/neurowatch.metainfo.xml).
+APP_ID="io.github.ttheekw.neurowatch"
 PKG_MAINTAINER="Neurowatch Developers <dev@neurowatch.invalid>"
 INSTALL_PREFIX="/opt/neurowatch"
 
@@ -23,7 +25,9 @@ DEB_DEPENDS=(
     liborc-0.4-0
     libopus0
     libpulse0
-    'libasound2 | libasound2t64'
+    # The real ALSA library first: on Ubuntu 24.04+ / Debian 13 "libasound2" is
+    # only provided by liboss4-salsa-asound2, a stub that breaks GStreamer's ALSA plugin.
+    'libasound2t64 | libasound2'
     libva2
     libva-drm2
     libdrm2
@@ -273,11 +277,11 @@ cat > "$WORK_DIR/neurowatch.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=Neurowatch
+Name=NeuroWatch
 GenericName=Network Video Recorder
 Comment=$PKG_SUMMARY
 Exec=neurowatch
-Icon=camera-video
+Icon=neurowatch
 Terminal=false
 Categories=AudioVideo;Video;Security;
 Keywords=NVR;CCTV;camera;surveillance;
@@ -292,6 +296,24 @@ cp -a "$BUNDLE_DIR/." "$STAGE$INSTALL_PREFIX/"
 rm -f "$STAGE$INSTALL_PREFIX/neurowatch.desktop"
 ln -s "$INSTALL_PREFIX/neurowatch" "$STAGE/usr/bin/neurowatch"
 install -m 0644 "$WORK_DIR/neurowatch.desktop" "$STAGE/usr/share/applications/neurowatch.desktop"
+# The logo for app menus and docks (the UI names its windows after
+# neurowatch.desktop), and the AppStream description software centres show
+# when the package is opened (scripts/make_app_icon.py renders the PNGs).
+LINUX_FILES="$ROOT/scripts/installer/linux"
+ICON_DIR="/usr/share/icons/hicolor"
+install -D -m 0644 "$ROOT/ui/neurowatch/resources/icons/neurowatch.svg" \
+    "$STAGE$ICON_DIR/scalable/apps/neurowatch.svg"
+for size in 48 64 128 256; do
+    install -D -m 0644 "$LINUX_FILES/icons/neurowatch-$size.png" \
+        "$STAGE$ICON_DIR/${size}x${size}/apps/neurowatch.png"
+done
+METAINFO="/usr/share/metainfo/$APP_ID.metainfo.xml"
+install -D -m 0644 "$LINUX_FILES/neurowatch.metainfo.xml" "$STAGE$METAINFO"
+RELEASE_DATE="$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%Y-%m-%d)"
+sed -i \
+    -e "s|<project_license>.*</project_license>|<project_license>$PKG_LICENSE</project_license>|" \
+    -e "s|<release version=\"[^\"]*\" date=\"[^\"]*\"/>|<release version=\"$VERSION\" date=\"$RELEASE_DATE\"/>|" \
+    "$STAGE$METAINFO"
 # Licence files live in the distro's licence directory (rpm, Arch); build_deb
 # moves them to /usr/share/doc/$PKG_NAME, the Debian location.
 LICENSE_DIR="/usr/share/licenses/$PKG_NAME"
@@ -300,6 +322,14 @@ install -d -m 0755 "$STAGE$LICENSE_DIR"
 install -m 0644 "$ROOT/LICENSE" "$STAGE$LICENSE_DIR/LICENSE"
 install -m 0644 "$ROOT/NOTICE" "$STAGE$LICENSE_DIR/NOTICE"
 INSTALLED_SIZE_KB="$(du -sk "$STAGE" | cut -f1)"
+
+# What the software centre shows on the install screen (deb, rpm).
+LONG_DESCRIPTION="NeuroWatch is a network video recorder for your computer. It shows
+your IP cameras on a live video wall, records them in the background,
+and lets you play back and export recordings. No camera limit; free
+and open source. Provided as is, without any warranty (see NOTICE)."
+# Debian continuation lines start with a space.
+LONG_DESCRIPTION_DEB="$(printf '%s\n' "$LONG_DESCRIPTION" | sed '2,$s/^/ /')"
 
 join_by() {
     local separator="$1"
@@ -340,8 +370,7 @@ Section: video
 Priority: optional
 Homepage: $PKG_URL
 Description: $PKG_SUMMARY
- Desktop network video recorder with a Rust/GStreamer backend and a
- PySide6 user interface. Installed under $INSTALL_PREFIX.
+ $LONG_DESCRIPTION_DEB
 CONTROL
     dpkg-deb --root-owner-group --build "$root" "$output" >/dev/null
     echo "  deb: $output"
@@ -372,8 +401,7 @@ Recommends:     $(join_by ' ' "${RPM_RECOMMENDS[@]}")
 %global _build_id_links none
 
 %description
-Desktop network video recorder with a Rust/GStreamer backend and a
-PySide6 user interface. Installed under $INSTALL_PREFIX.
+$LONG_DESCRIPTION
 
 %install
 mkdir -p %{buildroot}
@@ -384,6 +412,12 @@ cp -a "$STAGE/." %{buildroot}/
 $INSTALL_PREFIX
 /usr/bin/neurowatch
 /usr/share/applications/neurowatch.desktop
+$ICON_DIR/scalable/apps/neurowatch.svg
+$ICON_DIR/48x48/apps/neurowatch.png
+$ICON_DIR/64x64/apps/neurowatch.png
+$ICON_DIR/128x128/apps/neurowatch.png
+$ICON_DIR/256x256/apps/neurowatch.png
+$METAINFO
 %dir $LICENSE_DIR
 %license $LICENSE_DIR/LICENSE
 %license $LICENSE_DIR/NOTICE

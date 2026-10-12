@@ -70,7 +70,7 @@ without versions.
 | Requirement | Notes |
 |---|---|
 | Windows 10 or 11, 64-bit | The installer requires 10.0; Qt 6 expects 1809 or newer |
-| GPU driver | Optional, for hardware decoding |
+| GPU driver | Optional, for hardware decoding: Direct3D 11 (Intel, AMD, NVIDIA), or NVDEC on NVIDIA. VA-API is Linux only |
 | Nothing else | GStreamer and the MSVC runtime are bundled. Installs per user, no administrator rights |
 
 The installer is not signed yet, so SmartScreen warns on first run.

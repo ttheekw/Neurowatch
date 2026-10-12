@@ -12,6 +12,8 @@ import os
 import socket
 from typing import Any
 
+from neurowatch.ipc.auth import with_auth
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_ENDPOINT = "tcp:127.0.0.1:7676" if os.name == "nt" else "unix:/run/neurowatch/control.sock"
@@ -88,10 +90,7 @@ class SyncIpcClient:
         """
         rpc_id = self._next_id
         self._next_id += 1
-        payload = (
-            json.dumps({"jsonrpc": "2.0", "id": rpc_id, "method": method, "params": params or {}})
-            + "\n"
-        )
+        request = {"jsonrpc": "2.0", "id": rpc_id, "method": method, "params": params or {}}
 
         logger.debug("IPC send: %s (id=%d)", method, rpc_id)
         try:
@@ -99,6 +98,8 @@ class SyncIpcClient:
         except (FileNotFoundError, ConnectionRefusedError, TimeoutError, OSError) as e:
             logger.warning("IPC connection failed for %s: %s", method, e)
             raise BackendOfflineError(f"Backend not reachable: {e}") from e
+        # On TCP, this user's token (the endpoint is known once connected).
+        payload = json.dumps(with_auth(request, self._endpoint)) + "\n"
 
         try:
             if timeout is not None:

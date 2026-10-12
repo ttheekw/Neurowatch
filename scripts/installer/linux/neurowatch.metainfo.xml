@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream description: the name, logo, summary and licence software
+     centres (GNOME Software, App Center, Discover) show for NeuroWatch.
+     Installed by scripts/package_release_linux.sh as
+     /usr/share/metainfo/io.github.ttheekw.neurowatch.metainfo.xml; it fills in
+     the licence and the release (version, date) being built. -->
+<component type="desktop-application">
+  <id>io.github.ttheekw.neurowatch</id>
+  <name>NeuroWatch</name>
+  <summary>Watch and record your security cameras</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <developer id="io.github.ttheekw">
+    <name>NeuroWatch Project</name>
+  </developer>
+  <description>
+    <p>
+      NeuroWatch is a network video recorder for your computer. It shows your
+      IP cameras on a live video wall, records them in the background, and
+      lets you play back and export recordings.
+    </p>
+    <ul>
+      <li>Live video wall with pages, layouts and extra windows</li>
+      <li>Finds ONVIF cameras on your network</li>
+      <li>Keeps recording in the background after the window closes</li>
+      <li>Playback with a timeline, and clip export to MP4</li>
+      <li>No camera limit; free and open source</li>
+    </ul>
+    <p>
+      NeuroWatch is provided as is, without any warranty; see the NOTICE file
+      for the full disclaimer.
+    </p>
+  </description>
+  <launchable type="desktop-id">neurowatch.desktop</launchable>
+  <icon type="stock">neurowatch</icon>
+  <url type="homepage">https://github.com/ttheekw/Neurowatch</url>
+  <url type="bugtracker">https://github.com/ttheekw/Neurowatch/issues</url>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Video</category>
+  </categories>
+  <keywords>
+    <keyword>NVR</keyword>
+    <keyword>CCTV</keyword>
+    <keyword>camera</keyword>
+    <keyword>surveillance</keyword>
+    <keyword>ONVIF</keyword>
+  </keywords>
+  <provides>
+    <binary>neurowatch</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.0.0" date="1970-01-01"/>
+  </releases>
+</component>

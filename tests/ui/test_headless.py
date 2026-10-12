@@ -188,6 +188,8 @@ def test_headless_starts_the_service_in_headless_mode_and_outlives_ctrl_c(monkey
     assert "Restarting the NeuroWatch service in headless mode" in text
     assert "it starts at boot" in text
     assert "NeuroWatch keeps running in the background" in text
+    assert text.splitlines()[0].endswith(headless.NO_WARRANTY), "the notice comes first"
+    assert "ABSOLUTELY NO WARRANTY" in headless._parser().format_help()
 
     calls.clear()
     headless.main(["monitor", "--service", "--no-autostart"], out=io.StringIO())

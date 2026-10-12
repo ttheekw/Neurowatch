@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from PySide6.QtCore import QElapsedTimer, QEvent, QEventLoop, QObject, Qt, QThread, QTimer
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QFrame, QLabel, QWidget
 
 from neurowatch import theme
 from neurowatch.ipc.sync_client import BackendOfflineError, IpcError
@@ -223,10 +223,9 @@ def test_backend_unavailable_closes_welcome_before_error_popup(app, monkeypatch,
     def _critical(parent, title, text, *args, **kwargs):
         popups.append((recording_welcome.instances[0].isVisible(), title))
         assert "unix:/nonexistent/test.sock" in text
-        return QMessageBox.StandardButton.Ok
 
     monkeypatch.setattr(main_mod, "MainWindow", FailingWindow)
-    monkeypatch.setattr(main_mod.QMessageBox, "critical", _critical)
+    monkeypatch.setattr(main_mod, "show_message", _critical)
 
     with pytest.raises(SystemExit) as exc:
         main_mod._start_main_window(app, "1.0.0-test")
@@ -305,7 +304,7 @@ def test_main_window_raises_backend_unavailable_after_retries(monkeypatch):
         raising=False,
     )
     popups: list[str] = []
-    monkeypatch.setattr(main_mod.QMessageBox, "critical", lambda *a, **k: popups.append(a[1]))
+    monkeypatch.setattr(main_mod, "show_message", lambda *a, **k: popups.append(a[1]))
 
     with pytest.raises(main_mod.BackendUnavailableError) as exc:
         main_mod.MainWindow(progress=lambda stage, detail="": timeline.append(detail))
@@ -357,10 +356,8 @@ def _record_popups(monkeypatch, main_mod, welcome_cls, windows):
         welcome_visible = bool(welcome_cls.instances) and welcome_cls.instances[0].isVisible()
         window_visible = bool(windows) and windows[0].isVisible()
         popups.append((welcome_visible, window_visible, title))
-        return QMessageBox.StandardButton.Ok
 
-    monkeypatch.setattr(main_mod.QMessageBox, "critical", _popup)
-    monkeypatch.setattr(main_mod.QMessageBox, "warning", _popup)
+    monkeypatch.setattr(main_mod, "show_message", _popup)
     return popups
 
 

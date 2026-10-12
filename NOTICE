@@ -10,6 +10,46 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
 PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
 
+Disclaimer and limitation of liability
+--------------------------------------
+This restates, for a video recorder, what sections 15 and 16 of the License
+already say; the License governs. It applies to the desktop app, the
+background service and the command-line and headless modes.
+
+1. Provided "as is". NeuroWatch is open-source software provided free of
+   charge, at your own risk, without any warranty, express or implied. No
+   support, maintenance, updates or fixes are promised.
+
+2. Not a guaranteed security, safety or alarm system. Do not rely on
+   NeuroWatch as your only means of protecting people, property or evidence,
+   or for any life-safety, emergency or critical purpose. Video may fail to be
+   shown, recorded, kept or exported, for example because of camera, network,
+   power, disk or hardware faults, software defects, updates, configuration,
+   or the automatic deletion of old recordings when a drive fills up. Check
+   that it works for you, and keep your own backups of footage you need.
+
+3. No liability. To the fullest extent permitted by applicable law, the
+   authors, copyright holders and contributors are not liable for any damages
+   or loss of any kind arising from the use of, or inability to use,
+   NeuroWatch, including missed, lost, corrupted or disclosed recordings, loss
+   of data, property, profit or business, security incidents, and any claim by
+   a third party, even if advised of the possibility of such damages.
+
+4. Your installation, your responsibility. You install, configure, secure and
+   operate NeuroWatch and the computers and cameras it uses. You alone are
+   responsible for using it lawfully, including privacy, data-protection,
+   surveillance, employment and audio-recording laws, notices and consent,
+   and how long footage is kept. The authors do not operate your installation
+   and never receive your video.
+
+5. Other versions and software. Modified versions, builds from other sources
+   and third-party software (including cameras, drivers, GStreamer and codecs)
+   are the responsibility of those who provide them. NeuroWatch Cloud is
+   provided under its own terms.
+
+Some jurisdictions do not allow certain warranties or liabilities to be
+excluded; there, these exclusions apply to the extent the law allows.
+
 Trademarks (AGPL-3.0 section 7(e)): this License grants no rights to use the
 name "NeuroWatch" or its logo. A modified version must not be presented as the
 official NeuroWatch.
