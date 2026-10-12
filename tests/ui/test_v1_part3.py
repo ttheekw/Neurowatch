@@ -34,7 +34,6 @@ class _FakeIpcClient:
 def _make_main_window(monkeypatch, qtbot, shm_prefix: str) -> MainWindow:
     monkeypatch.setattr("neurowatch.main.SyncIpcClient", _FakeIpcClient)
     monkeypatch.setattr("neurowatch.ipc.frame_reader.SHM_PREFIX", shm_prefix)
-    monkeypatch.setattr("neurowatch.main.ask", lambda *a, **k: False)
     win = MainWindow()
     qtbot.addWidget(win)
     return win
@@ -311,7 +310,6 @@ def test_config_file_change_reload_prompts_before_applying(monkeypatch, qtbot):
 
     monkeypatch.setattr("neurowatch.main.SyncIpcClient", _FakeClient)
     monkeypatch.setattr("neurowatch.ipc.frame_reader.SHM_PREFIX", "/nonexistent/nw-test-reload-")
-    monkeypatch.setattr("neurowatch.main.ask", lambda *a, **k: False)
 
     win = MainWindow()
     qtbot.addWidget(win)
@@ -319,24 +317,8 @@ def test_config_file_change_reload_prompts_before_applying(monkeypatch, qtbot):
         reload_calls: list[bool] = []
         win._load_from_backend = lambda *a, **k: reload_calls.append(True)
 
-        questions: list[tuple] = []
-
-        def _question_no(*args, **kwargs):
-            questions.append(args)
-            return False
-
-        monkeypatch.setattr("neurowatch.main.ask", _question_no)
+        # Applied at once; asking would fail the test (tests/ui/conftest.py).
         win._reload_config_after_change()
-        assert len(questions) == 1
-        assert reload_calls == []
-
-        def _question_yes(*args, **kwargs):
-            questions.append(args)
-            return True
-
-        monkeypatch.setattr("neurowatch.main.ask", _question_yes)
-        win._reload_config_after_change()
-        assert len(questions) == 2
         assert reload_calls == [True]
     finally:
         win.close()
@@ -367,7 +349,6 @@ def test_main_settings_tab_opens_dialog(monkeypatch, qtbot):
 
     monkeypatch.setattr("neurowatch.main.SyncIpcClient", _FakeClient)
     monkeypatch.setattr("neurowatch.ipc.frame_reader.SHM_PREFIX", "/nonexistent/nw-test-")
-    monkeypatch.setattr("neurowatch.main.ask", lambda *a, **k: False)
 
     win = MainWindow()
     qtbot.addWidget(win)

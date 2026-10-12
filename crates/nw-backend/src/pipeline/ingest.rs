@@ -353,6 +353,7 @@ impl IngestSupervisor {
                 gstreamer::PadProbeReturn::Ok
             });
         }
+        warn_when_the_writer_falls_behind(pipeline, &self.cam_id);
         let outcome = self.watch_recording(pipeline, &tap, &units);
         let _ = pipeline.set_state(gstreamer::State::Null);
         let _ = pipeline.state(Some(gstreamer::ClockTime::from_seconds(5)));
@@ -605,6 +606,36 @@ pub(crate) fn describe(camera: &CameraConfig) -> Result<StreamInfo, String> {
     })();
     let _ = pipeline.set_state(gstreamer::State::Null);
     outcome
+}
+
+/// Log when the segment writer stalled long enough to fill the recording
+/// queue (`builder::RECORDING_STALL_NS`): from then on the camera connection
+/// waits and video is lost. At most once a minute per recording.
+fn warn_when_the_writer_falls_behind(pipeline: &gstreamer::Pipeline, cam_id: &str) {
+    let Some(queue) = pipeline.by_name(super::builder::RECORDING_QUEUE) else {
+        return;
+    };
+    let cam_id = cam_id.to_owned();
+    let last_warned = std::sync::Mutex::new(None::<std::time::Instant>);
+    queue.connect("overrun", false, move |_| {
+        let now = std::time::Instant::now();
+        if let Ok(mut last) = last_warned.lock() {
+            let due = match *last {
+                Some(at) => now.duration_since(at) >= std::time::Duration::from_secs(60),
+                None => true,
+            };
+            if due {
+                *last = Some(now);
+                tracing::warn!(
+                    cam_id = %cam_id,
+                    stall_s = super::builder::RECORDING_STALL_NS / 1_000_000_000,
+                    "Recording fell behind writing to disk; video may be missing. \
+                     A slow or busy drive, or an antivirus scanning recordings, can cause this"
+                );
+            }
+        }
+        None
+    });
 }
 
 #[cfg(test)]

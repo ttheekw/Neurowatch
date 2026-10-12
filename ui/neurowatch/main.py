@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neurowatch import build_info, extensions
+from neurowatch import build_info, extensions, windows_icon
 from neurowatch.app_launch import (
     LaunchOptions,
     SingleInstance,
@@ -50,7 +50,7 @@ from neurowatch.dialogs.camera_dialog import AddEditCameraDialog
 from neurowatch.dialogs.confirm import confirm_action
 from neurowatch.dialogs.custom_grid_dialog import CustomGridDialog
 from neurowatch.dialogs.export_video_dialog import ExportVideoDialog
-from neurowatch.dialogs.message import ask, show_message
+from neurowatch.dialogs.message import show_message
 from neurowatch.dialogs.new_window_dialog import NewWindowDialog, PageSummary, WindowSummary
 from neurowatch.dialogs.settings_dialog import SettingsDialog
 from neurowatch.ipc.quality_dispatcher import CameraQualityDispatcher
@@ -60,7 +60,7 @@ from neurowatch.ipc.viewer_client import NativeViewerClient
 from neurowatch.models.camera import CameraConfig, WallPosition
 from neurowatch.models.wall_layout import Placement
 from neurowatch.models.window_session import saved_windows
-from neurowatch.theme import app_icon, apply_app_theme
+from neurowatch.theme import app_icon, apply_app_theme, icon_path
 from neurowatch.utils.threads import wait_for_retired
 from neurowatch.widgets.camera_panel import CameraPanel
 from neurowatch.widgets.compact_bar import CompactTitleBar
@@ -83,6 +83,13 @@ _DEFAULT_ROWS, _DEFAULT_COLS = 4, 8  # 8 cols × 4 rows (matches "8×4 Grid" lab
 # it: enough to connect and reach a keyframe, so it opens on live pictures
 # instead of each tile catching up on its own.
 _PREWARM_LEAD_MS = 3000
+#: After a page is picked by hand, the page left and the pages either side
+#: keep decoding this long, so going back or on is instant, as auto-scroll's
+#: warmed next page is. Then only the visible page decodes again.
+_BROWSE_WARM_MS = 15_000
+#: A page whose dot (or arrow) the pointer leaves keeps decoding this long:
+#: the pointer may pass the dot just before the click.
+_HOVER_WARM_MS = 2_000
 
 StartupProgress = Callable[[StartupStage, str], None]
 
@@ -166,6 +173,9 @@ class _PollWorker(QThread):
     """Background thread that polls camera states every 2 s without blocking the UI."""
 
     poll_done = Signal(dict, dict, dict, bool)  # states, stream_infos, recording_states, backend_ok
+    #: ``stats.get_performance`` (CPU, memory, network for the status bar),
+    #: or None when the backend is unreachable.
+    performance = Signal(object)
 
     def __init__(self, endpoint: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -191,8 +201,13 @@ class _PollWorker(QThread):
                     rec_states if isinstance(rec_states, dict) else {},
                     True,
                 )
+                try:
+                    self.performance.emit(client.call("stats.get_performance"))
+                except Exception:
+                    self.performance.emit(None)
             except Exception:
                 self.poll_done.emit({}, {}, {}, False)
+                self.performance.emit(None)
             # Sleep in 200 ms increments so interruption is responsive
             for _ in range(10):
                 if self.isInterruptionRequested():
@@ -380,6 +395,7 @@ class MainWindow(QMainWindow):
         holder_layout.setContentsMargins(0, 0, 0, 0)
         self._page_strip = PageStripWidget()
         self._page_strip.page_clicked.connect(self._on_page_strip_clicked)
+        self._page_strip.page_hovered.connect(self._on_page_hovered)
         holder_layout.addWidget(self._page_strip)
         layout.addWidget(self._page_strip_holder)
 
@@ -403,12 +419,23 @@ class MainWindow(QMainWindow):
         self._prewarm_timer = QTimer(self)
         self._prewarm_timer.setSingleShot(True)
         self._prewarm_timer.timeout.connect(self._prewarm_next_pages)
+        # Manual browsing: the page pointed at, and the pages around the one
+        # just picked (see _BROWSE_WARM_MS / _HOVER_WARM_MS).
+        self._hover_warm: frozenset[str] = frozenset()
+        self._browse_warm: frozenset[str] = frozenset()
+        self._hover_warm_timer = QTimer(self)
+        self._hover_warm_timer.setSingleShot(True)
+        self._hover_warm_timer.timeout.connect(lambda: self._set_hover_warm(frozenset()))
+        self._browse_warm_timer = QTimer(self)
+        self._browse_warm_timer.setSingleShot(True)
+        self._browse_warm_timer.timeout.connect(lambda: self._set_browse_warm(frozenset()))
         self._wall.view_demand_changed.connect(self._sync_view_demand)
         self._content_stack.currentChanged.connect(self._sync_view_demand)
         self._sync_view_demand()
 
         self._poll_worker = _PollWorker(endpoint, self)
         self._poll_worker.poll_done.connect(self._on_poll_done)
+        self._poll_worker.performance.connect(self._status_bar.set_performance)
         self._poll_worker.start()
 
         # The one page clock: the main wall's auto-scroll and every extra
@@ -521,8 +548,18 @@ class MainWindow(QMainWindow):
         return str(getattr(self._ipc, "endpoint", getattr(self._ipc, "_endpoint", "")))
 
     def _on_add_camera(self) -> None:
-        dlg = AddEditCameraDialog(parent=self, ipc_endpoint=self._ipc_endpoint() or None)
-        if dlg.exec() != AddEditCameraDialog.DialogCode.Accepted:
+        dlg = AddEditCameraDialog(
+            parent=self,
+            ipc_endpoint=self._ipc_endpoint() or None,
+            existing_names=[c.name for c in self._cameras],
+        )
+        accepted = dlg.exec() == AddEditCameraDialog.DialogCode.Accepted
+        # Cameras added from the search (the backend already has them), also
+        # when the dialog was closed after adding some.
+        added = dlg.added_cameras()
+        for camera in added:
+            self._on_add_camera_result(camera, CameraConfig.from_dict(camera))
+        if not accepted or added:
             return
         cam = dlg.get_config()
         if self._add_worker and self._add_worker.isRunning():
@@ -762,10 +799,45 @@ class MainWindow(QMainWindow):
 
     def _navigate_to_page(self, page: int) -> None:
         """Manual navigation: always restarts the auto-scroll countdown."""
+        left = self._wall.page
         # Page first: restarting the countdown drops the warmed next page,
         # which may be the one this shows.
         self._change_page(page)
         self._restart_autoscroll_timer()
+        self._warm_while_browsing(left)
+
+    def _warm_while_browsing(self, left: int) -> None:
+        """Keep the page just left and the pages either side of this one
+        decoding for a while: browsing on or back then shows live video at
+        once instead of reconnecting (``_BROWSE_WARM_MS``)."""
+        wall = self._wall
+        pages = {left, wall.page - 1, wall.page + 1} - {wall.page}
+        cameras: set[str] = set()
+        for page in pages:
+            if 0 <= page < wall.page_count:
+                cameras.update(wall.page_demand(page))
+        self._set_browse_warm(frozenset(cameras))
+        self._browse_warm_timer.start(_BROWSE_WARM_MS)
+
+    def _on_page_hovered(self, page: int) -> None:
+        """The pointer is on a page's dot or arrow: start that page's video
+        before the click; it lingers briefly after the pointer leaves."""
+        wall = self._wall
+        if 0 <= page < wall.page_count and page != wall.page:
+            self._hover_warm_timer.stop()
+            self._set_hover_warm(frozenset(wall.page_demand(page)))
+        elif self._hover_warm:
+            self._hover_warm_timer.start(_HOVER_WARM_MS)
+
+    def _set_hover_warm(self, cameras: frozenset[str]) -> None:
+        if cameras != self._hover_warm:
+            self._hover_warm = cameras
+            self._sync_view_demand()
+
+    def _set_browse_warm(self, cameras: frozenset[str]) -> None:
+        if cameras != self._browse_warm:
+            self._browse_warm = cameras
+            self._sync_view_demand()
 
     def _update_page_display(self) -> None:
         page = self._wall.page
@@ -1250,6 +1322,8 @@ class MainWindow(QMainWindow):
         demand = set(self._wall.desktop_demand() if shown else [])
         if shown:
             demand.update(self._prewarm_main)
+            demand.update(self._hover_warm)
+            demand.update(self._browse_warm)
         for window in self._detached:
             demand.update(window.desktop_demand())
         demand.update(self._prewarm_windows)
@@ -1713,16 +1787,9 @@ class MainWindow(QMainWindow):
         self._config_reload_timer.start()  # restarts if already running (debounce)
 
     def _reload_config_after_change(self) -> None:
-        if not ask(
-            self,
-            "Configuration Changed",
-            "The configuration file changed on disk. Reload cameras and settings now?",
-            yes_text="Reload",
-            no_text="Not now",
-        ):
-            logger.info("Config file changed on disk — user declined reload")
-            return
-        logger.info("Config file changed on disk — applying update")
+        # Applied without asking: the file changes when cameras are added from
+        # a search, by the web portal or by hand, and the new settings are wanted.
+        logger.info("Config file changed on disk — reloading cameras and settings")
         self._load_from_backend()
 
 
@@ -2018,6 +2085,8 @@ def main() -> None:
     app.setApplicationName("NeuroWatch")
     app.setOrganizationName("Neurowatch")
     app.setWindowIcon(app_icon())
+    # Windows: the logo on taskbar buttons straight through Win32.
+    windows_icon.install(app, icon_path("neurowatch.ico"))
     # Linux docks match windows to the installed neurowatch.desktop (its logo).
     app.setDesktopFileName("neurowatch")
     if activate_running_instance():

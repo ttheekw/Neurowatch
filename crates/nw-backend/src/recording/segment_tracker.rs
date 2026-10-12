@@ -1,6 +1,7 @@
 //! Segment tracker — scans a camera's recording directory and inserts/updates
 //! rows in the `segments` SQLite table.
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,22 @@ fn is_matroska_segment(path: &Path) -> bool {
     };
     let mut header = [0_u8; 4];
     file.read_exact(&mut header).is_ok() && header == MATROSKA_EBML_HEADER
+}
+
+/// `(run_epoch_ms, run_sequence, fragment)` of a splitmux filename,
+/// `{camera_id}_{run_epoch_ms}_{run_sequence}_{fragment}.mkv`; None for older
+/// names.
+fn splitmux_parts(filename: &str, camera_id: &str) -> Option<(i64, u64, i64)> {
+    let encoded = filename
+        .strip_prefix(&format!("{camera_id}_"))
+        .and_then(|name| name.strip_suffix(".mkv"))?;
+    let mut parts = encoded.rsplitn(3, '_');
+    let fragment = parts.next()?.parse::<i64>().ok()?;
+    // The middle component is a process-local sequence used to avoid filename
+    // collisions. Validate it so legacy names are not mistaken for this format.
+    let sequence = parts.next()?.parse::<u64>().ok()?;
+    let run_epoch_ms = parts.next()?.parse::<i64>().ok()?;
+    (run_epoch_ms > 0 && fragment >= 0).then_some((run_epoch_ms, sequence, fragment))
 }
 
 /// Derive the start time from the splitmux filename when possible.
@@ -34,35 +51,36 @@ fn segment_start_ts(filename: &str, camera_id: &str, end_ts: i64, segment_durati
     if segment_duration_ms <= 0 {
         return fallback;
     }
-
-    let Some(encoded) = filename
-        .strip_prefix(&format!("{camera_id}_"))
-        .and_then(|name| name.strip_suffix(".mkv"))
-    else {
+    let Some((run_epoch_ms, _sequence, fragment)) = splitmux_parts(filename, camera_id) else {
         return fallback;
     };
-    let mut parts = encoded.rsplitn(3, '_');
-    let Some(fragment) = parts.next().and_then(|value| value.parse::<i64>().ok()) else {
-        return fallback;
-    };
-    // The middle component is a process-local sequence used to avoid filename
-    // collisions. Validate it so legacy names are not mistaken for this format.
-    if parts
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .is_none()
-    {
-        return fallback;
-    }
-    let Some(run_epoch_ms) = parts.next().and_then(|value| value.parse::<i64>().ok()) else {
-        return fallback;
-    };
-
     let nominal_start = run_epoch_ms.saturating_add(fragment.saturating_mul(segment_duration_ms));
-    if run_epoch_ms <= 0 || fragment < 0 || nominal_start >= end_ts {
+    if nominal_start >= end_ts {
         return fallback;
     }
     nominal_start
+}
+
+/// The end of a finished fragment: where the next fragment of the same run
+/// starts. splitmuxsink switches files without dropping anything, so a run's
+/// fragments are back to back; the file's modification time is not a
+/// reliable end (Windows recorded it seconds early, which showed a gap at
+/// every minute on the playback timeline). None for the run's last fragment
+/// (still being written, or the run stopped), which keeps its own end.
+fn run_continues_at(
+    filename: &str,
+    camera_id: &str,
+    segment_duration_ms: i64,
+    present: &HashSet<(i64, u64, i64)>,
+) -> Option<i64> {
+    if segment_duration_ms <= 0 {
+        return None;
+    }
+    let (run_epoch_ms, sequence, fragment) = splitmux_parts(filename, camera_id)?;
+    let next = fragment.checked_add(1)?;
+    present
+        .contains(&(run_epoch_ms, sequence, next))
+        .then(|| run_epoch_ms.saturating_add(next.saturating_mul(segment_duration_ms)))
 }
 
 /// Scan `storage_dir` for `.mkv` files belonging to `cam_id` (named
@@ -90,6 +108,21 @@ pub fn scan_and_record(
     };
 
     let prefix = format!("{}_", cam_id);
+    let files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".mkv"))
+        })
+        .collect();
+    // Which fragments of which runs exist, to join each to the next.
+    let present: HashSet<(i64, u64, i64)> = files
+        .iter()
+        .filter_map(|path| path.file_name().and_then(|n| n.to_str()))
+        .filter_map(|name| splitmux_parts(name, cam_id))
+        .collect();
     let mut guard = match db.lock() {
         Ok(c) => c,
         Err(_) => return,
@@ -104,12 +137,8 @@ pub fn scan_and_record(
         }
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in files {
         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !fname.starts_with(&prefix) || !fname.ends_with(".mkv") {
-            continue;
-        }
 
         let path_str = path.to_string_lossy().to_string();
         if !is_matroska_segment(&path) {
@@ -144,6 +173,10 @@ pub fn scan_and_record(
             })
             .unwrap_or(0);
         let start_ts = segment_start_ts(fname, cam_id, end_ts, segment_duration_ms);
+        let end_ts = match run_continues_at(fname, cam_id, segment_duration_ms, &present) {
+            Some(next_start) if next_start > start_ts => next_start,
+            _ => end_ts,
+        };
 
         // Refresh an existing row only if the file changed (a segment still
         // being written grows between scans); insert otherwise.
@@ -248,6 +281,77 @@ mod tests {
         );
 
         assert_eq!(start, 1_789_659_035_708);
+    }
+
+    #[test]
+    fn a_runs_fragments_are_indexed_back_to_back_whatever_their_mtimes() {
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nw-segjoin-{now_ns}"));
+        fs::create_dir_all(&dir).expect("create dir");
+        let cam = "cam-join";
+        let run: i64 = 1_789_659_000_000;
+        let minute: i64 = 60_000;
+        // As seen on Windows: each file's modification time is 3 s before the
+        // next file of its run starts.
+        let segment = |name: &str, mtime_ms: i64| {
+            let path = dir.join(name);
+            let mut f = File::create(&path).expect("create segment");
+            f.write_all(&[0x1a, 0x45, 0xdf, 0xa3]).expect("write");
+            let when = UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms as u64);
+            f.set_modified(when).expect("set mtime");
+        };
+        segment(&format!("{cam}_{run}_1_00000.mkv"), run + minute - 3_000);
+        segment(
+            &format!("{cam}_{run}_1_00001.mkv"),
+            run + 2 * minute - 3_000,
+        );
+        segment(
+            &format!("{cam}_{run}_1_00002.mkv"),
+            run + 2 * minute + 20_000,
+        ); // still open
+           // Another run (the recording restarted): never joined to the first.
+        let later = run + 5 * minute;
+        segment(&format!("{cam}_{later}_2_00000.mkv"), later + 30_000);
+
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                camera_id TEXT NOT NULL,
+                start_ts INTEGER NOT NULL,
+                end_ts INTEGER,
+                path TEXT NOT NULL,
+                size_bytes INTEGER DEFAULT 0,
+                local_deleted INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .expect("schema");
+        let db = Arc::new(Mutex::new(conn));
+        scan_and_record(&db, &cam.to_owned(), &dir, minute);
+
+        let rows: Vec<(i64, i64)> = {
+            let conn = db.lock().expect("db lock");
+            let mut stmt = conn
+                .prepare("SELECT start_ts, end_ts FROM segments ORDER BY start_ts")
+                .expect("prepare");
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("rows")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (run, run + minute),                           // joined to fragment 1
+                (run + minute, run + 2 * minute),              // joined to fragment 2
+                (run + 2 * minute, run + 2 * minute + 20_000), // last: its own end
+                (later, later + 30_000),                       // another run
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

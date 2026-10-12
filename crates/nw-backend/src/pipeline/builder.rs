@@ -188,18 +188,32 @@ pub(crate) const RECORDING_MUX: &str = "recording_mux";
 /// The RTSP source of a recording, so its audio track can be linked too.
 const RECORDING_SOURCE: &str = "recording_src";
 
+/// The recording's video queue in front of the segment writer.
+pub(crate) const RECORDING_QUEUE: &str = "recording_queue";
+/// How long the segment writer may stall (opening a new segment file, an
+/// antivirus scan of a finished one on Windows, a slow drive) before the
+/// camera connection has to wait. A connection that waits loses video: the
+/// camera drops what it cannot send and the recording resumes at the next
+/// keyframe, a few seconds missing at every segment change.
+pub(crate) const RECORDING_STALL_NS: u64 = 10_000_000_000;
+/// Memory bound of that wait: 10 s of a 50 Mbit/s stream.
+const RECORDING_QUEUE_BYTES: u64 = 64 * 1024 * 1024;
+const RECORDING_AUDIO_QUEUE_BYTES: u64 = 4 * 1024 * 1024;
+
 /// The writer end of a recording: `ingest_tap` (where the recorder counts
 /// access units and reads codec and size), then disk I/O on its own thread.
-/// The queue holds complete compressed frames, bounded in bytes as well as
-/// count, and `splitmuxsink` cuts segments at keyframes. `paced` holds a
-/// file source to its own timestamps; a camera arrives at its own pace.
+/// The queue holds complete compressed frames for up to `RECORDING_STALL_NS`
+/// (bounded in bytes too), and `splitmuxsink` cuts segments at keyframes.
+/// `paced` holds a file source to its own timestamps; a camera arrives at its
+/// own pace.
 pub(crate) fn recording_tail(location: &str, segment_minutes: u32, paced: bool) -> String {
     let ns = u64::from(segment_minutes) * 60 * 1_000_000_000;
     let location = gst_quote(location);
     let sync = if paced { " sync=true" } else { "" };
     format!(
         "identity name=ingest_tap silent=true{sync} \
-         ! queue max-size-buffers=300 max-size-time=0 max-size-bytes=524288 \
+         ! queue name={RECORDING_QUEUE} max-size-buffers=0 \
+              max-size-time={RECORDING_STALL_NS} max-size-bytes={RECORDING_QUEUE_BYTES} \
          ! splitmuxsink name={RECORDING_MUX} location=\"{location}\" max-size-time={ns} \
               async-finalize=true muxer-factory=matroskamux"
     )
@@ -273,7 +287,8 @@ pub fn encoded_recording_pipeline(
     let audio = if with_audio && is_rtsp {
         format!(
             " {RECORDING_SOURCE}. ! application/x-rtp,media=audio ! parsebin \
-             ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=1048576 \
+             ! queue max-size-buffers=0 max-size-time={RECORDING_STALL_NS} \
+                  max-size-bytes={RECORDING_AUDIO_QUEUE_BYTES} \
              ! {RECORDING_MUX}.audio_0"
         )
     } else {
@@ -301,8 +316,8 @@ mod tests {
     use nw_core::camera::CameraConfig;
 
     use super::{
-        encoded_recording_pipeline, is_local_file_url, recording_location, select_pipeline,
-        HwAccelKind, RECORDING_MUX,
+        encoded_recording_pipeline, is_local_file_url, recording_location, recording_tail,
+        select_pipeline, HwAccelKind, RECORDING_MUX,
     };
 
     #[test]
@@ -398,12 +413,25 @@ mod tests {
     }
 
     #[test]
+    fn the_segment_writer_may_stall_seconds_without_the_camera_waiting() {
+        // A new segment file (Windows: an antivirus scan, a slow drive) must
+        // not make the connection wait: the camera would drop video.
+        let tail = recording_tail("/tmp/x_%05d.mkv", 1, false);
+        let compact = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(compact.contains(
+            "! queue name=recording_queue max-size-buffers=0 \
+             max-size-time=10000000000 max-size-bytes=67108864 ! splitmuxsink"
+        ));
+    }
+
+    #[test]
     fn rtsp_recording_keeps_the_cameras_audio_track_when_asked() {
         let cam = CameraConfig::new("Cam", "rtsp://example/main");
         let rec = encoded_recording_pipeline(&cam, "cam-1", "/tmp", 1, true).unwrap();
-        assert!(rec.contains(
+        let compact = rec.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(compact.contains(
             "recording_src. ! application/x-rtp,media=audio ! parsebin \
-             ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=1048576 \
+             ! queue max-size-buffers=0 max-size-time=10000000000 max-size-bytes=4194304 \
              ! recording_mux.audio_0"
         ));
         assert!(rec.contains("splitmuxsink name=recording_mux"));

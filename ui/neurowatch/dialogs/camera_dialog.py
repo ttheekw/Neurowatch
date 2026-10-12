@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import base64
 import logging
+from collections.abc import Iterable
 from urllib.parse import quote as url_quote
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPaintEvent, QPen, QPixmap, QShowEvent
 from PySide6.QtWidgets import (
     QBoxLayout,
@@ -44,6 +45,7 @@ from PySide6.QtWidgets import (
 
 from neurowatch.dialogs.message import show_message
 from neurowatch.ipc.sync_client import BackendOfflineError, IpcError, SyncIpcClient
+from neurowatch.models import bulk_add
 from neurowatch.models.camera import (
     CameraConfig,
     CameraRecordingConfig,
@@ -61,7 +63,12 @@ from neurowatch.theme import (
     style_button_box,
 )
 from neurowatch.utils.threads import retire
-from neurowatch.widgets.window_chrome import chrome_size_hint, install_dialog_chrome
+from neurowatch.widgets.window_chrome import (
+    card_overlay,
+    chrome_size_hint,
+    install_dialog_chrome,
+    positions_windows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +185,78 @@ class _StreamsWorker(QThread):
             self.done.emit(client.call("camera.discovery.profiles", params))
         except Exception as e:
             self.done.emit(e)
+
+
+class _BatchWorker(QThread):
+    """Signs in to the ticked cameras with one login and, when ``add``, adds
+    each with the streams the backend picks; a few at a time."""
+
+    row = Signal(str, str, str, object)  # candidate_id, phase, detail, added camera dict
+    #: How many cameras are contacted at once.
+    PARALLEL = 4
+
+    def __init__(
+        self,
+        endpoint: str | None,
+        jobs: list[tuple[str, str]],  # (candidate_id, name)
+        username: str,
+        password: str,
+        *,
+        add: bool,
+        record: bool,
+    ) -> None:
+        super().__init__()
+        self._endpoint = endpoint
+        self._jobs = jobs
+        self._username = username
+        self._password = password
+        self._add = add
+        self._record = record
+
+    def run(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=self.PARALLEL) as pool:
+            for job in self._jobs:
+                pool.submit(self._one, *job)
+
+    def _one(self, candidate_id: str, name: str) -> None:
+        if self.isInterruptionRequested():
+            return
+        client = SyncIpcClient(endpoint=self._endpoint)
+        self.row.emit(candidate_id, bulk_add.CHECKING, "", None)
+        params: dict = {"candidate_id": candidate_id}
+        if self._username:
+            params["username"] = self._username
+            params["password_b64"] = _password_b64(self._password)
+        try:
+            found = client.call("camera.discovery.profiles", params)
+        except Exception as e:  # IpcError or the backend going away
+            message = getattr(e, "message", str(e))
+            self.row.emit(candidate_id, bulk_add.phase_for_error(message), message, None)
+            return
+        if not isinstance(found, dict) or not found.get("main_stream_id"):
+            self.row.emit(candidate_id, bulk_add.NO_STREAMS, "", None)
+            return
+        detail = bulk_add.stream_detail(found)
+        if not self._add or self.isInterruptionRequested():
+            self.row.emit(candidate_id, bulk_add.SIGNED_IN, detail, None)
+            return
+        self.row.emit(candidate_id, bulk_add.ADDING, detail, None)
+        request = {
+            "candidate_id": candidate_id,
+            "main_stream_id": found["main_stream_id"],
+            "name": name,
+            "record": self._record,
+        }
+        if found.get("sub_stream_id"):
+            request["sub_stream_id"] = found["sub_stream_id"]
+        try:
+            camera = client.call("camera.discovery.add", request)
+        except Exception as e:
+            self.row.emit(candidate_id, bulk_add.FAILED, getattr(e, "message", str(e)), None)
+            return
+        self.row.emit(candidate_id, bulk_add.ADDED, detail, camera)
 
 
 class _ScanWorker(QThread):
@@ -338,9 +417,12 @@ class AddEditCameraDialog(QDialog):
         is_recording: bool = False,
         parent: QWidget | None = None,
         ipc_endpoint: str | None = None,
+        existing_names: Iterable[str] = (),
     ) -> None:
         super().__init__(parent)
         self._endpoint = ipc_endpoint or None
+        #: Names in use, so cameras added from a search get distinct ones.
+        self._camera_names: set[str] = set(existing_names)
         self._is_edit = camera is not None
         self._is_recording = is_recording
         self.setWindowTitle("Edit Camera" if self._is_edit else "Add Camera")
@@ -352,6 +434,13 @@ class AddEditCameraDialog(QDialog):
         self._streams_worker: _StreamsWorker | None = None
         self._scan_worker: _ScanWorker | None = None
         self._interfaces_worker: _RpcWorker | None = None
+        # Search tab: the ticked cameras, their progress, and those added.
+        self._batch_worker: _BatchWorker | None = None
+        self._ticked: dict[str, bool] = {}
+        self._progress: dict[str, bulk_add.RowProgress] = {}
+        self._added: list[dict] = []
+        self._batch_ids: list[str] = []
+        self._batch_adds = False
         # The device the ONVIF tab reads, when it came from a search or lookup.
         self._candidate: Candidate | None = None
         self._discovered: list[StreamChoice] = []
@@ -410,13 +499,15 @@ class AddEditCameraDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
-            "Save Changes" if self._is_edit else "Add Camera"
-        )
+        self._ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self._ok_btn.setText("Save Changes" if self._is_edit else "Add Camera")
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         style_button_box(buttons)
         layout.addWidget(buttons)
+
+        self._tabs.currentChanged.connect(lambda _index: self._on_tab_changed())
+        self._on_tab_changed()
 
         # Pre-fill if editing; open Advanced tab for edits (URL is already known)
         if camera:
@@ -440,7 +531,11 @@ class AddEditCameraDialog(QDialog):
         screen's height, else put it beside them."""
         self._set_direction(QBoxLayout.Direction.TopToBottom)
         stacked = chrome_size_hint(self).height()
-        wide = stacked > self._available_height() * self.STACKED_SCREEN_SHARE
+        # Only a shown connection test can move beside the tabs.
+        wide = (
+            not self._test_panel.isHidden()
+            and stacked > self._available_height() * self.STACKED_SCREEN_SHARE
+        )
         if wide:
             self._set_direction(QBoxLayout.Direction.LeftToRight)
         self.setProperty("columns", 2 if wide else 1)
@@ -481,8 +576,8 @@ class AddEditCameraDialog(QDialog):
         vl.setSpacing(8)
 
         hint = QLabel(
-            "Find ONVIF cameras on the recorder's network, like an NVR's device list. "
-            "Nothing is sent until you click Search."
+            "Find the ONVIF cameras on the recorder's network, tick the ones to add, "
+            "and add them all with one login. Nothing is sent until you click Search."
         )
         hint.setWordWrap(True)
         set_label_role(hint, "hint")
@@ -527,7 +622,7 @@ class AddEditCameraDialog(QDialog):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self._results_table.itemSelectionChanged.connect(self._on_result_selected)
-        self._results_table.doubleClicked.connect(lambda _index: self._use_selected())
+        self._results_table.itemChanged.connect(self._on_result_ticked)
 
         # No rows: a panel says why (not searched yet, searching, none found,
         # failed) instead of an empty table.
@@ -546,17 +641,44 @@ class AddEditCameraDialog(QDialog):
         vl.addWidget(self._results_stack, stretch=1)
         self._results_state = "idle"
 
+        # One login for every ticked camera.
+        self._login_row = QWidget()
+        login = QHBoxLayout(self._login_row)
+        login.setContentsMargins(0, 0, 0, 0)
+        login.setSpacing(6)
+        login_label = QLabel("Camera login:")
+        login.addWidget(login_label)
+        self._bulk_user = QLineEdit()
+        self._bulk_user.setPlaceholderText("Username (e.g. admin)")
+        self._bulk_user.setAccessibleName("Username for the ticked cameras")
+        login.addWidget(self._bulk_user, stretch=1)
+        self._bulk_pass = QLineEdit()
+        self._bulk_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self._bulk_pass.setPlaceholderText("Password")
+        self._bulk_pass.setAccessibleName("Password for the ticked cameras")
+        self._bulk_pass.returnPressed.connect(lambda: self._run_batch(add=True))
+        login.addWidget(self._bulk_pass, stretch=1)
+        self._check_btn = QPushButton("Check Login")
+        self._check_btn.setToolTip("Sign in to every ticked camera without adding it")
+        set_button_variant(self._check_btn, "secondary")
+        self._check_btn.clicked.connect(lambda: self._run_batch(add=False))
+        login.addWidget(self._check_btn)
+        vl.addWidget(self._login_row)
+
         self._use_row = QWidget()
         use_row = QHBoxLayout(self._use_row)
         use_row.setContentsMargins(0, 0, 0, 0)
+        self._bulk_record = QCheckBox("Record the added cameras")
+        self._bulk_record.setChecked(True)
+        use_row.addWidget(self._bulk_record)
         note = QLabel(
-            "Not every camera answers a search. Look one up by address on the ONVIF tab, "
-            "or enter its stream URL on Advanced."
+            "Not listed? Look a camera up by address on ONVIF, or enter its URL on Advanced."
         )
         note.setWordWrap(True)
         set_label_role(note, "hint")
         use_row.addWidget(note, stretch=1)
-        self._use_btn = QPushButton("Use Selected Camera")
+        self._use_btn = QPushButton("Set Up Manually…")
+        self._use_btn.setToolTip("Choose the streams of the selected camera yourself")
         set_button_variant(self._use_btn, "secondary")
         self._use_btn.setEnabled(False)
         self._use_btn.clicked.connect(self._use_selected)
@@ -675,18 +797,197 @@ class AddEditCameraDialog(QDialog):
         ]
         candidates.sort(key=lambda c: (not c.can_add, c.state == "possible_match", c.address))
         selected = self._selected_candidate()
+        self._results_table.blockSignals(True)
         self._results_table.setRowCount(len(candidates))
         for row, candidate in enumerate(candidates):
+            cid = candidate.candidate_id
+            addable = (
+                candidate.can_add
+                and self._progress.get(cid, bulk_add.RowProgress()).phase != bulk_add.ADDED
+            )
+            # Ticked by default, except a device that may be a camera already added.
+            ticked = self._ticked.setdefault(cid, addable and candidate.state != "possible_match")
             title = QTableWidgetItem(candidate.title)
             title.setData(Qt.ItemDataRole.UserRole, candidate)
             title.setToolTip(" ".join(p for p in (candidate.manufacturer, candidate.model) if p))
+            flags = title.flags() & ~Qt.ItemFlag.ItemIsEditable
+            if addable:
+                title.setFlags(flags | Qt.ItemFlag.ItemIsUserCheckable)
+                title.setCheckState(
+                    Qt.CheckState.Checked if ticked and addable else Qt.CheckState.Unchecked
+                )
+            else:
+                title.setFlags(flags & ~Qt.ItemFlag.ItemIsUserCheckable)
             self._results_table.setItem(row, 0, title)
             self._results_table.setItem(row, 1, QTableWidgetItem(candidate.address))
-            self._results_table.setItem(row, 2, QTableWidgetItem(candidate.status_text))
-            if selected and selected.candidate_id == candidate.candidate_id:
+            status = QTableWidgetItem()
+            self._paint_status(status, candidate)
+            self._results_table.setItem(row, 2, status)
+            if selected and selected.candidate_id == cid:
                 self._results_table.selectRow(row)
+        self._results_table.blockSignals(False)
         self._set_results_state(self._results_state)
+        self._sync_add_button()
         return candidates
+
+    def _paint_status(self, item: QTableWidgetItem, candidate: Candidate) -> None:
+        """The status text, green when it worked and red when it did not."""
+        item.setText(self._status_text(candidate))
+        progress = self._progress.get(candidate.candidate_id)
+        tone = progress.tone if progress and progress.phase != bulk_add.IDLE else ""
+        colors = active_colors()
+        color = {"success": colors.success, "error": colors.error}.get(tone)
+        if color:
+            item.setForeground(QColor(color))
+        else:
+            item.setData(Qt.ItemDataRole.ForegroundRole, None)
+
+    def _status_text(self, candidate: Candidate) -> str:
+        progress = self._progress.get(candidate.candidate_id)
+        return progress.text if progress and progress.text else candidate.status_text
+
+    # -- one login, several cameras ------------------------------------
+
+    def _rows(self) -> list[tuple[int, Candidate]]:
+        rows = []
+        for row in range(self._results_table.rowCount()):
+            item = self._results_table.item(row, 0)
+            data = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if isinstance(data, Candidate):
+                rows.append((row, data))
+        return rows
+
+    def _ticked_candidates(self) -> list[Candidate]:
+        return [
+            candidate
+            for row, candidate in self._rows()
+            if (item := self._results_table.item(row, 0)) is not None
+            and item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+            and item.checkState() == Qt.CheckState.Checked
+        ]
+
+    def _on_result_ticked(self, item: QTableWidgetItem) -> None:
+        candidate = item.data(Qt.ItemDataRole.UserRole)
+        if item.column() == 0 and isinstance(candidate, Candidate):
+            self._ticked[candidate.candidate_id] = item.checkState() == Qt.CheckState.Checked
+            self._sync_add_button()
+
+    def _on_tab_changed(self) -> None:
+        # The connection test belongs to one camera's streams (ONVIF,
+        # Advanced): the Search tab tests each camera as it adds it.
+        on_search = self._search_tab is not None and self._tabs.currentWidget() is self._search_tab
+        self._test_panel.setVisible(not on_search)
+        self._sync_add_button()
+        if self.isVisible():
+            # Its size changes with the panel: fit the screen again, centred.
+            self.fit_to_screen()
+            QTimer.singleShot(0, self._recentre)
+
+    def _recentre(self) -> None:
+        if not positions_windows() or card_overlay(self) is not None:
+            return  # Wayland's card overlay centres the card itself
+        parent = self.parentWidget()
+        area = parent.window().frameGeometry() if parent is not None else None
+        if area is None and self.screen() is not None:
+            area = self.screen().availableGeometry()
+        if area is not None:
+            frame = self.frameGeometry()
+            frame.moveCenter(area.center())
+            self.move(frame.topLeft())
+
+    def _sync_add_button(self) -> None:
+        """On the Search tab the dialog's button adds the ticked cameras."""
+        if self._is_edit:
+            return
+        busy = self._batch_worker is not None
+        on_search = self._search_tab is not None and self._tabs.currentWidget() is self._search_tab
+        if not on_search:
+            self._ok_btn.setText("Add Camera")
+            self._ok_btn.setEnabled(True)
+            return
+        count = len(self._ticked_candidates())
+        if busy:
+            self._ok_btn.setText("Adding…" if self._batch_adds else "Checking…")
+        elif count:
+            self._ok_btn.setText(f"Add {count} Camera{'s' if count != 1 else ''}")
+        else:
+            self._ok_btn.setText("Add Cameras")
+        self._ok_btn.setEnabled(bool(count) and not busy)
+        self._check_btn.setEnabled(bool(count) and not busy)
+
+    def _run_batch(self, *, add: bool) -> None:
+        """Sign in to every ticked camera with the login entered; ``add``
+        also adds each one that signs in."""
+        ticked = self._ticked_candidates()
+        if not ticked or self._batch_worker is not None:
+            return
+        taken = set(self._camera_names)
+        names = bulk_add.camera_names([(c.candidate_id, c.title, c.address) for c in ticked], taken)
+        self._batch_ids = [c.candidate_id for c in ticked]
+        self._batch_adds = add
+        for c in ticked:
+            self._progress[c.candidate_id] = bulk_add.RowProgress(bulk_add.CHECKING)
+        worker = _BatchWorker(
+            self._endpoint,
+            [(c.candidate_id, names[c.candidate_id]) for c in ticked],
+            self._bulk_user.text().strip(),
+            self._bulk_pass.text(),
+            add=add,
+            record=self._bulk_record.isChecked(),
+        )
+        worker.row.connect(self._on_batch_row)
+        worker.finished.connect(self._on_batch_done)
+        worker.finished.connect(worker.deleteLater)
+        self._batch_worker = worker
+        set_status_tone(self._search_status, "info")
+        self._search_status.setText(
+            f"{'Adding' if add else 'Checking'} {len(ticked)} camera"
+            f"{'s' if len(ticked) != 1 else ''}…"
+        )
+        self._search_status.setVisible(True)
+        self._refresh_statuses()
+        self._sync_add_button()
+        worker.start()
+
+    def _on_batch_row(self, candidate_id: str, phase: str, detail: str, camera: object) -> None:
+        self._progress[candidate_id] = bulk_add.RowProgress(phase, detail)
+        if phase == bulk_add.ADDED and isinstance(camera, dict):
+            self._added.append(camera)
+            self._ticked[candidate_id] = False
+            name = camera.get("name")
+            if isinstance(name, str):
+                self._camera_names.add(name)
+        self._refresh_statuses()
+
+    def _refresh_statuses(self) -> None:
+        self._results_table.blockSignals(True)
+        for row, candidate in self._rows():
+            status = self._results_table.item(row, 2)
+            if status is not None:
+                self._paint_status(status, candidate)
+            progress = self._progress.get(candidate.candidate_id)
+            title = self._results_table.item(row, 0)
+            if title is not None and progress and progress.phase == bulk_add.ADDED:
+                title.setFlags(title.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                title.setData(Qt.ItemDataRole.CheckStateRole, None)
+        self._results_table.blockSignals(False)
+
+    def _on_batch_done(self) -> None:
+        self._batch_worker = None
+        ids = self._batch_ids
+        summary = bulk_add.BatchSummary.of(self._progress, ids)
+        text, tone = summary.message(len(ids), self._batch_adds)
+        set_status_tone(self._search_status, tone)
+        self._search_status.setText(text)
+        self._search_status.setVisible(True)
+        self._sync_add_button()
+        if self._batch_adds and summary.added == len(ids):
+            self.accept()  # every ticked camera was added
+
+    def added_cameras(self) -> list[dict]:
+        """Cameras this dialog added itself (the Search tab), as the backend
+        returned them; the caller adds nothing more for them."""
+        return list(self._added)
 
     def _on_scan_progress(self, results: object) -> None:
         if not isinstance(results, dict):
@@ -1214,6 +1515,18 @@ class AddEditCameraDialog(QDialog):
 
     def _stop_background_work(self) -> None:
         self._stop_streams_worker()
+        batch = self._batch_worker
+        if batch is not None:
+            try:
+                batch.row.disconnect(self._on_batch_row)
+                batch.finished.disconnect(self._on_batch_done)
+            except Exception:
+                pass
+            batch.requestInterruption()
+            if batch.isRunning():
+                batch.wait(3000)
+            retire(batch)
+            self._batch_worker = None
         scan = self._scan_worker
         if scan is not None:
             try:
@@ -1340,12 +1653,7 @@ class AddEditCameraDialog(QDialog):
 
     def _on_accept(self) -> None:
         if self._search_tab is not None and self._tabs.currentWidget() is self._search_tab:
-            show_message(
-                self,
-                "Choose a Camera",
-                "Select a camera in the search results and click Use Selected Camera, "
-                "then read its streams on the ONVIF tab.",
-            )
+            self._run_batch(add=True)
             return
         is_simple = self._tabs.currentWidget() is self._simple_tab
         if is_simple:

@@ -32,6 +32,7 @@ def test_add_camera_goes_side_by_side_when_stacking_would_not_fit(
     )
     dialog = camera_dialog.AddEditCameraDialog(parent=parent, ipc_endpoint=None)
     qtbot.addWidget(dialog)
+    dialog._tabs.setCurrentWidget(dialog._simple_tab)  # where the connection test shows
     dialog.fit_to_screen()
     assert dialog.property("columns") == columns
     if columns == 2:
@@ -83,3 +84,73 @@ def test_native_corners_are_only_asked_of_windows(qtbot) -> None:
     dialog = QDialog()
     qtbot.addWidget(dialog)
     assert round_native_corners(dialog) is False  # not Windows: nothing to do
+
+
+class _FakeWin32:
+    """Records the Win32 calls ``windows_icon.apply_icon`` makes."""
+
+    def __init__(self, dpi: int = 120) -> None:
+        self.dpi = dpi
+        self.calls: list[tuple] = []
+
+    def dpi_for_window(self, hwnd):
+        return self.dpi
+
+    def load_image(self, instance, path, kind, width, height, flags):
+        self.calls.append(("load", path, width, height))
+        return 1000 + width
+
+    def send_message(self, hwnd, message, wparam, lparam):
+        self.calls.append(("message", message, wparam, lparam))
+
+    def set_class_long(self, hwnd, index, value):
+        self.calls.append(("class", index, value))
+
+
+def test_windows_taskbar_icon_is_loaded_at_the_screens_scale(qtbot) -> None:
+    from PySide6.QtWidgets import QWidget
+
+    from neurowatch import windows_icon
+
+    window = QWidget()
+    qtbot.addWidget(window)
+    win32 = _FakeWin32(dpi=120)  # 125% scaling
+    assert windows_icon.apply_icon(window, "C:/x/neurowatch.ico", win32=win32)
+    assert ("load", "C:/x/neurowatch.ico", 40, 40) in win32.calls
+    assert ("load", "C:/x/neurowatch.ico", 20, 20) in win32.calls
+    assert ("message", 0x0080, 1, 1040) in win32.calls  # WM_SETICON, ICON_BIG
+    assert ("message", 0x0080, 0, 1020) in win32.calls  # ICON_SMALL
+    assert ("class", -14, 1040) in win32.calls and ("class", -34, 1020) in win32.calls
+    assert windows_icon.icon_sizes(96) == (32, 16) and windows_icon.icon_sizes(0) == (32, 16)
+
+
+def test_the_taskbar_icon_hook_does_nothing_off_windows(qtbot) -> None:
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    from neurowatch import windows_icon
+
+    assert windows_icon.install(QApplication.instance(), "neurowatch.ico") is False
+    assert windows_icon.apply_icon(QWidget(), "neurowatch.ico") is False
+
+
+def test_the_windows_icon_file_ships_with_the_package() -> None:
+    from neurowatch.theme import icon_path
+
+    icon = Path(icon_path("neurowatch.ico"))
+    assert icon.is_file() and icon.read_bytes()[:4] == b"\x00\x00\x01\x00"
+
+
+def test_the_search_tab_has_no_connection_test_and_stays_one_column(
+    qtbot, monkeypatch, parent
+) -> None:
+    from neurowatch.dialogs import camera_dialog
+
+    monkeypatch.setattr(camera_dialog.AddEditCameraDialog, "_available_height", lambda self: 400)
+    dialog = camera_dialog.AddEditCameraDialog(parent=parent, ipc_endpoint=None)
+    qtbot.addWidget(dialog)
+    assert dialog._tabs.currentWidget() is dialog._search_tab
+    assert dialog._test_panel.isHidden(), "each camera is tested as it is added"
+    dialog.fit_to_screen()
+    assert dialog.property("columns") == 1
+    dialog._tabs.setCurrentWidget(dialog._advanced_tab)
+    assert not dialog._test_panel.isHidden()

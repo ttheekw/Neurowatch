@@ -51,7 +51,7 @@ def test_title_bar_focus_does_not_move_or_box_the_tab(qtbot):
     bar.resize(1200, 38)
     bar.show()
     qtbot.waitExposed(bar)
-    tab = bar._tab_btns["diagnostics"]
+    tab = bar._tab_btns["settings"]
     # The label's upper half: the keyboard-focus underline is drawn below it.
     area = QRect(0, 0, tab.width(), tab.height() // 2)
     before = _image(tab)
@@ -171,3 +171,17 @@ def test_main_window_does_not_start_with_a_focused_title_bar_button(monkeypatch,
     finally:
         # Join the window's worker threads before Python drops it.
         win.shutdown()
+
+
+def test_diagnostics_opens_from_the_menu_not_a_tab(qtbot):
+    bar = TitleBar()
+    qtbot.addWidget(bar)
+    assert "diagnostics" not in bar._tab_btns
+    shown: list[str] = []
+    bar.tab_changed.connect(shown.append)
+    menu = bar._build_file_menu()
+    action = next(a for a in menu.actions() if a.text() == "Diagnostics")
+    action.trigger()
+    assert shown == ["diagnostics"]
+    bar.show_tab("live")  # the Live tab brings the wall back
+    assert shown == ["diagnostics", "live"]

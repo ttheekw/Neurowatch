@@ -1,25 +1,43 @@
-"""Status-bar host metrics work without optional third-party packages."""
+"""Status bar: the backend's readings (every platform), decoder and backend badges."""
 
 from __future__ import annotations
 
 import neurowatch.widgets.status_bar_widget as status_mod
 
 
-def test_proc_fallback_populates_cpu_and_memory(qtbot, monkeypatch):
-    samples = iter([(100, 1_000), (120, 1_100)])
-    monkeypatch.setattr(status_mod, "_HAS_PSUTIL", False)
-    monkeypatch.setattr(status_mod, "_read_proc_cpu_sample", lambda: next(samples))
-    monkeypatch.setattr(status_mod, "_read_proc_memory_used_mb", lambda: 2048.0)
-
+def test_cpu_memory_and_network_are_the_backends_readings(qtbot):
     bar = status_mod.StatusBarWidget()
     qtbot.addWidget(bar)
-    assert bar._cpu_lbl.text() == "CPU: …"
-    assert bar._mem_lbl.text() == "MEM: 2048 MB"
+    # Before the first reading (and while the backend is offline).
+    assert bar._cpu_lbl.text() == "CPU: --"
+    assert bar._mem_lbl.text() == "MEM: --"
+    assert bar._net_lbl.text() == "NET: --"
 
-    bar._update_stats()
+    bar.set_performance(
+        {
+            "process": {
+                "system_cpu_percent": 37.6,
+                "system_memory_percent": 61.2,
+                "network": {"rx_bits_per_sec": 12_340_000, "tx_bits_per_sec": 1_024_000_000},
+            }
+        }
+    )
+    assert bar._cpu_lbl.text() == "CPU: 38%"
+    assert bar._mem_lbl.text() == "MEM: 61%"
+    assert bar._net_lbl.text() == "NET ↓ 12.3 Mbps  ↑ 1.02 Gbps"
 
-    assert bar._cpu_lbl.text() == "CPU: 80%"
-    assert bar._mem_lbl.text() == "MEM: 2048 MB"
+    # The first sample has no CPU delta and no network rate yet.
+    bar.set_performance({"process": {"system_memory_percent": 50, "network": None}})
+    assert bar._cpu_lbl.text() == "CPU: --" and bar._mem_lbl.text() == "MEM: 50%"
+    assert bar._net_lbl.text() == "NET: --"
+    bar.set_performance(None)
+    assert bar._mem_lbl.text() == "MEM: --"
+
+
+def test_the_bar_reads_no_linux_only_files():
+    source = status_mod.__file__
+    text = open(source, encoding="utf-8").read()
+    assert "/proc" not in text, "CPU, memory and network come from the backend"
 
 
 def test_acceleration_badge_distinguishes_hardware_and_software(qtbot):

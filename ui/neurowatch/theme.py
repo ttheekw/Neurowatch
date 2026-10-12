@@ -8,6 +8,7 @@ custom-painted surfaces keep their existing look.
 
 from __future__ import annotations
 
+import logging
 import sys
 from dataclasses import dataclass
 from functools import cache
@@ -180,6 +181,10 @@ def app_icon() -> QIcon:
     from PySide6.QtSvg import QSvgRenderer
 
     renderer = QSvgRenderer(_icon("neurowatch.svg"))
+    if not renderer.isValid():
+        logging.getLogger(__name__).warning(
+            "App logo could not be read: %s", _icon("neurowatch.svg")
+        )
     icon = QIcon()
     for size in _APP_ICON_SIZES:
         pixmap = QPixmap(size, size)
@@ -637,6 +642,21 @@ QRadioButton::indicator:checked {{
 QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
     background-color: {c.surface};
     border-color: {c.border};
+}}
+QAbstractItemView::indicator {{
+    width: 16px;
+    height: 16px;
+    background-color: {c.surface_sunken};
+    border: 1px solid {c.border_control};
+    border-radius: {m.radius_small}px;
+}}
+QAbstractItemView::indicator:hover {{
+    border-color: {c.focus_ring};
+}}
+QAbstractItemView::indicator:checked {{
+    background-color: {c.accent};
+    border-color: {c.accent};
+    image: url("{_icon("check.svg")}");
 }}
 """
 

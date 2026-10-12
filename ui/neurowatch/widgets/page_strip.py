@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QToolButton, QWidget
 
@@ -27,13 +27,17 @@ class _DotCanvas(QWidget):
     """Draws the dot row and handles click-to-page."""
 
     page_clicked = Signal(int)
+    #: The page whose dot the pointer is over, or -1 when it is over none.
+    page_hovered = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._count = 1
         self._current = 0
+        self._hovered = -1
         self.setFixedHeight(_STRIP_HEIGHT)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
 
     def set_state(self, count: int, current: int) -> None:
         self._count = max(1, count)
@@ -53,20 +57,43 @@ class _DotCanvas(QWidget):
             painter.drawEllipse(x, y, _DOT_SIZE, _DOT_SIZE)
         painter.end()
 
+    def page_at(self, x: float) -> int:
+        """The page whose dot is at ``x``, or -1."""
+        total_w = self._count * (_DOT_SIZE + _DOT_SPACING) - _DOT_SPACING
+        x0 = (self.width() - total_w) // 2
+        rel_x = x - x0
+        if rel_x < 0:
+            return -1
+        idx = int(rel_x // (_DOT_SIZE + _DOT_SPACING))
+        return idx if 0 <= idx < self._count else -1
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            total_w = self._count * (_DOT_SIZE + _DOT_SPACING) - _DOT_SPACING
-            x0 = (self.width() - total_w) // 2
-            rel_x = event.position().x() - x0
-            idx = int(rel_x // (_DOT_SIZE + _DOT_SPACING))
-            if 0 <= idx < self._count:
+            idx = self.page_at(event.position().x())
+            if idx >= 0:
                 self.page_clicked.emit(idx)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        self._hover(self.page_at(event.position().x()))
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        self._hover(-1)
+        super().leaveEvent(event)
+
+    def _hover(self, page: int) -> None:
+        if page != self._hovered:
+            self._hovered = page
+            self.page_hovered.emit(page)
 
 
 class PageStripWidget(QWidget):
     """Previous/next arrows, a page label and clickable dots below the wall."""
 
     page_clicked = Signal(int)
+    #: The page the pointer is about to pick (a dot, or an arrow's page), so
+    #: its video can start before the click; -1 when it moves away.
+    page_hovered = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -90,6 +117,7 @@ class PageStripWidget(QWidget):
         self._canvas = _DotCanvas()
         self._canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._canvas.page_clicked.connect(self.page_clicked)
+        self._canvas.page_hovered.connect(self.page_hovered)
         layout.addWidget(self._canvas)
 
         self._label = QLabel()
@@ -105,6 +133,17 @@ class PageStripWidget(QWidget):
         self._next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._next_btn.clicked.connect(lambda: self.page_clicked.emit(self._current + 1))
         layout.addWidget(self._next_btn)
+        self._prev_btn.installEventFilter(self)
+        self._next_btn.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Enter and watched in (self._prev_btn, self._next_btn):
+            step = -1 if watched is self._prev_btn else 1
+            page = self._current + step
+            self.page_hovered.emit(page if 0 <= page < self._count else -1)
+        elif event.type() == QEvent.Type.Leave and watched in (self._prev_btn, self._next_btn):
+            self.page_hovered.emit(-1)
+        return False
 
     def set_state(self, count: int, current: int) -> None:
         self._count = max(1, count)
