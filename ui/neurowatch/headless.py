@@ -4,11 +4,13 @@
 headless mode (starting it, and by default registering it to start at boot;
 see ``neurowatch.service``), then runs this module's ``monitor``: it prints
 timestamped lines when the backend comes up, cameras change state, or
-recording starts or stops, plus a periodic summary. Ctrl+C ends the monitor;
-the service keeps running. (``--foreground`` instead runs the backend in the
-launcher's terminal, as before.) ``status`` prints the same once, from any
-terminal. Extensions (``neurowatch.extensions``) can add status lines,
-monitor options and commands.
+recording starts or stops, or an event happens (motion, a camera offline),
+plus a periodic summary. Ctrl+C ends the monitor; the service keeps running.
+(``--foreground`` instead runs the backend in the launcher's terminal, as
+before.) ``status`` prints the same once, from any terminal; ``events``
+lists recent events and, with ``--follow``, prints new ones as they happen.
+NeuroWatch Cloud (``neurowatch.cloud.headless``) adds its status line,
+``--link CODE --name NAME`` for ``--headless`` and the ``cloud`` commands.
 
 This module must not import Qt, so it also runs on servers without a display.
 """
@@ -26,9 +28,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, TextIO
 
-from neurowatch import extensions
 from neurowatch.ipc.sync_client import SyncIpcClient
 from neurowatch.models.camera import connection_status
+from neurowatch.models.events import END_LABELS
+from neurowatch.models.events import label as event_label
+
+logger = logging.getLogger(__name__)
 
 Rpc = Callable[[str, dict[str, Any], float], Any]
 
@@ -60,7 +65,7 @@ class Snapshot:
     statuses: dict[str, str]
     names: dict[str, str] = field(default_factory=dict)
     recording: dict[str, str] = field(default_factory=dict)
-    # One "Label: text" line per extension (see ``neurowatch.extensions``).
+    # Further "Label: text" lines (the cloud's).
     extras: tuple[str, ...] = ()
 
     def name(self, cam_id: str) -> str:
@@ -158,6 +163,72 @@ def decoder_label(system: dict[str, Any]) -> str:
     return _DECODERS.get(kind, "unknown")
 
 
+# Long-poll wait for ``events --follow`` (the backend answers sooner on news).
+_FOLLOW_WAIT_MS = 20_000
+
+
+def _clock_time(ms: Any) -> str:
+    if not isinstance(ms, (int, float)):
+        return "?"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ms / 1000))
+
+
+def event_line(event: dict[str, Any], names: dict[str, str], phase: str = "start") -> str | None:
+    """A line for an event notice, or ``None`` for one not worth a line
+    (the end of a motion event, an update)."""
+    kind = str(event.get("kind") or "")
+    if phase == "update" or (phase == "end" and kind not in END_LABELS):
+        return None
+    label = END_LABELS[kind] if phase == "end" else event_label(kind)
+    camera = event.get("camera_id")
+    parts = [label]
+    if isinstance(camera, str) and camera:
+        parts.append(names.get(camera) or camera)
+    detail = event.get("detail")
+    if isinstance(detail, str) and detail and detail != names.get(str(camera)):
+        parts.append(detail)
+    if kind == "camera_event" and isinstance(event.get("topic"), str):
+        parts.append(event["topic"])
+    return " · ".join(parts)
+
+
+def event_summary(event: dict[str, Any], names: dict[str, str]) -> str:
+    """One stored event for ``events``: when, what, how long."""
+    line = event_line(event, names) or str(event.get("kind"))
+    start, end = event.get("start_ms"), event.get("end_ms")
+    if end is None:
+        span = "going on"
+    elif isinstance(start, (int, float)) and isinstance(end, (int, float)) and end > start:
+        span = f"{(end - start) / 1000:.0f} s"
+    else:
+        span = ""
+    return f"{_clock_time(start)}  {line}" + (f"  ({span})" if span else "")
+
+
+class EventFeed:
+    """New event notices through ``events.wait``, from where the last call left off."""
+
+    def __init__(self, rpc: Rpc) -> None:
+        self._rpc = rpc
+        self._boot: str | None = None
+        self._seq: int | None = None
+
+    def poll(self, wait_ms: int = 0) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"timeout_ms": wait_ms}
+        if self._seq is not None:
+            params.update(after=self._seq, boot=self._boot)
+        result = self._rpc("events.wait", params, _STATUS_TIMEOUT_S + wait_ms / 1000)
+        if not isinstance(result, dict):
+            return []
+        first = self._seq is None
+        self._boot = result.get("boot") if isinstance(result.get("boot"), str) else None
+        self._seq = int(result.get("seq") or 0)
+        if first or result.get("reset"):
+            # Only what happens from now on; ``events`` lists the past.
+            return []
+        return [n for n in result.get("notices") or [] if isinstance(n, dict)]
+
+
 # ---------------------------------------------------------------------------
 # Backend access
 # ---------------------------------------------------------------------------
@@ -192,7 +263,14 @@ def poll(rpc: Rpc, names: dict[str, str]) -> Snapshot:
                 }
             )
     recording = _optional(rpc, "recording.status_all")
-    extras = extensions.call_each("status_line", rpc)
+    from neurowatch.cloud import headless as cloud_cli  # it imports this module
+
+    try:
+        extras: tuple[str, ...] = (cloud_cli.status_line(rpc),)
+    except Exception:
+        # The cameras' status never depends on the cloud's.
+        logger.exception("Cloud status line failed")
+        extras = ()
     return Snapshot(
         statuses=statuses,
         names=dict(names),
@@ -236,6 +314,7 @@ def monitor(
     a rebuild in development); Ctrl+C ends the monitor.
     """
     names: dict[str, str] = {}
+    events = EventFeed(rpc)
     previous: Snapshot | None = None
     failures = 0
     last_status = clock()
@@ -268,6 +347,19 @@ def monitor(
         failures = 0
         for line in describe_changes(previous, current):
             say(line)
+        try:
+            notices = events.poll()
+        except Exception:
+            notices = []  # an older backend without events
+        for notice in notices:
+            event = notice.get("event")
+            event_text = (
+                event_line(event, names, str(notice.get("phase")))
+                if isinstance(event, dict)
+                else None
+            )
+            if event_text:
+                say(event_text)
         if clock() - last_status >= heartbeat:
             say(status_line(current, free_gb(recordings)))
             last_status = clock()
@@ -276,11 +368,11 @@ def monitor(
     return 0
 
 
-#: Shown when the terminal monitor starts and in ``--help``, as the licence
-#: asks of interactive programs (the full text: NOTICE).
+#: Shown when the terminal monitor starts and in ``--help``: the licence and
+#: its warranty disclaimer in short (the full text: NOTICE).
 NO_WARRANTY = (
     "NeuroWatch comes with ABSOLUTELY NO WARRANTY and is used at your own risk;"
-    " it is free software under the GNU AGPL v3 or later (see NOTICE and LICENSE)."
+    " it is open source under the Apache License 2.0 (see NOTICE and LICENSE)."
 )
 
 
@@ -310,8 +402,16 @@ def _parser() -> argparse.ArgumentParser:
         help="with --service: do not register it to start at boot / login",
     )
     commands.add_parser("status", help="print camera and recording status once")
-    extensions.call_each("add_monitor_arguments", watch)
-    extensions.call_each("add_commands", commands)
+    events = commands.add_parser(
+        "events", help="list recent events (motion, cameras offline, …); --follow for new ones"
+    )
+    events.add_argument("--limit", type=int, default=20, help="how many recent events to list")
+    events.add_argument("--camera", help="only this camera (its id or name)")
+    events.add_argument("--follow", action="store_true", help="then print new events until Ctrl+C")
+    from neurowatch.cloud import headless as cloud_cli  # it imports this module
+
+    cloud_cli.add_monitor_arguments(watch)
+    cloud_cli.add_commands(commands)
     return parser
 
 
@@ -355,7 +455,7 @@ def _start_headless_service(say: Callable[[str], None], *, autostart: bool) -> i
 
 
 def print_status(rpc: Rpc, say: Callable[[str], None]) -> int:
-    """Cameras, recording and the extensions' lines, once. Returns an exit code."""
+    """Cameras, recording and the cloud's line, once. Returns an exit code."""
     try:
         snapshot = poll(rpc, {})
     except Exception as exc:
@@ -368,6 +468,60 @@ def print_status(rpc: Rpc, say: Callable[[str], None]) -> int:
     return 0
 
 
+def _camera_names(rpc: Rpc) -> dict[str, str]:
+    cameras = _optional(rpc, "camera.list")
+    if not isinstance(cameras, list):
+        return {}
+    return {c["id"]: c.get("name") or c["id"] for c in cameras if isinstance(c, dict) and "id" in c}
+
+
+def print_events(
+    rpc: Rpc,
+    say: Callable[[str], None],
+    *,
+    limit: int = 20,
+    camera: str | None = None,
+    follow: bool = False,
+) -> int:
+    """Recent events, oldest first; with ``follow``, new ones until Ctrl+C."""
+    try:
+        names = _camera_names(rpc)
+        params: dict[str, Any] = {"limit": max(1, min(limit, 1000))}
+        if camera:
+            ids = [cid for cid, name in names.items() if camera in (cid, name)]
+            if not ids:
+                say(f"No camera named {camera!r}")
+                return 2
+            params["camera_ids"] = ids
+        listed = rpc("events.list", params, _STATUS_TIMEOUT_S)
+    except Exception as exc:
+        say(_unreachable(exc))
+        return 1
+    stored = listed.get("events") if isinstance(listed, dict) else None
+    events = [e for e in stored or [] if isinstance(e, dict)]
+    if not events:
+        say("No events yet")
+    for event in reversed(events):
+        say(event_summary(event, names))
+    if not follow:
+        return 0
+    feed = EventFeed(rpc)
+    wanted = set(params.get("camera_ids", []))
+    while True:
+        try:
+            notices = feed.poll(_FOLLOW_WAIT_MS)
+        except Exception as exc:
+            say(_unreachable(exc))
+            return 1
+        for notice in notices:
+            changed = notice.get("event")
+            if not isinstance(changed, dict) or (wanted and changed.get("camera_id") not in wanted):
+                continue
+            text = event_line(changed, names, str(notice.get("phase")))
+            if text:
+                say(text)
+
+
 def _unreachable(exc: Exception) -> str:
     detail = str(exc).removeprefix("Backend not reachable: ")
     return (
@@ -377,6 +531,8 @@ def _unreachable(exc: Exception) -> str:
 
 
 def main(argv: list[str] | None = None, out: TextIO = sys.stdout) -> int:
+    from neurowatch.cloud import headless as cloud_cli  # it imports this module
+
     args = _parser().parse_args(argv)
     # These commands report connection problems themselves, in plain words;
     # the IPC client's own retry warnings would only repeat them.
@@ -390,10 +546,9 @@ def main(argv: list[str] | None = None, out: TextIO = sys.stdout) -> int:
                 started = _start_headless_service(say, autostart=not args.no_autostart)
                 if started:
                     return started
-            for _extension, before_monitor in extensions.hooks("before_monitor"):
-                stop = before_monitor(args, rpc, say)
-                if stop is not None:
-                    return int(stop)
+            stop = cloud_cli.before_monitor(args, rpc, say)
+            if stop is not None:
+                return int(stop)
             try:
                 return monitor(
                     rpc,
@@ -412,10 +567,11 @@ def main(argv: list[str] | None = None, out: TextIO = sys.stdout) -> int:
                 raise
         if args.command == "status":
             return print_status(rpc, say)
-        for _extension, run_command in extensions.hooks("run_command"):
-            result = run_command(args, rpc, say)
-            if result is not None:
-                return int(result)
+        if args.command == "events":
+            return print_events(rpc, say, limit=args.limit, camera=args.camera, follow=args.follow)
+        result = cloud_cli.run_command(args, rpc, say)
+        if result is not None:
+            return int(result)
         say(f"Unknown command: {args.command}")
         return 2
     except KeyboardInterrupt:

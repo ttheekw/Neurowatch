@@ -39,12 +39,17 @@ def ipc_token(port: int, data_dirs: list[Path]) -> str:
     raise RuntimeError(f"the backend wrote no IPC token ({name}) in {data_dirs}")
 
 
+#: The only cloud a release build links to (`NEUROWATCH_CLOUD` in the backend).
+NEUROWATCH_CLOUD = "https://neurowatch.app"
+
+
 def check_cloud(port: int, data_dirs: list[Path]) -> None:
-    """An official build's cloud must be on, and reachable over TCP with this
-    user's token (Windows always uses TCP): a fresh install once had it off."""
+    """Every build carries the cloud, on and linking to NeuroWatch Cloud (a
+    fresh install once had it off), reachable over TCP with this user's token
+    (Windows always uses TCP)."""
     status = rpc(port, "cloud.status", auth=ipc_token(port, data_dirs))
     assert status.get("cloud_configured") is True, status
-    assert status.get("cloud_endpoint"), status
+    assert status.get("cloud_endpoint") == NEUROWATCH_CLOUD, status
     try:
         rpc(port, "cloud.status")
     except RuntimeError:
@@ -134,17 +139,20 @@ def smoke(bundle: Path) -> None:
             assert status["cameras"] == 0, status
             assert status["site_name"] == "Release smoke check", status
             assert status["pid"] > 0, status
+            # NW_EXPECT_EDITION (the release workflow's matrix): an unlimited
+            # package must never ship the free backend, or the other way round.
+            expected_edition = os.environ.get("NW_EXPECT_EDITION")
+            if expected_edition:
+                assert status.get("edition") == expected_edition, status
+                limit = None if expected_edition == "unlimited" else 16
+                assert status.get("camera_limit") == limit, status
             print("Packaged backend:", json.dumps(status), flush=True)
-            # Official builds carry the cloud (and its terms, LICENSE-EXTENSIONS).
-            if (bundle / "LICENSE-EXTENSIONS").is_file():
-                # Rust finds Windows' local app data through Known Folders,
-                # not the LOCALAPPDATA override above.
-                data_dirs = [Path(env["XDG_DATA_HOME"]), Path(env["LOCALAPPDATA"])]
-                if os.environ.get("LOCALAPPDATA"):
-                    data_dirs.append(Path(os.environ["LOCALAPPDATA"]))
-                check_cloud(port, data_dirs)
-            else:
-                print("Open-source build: no cloud to check", flush=True)
+            # Rust finds Windows' local app data through Known Folders,
+            # not the LOCALAPPDATA override above.
+            data_dirs = [Path(env["XDG_DATA_HOME"]), Path(env["LOCALAPPDATA"])]
+            if os.environ.get("LOCALAPPDATA"):
+                data_dirs.append(Path(os.environ["LOCALAPPDATA"]))
+            check_cloud(port, data_dirs)
             ui_command("service", "status", "--json")
 
             media_env = env.copy()

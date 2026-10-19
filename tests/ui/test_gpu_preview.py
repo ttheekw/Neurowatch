@@ -110,6 +110,7 @@ def test_offscreen_uses_rgb(qtbot):
 def gpu_wall(qtbot, monkeypatch):
     from PySide6.QtCore import QObject, Signal
     from PySide6.QtWidgets import QWidget
+
     from neurowatch.models.camera import CameraConfig
     from neurowatch.widgets import gpu_video_surface, video_wall
 

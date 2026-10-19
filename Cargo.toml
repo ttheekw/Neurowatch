@@ -3,17 +3,24 @@ resolver = "2"
 members  = [
     "crates/nw-core",
     "crates/nw-backend",
+    "crates/nw-cloud-protocol",
+    "crates/nw-api",
 ]
 
 [workspace.package]
 version      = "0.1.0"
 edition      = "2021"
 authors      = ["Neurowatch Contributors"]
-license      = "AGPL-3.0-or-later"
+license      = "Apache-2.0"
 repository   = "https://github.com/ttheekw/Neurowatch"
 rust-version = "1.75"
+publish      = false
 
 [workspace.dependencies]
+# Workspace crates
+nw-core             = { path = "crates/nw-core" }
+nw-backend          = { path = "crates/nw-backend" }
+nw-cloud-protocol   = { path = "crates/nw-cloud-protocol" }
 # Async
 tokio               = { version = "1",    features = ["full"] }
 # Serialization

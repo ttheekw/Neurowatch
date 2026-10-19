@@ -29,6 +29,10 @@
 //! Nothing here is paced: files are read as fast as the disk and the muxer
 //! allow, with at most [`MAX_QUEUED_BYTES`] of video waiting for the muxer.
 
+#[path = "timelapse.rs"]
+mod timelapse;
+pub use timelapse::remux_timelapse;
+
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 use std::path::{Path, PathBuf};

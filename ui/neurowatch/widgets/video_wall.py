@@ -27,6 +27,7 @@ from PySide6.QtWidgets import QGridLayout, QLayout, QWidget
 from neurowatch.ipc.frame_reader import FrameReaderThread
 from neurowatch.ipc.viewer_client import NativeViewerClient
 from neurowatch.models.camera import MAIN_STREAM, SUB_STREAM, CameraConfig, connection_status
+from neurowatch.models.preview_fps import PreviewFps
 from neurowatch.models.wall_layout import (
     Placement,
     Slot,
@@ -50,7 +51,8 @@ from neurowatch.widgets.native_viewer_surface import BindResult, NativeViewerSur
 
 logger = logging.getLogger(__name__)
 
-_HIDDEN_PAGE_FPS = 2.0
+# The default limits (``ui.preview_fps``); ``set_preview_fps`` changes them.
+_HIDDEN_PAGE_FPS = float(PreviewFps().hidden)
 # A cached frame younger than this came from a running decoder (a page warmed
 # before an automatic page change): shown as live, not "refreshing".
 _FRESH_FRAME_S = 1.5
@@ -274,6 +276,10 @@ class VideoWallWidget(QWidget):
     view_demand_changed = Signal(list)
     # A tile's speaker was clicked: hear this camera live, or stop (cam_id).
     listen_toggled = Signal(str)
+    motion_acknowledge_requested = Signal(str)
+    cell_ptz_requested = Signal(str)
+    cell_bookmark_requested = Signal(str)
+    cell_talk_requested = Signal(str)
     cell_edit_requested = Signal(str)  # cam_id (right-click → Edit)
     cell_remove_requested = Signal(str)  # cam_id (right-click → Remove)
     # A tile held at the wall's edge brought another page into view (0-based);
@@ -325,6 +331,9 @@ class VideoWallWidget(QWidget):
         self._encoding_by_id: dict[str, str] = {}
         # cam_id -> the camera's audio track ("AAC", …), when it has one.
         self._audio_by_id: dict[str, str] = {}
+        # Cameras whose tiles show the MOTION badge (motion going on).
+        self._motion_ids: set[str] = set()
+        self._pending_motion_ids: set[str] = set()
         self._listening: str | None = None
         self._auto_fit: bool = True
         self._no_sub_ids: set[str] = set()  # cameras in grid view with no sub stream
@@ -334,6 +343,11 @@ class VideoWallWidget(QWidget):
         self._view_stream: dict[str, str] = {}
         self._cell_by_cam_id: dict[str, int] = {}
         self._cam_by_id: dict[str, CameraConfig] = {}
+        # Preview frame-rate limits, and what they were last applied to.
+        self._preview_fps = PreviewFps()
+        self._shown_ids: set[str] = set()
+        self._shown_count = 0
+        self._single_view = False
         # Tiles of every page (wall order), and the slots laid out right now.
         self._placement_list: list[Placement] = []
         self._placements: dict[str, Placement] = {}
@@ -678,9 +692,13 @@ class VideoWallWidget(QWidget):
             cell.add_camera_requested.connect(self.cell_add_camera_requested)
             cell.camera_drop_requested.connect(lambda cam_id, idx=i: self.drop_camera(cam_id, idx))
             cell.edit_requested.connect(self.cell_edit_requested)
+            cell.ptz_requested.connect(self.cell_ptz_requested)
+            cell.bookmark_requested.connect(self.cell_bookmark_requested)
+            cell.talk_requested.connect(self.cell_talk_requested)
             cell.remove_requested.connect(self.cell_remove_requested)
             cell.stream_requested.connect(self.set_view_stream)
             cell.audio_toggle_requested.connect(self.listen_toggled)
+            cell.motion_acknowledge_requested.connect(self.motion_acknowledge_requested)
             cell.tile_size_requested.connect(self.set_tile_size)
             cell.move_drag_started.connect(
                 lambda cam_id, pos, c=cell: self._begin_layout_drag("move", cam_id, c, pos)
@@ -735,7 +753,8 @@ class VideoWallWidget(QWidget):
         # Empty grid slots cost nothing.  Base the preview rate on cameras that
         # are actually visible, not the preset's theoretical capacity (for
         # example, the default 4x8 layout with only 16 cameras).
-        target_fps = self._target_ui_fps(len(page_cams), single_view=cap <= 1)
+        self._shown_count, self._single_view = len(page_cams), cap <= 1
+        target_fps = self._target_ui_fps(self._shown_count, single_view=self._single_view)
         # Sample at twice the delivery rate.  This avoids phase-locking a 15
         # FPS producer to a 15 FPS GUI timer and accidentally rendering every
         # other frame, while the reader remains the actual FPS limiter.
@@ -793,6 +812,8 @@ class VideoWallWidget(QWidget):
             cell.set_stream_choice(self._view_stream.get(cam.id))
             self._cell_by_cam_id[cam.id] = i
             cell.set_status(self._status_by_id.get(cam.id, CellStatus.CONNECTING))
+            cell.set_motion(cam.id in self._motion_ids)
+            cell.set_motion_pending(cam.id in self._pending_motion_ids)
 
             if cam.id in self._no_sub_ids:
                 # No sub stream configured — show error overlay, no reader
@@ -829,6 +850,7 @@ class VideoWallWidget(QWidget):
         # page becomes visible. Fallback-visible cameras run at wall FPS.
         native_ids = set(self._native_surfaces)
         visible_ids = set(next_cell)
+        self._shown_ids = visible_ids
         desired_reader_ids = current_ids - native_ids
         for cam_id in list(self._readers):
             if cam_id not in desired_reader_ids:
@@ -839,7 +861,7 @@ class VideoWallWidget(QWidget):
         for cam in self._cameras:
             if cam.id not in desired_reader_ids:
                 continue
-            reader_fps = target_fps if cam.id in visible_ids else _HIDDEN_PAGE_FPS
+            reader_fps = target_fps if cam.id in visible_ids else float(self._preview_fps.hidden)
             if cam.id not in self._readers:
                 logger.debug(
                     "Starting frame reader for cam_id=%s at %.1f FPS",
@@ -1434,6 +1456,24 @@ class VideoWallWidget(QWidget):
         if cell is not None:
             cell.set_recording(state)
 
+    def set_pending_motion_cameras(self, camera_ids: set[str]) -> None:
+        """Show pending activity by camera, including after page changes."""
+        changed = self._pending_motion_ids ^ camera_ids
+        self._pending_motion_ids = set(camera_ids)
+        for cam_id in changed:
+            cell = self._cell_for_cam_id(cam_id)
+            if cell is not None:
+                cell.set_motion_pending(cam_id in camera_ids)
+
+    def set_motion_cameras(self, camera_ids: set[str]) -> None:
+        """Cameras with motion going on: their tiles show the MOTION badge."""
+        changed = self._motion_ids ^ camera_ids
+        self._motion_ids = set(camera_ids)
+        for cam_id in changed:
+            cell = self._cell_for_cam_id(cam_id)
+            if cell is not None:
+                cell.set_motion(cam_id in camera_ids)
+
     def set_camera_audio(self, cam_id: str, audio: str | None) -> None:
         """The camera's audio track (``AAC``, …), or None: its tile shows a
         speaker only when it has one."""
@@ -1560,16 +1600,21 @@ class VideoWallWidget(QWidget):
         return "CODEC?"
 
     def _target_ui_fps(self, visible_count: int, *, single_view: bool = False) -> float:
-        """Scale preview FPS based on visible cell count to keep the UI responsive.
+        """The preview limit for the tiles on screen (``ui.preview_fps``: single
+        view, up to 16 tiles, more). It limits preview delivery only, never the
+        source or recording frame rate."""
+        return self._preview_fps.visible(visible_count, single_view=single_view)
 
-        Keep standard walls (up to 16 cameras) at 15 FPS. This limits preview
-        delivery only; it does not change the source or recording frame rate.
-        """
-        if single_view:
-            return 25.0
-        if visible_count <= 16:
-            return 15.0
-        return 4.0
+    def set_preview_fps(self, limits: PreviewFps) -> None:
+        """Use new preview limits, retuning running readers in place (no
+        reader restarts, no reconnects)."""
+        if limits == self._preview_fps:
+            return
+        self._preview_fps = limits
+        target = self._target_ui_fps(self._shown_count, single_view=self._single_view)
+        self._render_timer.setInterval(max(8, round(500.0 / target)))
+        for cam_id, reader in self._readers.items():
+            reader.set_max_emit_fps(target if cam_id in self._shown_ids else float(limits.hidden))
 
     def mark_quality_unsynced(self, cam_id: str) -> None:
         """Force a quality re-sync on next camera assignment."""

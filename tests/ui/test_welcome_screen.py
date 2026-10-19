@@ -294,8 +294,10 @@ def test_main_window_raises_backend_unavailable_after_retries(monkeypatch):
 
     monkeypatch.setattr(main_mod, "SyncIpcClient", OfflineClient)
     timeline: list[str] = []
+    from PySide6.QtCore import QThread
+
     monkeypatch.setattr(
-        main_mod.QThread, "msleep", staticmethod(lambda ms: timeline.append(f"wait {ms}"))
+        QThread, "msleep", staticmethod(lambda ms: timeline.append(f"wait {ms}"))
     )
     monkeypatch.setattr(
         main_mod,

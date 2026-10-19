@@ -63,6 +63,8 @@ class FakeSystemctl:
                 if not self.linger_allowed:
                     return subprocess.CompletedProcess(argv, 1, "", "Access denied")
                 self.linger = True
+            if argv[1] == "disable-linger":
+                self.linger = False
             out = ("yes" if self.linger else "no") if argv[1] == "show-user" else ""
             return subprocess.CompletedProcess(argv, 0, out, "")
         args = argv[2:]
@@ -181,13 +183,8 @@ def test_a_source_checkout_runs_the_dev_supervisor(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux runtime overlay")
-def test_source_checkout_prefers_installed_va_bugfix_runtime(
-    tmp_path, monkeypatch
-) -> None:
-    plugin_dir = (
-        tmp_path
-        / ".cache/gstreamer-1.24.13/lib/x86_64-linux-gnu/gstreamer-1.0"
-    )
+def test_source_checkout_prefers_installed_va_bugfix_runtime(tmp_path, monkeypatch) -> None:
+    plugin_dir = tmp_path / ".cache/gstreamer-1.24.13/lib/x86_64-linux-gnu/gstreamer-1.0"
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "libgstva.so").touch()
     monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/lib")
@@ -209,14 +206,14 @@ def test_source_checkout_prefers_installed_va_bugfix_runtime(
 def test_the_service_gets_the_backend_settings_of_its_session(packaged, monkeypatch) -> None:
     # A development script sets backend settings, then (re)starts the service.
     monkeypatch.setenv("NW_EXAMPLE_ENDPOINT", "http://127.0.0.1:8000")
-    monkeypatch.setenv("LIVEKIT_URL", "ws://127.0.0.1:7880")
+    monkeypatch.setenv("LIVEKIT_URL", "ws://127.0.0.1:7880")  # not the backend's: the cloud sends it
     monkeypatch.setenv("RUST_LOG", "debug")
     monkeypatch.setenv("NW_HEADLESS", "1")
     monkeypatch.setenv("NW_SERVICE", "external")
     monkeypatch.setenv("UNRELATED", "x")
     env = service_command().env
     assert env["NW_EXAMPLE_ENDPOINT"] == "http://127.0.0.1:8000"
-    assert env["LIVEKIT_URL"] == "ws://127.0.0.1:7880" and env["RUST_LOG"] == "debug"
+    assert env["RUST_LOG"] == "debug" and "LIVEKIT_URL" not in env
     assert env["NW_HEADLESS"] == "0", "the mode decides, not the shell's NW_HEADLESS=1"
     assert "NW_SERVICE" not in env and "UNRELATED" not in env
 
@@ -703,3 +700,79 @@ def test_the_bundled_nettle_3_is_used_only_without_the_systems_own(tmp_path) -> 
     # Debian, Fedora, Ubuntu: their own nettle 3, which their TLS library needs.
     debian = bundled_library_path(gst, has_library=lambda soname: soname == "libnettle.so.8")
     assert debian == str(gst / "lib")
+
+
+# ---------------------------------------------------------------------------
+# Settings → Startup: the user's choice decides what is registered
+# ---------------------------------------------------------------------------
+
+
+def test_startup_choices_are_saved_and_default_to_starting_at_login() -> None:
+    from neurowatch.service.startup import StartupPrefs, load_prefs, save_prefs
+
+    assert load_prefs() == StartupPrefs(at_login=True, open_window=False, at_boot=False)
+    save_prefs(StartupPrefs(at_login=False, open_window=True, at_boot=False))
+    assert load_prefs() == StartupPrefs(at_login=False, open_window=True, at_boot=False)
+
+
+def test_opening_the_app_respects_a_switched_off_start_at_sign_in(tmp_path, packaged) -> None:
+    """Every UI launch registers the service; a user who switched starting at
+    sign-in off must not find it switched back on."""
+    from neurowatch.service.startup import StartupPrefs, save_prefs
+
+    save_prefs(StartupPrefs(at_login=False))
+    systemctl, backend = FakeSystemctl(), FakeBackend()
+    controller, _ = _controller(tmp_path, systemctl, backend)
+
+    assert controller.ensure_running(autostart=True)
+
+    assert "enable" not in systemctl.verbs()
+    assert not (tmp_path / "autostart" / "neurowatch-tray.desktop").exists()
+    assert not controller.starts_at_login()
+
+
+def test_applying_startup_choices_registers_the_window_and_recording_from_boot(
+    tmp_path, packaged
+) -> None:
+    from neurowatch.service.startup import StartupPrefs, load_prefs
+
+    systemctl, backend = FakeSystemctl(), FakeBackend()
+    controller, _ = _controller(tmp_path, systemctl, backend)
+    entry = tmp_path / "autostart" / "neurowatch-tray.desktop"
+
+    wanted = StartupPrefs(at_login=True, open_window=True, at_boot=True)
+    assert controller.apply_startup(wanted) == []
+    assert load_prefs() == wanted
+    assert controller.starts_at_login() and systemctl.linger, "records from boot"
+    assert "neurowatch.tray" not in entry.read_text(), "the window opens at sign-in"
+
+    assert controller.apply_startup(StartupPrefs(at_login=True)) == []
+    assert "neurowatch.tray" in entry.read_text(), "only the tray at sign-in"
+    assert not systemctl.linger, "starts at sign-in again, not at boot"
+
+    assert controller.apply_startup(StartupPrefs(at_login=False)) == []
+    assert not entry.exists() and not controller.starts_at_login()
+
+
+def test_recording_from_boot_refused_says_what_to_run(tmp_path, packaged) -> None:
+    from neurowatch.service.startup import StartupPrefs
+
+    systemctl, backend = FakeSystemctl(), FakeBackend()
+    systemctl.linger_allowed = False
+    controller, _ = _controller(tmp_path, systemctl, backend)
+
+    [problem] = controller.apply_startup(StartupPrefs(at_login=True, at_boot=True))
+
+    assert "sudo loginctl enable-linger" in problem
+    assert controller.starts_at_login(), "it still starts at sign-in"
+
+
+def test_cli_install_and_uninstall_change_the_startup_choice(tmp_path, packaged, capsys) -> None:
+    from neurowatch.service.startup import load_prefs
+
+    systemctl, backend = FakeSystemctl(), FakeBackend()
+    controller, _ = _controller(tmp_path, systemctl, backend)
+    assert cli.main(["uninstall"], controller=controller) == 0
+    assert not load_prefs().at_login
+    assert cli.main(["install"], controller=controller) == 0
+    assert load_prefs().at_login and controller.starts_at_login()

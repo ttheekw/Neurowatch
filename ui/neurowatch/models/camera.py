@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import uuid
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
 def connection_status(state: str) -> str:
@@ -37,6 +39,11 @@ class LocalRecordingDest:
 class CameraRecordingConfig:
     schedule: str | None = None
     local: LocalRecordingDest = field(default_factory=LocalRecordingDest)
+    mode: str | None = None
+    weekly_rules: list[dict] | None = None
+    event_pre_sec: int | None = None
+    event_post_sec: int | None = None
+    non_event_keep_hours: int | None = None
 
 
 MAIN_STREAM = "main"
@@ -100,6 +107,11 @@ class CameraConfig:
     streams: list[CameraStream] = field(default_factory=list)
     # Absent for cameras entered by hand.
     discovery: DiscoveryIdentity | None = None
+    # Motion settings (``motion.configure``) and the camera's ONVIF service,
+    # kept as the backend sent them so an edit never drops them. Empty / None:
+    # left out of updates, so the backend keeps what it has.
+    motion: dict[str, Any] = field(default_factory=dict)
+    onvif: dict[str, Any] | None = None
 
     def stream_options(self) -> list[CameraStream]:
         """Streams a viewer may pick; main and sub for a camera without a list."""
@@ -125,8 +137,21 @@ class CameraConfig:
 
     def to_dict(self) -> dict:
         d = asdict(self)
+        for key in (
+            "mode",
+            "weekly_rules",
+            "event_pre_sec",
+            "event_post_sec",
+            "non_event_keep_hours",
+        ):
+            if d["recording"].get(key) is None:
+                d["recording"].pop(key, None)
         if d.get("discovery") is None:
             d.pop("discovery", None)
+        if not d.get("motion"):
+            d.pop("motion", None)
+        if d.get("onvif") is None:
+            d.pop("onvif", None)
         return d
 
     @classmethod
@@ -136,8 +161,13 @@ class CameraConfig:
         rec = data.pop("recording", None)
         streams = data.pop("streams", None)
         discovery = data.pop("discovery", None)
-        data.pop("motion", None)  # ignore motion for now
+        motion = data.pop("motion", None)
+        onvif = data.pop("onvif", None)
         obj = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        if isinstance(motion, dict):
+            obj.motion = copy.deepcopy(motion)
+        if isinstance(onvif, dict):
+            obj.onvif = dict(onvif)
         if isinstance(wp, dict):
             fields = WallPosition.__dataclass_fields__
             obj.wall_position = WallPosition(**{k: v for k, v in wp.items() if k in fields})
@@ -174,6 +204,11 @@ class CameraConfig:
             # persisted back to disk.
             obj.recording = CameraRecordingConfig(
                 schedule=rec.get("schedule"),
+                mode=rec.get("mode"),
+                weekly_rules=rec.get("weekly_rules"),
+                event_pre_sec=rec.get("event_pre_sec"),
+                event_post_sec=rec.get("event_post_sec"),
+                non_event_keep_hours=rec.get("non_event_keep_hours"),
                 local=LocalRecordingDest(
                     enabled=local_d.get("enabled", False),
                     storage_path=local_d.get("storage_path"),

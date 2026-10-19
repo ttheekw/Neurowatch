@@ -1,0 +1,21 @@
+[package]
+name        = "nw-cloud-protocol"
+description = "Types shared by the NeuroWatch node and NeuroWatch Cloud (browser media sessions)"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+rust-version.workspace = true
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time      = { workspace = true, features = ["formatting", "parsing"] }
+
+
+[[test]]
+name = "test_media_session_contract"
+path = "../../tests/rust/test_media_session_contract.rs"

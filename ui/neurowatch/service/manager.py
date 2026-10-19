@@ -56,7 +56,9 @@ from neurowatch.service.paths import (
     service_endpoint,
     source_root,
     state_dir,
+    ui_command,
 )
+from neurowatch.service.startup import StartupPrefs, load_prefs, save_prefs
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +68,7 @@ START_TIMEOUT_S = 30.0
 DEV_START_TIMEOUT_S = 900.0
 STOP_TIMEOUT_S = 35.0  # the backend bounds its own shutdown at 15 s
 #: Variables a systemd unit cannot inherit from the session that installs it:
-#: the dev build's toolchain, and the backend's own settings (``NW_*``, and
-#: ``LIVEKIT_*`` for builds whose extensions use LiveKit).
+#: the dev build's toolchain, and the backend's own settings (``NW_*``).
 _DEV_ENV = (
     "PATH",
     "CXX",
@@ -77,7 +78,7 @@ _DEV_ENV = (
     "RUSTUP_HOME",
     "PKG_CONFIG_PATH",
 )
-_BACKEND_ENV_PREFIXES = ("NW_", "LIVEKIT_")
+_BACKEND_ENV_PREFIXES = ("NW_",)
 _BACKEND_ENV = ("RUST_LOG", "GST_DEBUG")
 #: Launcher and UI settings that are not the backend's.
 _NOT_BACKEND_ENV = {"NW_IPC_ENDPOINT", "NW_HEADLESS", "NW_SOURCE_ROOT", "NW_SERVICE"}
@@ -393,6 +394,21 @@ class SystemdUser:
         logger.info("Enabled lingering: NeuroWatch starts at boot")
         return True
 
+    def disable_linger(self) -> bool:
+        """Start this user's services at login again, not at boot."""
+        if not self.lingering():
+            return True
+        result = self._loginctl("disable-linger")
+        if result.returncode != 0:
+            logger.warning(
+                "Could not disable lingering (%s): sudo loginctl disable-linger %s",
+                (result.stderr or result.stdout).strip(),
+                getpass.getuser(),
+            )
+            return False
+        logger.info("Disabled lingering: NeuroWatch starts at login")
+        return True
+
     def _loginctl(self, *args: str) -> subprocess.CompletedProcess[str]:
         try:
             return self._run(["loginctl", *args], capture_output=True, text=True, timeout=30)
@@ -592,18 +608,53 @@ class ServiceController:
 
     def install(self, *, autostart: bool = True, mode: str | None = None) -> None:
         """Register the service in ``mode`` (default: the last one); with
-        ``autostart`` it starts at every login (headless: at boot) and the
-        desktop mode's tray with it. Without, nothing is registered."""
-        if not autostart:
+        ``autostart`` and the user's startup choice (``startup.StartupPrefs``)
+        it starts at every login (headless, or "record from boot": at boot),
+        with the desktop mode's tray or window. Otherwise nothing is
+        registered."""
+        prefs = load_prefs()
+        if not autostart or not prefs.at_login:
             return
         mode = mode or saved_mode()
         command = service_command(self.endpoint, mode)
         if self.uses_systemd():
             self.systemd.install(command, enable=True)
-            if mode == HEADLESS:
+            if mode == HEADLESS or prefs.at_boot:
                 self.systemd.enable_linger()
         if mode == DESKTOP:
-            self.login_items.install(python_command("neurowatch.tray", windowless=True))
+            self.login_items.install(
+                ui_command()
+                if prefs.open_window
+                else python_command("neurowatch.tray", windowless=True)
+            )
+
+    def apply_startup(self, prefs: StartupPrefs) -> list[str]:
+        """Save the user's startup choices and register (or unregister) the
+        service to match. Returns what could not be done, in plain words."""
+        save_prefs(prefs)
+        problems: list[str] = []
+        try:
+            if prefs.at_login:
+                self.install(autostart=True)
+            else:
+                self.uninstall()
+        except (OSError, ServiceError) as error:
+            problems.append(f"Could not change what starts at sign-in: {error}")
+        if IS_WINDOWS or not self.uses_systemd():
+            return problems
+        user = getpass.getuser()
+        if prefs.at_login and prefs.at_boot:
+            if not self.systemd.enable_linger():
+                problems.append(
+                    "Recording from boot needs permission once: run "
+                    f"sudo loginctl enable-linger {user}"
+                )
+        elif saved_mode() != HEADLESS and not self.systemd.disable_linger():
+            # Headless mode starts at boot by design; leave it.
+            problems.append(
+                f"Could not stop starting at boot: run sudo loginctl disable-linger {user}"
+            )
+        return problems
 
     def uninstall(self) -> None:
         """Stop starting at login (the running service keeps running)."""

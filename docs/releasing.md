@@ -9,10 +9,49 @@ The [release workflow](../.github/workflows/release.yml) produces these download
 | Windows x86_64 | Inno Setup `-setup.exe`, portable `.zip` |
 | All | `SHA256SUMS` |
 
-Each download is also published under a version-free name (for example
-`neurowatch-windows-x86_64-setup.exe`, `neurowatch_amd64.deb`), which the
-README's download buttons link through
-`https://github.com/ttheekw/Neurowatch/releases/latest/download/<name>`.
+Every package is built twice: **free** (runs up to 16 cameras) and
+**unlimited** (the backend's `unlimited` Cargo feature; `--edition` /
+`-Edition` of the packaging scripts). Only the free packages are attached to
+the GitHub Release. The `publish-downloads` job uploads the unlimited ones to
+the private downloads bucket, under `releases/<tag>/unlimited/`, then
+`releases/<tag>/manifest.json` (`scripts/release_manifest.py`: both editions;
+free entries link to the GitHub Release). The downloads page
+(`https://neurowatch.app/downloads`, the web portal) reads the bucket and
+gives unlimited packages only to buyers, as short-lived signed links. The
+smoke checks assert each package's edition (`NW_EXPECT_EDITION`).
+
+Unlimited packages are never uploaded as public GitHub Actions artifacts.
+The build jobs stage them in the same private bucket under
+`staging/<run id>/<run attempt>/unlimited/`; the publishing job reads them
+there after the build and install checks pass. Keep the bucket private,
+give the workflow key read/write access to both `staging/` and `releases/`,
+and set a bucket lifecycle rule to expire `staging/` objects after 7 days.
+Free packages remain available as workflow artifacts and GitHub Release assets.
+
+The README's download links open the downloads page
+(`?version=latest&platform=…&arch=…&kind=…`). Each free download is also
+published under a version-free name (for example
+`neurowatch-windows-x86_64-setup.exe`), so older
+`https://github.com/ttheekw/Neurowatch/releases/latest/download/<name>` links
+keep working.
+
+| Repository secret | Value |
+|---|---|
+| `DOWNLOADS_S3_BUCKET` | Private bucket the downloads page reads (the portal's `NEUROWATCH_DOWNLOADS_S3_BUCKET`) |
+| `DOWNLOADS_S3_ENDPOINT` | S3-compatible endpoint, e.g. Cloudflare R2's `https://<account>.r2.cloudflarestorage.com`; empty for AWS |
+| `DOWNLOADS_S3_REGION` | Region (`auto` for R2, the default) |
+| `DOWNLOADS_S3_ACCESS_KEY_ID`, `DOWNLOADS_S3_SECRET_ACCESS_KEY` | A key that may write to the bucket |
+
+The official repository fails an Unlimited build if the bucket or key pair is
+missing. Forks warn and retain no Unlimited artifacts without private storage.
+
+Before accepting purchases, deploy the webapp's downloads page and configure
+its read-only bucket credentials, live payments.lk key and signing secret
+(`../Neurowatch-webapp/docs/integrations/downloads.md`). Publish a release and
+verify that Free downloads work signed out and Unlimited downloads require a
+confirmed purchase. The advertised desktop offer is USD 50 once, no software
+camera limit (capacity depends on hardware), and a support response within
+24 hours at `hello@neurowatch.app`. Optional Cloud plans are separate.
 
 Ordinary branch pushes run CI. A `vMAJOR.MINOR.PATCH` tag, optionally followed
 by `-rc.1`, runs the release build. No self-hosted runner is required. GitHub
@@ -23,33 +62,19 @@ Actions must be enabled, with repository policy allowing the publish job's
 
 Commit and push the packaging changes. In **Actions → Release → Run workflow**,
 select the branch and enter a version such as `v0.1.0-rc.1`. A manual run uploads
-workflow artifacts and never creates or modifies a GitHub Release.
+Free workflow artifacts and stages Unlimited packages privately; it never
+creates or modifies a GitHub Release.
 
 ## Official builds and NeuroWatch Cloud
 
-The downloads on the Releases page are the official builds: the open-source app
-plus the proprietary NeuroWatch Cloud extension, from the private
-`Neurowatch-cloud` repository. The release workflow adds it when the repository
-has:
+Every build includes the NeuroWatch Cloud client: it is part of the
+`nw-backend` binary and of the `neurowatch` UI package. Linux builds install
+clang 21, which the cloud's libwebrtc needs.
 
-| Setting | Kind | Value |
-|---|---|---|
-| `NEUROWATCH_CLOUD_TOKEN` | Actions secret | A fine-grained token with read-only **Contents** access to the private cloud repository |
-| `NEUROWATCH_CLOUD_URL` | Actions variable | The NeuroWatch Cloud address built into official builds, e.g. `https://cloud.example.com` |
-| `NEUROWATCH_CLOUD_REPOSITORY` | Actions variable (optional) | The cloud repository, if not `ttheekw/Neurowatch-cloud` |
-
-The packaging scripts then build the backend from the cloud workspace
-(`NW_BACKEND_MANIFEST`, `NW_BACKEND_PACKAGE`), bundle the UI extension
-(`NW_UI_EXTENSION_DIR`, `_DIST`, `_MODULE`), build in the cloud address
-(`NW_CLOUD_ENDPOINT`, read at compile time; release builds ignore it at run
-time) and ship the cloud's terms as `LICENSE-EXTENSIONS`. Linux official builds
-also install clang 21, which the cloud's libwebrtc needs.
-
-A tagged release checks out the cloud repository's tag of the same version, so
-tag the cloud repository first (for example `v0.1.0` in both); a manual build
-uses its default branch. Without the secret, as in forks, the workflow builds
-the open-source app with no cloud. Nothing proprietary is stored in this repository; the cloud code is
-fetched only on the build machine, during the release run.
+Every release build links to NeuroWatch Cloud at `https://neurowatch.app`
+and nowhere else (`NEUROWATCH_CLOUD` in `crates/nw-backend/src/cloud/link/mod.rs`);
+there is no build or run-time setting for it. Only development (debug)
+builds read `NW_CLOUD_ENDPOINT`, to link to a development portal.
 
 ## Prereleases and stable releases
 
@@ -165,7 +190,5 @@ For local Linux builds, install the build prerequisites listed in the workflow,
 then use `scripts/package_release_linux.sh --version v0.1.0 --arch x86_64
 --format portable,deb,rpm,arch` (`arch` is x86_64 only). Build inside the oldest target OS. Windows
 requires Python 3.12, Rust/MSVC, the GStreamer MSVC SDK and Inno Setup 6; run
-`scripts/package_windows.ps1 -Version v0.1.0` in an MSVC developer shell. To build an
-official package locally, set the variables listed under
-[Official builds](#official-builds-and-neurowatch-cloud) first (on Linux also
-`CXX=clang++-21`).
+`scripts/package_windows.ps1 -Version v0.1.0` in an MSVC developer shell. On
+Linux set `CXX=clang++-21` first.

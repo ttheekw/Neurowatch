@@ -1,0 +1,5 @@
+# LiveKit's prebuilt libwebrtc for Windows is built against the static C
+# runtime (/MT); the rest of the binary must be too, or linking fails with
+# LNK2038 "RuntimeLibrary mismatch".
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

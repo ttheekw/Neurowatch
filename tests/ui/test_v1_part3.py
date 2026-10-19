@@ -177,16 +177,16 @@ def test_settings_save_worker_uses_active_endpoint_and_refreshes_config(monkeypa
 def test_camera_dialog_disables_credentials_for_v4l2(qtbot):
     dlg = AddEditCameraDialog()
     qtbot.addWidget(dlg)
-    dlg._tabs.setCurrentWidget(dlg._advanced_tab)
+    dlg._show_camera_tab("urls")
 
     dlg._a_url.setText("/dev/video0")
 
-    assert not dlg._a_user.isEnabled()
-    assert not dlg._a_pass.isEnabled()
+    assert not dlg._user.isEnabled()
+    assert not dlg._pass.isEnabled()
 
     dlg._a_url.setText("rtsp://cam/stream")
-    assert dlg._a_user.isEnabled()
-    assert dlg._a_pass.isEnabled()
+    assert dlg._user.isEnabled()
+    assert dlg._pass.isEnabled()
 
 
 def test_camera_dialog_v4l2_config_carries_no_credentials(qtbot):
@@ -194,11 +194,11 @@ def test_camera_dialog_v4l2_config_carries_no_credentials(qtbot):
     # before switching the URL must not be persisted with the camera.
     dlg = AddEditCameraDialog()
     qtbot.addWidget(dlg)
-    dlg._tabs.setCurrentWidget(dlg._advanced_tab)
+    dlg._show_camera_tab("urls")
 
     dlg._a_url.setText("rtsp://cam/stream")
-    dlg._a_user.setText("admin")
-    dlg._a_pass.setText("secret")
+    dlg._user.setText("admin")
+    dlg._pass.setText("secret")
     dlg._a_url.setText("/dev/video0")
 
     cfg = dlg.get_config()
@@ -220,7 +220,7 @@ def test_camera_dialog_advanced_protocol_includes_rtmp_and_v4l2(qtbot):
 def test_camera_dialog_rtmp_protocol_selection_does_not_alter_url(qtbot):
     dlg = AddEditCameraDialog()
     qtbot.addWidget(dlg)
-    dlg._tabs.setCurrentWidget(dlg._advanced_tab)
+    dlg._show_camera_tab("urls")
 
     dlg._a_url.setText("rtmp://example/live")
     idx = dlg._a_protocol.findText("RTMP", Qt.MatchFlag.MatchFixedString)

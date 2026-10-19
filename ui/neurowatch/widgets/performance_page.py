@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QFrame,
@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from neurowatch.utils.network import format_bitrate
+from neurowatch.utils.threads import Worker
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ _ACCEL_PRESENTATION = {
 # ---------------------------------------------------------------------------
 
 
-class _StatsWorker(QThread):
+class _StatsWorker(Worker):
     """Runs one ``stats.get_performance`` call and emits the result."""
 
     snapshot_ready = Signal(object)  # dict OR Exception
@@ -154,6 +155,7 @@ _BOTTLENECK_NAMES = {
     "ram": "Memory",
     "ipc": "IPC",
     "decode_render": "Decode/render",
+    "motion": "Motion detection",
 }
 
 
@@ -189,6 +191,7 @@ class PerformancePage(QWidget):
         self._active_worker: _StatsWorker | None = None
         self._last_snapshot: dict[str, Any] | None = None
         self._last_error: str | None = None
+        self._names: dict[str, str] = {}
 
         self.setObjectName("PerformancePage")
         self.setStyleSheet("QWidget#PerformancePage { background-color: #12121c; color: #c8c8dc; }")
@@ -239,6 +242,7 @@ class PerformancePage(QWidget):
             self._gpu_container,
             self._ipc_grid_container,
             self._cameras_container,
+            self._motion_container,
             self._bottleneck_container,
         ):
             for child in widget.findChildren(QLabel):
@@ -415,6 +419,21 @@ class PerformancePage(QWidget):
         cameras_section_layout.addWidget(cameras_wrapper)
         body_layout.addWidget(self._cameras_container)
 
+        self._motion_container = self._labeled_section("Motion detection")
+        self._motion_label = QLabel("Motion diagnostics unavailable")
+        self._motion_label.setWordWrap(True)
+        self._motion_label.setStyleSheet("color: #a0a0c0; font-size: 11px;")
+        motion_layout = self._motion_container.layout()
+        assert motion_layout is not None  # installed by _labeled_section
+        motion_layout.addWidget(self._motion_label)
+        self._motion_grid_widget = QWidget()
+        self._motion_grid = QGridLayout(self._motion_grid_widget)
+        self._motion_grid.setContentsMargins(0, 0, 0, 0)
+        self._motion_grid.setHorizontalSpacing(18)
+        self._motion_grid.setVerticalSpacing(5)
+        motion_layout.addWidget(self._motion_grid_widget)
+        body_layout.addWidget(self._motion_container)
+
         # Footer with capture timestamp.
         self._captured_label = QLabel("Last capture: —")
         self._captured_label.setStyleSheet("color: #7878a0; font-size: 10px;")
@@ -506,6 +525,7 @@ class PerformancePage(QWidget):
         self._gpu_decoder_label.setText("—")
         self._gpu_reason_label.setText(f"error: {reason}")
         self._captured_label.setText("Last capture: never (backend error)")
+        self._motion_label.setText("Motion diagnostics unavailable")
 
     def _render_snapshot(self, snap: dict[str, Any]) -> None:
         # Process
@@ -590,6 +610,7 @@ class PerformancePage(QWidget):
 
         # Cameras
         self._render_cameras(snap.get("cameras") or [])
+        self._render_motion(snap)
 
         # Bottleneck
         b = snap.get("bottleneck", {}) or {}
@@ -624,7 +645,63 @@ class PerformancePage(QWidget):
             f"color: {color}; background: transparent; border: none; "
             "font-size: 12px; font-weight: 700; padding: 0 4px;"
         )
+        reason = info.get("reason")
+        if kind == "software" and isinstance(reason, str) and reason:
+            detail = reason  # e.g. the graphics card is not available until sign-in
         self._accel_detail_label.setText(detail)
+
+    def set_camera_names(self, names: dict[str, str]) -> None:
+        """Show cameras by name rather than by id."""
+        self._names = dict(names)
+        if self._last_snapshot is not None:
+            self._render_snapshot(self._last_snapshot)
+
+    def _name(self, camera_id: object) -> str:
+        return self._names.get(str(camera_id), str(camera_id or "?"))
+
+    def _render_motion(self, snap: dict[str, Any]) -> None:
+        while self._motion_grid.count():
+            item = self._motion_grid.takeAt(0)
+            widget = item.widget() if item else None
+            if widget is not None:
+                widget.deleteLater()
+        if "motion_decoders" not in snap:
+            self._motion_label.setText("Motion diagnostics unavailable")
+            return
+        motion = [m for m in snap.get("motion") or [] if isinstance(m, dict)]
+        decoders = snap.get("motion_decoders", 0)
+        self._motion_label.setText(
+            f"{decoders} analysis decoder{'s' if decoders != 1 else ''} running"
+            if motion
+            else "No camera uses NeuroWatch motion detection."
+        )
+        if not motion:
+            return
+        headings = ("Camera", "State", "Mode", "Decoder", "Analysis", "Detector", "Dropped")
+        for column, text in enumerate(headings):
+            label = QLabel(text)
+            label.setStyleSheet("color: #7878a0; font-size: 10px; font-weight: bold;")
+            self._motion_grid.addWidget(label, 0, column)
+        state_colors = {"running": "#4ade80", "connecting": "#60a5fa", "backoff": "#fbbf24"}
+        for row, entry in enumerate(motion, start=1):
+            state = str(entry.get("state", "?"))
+            cells = (
+                self._name(entry.get("camera_id")),
+                state,
+                ("Keyframes only" if entry.get("low_cpu") else "Normal")
+                + (" · substream" if entry.get("using_substream") else " · main stream"),
+                str(entry.get("decoder") or "—"),
+                f"{_fmt_number(entry.get('analysis_fps'))} fps",
+                f"{_fmt_number(entry.get('analysis_ms'))} ms / picture",
+                f"{entry.get('dropped_frames', 0)} ({_fmt_number(entry.get('dropped_fps'))}/s)",
+            )
+            for column, text in enumerate(cells):
+                label = QLabel(text)
+                color = state_colors.get(state, "#f87171") if column == 1 else "#c8c8dc"
+                weight = " font-weight: bold;" if column == 0 else ""
+                label.setStyleSheet(f"color: {color}; font-size: 11px;{weight}")
+                self._motion_grid.addWidget(label, row, column)
+        self._motion_grid.setColumnStretch(len(headings), 1)
 
     def _render_cameras(self, cams: list[dict[str, Any]]) -> None:
         # Clear existing rows.
@@ -643,7 +720,7 @@ class PerformancePage(QWidget):
             layout = QGridLayout(row)
             layout.setContentsMargins(0, 0, 0, 0)
             layout.setHorizontalSpacing(12)
-            id_label = QLabel(str(cam.get("camera_id", "?")))
+            id_label = QLabel(self._name(cam.get("camera_id")))
             id_label.setStyleSheet("color: #c8c8dc; font-size: 12px; font-weight: bold;")
             state_label = QLabel(str(cam.get("state", "?")))
             state_label.setStyleSheet("color: #a0a0c0; font-size: 11px;")

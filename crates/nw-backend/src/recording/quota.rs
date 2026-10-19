@@ -11,9 +11,13 @@
 //! keep a row alive for the now-removed direct-S3 uploader's quota tracking);
 //! the column remains for schema compatibility with existing databases and
 //! is still honored by playback queries as a defensive filter.
+//!
+//! Recordings on a location that is missing now (an unmounted drive or
+//! network share, `crate::storage_guard`) are left alone: their files are
+//! out of reach, not gone, so their rows stay and they count as nothing freed.
 
 use std::fs::Metadata;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -49,6 +53,22 @@ struct Candidate {
     start_ts: i64,
     path: String,
     size_bytes: i64,
+    has_event: i64,
+}
+
+/// Which recordings a pass may delete.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Scope<'a> {
+    /// Only this storage tier (`local`, `archive`); every tier when `None`.
+    pub tier: Option<&'a str>,
+    /// Locations that are missing now: recordings under them are skipped.
+    pub offline: &'a [PathBuf],
+}
+
+impl Scope<'_> {
+    fn reachable(&self, path: &Path) -> bool {
+        !self.offline.iter().any(|root| path.starts_with(root))
+    }
 }
 
 /// The next oldest segments after `cursor` (`start_ts`, `id`), of one camera
@@ -56,26 +76,34 @@ struct Candidate {
 fn candidates(
     db: &Arc<Mutex<Connection>>,
     camera: Option<&str>,
-    cursor: (i64, i64),
+    tier: Option<&str>,
+    cursor: (i64, i64, i64),
 ) -> Option<Vec<Candidate>> {
     let conn = db.lock().ok()?;
+    // Footage a kept bookmark covers is never a candidate.
     let mut stmt = conn
-        .prepare(
-            "SELECT id, start_ts, path, COALESCE(size_bytes, 0) FROM segments \
-             WHERE local_deleted = 0 AND (?3 IS NULL OR camera_id = ?3) \
-               AND (start_ts > ?1 OR (start_ts = ?1 AND id > ?2)) \
-             ORDER BY start_ts ASC, id ASC LIMIT ?4",
-        )
+        .prepare(&format!(
+            "SELECT id, start_ts, path, COALESCE(size_bytes, 0), has_event FROM segments \
+             WHERE local_deleted = 0 AND (?4 IS NULL OR camera_id = ?4) \
+               AND (?6 IS NULL OR tier = ?6) \
+               AND (has_event,start_ts,id) > (?1,?2,?3) AND {} \
+             ORDER BY has_event ASC,start_ts ASC,id ASC LIMIT ?5",
+            super::NOT_KEPT
+        ))
         .ok()?;
     let rows = stmt
-        .query_map(rusqlite::params![cursor.0, cursor.1, camera, BATCH], |r| {
-            Ok(Candidate {
-                id: r.get(0)?,
-                start_ts: r.get(1)?,
-                path: r.get(2)?,
-                size_bytes: r.get(3)?,
-            })
-        })
+        .query_map(
+            rusqlite::params![cursor.0, cursor.1, cursor.2, camera, BATCH, tier],
+            |r| {
+                Ok(Candidate {
+                    id: r.get(0)?,
+                    start_ts: r.get(1)?,
+                    path: r.get(2)?,
+                    size_bytes: r.get(3)?,
+                    has_event: r.get(4)?,
+                })
+            },
+        )
         .ok()?;
     Some(rows.flatten().collect())
 }
@@ -99,14 +127,15 @@ fn remove_rows(db: &Arc<Mutex<Connection>>, ids: &[i64]) {
 fn delete_oldest(
     db: &Arc<Mutex<Connection>>,
     camera: Option<&str>,
+    scope: Scope<'_>,
     need: u64,
     count: Count,
     keep: impl Fn(&Path, &Metadata) -> bool,
 ) -> Cleanup {
     let mut done = Cleanup::default();
-    let mut cursor = (i64::MIN, i64::MIN);
+    let mut cursor = (i64::MIN, i64::MIN, i64::MIN);
     while done.freed_bytes < need {
-        let batch = match candidates(db, camera, cursor) {
+        let batch = match candidates(db, camera, scope.tier, cursor) {
             Some(batch) if !batch.is_empty() => batch,
             _ => break,
         };
@@ -115,7 +144,10 @@ fn delete_oldest(
             if done.freed_bytes >= need {
                 break;
             }
-            cursor = (segment.start_ts, segment.id);
+            cursor = (segment.has_event, segment.start_ts, segment.id);
+            if !scope.reachable(Path::new(&segment.path)) {
+                continue;
+            }
             let indexed_size = u64::try_from(segment.size_bytes).unwrap_or(0);
             let meta = match std::fs::metadata(&segment.path) {
                 Ok(meta) => meta,
@@ -167,7 +199,9 @@ fn written_after(meta: &Metadata, active_after: Option<SystemTime>) -> bool {
 
 /// Enforce the local disk quota for `cam_id`.
 ///
-/// Only locally-present segments (`local_deleted = 0`) count toward usage.
+/// Only locally-present segments (`local_deleted = 0`) of the local tier
+/// count toward usage (archived ones have a quota of their own,
+/// [`enforce_archive`]).
 /// When usage exceeds `quota_bytes`, the oldest segments (by `start_ts`) are
 /// deleted — both the file and the database row — until usage is within
 /// budget. Files modified after `active_after` are kept (a recording that is
@@ -177,28 +211,73 @@ pub fn enforce(
     cam_id: &CameraId,
     quota_bytes: i64,
     active_after: Option<SystemTime>,
+    offline: &[PathBuf],
 ) -> Cleanup {
-    let total: i64 = match db.lock() {
-        Ok(conn) => conn
-            .query_row(
-                "SELECT COALESCE(SUM(size_bytes), 0) FROM segments \
-                 WHERE camera_id = ?1 AND local_deleted = 0",
-                [cam_id.as_str()],
-                |r| r.get(0),
-            )
-            .unwrap_or(0),
-        Err(_) => return Cleanup::default(),
+    let scope = Scope {
+        tier: Some(LOCAL_TIER),
+        offline,
+    };
+    let Some(total) = indexed_bytes(db, Some(cam_id.as_str()), LOCAL_TIER) else {
+        return Cleanup::default();
     };
     let need = u64::try_from(total.saturating_sub(quota_bytes)).unwrap_or(0);
-    let done = delete_oldest(db, Some(cam_id.as_str()), need, Count::Index, |_, meta| {
-        written_after(meta, active_after)
-    });
+    let done = delete_oldest(
+        db,
+        Some(cam_id.as_str()),
+        scope,
+        need,
+        Count::Index,
+        |_, meta| written_after(meta, active_after),
+    );
     if done.deleted > 0 {
         tracing::info!(
             cam_id = %cam_id,
             deleted = done.deleted,
             freed_bytes = done.freed_bytes,
             "Oldest recordings deleted (camera storage quota)"
+        );
+    }
+    done
+}
+
+/// The storage tier of recordings in their camera's recording location.
+pub const LOCAL_TIER: &str = "local";
+/// The storage tier of recordings moved to the archive (`recording::archive`).
+pub const ARCHIVE_TIER: &str = "archive";
+
+/// Indexed bytes of one tier, of one camera or of every camera.
+fn indexed_bytes(db: &Arc<Mutex<Connection>>, camera: Option<&str>, tier: &str) -> Option<i64> {
+    let conn = db.lock().ok()?;
+    conn.query_row(
+        "SELECT COALESCE(SUM(size_bytes), 0) FROM segments \
+         WHERE local_deleted = 0 AND tier = ?2 AND (?1 IS NULL OR camera_id = ?1)",
+        rusqlite::params![camera, tier],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// Keep the archive within `quota_bytes` by deleting its oldest recordings
+/// (footage without events first; never what a kept bookmark covers).
+pub fn enforce_archive(
+    db: &Arc<Mutex<Connection>>,
+    quota_bytes: i64,
+    offline: &[PathBuf],
+) -> Cleanup {
+    let Some(total) = indexed_bytes(db, None, ARCHIVE_TIER) else {
+        return Cleanup::default();
+    };
+    let need = u64::try_from(total.saturating_sub(quota_bytes)).unwrap_or(0);
+    let scope = Scope {
+        tier: Some(ARCHIVE_TIER),
+        offline,
+    };
+    let done = delete_oldest(db, None, scope, need, Count::Index, |_, _| false);
+    if done.deleted > 0 {
+        tracing::info!(
+            deleted = done.deleted,
+            freed_bytes = done.freed_bytes,
+            "Oldest archived recordings deleted (archive size limit)"
         );
     }
     done
@@ -226,6 +305,7 @@ pub fn enforce_disk_threshold(
     storage_root: &Path,
     threshold_percent: u8,
     active_after: SystemTime,
+    offline: &[PathBuf],
     space: impl Fn(&Path) -> Option<(u64, u64)>,
 ) -> Option<DiskCleanup> {
     if threshold_percent == 0 || threshold_percent >= 100 {
@@ -239,9 +319,14 @@ pub fn enforce_disk_threshold(
         return None;
     }
     let root_meta = std::fs::metadata(storage_root).ok()?;
+    let scope = Scope {
+        tier: None,
+        offline,
+    };
     let cleanup = delete_oldest(
         db,
         None,
+        scope,
         used_bytes - limit_bytes,
         Count::Disk,
         |path, meta| {
@@ -290,6 +375,104 @@ mod tests {
     use crate::db::schema::apply_migrations;
 
     const CAM: &str = "cam-quota";
+
+    #[test]
+    fn quota_prefers_unmarked_footage_but_event_marks_do_not_override_disk_limits() {
+        let fixture = Fixture::new("event-priority");
+        let event = fixture.segment("event.mkv", 1000, 10, true);
+        let plain = fixture.segment("plain.mkv", 2000, 10, true);
+        fixture
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE segments SET has_event=1 WHERE path=?1",
+                [event.to_string_lossy()],
+            )
+            .unwrap();
+        enforce(&fixture.db, &CAM.to_owned(), 10, None, &[]);
+        assert!(event.exists());
+        assert!(!plain.exists());
+        enforce(&fixture.db, &CAM.to_owned(), 0, None, &[]);
+        assert!(!event.exists());
+    }
+
+    #[test]
+    fn footage_a_kept_bookmark_covers_is_never_deleted() {
+        let fixture = Fixture::new("kept");
+        // Segments end 1 ms after they start; the bookmark (with 30 s either
+        // side) covers only the one starting at 100 s.
+        let old = fixture.segment("old.mkv", 1_000, 10, true);
+        let kept = fixture.segment("kept.mkv", 100_000, 10, true);
+        let later = fixture.segment("later.mkv", 200_000, 10, true);
+        let conn = fixture.db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO events (id, ts, end_ts, camera_id, event_type, source, kept) \
+             VALUES (1, 120000, 125000, ?1, 'bookmark', 'user', 1)",
+            [CAM],
+        )
+        .unwrap();
+        drop(conn);
+        enforce(&fixture.db, &CAM.to_owned(), 0, None, &[]);
+        assert!(!old.exists() && !later.exists());
+        assert!(kept.exists(), "kept footage survives an over-full quota");
+        fixture
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE events SET kept = 0", [])
+            .unwrap();
+        enforce(&fixture.db, &CAM.to_owned(), 0, None, &[]);
+        assert!(
+            !kept.exists(),
+            "released once the bookmark is no longer kept"
+        );
+    }
+
+    #[test]
+    fn rows_on_a_missing_location_are_kept_and_tiers_have_their_own_quotas() {
+        let fixture = Fixture::new("tiers");
+        // On a share that is not mounted: the file is out of reach, not gone.
+        let unreachable = fixture.segment("share/old.mkv", 1_000, 10, false);
+        let local = fixture.segment("local.mkv", 2_000, 10, true);
+        let archived = fixture.segment("archived.mkv", 500, 10, true);
+        let newer_archived = fixture.segment("archived-2.mkv", 3_000, 10, true);
+        fixture
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE segments SET tier = 'archive' WHERE path LIKE '%archived%'",
+                [],
+            )
+            .unwrap();
+        let offline = [fixture.root.join("share")];
+        // The local quota counts local recordings only (30 bytes with the
+        // unreachable one) and skips what it cannot reach.
+        let done = enforce(&fixture.db, &CAM.to_owned(), 20, None, &offline);
+        assert_eq!(
+            done.deleted, 0,
+            "archived recordings are not the camera's to delete"
+        );
+        enforce(&fixture.db, &CAM.to_owned(), 0, None, &offline);
+        assert!(!local.exists());
+        assert!(archived.exists() && newer_archived.exists());
+        let rows: i64 = fixture
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM segments WHERE path = ?1",
+                [unreachable.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "an unreachable recording keeps its row");
+        // The archive's own limit deletes its oldest.
+        let done = super::enforce_archive(&fixture.db, 10, &offline);
+        assert_eq!(done.deleted, 1);
+        assert!(!archived.exists() && newer_archived.exists());
+    }
 
     struct Fixture {
         root: PathBuf,
@@ -368,7 +551,7 @@ mod tests {
         }
 
         fn enforce(&self, quota_bytes: i64) {
-            enforce(&self.db, &CAM.to_owned(), quota_bytes, None);
+            enforce(&self.db, &CAM.to_owned(), quota_bytes, None, &[]);
         }
 
         /// A drive of `total` bytes with `available` free, at `percent`.
@@ -379,7 +562,7 @@ mod tests {
             percent: u8,
             active_after: SystemTime,
         ) -> Option<super::DiskCleanup> {
-            enforce_disk_threshold(&self.db, &self.root, percent, active_after, |_| {
+            enforce_disk_threshold(&self.db, &self.root, percent, active_after, &[], |_| {
                 Some((total, available))
             })
         }
@@ -487,7 +670,7 @@ mod tests {
         let fx = Fixture::new("quota-active");
         let active = fx.segment("active.mkv", 100, 80, true);
 
-        let done = enforce(&fx.db, &CAM.to_owned(), 10, Some(UNIX_EPOCH));
+        let done = enforce(&fx.db, &CAM.to_owned(), 10, Some(UNIX_EPOCH), &[]);
 
         assert!(active.exists());
         assert_eq!(done.deleted, 0);

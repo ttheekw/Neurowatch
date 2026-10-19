@@ -30,7 +30,7 @@ from neurowatch.widgets.video_wall import VideoWallWidget
 @pytest.fixture(autouse=True)
 def x11_platform(monkeypatch):
     # Stubbed sessions exercise X11 IPC without creating real overlay sinks.
-    monkeypatch.setattr(QGuiApplication, "platformName", lambda: "xcb")
+    monkeypatch.setattr(QGuiApplication, "platformName", staticmethod(lambda: "xcb"))
 
 # ---------------------------------------------------------------------------
 # Stubs
@@ -442,7 +442,7 @@ def test_capabilities_reason_never_leaks_paths(monkeypatch, qtbot):
 def test_unsupported_qt_platform_uses_frames_without_sending_handle(monkeypatch, qtbot, platform):
     from neurowatch.ipc.viewer_client import ViewerUnavailableError
 
-    monkeypatch.setattr(QGuiApplication, "platformName", lambda: platform)
+    monkeypatch.setattr(QGuiApplication, "platformName", staticmethod(lambda: platform))
     fake_reader = _stub_frame_reader(monkeypatch)
     ipc = _StubIpc(available=True)
     client = NativeViewerClient(ipc=ipc)
@@ -493,7 +493,7 @@ def test_wayland_and_xwayland_never_create_native_surfaces(
 ):
     from neurowatch.widgets import video_wall as video_wall_module
 
-    monkeypatch.setattr(QGuiApplication, "platformName", lambda: platform)
+    monkeypatch.setattr(QGuiApplication, "platformName", staticmethod(lambda: platform))
     fake_reader = _stub_frame_reader(monkeypatch)
     created_surfaces: list[object] = []
     real_surface = video_wall_module.NativeViewerSurface

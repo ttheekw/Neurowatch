@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import datetime
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from PySide6.QtCore import QPointF, QSize, Qt
@@ -183,6 +183,44 @@ def test_a_press_away_from_the_handles_seeks_as_before(qtbot):
     assert timeline.trim() == (T0 + 60_000, T0 + 300_000)
 
 
+def test_trim_handles_stay_below_the_date_header_on_multi_day_ranges(qtbot):
+    from PySide6.QtGui import QMouseEvent
+
+    start = int(datetime.datetime(2025, 12, 31, 23).timestamp() * 1000)
+    timeline = TrimTimeline()
+    qtbot.addWidget(timeline)
+    timeline.resize(1000, 200)
+    timeline.set_range(start, start + 8 * 3_600_000)
+    timeline.set_camera_rows(
+        [{"label": "Gate", "segments": [{"start_ms": start, "end_ms": start + 8 * 3_600_000}]}]
+    )
+    original_start, original_end = start + 30 * 60_000, start + 150 * 60_000
+    timeline.set_trim(original_start, original_end)
+    timeline.show()
+    qtbot.waitExposed(timeline)
+    x = timeline.handle_x(START)
+    assert x is not None
+    assert timeline._handle_at(x, timeline.ruler_height() - 1) is None
+    y = timeline.ruler_height() + 10
+    assert timeline._handle_at(x, y) == START
+    seeks: list[int] = []
+    timeline.seek_requested.connect(seeks.append)
+    qtbot.mousePress(timeline, Qt.MouseButton.LeftButton, pos=QPointF(x, y).toPoint())
+    move = QMouseEvent(
+        QMouseEvent.Type.MouseMove,
+        QPointF(x + 40, y),
+        QPointF(x + 40, y),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    timeline.mouseMoveEvent(move)
+    qtbot.mouseRelease(timeline, Qt.MouseButton.LeftButton, pos=QPointF(x + 40, y).toPoint())
+    moved_start, moved_end = timeline.trim()
+    assert moved_start > original_start and moved_end == original_end
+    assert seeks == [moved_start]
+
+
 # ---------------------------------------------------------------------------
 # Dialog
 # ---------------------------------------------------------------------------
@@ -202,7 +240,7 @@ class _Worker:
 
 
 class _Reader:
-    instances: list[_Reader] = []
+    instances: ClassVar[list[_Reader]] = []
 
     def __init__(self, shm_key: str, max_emit_fps: float | None = None) -> None:
         self.shm_key = shm_key
@@ -268,6 +306,74 @@ def _load(dlg: ExportVideoDialog, segments: list[dict]) -> None:
 
 def _minute(ms: int) -> int:
     return ms - ms % 60_000
+
+
+def test_preview_scrubbing_does_not_queue_every_obsolete_seek(dialog, monkeypatch):
+    dialog._session_id = "preview"
+    monkeypatch.setattr(dialog, "_drain_controls", lambda: None)
+    for at in range(1000):
+        dialog._control("playback.seek", ts_ms=at)
+    assert dialog._controls == [("playback.seek", {"session_id": "preview", "ts_ms": 999})]
+    dialog._control("playback.set_playing", playing=False)
+    dialog._control("playback.seek", ts_ms=1000)
+    assert len(dialog._controls) == 3
+
+
+def test_event_preset_loads_and_trims_without_starting_export(dialog):
+    from neurowatch.models.events import Event
+
+    event = Event(31, "motion", "cam-b", T0 + 120_000, T0 + 125_000)
+    dialog.load_event(event, now_ms=T0 + 600_000)
+    params, loaded = dialog.calls.last("playback.get_timeline")
+    assert params["camera_id"] == "cam-b"
+    assert params["start_ms"] <= event.start_ms - 10_000
+    assert params["end_ms"] >= event.end_ms + 15_000
+    loaded([[{"start_ms": T0 + 115_000, "end_ms": T0 + 132_000}]])
+    assert dialog.clip() == (T0 + 115_000, T0 + 132_000)
+    assert "adjusted" in dialog.status_label.text().lower()
+    assert "export.start" not in dialog.calls.methods()
+    assert dialog.export_button.isEnabled()
+
+
+def test_event_preset_does_not_select_non_overlapping_recordings(dialog):
+    from neurowatch.models.events import Event
+
+    dialog.load_event(Event(32, "motion", "cam-b", T0 + 120_000, T0 + 125_000), now_ms=T0 + 600_000)
+    _, loaded = dialog.calls.last("playback.get_timeline")
+    loaded([[{"start_ms": T0 + 145_000, "end_ms": T0 + 155_000}]])
+    assert not dialog.export_button.isEnabled()
+    assert "event" in dialog.status_label.text().lower()
+
+
+def test_event_preset_preserves_camera_zero_padding_and_manual_source_selection(dialog):
+    from neurowatch.models.events import Event
+
+    camera = dialog._cameras[1]
+    camera.recording.event_pre_sec = 0
+    camera.recording.event_post_sec = 0
+    event = Event(33, "motion", "cam-b", T0 + 120_000, T0 + 125_000)
+    dialog.load_event(event, now_ms=T0 + 600_000)
+    _, loaded = dialog.calls.last("playback.get_timeline")
+    loaded([[{"start_ms": T0, "end_ms": T0 + 600_000}]])
+    assert dialog.clip() == (event.start_ms, event.end_ms)
+    dialog.camera_combo.setCurrentIndex(0)
+    dialog._on_load()
+    _, loaded = dialog.calls.last("playback.get_timeline")
+    loaded([[{"start_ms": T0 + 110_000, "end_ms": T0 + 160_000}]])
+    assert dialog.clip() == (T0 + 110_000, T0 + 160_000)
+    assert "export.start" not in dialog.calls.methods()
+
+
+def test_manual_reload_after_event_preset_can_choose_other_footage(dialog):
+    from neurowatch.models.events import Event
+
+    dialog.load_event(Event(34, "motion", "cam-b", T0 + 120_000, T0 + 125_000), now_ms=T0 + 600_000)
+    _, loaded = dialog.calls.last("playback.get_timeline")
+    loaded([[{"start_ms": T0 + 110_000, "end_ms": T0 + 145_000}]])
+    dialog._on_load()
+    _, loaded = dialog.calls.last("playback.get_timeline")
+    loaded([[{"start_ms": T0 + 145_000, "end_ms": T0 + 155_000}]])
+    assert dialog.clip() == (T0 + 145_000, T0 + 155_000)
 
 
 def test_loading_shows_the_recordings_and_selects_all_of_them(dialog):
@@ -527,3 +633,45 @@ def test_a_backwards_range_says_which_times_it_compared(dialog):
     assert "end (" in text and "start (" in text
     assert dialog.to_edit.dateTime().toString("yyyy") in text
     assert "playback.get_timeline" not in dialog.calls.methods()
+
+
+def test_timelapse_uses_shared_export_jobs_and_freezes_sampling_controls(
+    dialog, monkeypatch, tmp_path
+):
+    start = _minute(T0)
+    _load(dialog, [{"start_ms": start, "end_ms": start + 600_000}])
+    dialog.export_mode.setCurrentIndex(dialog.export_mode.findData("timelapse"))
+    dialog.sample_interval.setValue(5)
+    dialog.output_fps.setValue(10)
+    assert "silent MP4" in dialog.timelapse_hint.text()
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", lambda *a: (str(tmp_path / "timelapse.mp4"), "")
+    )
+    dialog.export_button.click()
+    params, done = dialog.calls.last("export.start")
+    assert params["timelapse"] == {"interval_sec": 5, "fps": 10}
+    assert not dialog.output_fps.isEnabled()
+    done(
+        [
+            {
+                "job_id": "j",
+                "state": "done",
+                "progress": 1,
+                "path": params["path"],
+                "start_ms": start,
+                "end_ms": start + 600_000,
+                "duration_ms": 12_000,
+                "audio": False,
+            }
+        ]
+    )
+    assert dialog.output_fps.isEnabled()
+    assert dialog.show_button.isVisibleTo(dialog)
+
+
+def test_timelapse_range_limit_is_independent_of_normal_video_and_caps_picture_count():
+    assert clip_export.check_timelapse(0, 48 * 3_600_000, 10, 25) is None
+    assert clip_export.check_clip(0, 48 * 3_600_000)
+    assert clip_export.check_timelapse(0, 1000, 0, 25)
+    assert clip_export.check_timelapse(0, 1000, 10, 61)
+    assert clip_export.check_timelapse(0, 31 * clip_export.MAX_CLIP_MS, 1, 25)

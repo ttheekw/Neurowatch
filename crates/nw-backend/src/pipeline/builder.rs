@@ -80,6 +80,28 @@ pub fn rtsp_pipeline_str(config: &CameraConfig, hwaccel: HwAccelKind) -> String 
     )
 }
 
+/// The desktop view's `appsrc` when it decodes a shared camera connection
+/// (`crate::streams`): the view pushes the hub's parsed units here.
+pub(crate) const VIEW_INPUT: &str = "view_src";
+
+/// Whether a desktop view of `url` takes its pictures from the camera's
+/// shared connection: RTSP and RTMP cameras. A file keeps looping on its own
+/// pipeline; MJPEG over HTTP and V4L2 devices keep theirs.
+pub fn shared_view_supported(url: &str) -> bool {
+    url.starts_with("rtsp://") || url.starts_with("rtsps://") || url.starts_with("rtmp://")
+}
+
+/// A desktop view decoding units from a shared camera connection: the same
+/// decode and conversion tail as [`rtsp_pipeline_str`], fed by an `appsrc`.
+pub fn shared_view_pipeline_str(hwaccel: HwAccelKind) -> String {
+    let converter = super::hwaccel::color_converter(hwaccel);
+    format!(
+        "appsrc name={VIEW_INPUT} format=time is-live=true do-timestamp=false block=false max-bytes=0 ! \
+         decodebin ! {converter} ! video/x-raw,format=RGB ! \
+         appsink name=frame_sink max-buffers=2 drop=true sync=false emit-signals=true"
+    )
+}
+
 pub fn mjpeg_pipeline_str(config: &CameraConfig, _hwaccel: HwAccelKind) -> String {
     let effective = url_with_credentials_str(
         &config.url,
@@ -176,6 +198,13 @@ pub(crate) fn recording_location(storage_path: &str, cam_id: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
+    recording_location_at(storage_path, cam_id, epoch_ms)
+}
+
+/// A recording run's file pattern for a run whose timestamp 0 is `epoch_ms`
+/// (wall clock): the index places each segment at the run's epoch plus the
+/// segment's own first timestamp (`recording::mkv_timing`).
+pub(crate) fn recording_location_at(storage_path: &str, cam_id: &str, epoch_ms: u128) -> String {
     let sequence = RECORDING_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(
         "{}/{cam_id}_{epoch_ms}_{sequence}_%05d.mkv",
@@ -199,6 +228,11 @@ pub(crate) const RECORDING_STALL_NS: u64 = 10_000_000_000;
 /// Memory bound of that wait: 10 s of a 50 Mbit/s stream.
 const RECORDING_QUEUE_BYTES: u64 = 64 * 1024 * 1024;
 const RECORDING_AUDIO_QUEUE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The recording's video input when it records a shared camera connection
+/// (`crate::streams`); `RECORDING_AUDIO_INPUT` takes its sound.
+pub(crate) const RECORDING_VIDEO_INPUT: &str = "recording_video_in";
+pub(crate) const RECORDING_AUDIO_INPUT: &str = "recording_audio_in";
 
 /// The writer end of a recording: `ingest_tap` (where the recorder counts
 /// access units and reads codec and size), then disk I/O on its own thread.
@@ -298,6 +332,34 @@ pub fn encoded_recording_pipeline(
         "{head} ! {}{audio}",
         recording_tail(&location, segment_minutes, paced)
     ))
+}
+
+/// Record units from a shared camera connection: the recorder pushes the
+/// camera's parsed units (as they arrived, never decoded) into `appsrc`s in
+/// front of the same writer end as [`encoded_recording_pipeline`]. Caps and
+/// timestamps are set by the recorder.
+pub(crate) fn shared_recording_pipeline(
+    location: &str,
+    segment_minutes: u32,
+    with_audio: bool,
+) -> String {
+    let input = |name: &str| {
+        format!("appsrc name={name} format=time is-live=true do-timestamp=false block=false max-bytes=0")
+    };
+    let audio = if with_audio {
+        format!(
+            " {} ! queue max-size-buffers=0 max-size-time={RECORDING_STALL_NS} \
+                  max-size-bytes={RECORDING_AUDIO_QUEUE_BYTES} ! {RECORDING_MUX}.audio_0",
+            input(RECORDING_AUDIO_INPUT)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{} ! {}{audio}",
+        input(RECORDING_VIDEO_INPUT),
+        recording_tail(location, segment_minutes, false)
+    )
 }
 
 /// Parse the pipeline string and return a `gstreamer::Pipeline`.

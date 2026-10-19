@@ -15,7 +15,7 @@ from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent
 from PySide6.QtWidgets import QWidget
 
-from neurowatch.widgets.playback_timeline import _RULER_H, _SCROLLBAR_H, PlaybackTimeline
+from neurowatch.widgets.playback_timeline import _SCROLLBAR_H, PlaybackTimeline
 
 _OUTSIDE = QColor(0, 0, 0, 120)
 _HANDLE = QColor(250, 204, 21)  # amber
@@ -85,7 +85,8 @@ class TrimTimeline(PlaybackTimeline):
         painter = QPainter(self)
         track_left, track_right, _ = self._track_bounds()
         track_h = self._track_height()
-        top, height = _RULER_H, max(1, track_h - _RULER_H)
+        top = self.ruler_height()
+        height = max(1, track_h - top)
         start_x = max(track_left, min(track_right, self._ms_to_x(self._trim[0])))
         end_x = max(track_left, min(track_right, self._ms_to_x(self._trim[1])))
         if start_x > track_left:
@@ -161,7 +162,7 @@ class TrimTimeline(PlaybackTimeline):
 
     def _handle_at(self, x: float, y: float) -> str | None:
         """The handle under (x, y), the nearer one when both are close."""
-        if self._trim is None or not _RULER_H <= y <= self._track_height():
+        if self._trim is None or not self.ruler_height() <= y <= self._track_height():
             return None
         best: tuple[float, str] | None = None
         for which in (END, START):  # END first: at a zero gap, drag the end out

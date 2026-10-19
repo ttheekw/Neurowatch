@@ -159,19 +159,15 @@ def test_windows_job_builds_x86_64_zip(workflow: str) -> None:
     assert "msvc-x86_64" in job
 
 
-def test_official_builds_add_the_cloud_only_with_its_secret(workflow: str) -> None:
-    # Forks have no NEUROWATCH_CLOUD_TOKEN and build the open-source app.
-    for name in ("package-linux", "package-windows"):
-        job = _jobs(workflow)[name]
-        assert "OFFICIAL_BUILD: ${{ secrets.NEUROWATCH_CLOUD_TOKEN != '' }}" in job
-        for step in (
-            "Check out NeuroWatch Cloud (official builds)",
-            "Build with NeuroWatch Cloud (official builds)",
-        ):
-            following = job[job.index(step) :].splitlines()[1].strip()
-            assert following == "if: env.OFFICIAL_BUILD == 'true'", f"{name}: {step}"
-        assert "NW_BACKEND_PACKAGE=nw-backend-cloud" in job
-        assert "NW_UI_EXTENSION_MODULE=neurowatch_cloud" in job
+def test_release_builds_include_the_cloud_with_its_address(workflow: str) -> None:
+    # The cloud is part of this repository: no private checkout. Its address
+    # is fixed in the backend; a build takes no cloud setting.
+    assert "NEUROWATCH_CLOUD_TOKEN" not in workflow
+    assert "NEUROWATCH_CLOUD_URL" not in workflow and "NW_CLOUD_ENDPOINT" not in workflow
+    link = (ROOT / "crates/nw-backend/src/cloud/link/mod.rs").read_text()
+    assert 'pub const NEUROWATCH_CLOUD: &str = "https://neurowatch.app";' in link
+    linux = _jobs(workflow)["package-linux"]
+    assert "llvm.sh 21" in linux and "CXX=clang++-21" in linux
 
 
 def test_publish_gathers_artifacts_checksums_and_uploads(workflow: str) -> None:
@@ -257,9 +253,10 @@ def test_linux_script_builds_from_root_pyproject_with_pyinstaller() -> None:
     assert "--copy-metadata neurowatch" in text
     assert "cargo build" in text and '-p "${NW_BACKEND_PACKAGE:-nw-backend}"' in text
     assert 'BACKEND_MANIFEST="${NW_BACKEND_MANIFEST:-$ROOT/Cargo.toml}"' in text
-    # A UI extension is bundled with its entry-point metadata, so it is found.
-    assert '--copy-metadata "$NW_UI_EXTENSION_DIST"' in text
-    assert '--collect-submodules "$NW_UI_EXTENSION_MODULE"' in text
+    # The cloud's UI is bundled; its entry point is in the neurowatch metadata.
+    # The cloud's UI modules, some imported only when used.
+    assert "--collect-submodules neurowatch.cloud" in text
+    assert "NW_UI_EXTENSION" not in text and "NW_EXTRA_LICENSE_FILE" not in text
     assert "packages are built natively" in text
 
 
@@ -295,7 +292,7 @@ def test_linux_packages_carry_the_logo_and_software_centre_description() -> None
     assert 'APP_ID="io.github.ttheekw.neurowatch"' in text
     metainfo = (linux / "neurowatch.metainfo.xml").read_text()
     assert "<id>io.github.ttheekw.neurowatch</id>" in metainfo
-    assert "<launchable type=\"desktop-id\">neurowatch.desktop</launchable>" in metainfo
+    assert '<launchable type="desktop-id">neurowatch.desktop</launchable>' in metainfo
     assert '<icon type="stock">neurowatch</icon>' in metainfo
     # The build fills in its own licence and release.
     assert "<project_license>$PKG_LICENSE</project_license>" in text
@@ -440,7 +437,9 @@ def test_windows_exe_and_installer_carry_the_app_logo() -> None:
     assert "SetupIconFile={#AppIcon}" in installer
     assert "UninstallDisplayIcon={app}\\app\\neurowatch-ui\\neurowatch-ui.exe" in installer
     # The taskbar groups the running app under its shortcut (main.WINDOWS_APP_ID).
-    shortcuts = [line for line in installer.splitlines() if "neurowatch-ui.exe\"; WorkingDir" in line]
+    shortcuts = [
+        line for line in installer.splitlines() if 'neurowatch-ui.exe"; WorkingDir' in line
+    ]
     assert shortcuts and all('AppUserModelID: "NeuroWatch.NeuroWatch"' in s for s in shortcuts)
     main = (ROOT / "ui/neurowatch/main.py").read_text()
     assert 'WINDOWS_APP_ID = "NeuroWatch.NeuroWatch"' in main
@@ -484,23 +483,222 @@ def test_the_bundled_nettle_3_reaches_the_package() -> None:
 
 def test_smoke_check_requires_a_working_cloud_in_official_builds() -> None:
     # A fresh install once switched the cloud off, and Windows (TCP) never
-    # served it: official bundles must answer cloud.status with the user's token.
+    # served it: every bundle must answer cloud.status with the user's token,
+    # with the cloud on and linking to NeuroWatch Cloud.
     smoke = (ROOT / "scripts/smoke_release.py").read_text()
-    assert 'if (bundle / "LICENSE-EXTENSIONS").is_file():' in smoke
+    assert "LICENSE-EXTENSIONS" not in smoke
     assert "check_cloud(port, data_dirs)" in smoke
+    assert 'NEUROWATCH_CLOUD = "https://neurowatch.app"' in smoke
     assert 'rpc(port, "cloud.status", auth=ipc_token(port, data_dirs))' in smoke
     assert 'assert status.get("cloud_configured") is True, status' in smoke
 
 
-def test_readme_download_links_name_files_every_release_publishes(workflow: str) -> None:
-    # The buttons use /releases/latest/download/<name>: the publish job must
-    # make each <name>, and mark the release Latest (GitHub's "latest" skips
-    # pre-releases).
+def test_readme_download_links_open_the_downloads_page_at_a_published_package(
+    workflow: str,
+) -> None:
+    # Every download link opens https://neurowatch.app/downloads (free and
+    # Unlimited) at a package the manifest describes; none bypasses it.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "release_manifest", ROOT / "scripts/release_manifest.py"
+    )
+    assert spec and spec.loader
+    manifest = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(manifest)
+    packages = {(platform, arch, kind) for _, platform, arch, kind, _ in manifest._PACKAGES}
+
     readme = (ROOT / "README.md").read_text()
-    linked = set(re.findall(r"releases/latest/download/([A-Za-z0-9_.\-]+)", readme))
-    published = set(re.findall(r"\]=(neurowatch[A-Za-z0-9_.\-]+)$", workflow, re.MULTILINE))
-    assert linked and linked <= published, linked - published
-    assert "neurowatch-windows-x86_64-setup.exe" in linked and "neurowatch_amd64.deb" in linked
+    assert "releases/latest/download/" not in readme
+    linked = set(
+        re.findall(
+            r"https://neurowatch\.app/downloads\?version=latest"
+            r"&platform=(\w+)&arch=(\w+)&kind=(\w+)",
+            readme,
+        )
+    )
+    assert linked and linked <= packages, linked - packages
+    assert ("windows", "x86_64", "installer") in linked
+    assert ("linux", "x86_64", "deb") in linked
+    # Version-free copies stay on GitHub for older links; the release stays Latest.
     job = workflow[workflow.index("  publish:") :]
+    assert '--notes "' in job and "neurowatch.app/downloads?version=$RELEASE_TAG" in job
     assert "--latest" in job and "--prerelease" not in job
     assert job.index("Add version-free download names") < job.index("Generate SHA256SUMS")
+
+
+def test_linux_packages_give_users_the_graphics_card_from_boot() -> None:
+    # A recorder started at boot (before sign-in) decodes on the CPU unless
+    # its user is in `render`; every native package adds them, and removal
+    # takes back only what it added.
+    script = (ROOT / "scripts/package_release_linux.sh").read_text()
+    access = (ROOT / "scripts/installer/linux/gpu-access.sh").read_text()
+    assert 'GPU_ACCESS="$(cat "$LINUX_FILES/gpu-access.sh")"' in script
+    assert "configure) neurowatch_grant_gpu_access" in script
+    assert "remove|purge) neurowatch_revoke_gpu_access" in script
+    assert '"$root/DEBIAN/postinst"' in script and '"$root/DEBIAN/postrm"' in script
+    assert "%post\n$GPU_ACCESS\nneurowatch_grant_gpu_access" in script
+    assert "%postun\n$GPU_ACCESS" in script and '[ "\\$1" -eq 0 ]' in script
+    assert "post_install() {" in script and "post_remove() {" in script
+    assert ".PKGINFO .INSTALL .MTREE opt usr" in script
+    assert 'NEUROWATCH_GPU_GROUPS="render video"' in access
+    assert 'usermod -aG "$group" "$user"' in access and 'gpasswd -d "$user" "$group"' in access
+    assert "/var/lib/neurowatch/device-group-users" in access
+    result = subprocess.run(["sh", "-n", str(ROOT / "scripts/installer/linux/gpu-access.sh")])
+    assert result.returncode == 0
+
+
+def test_every_package_is_built_free_and_unlimited(workflow: str) -> None:
+    # Free builds (16 cameras) go to GitHub Releases; unlimited ones only to
+    # the private downloads bucket, never to the public release.
+    jobs = _jobs(workflow)
+    for name in ("package-linux", "package-windows"):
+        assert "edition: [free, unlimited]" in jobs[name]
+    assert '--edition "${{ matrix.edition }}"' in jobs["package-linux"]
+    assert '-Edition "${{ matrix.edition }}"' in jobs["package-windows"]
+    assert "pattern: release-*-free" in jobs["publish"]
+    assert "release-*-unlimited" not in jobs["publish"]
+    downloads = jobs["publish-downloads"]
+    assert "pattern: release-*-unlimited" not in downloads
+    assert "Gather the privately staged Unlimited packages" in downloads
+    for name in ("package-linux", "package-windows"):
+        job = jobs[name]
+        upload = job[job.index("- uses: actions/upload-artifact@") :]
+        assert "if: matrix.edition == 'free'" in upload.split("with:", 1)[0]
+        assert "Stage Unlimited packages privately" in job
+        assert '"s3://$S3_BUCKET/staging/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/unlimited/"' in job
+        assert "secrets.DOWNLOADS_S3_SECRET_ACCESS_KEY" in job
+    assert "secrets.DOWNLOADS_S3_BUCKET" in downloads
+    assert "scripts/release_manifest.py" in downloads
+    order = [
+        downloads.index('"$bucket/$RELEASE_TAG/unlimited/"'),
+        downloads.index('"$bucket/$RELEASE_TAG/manifest.json"'),
+        downloads.index('dist/index.json "$bucket/index.json"'),
+    ]
+    assert order == sorted(order), "the index is uploaded last"
+    linux = (ROOT / "scripts/package_release_linux.sh").read_text()
+    assert "unlimited) BACKEND_FEATURES=(--features nw-backend/unlimited)" in linux
+    windows = (ROOT / "scripts/package_windows.ps1").read_text()
+    assert "$CargoArgs += @('--features', 'nw-backend/unlimited')" in windows
+    assert workflow.count("NW_EXPECT_EDITION: ${{ matrix.edition }}") == 2
+    smoke = (ROOT / "scripts/smoke_release.py").read_text()
+    assert 'assert status.get("edition") == expected_edition, status' in smoke
+    cargo = (ROOT / "crates/nw-backend/Cargo.toml").read_text()
+    assert "\nunlimited = []" in cargo
+
+
+@pytest.mark.parametrize("job_name", ["package-linux", "package-windows"])
+@pytest.mark.parametrize(
+    ("repository", "configured", "expected_code", "uploaded"),
+    [
+        ("ttheekw/Neurowatch", False, 1, False),
+        ("someone/fork", False, 0, False),
+        ("ttheekw/Neurowatch", True, 0, True),
+    ],
+)
+def test_unlimited_staging_uses_private_storage_or_refuses_to_publish(
+    workflow: str,
+    tmp_path: Path,
+    job_name: str,
+    repository: str,
+    configured: bool,
+    expected_code: int,
+    uploaded: bool,
+) -> None:
+    import os
+    import textwrap
+
+    job = _jobs(workflow)[job_name]
+    step = job.split("- name: Stage Unlimited packages privately", 1)[1]
+    script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+    fake_aws = tmp_path / "aws"
+    fake_aws.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$NW_TEST_AWS_LOG"\n')
+    fake_aws.chmod(0o755)
+    recorded = tmp_path / "aws-arguments"
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": f"{tmp_path}{os.pathsep}{os.defpath}",
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_RUN_ID": "123",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "AWS_ACCESS_KEY_ID": "example" if configured else "",
+            "AWS_SECRET_ACCESS_KEY": "example" if configured else "",
+            "S3_BUCKET": "private-downloads" if configured else "",
+            "S3_ENDPOINT": "https://objects.example.test",
+            "NW_TEST_AWS_LOG": str(recorded),
+        },
+    )
+    assert result.returncode == expected_code, result.stderr
+    assert recorded.exists() is uploaded
+    if uploaded:
+        arguments = recorded.read_text().splitlines()
+        assert arguments[-1] == "s3://private-downloads/staging/123/2/unlimited/"
+        assert arguments[:2] == ["--endpoint-url", "https://objects.example.test"]
+
+
+def test_the_release_manifest_lists_both_editions(tmp_path: Path) -> None:
+    import importlib.util
+    import json
+
+    spec = importlib.util.spec_from_file_location(
+        "release_manifest", ROOT / "scripts/release_manifest.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    free, unlimited = tmp_path / "free", tmp_path / "unlimited"
+    for folder in (free, unlimited):
+        folder.mkdir()
+        for name in (
+            "neurowatch-v1.2.3-windows-x86_64-setup.exe",
+            "neurowatch_1.2.3_amd64.deb",
+            "neurowatch-1.2.3-1.aarch64.rpm",
+            "neurowatch-1.2.3-linux-arm64.tar.gz",
+            "neurowatch_amd64.deb",  # a version-free README copy: not listed
+            "SHA256SUMS",
+        ):
+            (folder / name).write_bytes(name.encode())
+    out = tmp_path / "manifest.json"
+    assert (
+        module.main(
+            [
+                "--version",
+                "v1.2.3",
+                "--repo",
+                "ttheekw/Neurowatch",
+                "--free",
+                str(free),
+                "--unlimited",
+                str(unlimited),
+                "--out",
+                str(out),
+            ]
+        )
+        == 0
+    )
+    data = json.loads(out.read_text())
+    assert data["version"] == "v1.2.3" and data["prerelease"] is False
+    names = {entry["name"] for entry in data["free"]}
+    assert "neurowatch_amd64.deb" not in names and "SHA256SUMS" not in names
+    assert len(data["free"]) == len(data["unlimited"]) == 4
+    deb = next(e for e in data["free"] if e["kind"] == "deb")
+    assert deb["url"] == (
+        "https://github.com/ttheekw/Neurowatch/releases/download/v1.2.3/neurowatch_1.2.3_amd64.deb"
+    )
+    assert (deb["platform"], deb["arch"]) == ("linux", "x86_64")
+    rpm = next(e for e in data["unlimited"] if e["kind"] == "rpm")
+    assert rpm["key"] == "releases/v1.2.3/unlimited/neurowatch-1.2.3-1.aarch64.rpm"
+    assert "url" not in rpm, "unlimited packages are never public links"
+    assert len(rpm["sha256"]) == 64
+
+    # The index keeps every version, newest first; republishing replaces.
+    older = {"version": "v1.2.2", "published_at": "2020-01-01T00:00:00Z"}
+    index = module.merged_index({"versions": [older, {**data, "free": []}]}, data)
+    assert [v["version"] for v in index["versions"]] == ["v1.2.3", "v1.2.2"]
+    assert index["versions"][0]["free"] == data["free"]
+    assert module.merged_index("garbage", data)["versions"] == [data]

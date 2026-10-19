@@ -71,6 +71,14 @@ fn snapshot_round_trips_through_json() {
     let reparsed: PerformanceSnapshot =
         serde_json::from_value(value.clone()).expect("snapshot deserializes");
     assert_eq!(reparsed, snap);
+    let mut legacy = value;
+    legacy["motion_decoders"] = json!(1);
+    legacy["motion"] = json!([{"camera_id":"motion-camera"}]);
+    let legacy: PerformanceSnapshot = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        legacy, snap,
+        "additive runtime diagnostics preserve the shared snapshot contract"
+    );
 }
 
 #[test]

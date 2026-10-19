@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QEvent, QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QContextMenuEvent,
@@ -28,6 +28,7 @@ from PySide6.QtGui import (
     QImage,
     QMouseEvent,
     QPainter,
+    QPainterPath,
     QPaintEvent,
     QPen,
     QPixmap,
@@ -92,8 +93,15 @@ _GRIP = QColor(226, 232, 240, 200)
 _GRIP_SHADOW = QColor(0, 0, 0, 150)
 
 # Recording indicator colours
+_MOTION_BG = QColor(234, 88, 12, 235)  # #ea580c — motion going on
+_MOTION_TEXT = QColor(255, 247, 237)
+_MOTION_LABEL = "MOTION"
 _REC_DOT_RED = QColor(239, 68, 68)  # #ef4444 — recording
 _REC_DOT_AMBER = QColor(245, 158, 11)  # #f59e0b — scheduled
+
+_TOP_MARGIN = 4
+_TOP_HEIGHT = 24
+_TOP_GAP = 4
 
 
 #: The camera's audio as a tile shows it (``CellWidget.set_audio``).
@@ -115,11 +123,15 @@ class CellWidget(QWidget):
     single_click_requested = Signal(str)  # cam_id (single left-click)
     add_camera_requested = Signal()
     camera_drop_requested = Signal(str)
+    ptz_requested = Signal(str)
+    bookmark_requested = Signal(str)  # cam_id: mark this moment
+    talk_requested = Signal(str)  # cam_id: talk through its speaker
     edit_requested = Signal(str)  # cam_id
     remove_requested = Signal(str)  # cam_id
     stream_requested = Signal(str, object)  # cam_id, stream id or None for Auto
     # The speaker (or its menu item) was clicked: hear this camera, or stop.
     audio_toggle_requested = Signal(str)  # cam_id
+    motion_acknowledge_requested = Signal(str)  # cam_id
     # Wall layout editing. Positions are global so the wall can follow a
     # drag that leaves this tile (the tile keeps the mouse grab meanwhile).
     move_drag_started = Signal(str, QPoint)  # cam_id, global pos
@@ -148,11 +160,17 @@ class CellWidget(QWidget):
         self._fps: float | None = None
         self._aspect: str = "free"  # "free" | "16:9" | "4:3"
         self._recording_state: str = "idle"  # "idle" | "recording" | "scheduled"
+        # Motion (or other movement the camera reports) going on now.
+        self._motion = False
+        self._motion_pending = False
+        self._motion_alert_click_rect = QRect()
+        self._motion_alert_click_at = -1.0
         self._mode: str = "live"  # "live" | "playback"
         # Stream picked for this view from the context menu; None = Auto.
         self._stream_choice: str | None = None
         # slot -> (what it shows, rendered strip); see _cached_strip().
         self._overlay_cache: dict[str, tuple[tuple[object, ...], QPixmap]] = {}
+        self._top_layout_cache: tuple[tuple[object, ...], dict[str, QRect]] | None = None
         self._overlay_ts_ms: int | None = None
         # Optional native VideoOverlay surface — populated by VideoWallWidget
         # when the backend's native viewer runtime is available.  When set,
@@ -218,7 +236,80 @@ class CellWidget(QWidget):
         self._fps = None
         self._overlay_ts_ms = None
         self._audio = AUDIO_NONE
+        self._motion = False
+        self._motion_pending = False
+        self._motion_alert_click_rect = QRect()
+        self._refresh_tooltip()
         self.update()
+
+    def set_motion(self, active: bool) -> None:
+        """Show the MOTION badge beside the camera's name while the camera
+        reports motion (or intrusion, a line crossed)."""
+        if active != self._motion:
+            self._motion = active
+            self.update()
+
+    @property
+    def motion_active(self) -> bool:
+        return self._motion
+
+    def set_motion_pending(self, pending: bool) -> None:
+        """Keep a separate motion alert visible until the user clears it."""
+        if pending != self._motion_pending:
+            self._motion_pending = pending
+            self._refresh_tooltip()
+            self.update()
+
+    @property
+    def motion_pending(self) -> bool:
+        return self._motion_pending
+
+    def motion_alert_rect(self) -> QRect:
+        """The alert stays in the top strip, also over native/GPU video."""
+        if not self._motion_pending or self._camera is None:
+            return QRect()
+        return self._top_control_rects().get("motion", QRect())
+
+    def _top_control_rects(self) -> dict[str, QRect]:
+        """One common height and center line for the tile's overlay buttons."""
+        key = (
+            self.width(),
+            self._audio,
+            self._motion_pending,
+            self.zoom_supported,
+            self._zoom,
+            self.devicePixelRatioF(),
+        )
+        if self._top_layout_cache is not None and self._top_layout_cache[0] == key:
+            return self._top_layout_cache[1]
+        controls: list[tuple[str, int]] = []
+        if self._audio != AUDIO_NONE:
+            controls.append(("audio", _TOP_HEIGHT))
+        if self._motion_pending:
+            controls.append(("motion", _TOP_HEIGHT))
+        if self.zoom_supported and self._zoom > 1.0:
+            text = f"{self._zoom:.1f}× ↺"
+            available = self.width() - 2 * _TOP_MARGIN - _TOP_HEIGHT
+            available -= sum(width + _TOP_GAP for _, width in controls)
+            controls.append(
+                (
+                    "zoom",
+                    max(
+                        _TOP_HEIGHT,
+                        min(
+                            available,
+                            QFontMetrics(_overlay_fonts()["info"]).horizontalAdvance(text) + 12,
+                        ),
+                    ),
+                )
+            )
+        right = self.width() - _TOP_MARGIN
+        rects: dict[str, QRect] = {}
+        for name, width in controls:
+            rects[name] = QRect(right - width, _TOP_MARGIN, width, _TOP_HEIGHT)
+            right -= width + _TOP_GAP
+        self._top_layout_cache = (key, rects)
+        return rects
 
     def set_audio(self, state: str) -> None:
         """Show the speaker: ``AUDIO_NONE`` (camera without audio, no
@@ -406,6 +497,8 @@ class CellWidget(QWidget):
             hint = f"{hint}\n{_LAYOUT_HINT}"
         if getattr(self, "_audio", AUDIO_NONE) != AUDIO_NONE:
             hint = f"{hint}\nSpeaker (top right): hear this camera"
+        if self._motion_pending:
+            hint = f"{hint}\nOrange motion alert (top right): click to acknowledge motion"
         self.setToolTip(hint)
 
     def _layout_native_surface(self) -> None:
@@ -414,7 +507,7 @@ class CellWidget(QWidget):
         rect = self.rect()
         # Reserve a slim top strip (badge/name) and a bottom strip
         # (timestamp/info) so Qt-painted overlays remain visible.
-        top_reserved = 24
+        top_reserved = _TOP_MARGIN * 2 + _TOP_HEIGHT
         bottom_reserved = 22
         avail_h = max(1, rect.height() - top_reserved - bottom_reserved)
         self._native_surface.setGeometry(
@@ -490,9 +583,9 @@ class CellWidget(QWidget):
 
             self._draw_name_label(painter, rect)
             self._draw_speaker(painter, rect)
+            self._draw_motion_alert(painter)
             self._draw_bottom_info(painter, rect)
             if self.zoom_supported and self._zoom > 1.0:
-                self._draw_zoom_badge(painter, rect)
                 self._zoom_reset_rect = self._draw_zoom_reset_btn(painter, rect)
             else:
                 self._zoom_reset_rect = QRect()
@@ -526,18 +619,26 @@ class CellWidget(QWidget):
         if (
             event.button() == Qt.MouseButton.LeftButton
             and self._camera is not None
+            and self.motion_alert_rect().contains(event.position().toPoint())
+        ):
+            self._motion_alert_click_rect = self.motion_alert_rect()
+            self._motion_alert_click_at = time.monotonic()
+            self.motion_acknowledge_requested.emit(self._camera.id)
+            event.accept()
+            return
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._camera is not None
             and self._audio != AUDIO_NONE
-            and self._audio_rect.contains(event.position().toPoint())
+            and self._top_control_rects().get("audio", QRect()).contains(event.position().toPoint())
         ):
             self.audio_toggle_requested.emit(self._camera.id)
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
             # Check zoom reset badge first
-            if (
-                self._zoom > 1.0
-                and not self._zoom_reset_rect.isNull()
-                and self._zoom_reset_rect.contains(event.position().toPoint())
+            if self._zoom > 1.0 and self._top_control_rects().get("zoom", QRect()).contains(
+                event.position().toPoint()
             ):
                 self._zoom = _ZOOM_MIN
                 self._pan = QPoint(0, 0)
@@ -673,6 +774,13 @@ class CellWidget(QWidget):
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if self.motion_alert_rect().contains(event.position().toPoint()) or (
+            time.monotonic() - self._motion_alert_click_at
+            <= QApplication.doubleClickInterval() / 1000
+            and self._motion_alert_click_rect.contains(event.position().toPoint())
+        ):
+            event.accept()
+            return
         if self._camera and event.button() == Qt.MouseButton.LeftButton:
             self.expand_requested.emit(self._camera.id)
             event.accept()
@@ -699,9 +807,17 @@ class CellWidget(QWidget):
                 text = "Listen" if live else "Play Audio"
             menu.addAction(text, lambda: self.audio_toggle_requested.emit(cam_id))
             menu.addSeparator()
-        menu.addAction("Edit Camera", lambda: self.edit_requested.emit(cam_id))
-        menu.addAction("Remove Camera", lambda: self.remove_requested.emit(cam_id))
-        menu.addSeparator()
+        from neurowatch.ipc.auth import may
+
+        if may("admin"):
+            menu.addAction("Edit Camera", lambda: self.edit_requested.emit(cam_id))
+            menu.addAction("Remove Camera", lambda: self.remove_requested.emit(cam_id))
+            menu.addSeparator()
+        if self._mode != "playback" and may("operator"):
+            # The dialog asks the camera what it can do (ptz.capabilities).
+            menu.addAction("PTZ Controls…", lambda: self.ptz_requested.emit(cam_id))
+            menu.addAction("Add Bookmark…", lambda: self.bookmark_requested.emit(cam_id))
+            menu.addAction("Talk…", lambda: self.talk_requested.emit(cam_id))
         self._add_stream_menu(menu, cam_id)
         self._add_tile_size_menu(menu, cam_id)
         if self.zoom_supported:
@@ -871,28 +987,61 @@ class CellWidget(QWidget):
         name = self._camera.name or "Camera"
         badge_label, badge_bg = self._badge()
         dpr = self.devicePixelRatioF()
-        key = (name, self._recording_state, badge_label, badge_bg.rgba(), dpr)
+        motion = self._motion
+        controls = self._top_control_rects()
+        right = min(
+            (box.left() - _TOP_GAP for box in controls.values()),
+            default=rect.right() - _TOP_MARGIN + 1,
+        )
+        max_width = max(1, right - _TOP_MARGIN)
+        key = (name, self._recording_state, badge_label, badge_bg.rgba(), motion, dpr, max_width)
         strip = self._cached_strip(
             "label",
             key,
             lambda: self._render_label_strip(
-                name, self._recording_state, badge_label, badge_bg, dpr
+                name, self._recording_state, badge_label, badge_bg, dpr, motion, max_width
             ),
         )
-        painter.drawPixmap(rect.left() + 2, rect.top() + 2, strip)
+        painter.drawPixmap(rect.left() + _TOP_MARGIN, rect.top() + _TOP_MARGIN, strip)
 
     def _render_label_strip(
-        self, name: str, recording_state: str, badge_label: str, badge_bg: QColor, dpr: float
+        self,
+        name: str,
+        recording_state: str,
+        badge_label: str,
+        badge_bg: QColor,
+        dpr: float,
+        motion: bool = False,
+        max_width: int | None = None,
     ) -> QPixmap:
         fonts = _overlay_fonts()
-        padding_x, padding_y = 6, 3
+        padding_x = 6
         fm = QFontMetrics(fonts["name"])
         text_w = fm.horizontalAdvance(name) + padding_x * 2
-        text_h = fm.height() + padding_y * 2
+        text_h = _TOP_HEIGHT
         dot = {"recording": _REC_DOT_RED, "scheduled": _REC_DOT_AMBER}.get(recording_state)
         dot_w = text_h + 1 if dot is not None else 0
         bw = QFontMetrics(fonts["badge"]).horizontalAdvance(badge_label) + 8
-        width = dot_w + text_w + 3 + bw
+        # Motion badge: a sensor glyph (dot and two waves) and the word.
+        glyph_w = 14
+        mw = QFontMetrics(fonts["badge"]).horizontalAdvance(_MOTION_LABEL) + glyph_w + 10
+        compact_motion = False
+        if max_width is not None:
+            if motion and max_width < dot_w + bw + mw + 6 + 24:
+                compact_motion = True
+                mw = _TOP_HEIGHT
+            if motion and max_width < dot_w + bw + mw + 6 + 12:
+                motion = False
+            fixed_width = dot_w + 3 + bw + (3 + mw if motion else 0)
+            available = max(0, max_width - fixed_width)
+            if available < text_w:
+                text_w = available
+                name = fm.elidedText(
+                    name, Qt.TextElideMode.ElideRight, max(0, text_w - 2 * padding_x)
+                )
+        width = dot_w + text_w + 3 + bw + (3 + mw if motion else 0)
+        if max_width is not None:
+            width = min(width, max_width)
 
         strip = QPixmap(max(1, round(width * dpr)), max(1, round(text_h * dpr)))
         strip.setDevicePixelRatio(dpr)
@@ -900,16 +1049,17 @@ class CellWidget(QWidget):
         painter = QPainter(strip)
         # Recording indicator dot — drawn before the name label
         if dot is not None:
-            painter.setPen(dot)
-            painter.setFont(fonts["dot"])
-            painter.drawText(QRect(0, 0, text_h, text_h), Qt.AlignmentFlag.AlignCenter, "●")
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(dot)
+            painter.drawEllipse(QPointF(text_h / 2, text_h / 2), 4, 4)
         # Name label background
         name_rect = QRect(dot_w, 0, text_w, text_h)
         painter.fillRect(name_rect, _NAME_BG)
         painter.setPen(_NAME_TEXT)
         painter.setFont(fonts["name"])
         painter.drawText(
-            name_rect.adjusted(padding_x, padding_y, -padding_x, -padding_y),
+            name_rect.adjusted(padding_x, 0, -padding_x, 0),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
             name,
         )
@@ -919,81 +1069,119 @@ class CellWidget(QWidget):
         painter.setPen(_LIVE_TEXT)
         painter.setFont(fonts["badge"])
         painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_label)
+        if motion:
+            mx = dot_w + text_w + 3 + bw + 3
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(_MOTION_BG)
+            painter.drawRoundedRect(QRect(mx, 0, mw, text_h), 3, 3)
+            cy = text_h / 2
+            painter.setBrush(_MOTION_TEXT)
+            painter.drawEllipse(QPointF(mx + 6, cy), 2, 2)
+            wave = QPen(_MOTION_TEXT, 1.4)
+            wave.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(wave)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawArc(QRectF(mx + 3, cy - 4, 8, 8), -50 * 16, 100 * 16)
+            painter.drawArc(QRectF(mx + 2, cy - 7, 13, 14), -50 * 16, 100 * 16)
+            painter.setPen(_MOTION_TEXT)
+            painter.setFont(fonts["badge"])
+            if not compact_motion:
+                painter.drawText(
+                    QRect(mx + glyph_w + 4, 0, mw - glyph_w - 6, text_h),
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                    _MOTION_LABEL,
+                )
         painter.end()
         return strip
+
+    def _draw_motion_alert(self, painter: QPainter) -> None:
+        box = self.motion_alert_rect()
+        if box.isNull():
+            return
+        self._draw_top_button(painter, "motion", "motion", box)
 
     def _draw_speaker(self, painter: QPainter, rect: QRect) -> None:
         """The audio button at the top right: a muted speaker (struck through)
         on a camera with audio, a green one with sound waves while it is
         heard. Click to hear this camera, or to stop."""
-        if self._audio == AUDIO_NONE or rect.width() < 90:
-            self._audio_rect = QRect()
+        self._audio_rect = self._top_control_rects().get("audio", QRect())
+        if self._audio_rect.isNull():
             return
-        scale = 1.2  # drawn on a 24×20 grid
-        box = QRect(rect.right() - 32, rect.top() + 3, round(24 * scale), round(20 * scale))
-        self._audio_rect = box
-        on = self._audio == AUDIO_ON
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.translate(box.topLeft())
-        painter.scale(scale, scale)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(22, 128, 61, 235) if on else QColor(0, 0, 0, 170))
-        painter.drawRoundedRect(QRect(0, 0, 24, 20), 4, 4)
-        colour = QColor(255, 255, 255) if on else QColor(225, 225, 235, 220)
-        x, y = 5, 10
-        body = QPolygon(
-            [
-                QPoint(x, y - 3),
-                QPoint(x + 3, y - 3),
-                QPoint(x + 7, y - 7),
-                QPoint(x + 7, y + 7),
-                QPoint(x + 3, y + 3),
-                QPoint(x, y + 3),
-            ]
+        self._draw_top_button(painter, "audio", f"audio:{self._audio}", self._audio_rect)
+
+    def _draw_top_button(self, painter: QPainter, slot: str, kind: str, box: QRect) -> None:
+        dpr = self.devicePixelRatioF()
+        strip = self._cached_strip(
+            slot,
+            (kind, box.width(), dpr),
+            lambda: self._render_top_button(kind, box.width(), dpr),
         )
-        painter.setBrush(colour)
-        painter.drawPolygon(body)
-        pen = QPen(colour, 1.6)
+        painter.drawPixmap(box.topLeft(), strip)
+
+    def _render_top_button(self, kind: str, width: int, dpr: float) -> QPixmap:
+        """Render vector outlines at the screen's native density, once per change."""
+        strip = QPixmap(max(1, round(width * dpr)), max(1, round(_TOP_HEIGHT * dpr)))
+        strip.setDevicePixelRatio(dpr)
+        strip.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(strip)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        on = kind == f"audio:{AUDIO_ON}"
+        background = (
+            _MOTION_BG
+            if kind == "motion"
+            else (QColor(22, 128, 61, 235) if on else QColor(0, 0, 0, 170))
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(background)
+        painter.drawRoundedRect(QRectF(0, 0, width, _TOP_HEIGHT), 4, 4)
+        pen = QPen(_MOTION_TEXT if kind == "motion" else QColor(240, 240, 248), 1.6)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        if on:
-            painter.drawArc(QRect(x + 6, y - 4, 6, 8), -60 * 16, 120 * 16)
-            painter.drawArc(QRect(x + 6, y - 7, 10, 14), -60 * 16, 120 * 16)
+        if kind == "motion":
+            bell = QPainterPath()
+            bell.moveTo(6.5, 16.5)
+            bell.cubicTo(8, 14.5, 8, 13, 8, 10)
+            bell.cubicTo(8, 7.4, 9.6, 5.5, 12, 5.5)
+            bell.cubicTo(14.4, 5.5, 16, 7.4, 16, 10)
+            bell.cubicTo(16, 13, 16, 14.5, 17.5, 16.5)
+            bell.closeSubpath()
+            painter.drawPath(bell)
+            painter.drawLine(QPointF(12, 3.5), QPointF(12, 5.5))
+            clapper = QPainterPath()
+            clapper.moveTo(10.5, 19)
+            clapper.cubicTo(11, 20.3, 13, 20.3, 13.5, 19)
+            painter.drawPath(clapper)
+        elif kind.startswith("audio:"):
+            speaker = QPainterPath()
+            speaker.moveTo(4.5, 9)
+            speaker.lineTo(7.5, 9)
+            speaker.lineTo(11.5, 5.5)
+            speaker.lineTo(11.5, 18.5)
+            speaker.lineTo(7.5, 15)
+            speaker.lineTo(4.5, 15)
+            speaker.closeSubpath()
+            painter.drawPath(speaker)
+            if on:
+                painter.drawArc(QRectF(12.5, 8, 4, 8), -60 * 16, 120 * 16)
+                painter.drawArc(QRectF(12.5, 5.5, 8, 13), -60 * 16, 120 * 16)
+            else:
+                painter.drawLine(QPointF(15.5, 9.5), QPointF(19.5, 14.5))
+                painter.drawLine(QPointF(19.5, 9.5), QPointF(15.5, 14.5))
         else:
-            painter.drawLine(x + 10, y - 3, x + 15, y + 3)
-            painter.drawLine(x + 15, y - 3, x + 10, y + 3)
-        painter.restore()
-
-    def _draw_zoom_badge(self, painter: QPainter, rect: QRect) -> None:
-        text = f"{self._zoom:.1f}×"
-        font = mono_font(8, QFont.Weight.Bold)
-        painter.setFont(font)
-        fm = painter.fontMetrics()
-        tw = fm.horizontalAdvance(text) + 8
-        th = fm.height() + 4
-        x = rect.right() - tw - 4
-        y = rect.top() + 4
-        painter.fillRect(QRect(x, y, tw, th), QColor(0, 0, 0, 160))
-        painter.setPen(_ZOOM_TEXT)
-        painter.drawText(QRect(x + 4, y, tw - 8, th), Qt.AlignmentFlag.AlignVCenter, text)
+            painter.setFont(_overlay_fonts()["info"])
+            painter.setPen(_ZOOM_TEXT)
+            if width < QFontMetrics(_overlay_fonts()["info"]).horizontalAdvance(kind) + 12:
+                kind = "↺"
+            painter.drawText(QRect(0, 0, width, _TOP_HEIGHT), Qt.AlignmentFlag.AlignCenter, kind)
+        painter.end()
+        return strip
 
     def _draw_zoom_reset_btn(self, painter: QPainter, rect: QRect) -> QRect:
-        text = "↺ 1×"
-        font = ui_font(8, QFont.Weight.Bold)
-        painter.setFont(font)
-        fm = painter.fontMetrics()
-        tw = fm.horizontalAdvance(text) + 10
-        th = fm.height() + 4
-        x = rect.right() - tw - 4
-        # Place below the zoom badge (badge height ≈ fm.height()+4, +2 gap)
-        badge_th = painter.fontMetrics().height() + 4
-        y = rect.top() + 4 + badge_th + 2
-        btn_rect = QRect(x, y, tw, th)
-        painter.fillRect(btn_rect, QColor(60, 30, 10, 200))
-        painter.setPen(QColor(255, 200, 80))
-        painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter, text)
+        btn_rect = self._top_control_rects().get("zoom", QRect())
+        self._draw_top_button(painter, "zoom", f"{self._zoom:.1f}× ↺", btn_rect)
         return btn_rect
 
     def _draw_resize_grip(self, painter: QPainter) -> None:

@@ -11,27 +11,20 @@ from neurowatch.widgets.camera_panel import CameraPanel
 from neurowatch.widgets.cell_widget import CellWidget
 
 
-def test_dialog_allows_file_protocol_path(monkeypatch, qtbot):
+def test_dialog_allows_file_protocol_path(qtbot):
     dlg = AddEditCameraDialog()
     qtbot.addWidget(dlg)
 
     # Manual URLs (including local files) are entered on the Advanced tab.
-    dlg._tabs.setCurrentWidget(dlg._advanced_tab)
-    dlg._a_name.setText("Recorded Clip")
+    dlg._show_camera_tab("urls")
+    dlg._name.setText("Recorded Clip")
     dlg._a_url.setText("/tmp/demo.mp4")
     dlg._a_protocol.setCurrentText("File")
-
-    warned = {"called": False}
-
-    def _warn(*_args, **_kwargs):
-        warned["called"] = True
-
-    monkeypatch.setattr("neurowatch.dialogs.camera_dialog.show_message", _warn)
 
     dlg._on_accept()
 
     assert dlg.result() == dlg.DialogCode.Accepted
-    assert not warned["called"]
+    assert dlg._status_label.property("tone") != "warning"
     cfg = dlg.get_config()
     assert cfg.protocol == "file"
     assert cfg.name == "Recorded Clip"
@@ -68,7 +61,7 @@ def test_dialog_test_connection_updates_status(monkeypatch, qtbot):
 
     dlg = AddEditCameraDialog()
     qtbot.addWidget(dlg)
-    dlg._tabs.setCurrentWidget(dlg._advanced_tab)
+    dlg._show_camera_tab("urls")
     dlg._a_url.setText("rtsp://cam/stream")
 
     dlg._on_test()

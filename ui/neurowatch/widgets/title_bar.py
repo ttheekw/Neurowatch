@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QFont, QMouseEvent
+from PySide6.QtCore import QPoint, QSize, Qt, Signal
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neurowatch.theme import themed_menu, ui_font
+from neurowatch.theme import app_icon, themed_menu
+from neurowatch.widgets.chrome_glyphs import GlyphButton
 
 _HEIGHT = 38
 _BG = "#0e0e18"
@@ -23,6 +24,15 @@ _ACCENT = "#4e9af1"
 _TEXT = "#c8c8dc"
 _TAB_ACTIVE_BG = "#1a2440"
 _TAB_HOVER_BG = "#1a2233"
+_GLYPH = "#a0a0b8"
+_GLYPH_ACTIVE = "#ffffff"
+#: Logo size in the bar; every text size here is in pixels too.
+_LOGO = 18
+
+
+def _glyph_color(active: bool) -> str:
+    return _GLYPH_ACTIVE if active else _GLYPH
+
 
 # No state changes a border width, so focus or activation only changes
 # colours and never shifts a label or resizes a button. Keyboard focus (mouse
@@ -32,6 +42,8 @@ QPushButton {{
     background: transparent;
     color: {fg};
     border: none;
+    /* The transparent top line balances the underline: text stays centred. */
+    border-top: 2px solid transparent;
     border-bottom: 2px solid {border};
     padding: 0 18px;
     font-size: 13px;
@@ -55,7 +67,7 @@ QPushButton {
 QPushButton:hover, QPushButton:focus { background: #2a2a40; color: white; }
 """
 
-TABS = ("live", "playback", "settings")
+TABS = ("live", "playback", "events", "settings")
 #: Views opened from the ≡ menu rather than a tab of their own.
 MENU_VIEWS = ("diagnostics",)
 
@@ -63,11 +75,17 @@ MENU_VIEWS = ("diagnostics",)
 class TitleBar(QWidget):
     """Draggable title bar with tab navigation and window controls."""
 
-    tab_changed = Signal(str)  # "live" | "playback" | "diagnostics" (≡ menu) | "settings"
+    tab_changed = Signal(
+        str
+    )  # "live" | "playback" | "events" | "diagnostics" (≡ menu) | "settings"
     export_config_requested = Signal()
     export_video_requested = Signal()
     import_config_requested = Signal()
     settings_requested = Signal()
+    alerts_requested = Signal()
+    users_requested = Signal()
+    change_password_requested = Signal()
+    sign_out_requested = Signal()
     about_requested = Signal()
     # "Hide panels": show only the wall under a slim strip (compact view).
     hide_panels_requested = Signal()
@@ -88,7 +106,7 @@ class TitleBar(QWidget):
         layout.setContentsMargins(12, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._menu_btn = QPushButton("≡")
+        self._menu_btn = GlyphButton("menu", _glyph_color)
         self._menu_btn.setFixedSize(32, _HEIGHT)
         self._menu_btn.setStyleSheet(_WIN_BTN)
         # Keyboard focus only: a mouse click must not leave a focus box behind.
@@ -98,14 +116,21 @@ class TitleBar(QWidget):
         self._menu_btn.clicked.connect(self._show_file_menu)
         layout.addWidget(self._menu_btn)
 
-        # Logo
-        logo = QLabel("⬡ NeuroWatch")
-        logo.setFont(ui_font(12, QFont.Weight.Bold))
-        logo.setStyleSheet(f"color: {_ACCENT}; padding-right: 20px;")
+        # Logo: the app's own mark, then its name.
+        layout.addSpacing(4)
+        mark = QLabel()
+        mark.setFixedSize(_LOGO, _LOGO)
+        mark.setPixmap(app_icon().pixmap(QSize(_LOGO, _LOGO)))
+        mark.setAccessibleName("NeuroWatch logo")
+        layout.addWidget(mark)
+        layout.addSpacing(7)
+        logo = QLabel("NeuroWatch")
+        logo.setStyleSheet(f"color: {_ACCENT}; font-size: 14px; font-weight: 700;")
         layout.addWidget(logo)
+        layout.addSpacing(14)
 
         self._site_label = QLabel("My Site")
-        self._site_label.setStyleSheet(f"color: {_TEXT}; font-size: 11px; padding-left: 8px;")
+        self._site_label.setStyleSheet(f"color: {_TEXT}; font-size: 12px; padding-right: 8px;")
         layout.addWidget(self._site_label)
 
         # Tab buttons
@@ -141,12 +166,13 @@ class TitleBar(QWidget):
 
         # Window controls
         layout.setSpacing(0)
-        for name, symbol, obj_name in [
-            ("min", "─", "min"),
-            ("max", "□", "max"),
-            ("close", "✕", "close"),
+        self._max_btn: GlyphButton | None = None
+        for name, glyph, obj_name in [
+            ("min", "minimize", "min"),
+            ("max", "maximize", "max"),
+            ("close", "close", "close"),
         ]:
-            btn = QPushButton(symbol)
+            btn = GlyphButton(glyph, _glyph_color)
             btn.setObjectName(obj_name)
             btn.setFixedSize(42, _HEIGHT)
             btn.setStyleSheet(_WIN_BTN)
@@ -160,6 +186,8 @@ class TitleBar(QWidget):
                 btn.setToolTip("Close")
             btn.setAccessibleName(btn.toolTip())
             layout.addWidget(btn)
+            if name == "max":
+                self._max_btn = btn
             if name == "min":
                 btn.clicked.connect(self._minimize)
             elif name == "max":
@@ -239,6 +267,14 @@ class TitleBar(QWidget):
                 exit_fullscreen()
         win.showMinimized()
 
+    def sync_window_state(self) -> None:
+        """Show restore while the window is maximized or fullscreen."""
+        win = self.window()
+        if self._max_btn is not None:
+            self._max_btn.set_glyph(
+                "restore" if win.isMaximized() or win.isFullScreen() else "maximize"
+            )
+
     def _toggle_maximize(self) -> None:
         win = self.window()
         if win.isFullScreen():
@@ -250,6 +286,10 @@ class TitleBar(QWidget):
             win.showNormal()
         else:
             win.showMaximized()
+
+    def select_tab(self, key: str) -> None:
+        """Switch to a tab as if it was clicked."""
+        self._activate(key)
 
     def _activate(self, key: str) -> None:
         # "settings" opens a dialog — don't change the active tab highlight.
@@ -266,6 +306,15 @@ class TitleBar(QWidget):
         """Switch to tab ``key`` as if it were clicked."""
         self._activate(key)
 
+    def set_tab_badge(self, key: str, count: int) -> None:
+        """A count after a tab's name (``Events (3)``); 0 shows the name only."""
+        btn = self._tab_btns.get(key)
+        if btn is None:
+            return
+        name = key.capitalize()
+        btn.setText(f"{name} ({count})" if count > 0 else name)
+        btn.setAccessibleName(f"{name} tab, {count} new" if count > 0 else f"{name} tab")
+
     def set_site_name(self, name: str) -> None:
         self._site_label.setText(name or "My Site")
 
@@ -279,18 +328,40 @@ class TitleBar(QWidget):
         menu.deleteLater()
 
     def _build_file_menu(self) -> QMenu:
+        from neurowatch.ipc.auth import current_user, may
+
+        # Only what the signed-in account may do (everything without sign-in).
+        admin, operator = may("admin"), may("operator")
         menu = themed_menu(self)
-        menu.addAction("Export Config…", lambda: self.export_config_requested.emit())
-        menu.addAction("Export Video…", lambda: self.export_video_requested.emit())
-        menu.addAction("Import Config…", lambda: self.import_config_requested.emit())
+        if admin:
+            menu.addAction("Export Config…", lambda: self.export_config_requested.emit())
+        if operator:
+            menu.addAction("Export Video…", lambda: self.export_video_requested.emit())
+        if admin:
+            menu.addAction("Import Config…", lambda: self.import_config_requested.emit())
         menu.addSeparator()
-        menu.addAction("Settings", lambda: self.settings_requested.emit())
+        if admin:
+            menu.addAction("Settings", lambda: self.settings_requested.emit())
+            menu.addAction("Alert Notifications…", lambda: self.alerts_requested.emit())
+            menu.addAction("Users && Permissions…", lambda: self.users_requested.emit())
         menu.addAction("Diagnostics", lambda: self._activate("diagnostics"))
         for text, callback in self._extra_actions:
             menu.addAction(text, callback)
         menu.addSeparator()
+        user = current_user()
+        if user is not None:
+            menu.addAction("Change Password…", lambda: self.change_password_requested.emit())
+            menu.addAction(
+                f"Sign Out ({user.get('username', '')})", lambda: self.sign_out_requested.emit()
+            )
         menu.addAction("About Neurowatch", lambda: self.about_requested.emit())
         return menu
+
+    def apply_role(self) -> None:
+        """Hide the Settings tab from accounts that may not change settings."""
+        from neurowatch.ipc.auth import may
+
+        self._tab_btns["settings"].setVisible(may("admin"))
 
     def _update_tab_styles(self) -> None:
         for key, btn in self._tab_btns.items():

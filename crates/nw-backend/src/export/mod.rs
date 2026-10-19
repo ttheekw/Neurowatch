@@ -24,19 +24,54 @@
 //! file under the chosen name.
 
 pub mod remux;
+#[cfg(test)]
+pub(crate) mod testing;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::playback::session::PlaybackSegment;
 use remux::RemuxSummary;
 
 /// Longest range one export covers.
 pub const MAX_RANGE_MS: i64 = 24 * 60 * 60 * 1000;
+pub const MAX_TIMELAPSE_RANGE_MS: i64 = 31 * 24 * 60 * 60 * 1000;
+pub const MAX_TIMELAPSE_FRAMES: u64 = 500_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimelapseOptions {
+    pub interval_sec: u32,
+    pub fps: u32,
+}
+
+impl TimelapseOptions {
+    pub fn validate(self, start_ms: i64, end_ms: i64) -> Result<(), ExportError> {
+        if !(1..=3600).contains(&self.interval_sec) || !(1..=60).contains(&self.fps) {
+            return Err(ExportError::Invalid(
+                "Timelapse interval must be 1–3600 seconds; frame rate 1–60 fps".into(),
+            ));
+        }
+        if start_ms < 0 || end_ms <= start_ms || end_ms - start_ms > MAX_TIMELAPSE_RANGE_MS {
+            return Err(ExportError::Invalid(
+                "Choose a forward timelapse range of at most 31 days".into(),
+            ));
+        }
+        let pictures = (end_ms - start_ms + i64::from(self.interval_sec) * 1000 - 1)
+            / (i64::from(self.interval_sec) * 1000);
+        if pictures as u64 > MAX_TIMELAPSE_FRAMES {
+            return Err(ExportError::Invalid(
+                "Use a longer sampling interval for this time range".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Exports running at once (each reads and writes a whole clip).
 const MAX_RUNNING: usize = 2;
 /// Finished jobs whose status is kept for polling.
@@ -291,6 +326,7 @@ struct Job {
     end_ms: i64,
     path: PathBuf,
     created_ms: i64,
+    timelapse: Option<TimelapseOptions>,
     cancel: AtomicBool,
     progress: AtomicU32,
     state: Mutex<JobState>,
@@ -436,7 +472,29 @@ impl ExportService {
         request: &ExportRequest,
         segments: Vec<PlaybackSegment>,
     ) -> Result<ExportStatus, ExportError> {
-        validate_range(request.start_ms, request.end_ms)?;
+        self.start_with(request, segments, None)
+    }
+
+    pub fn start_timelapse(
+        &self,
+        request: &ExportRequest,
+        segments: Vec<PlaybackSegment>,
+        options: TimelapseOptions,
+    ) -> Result<ExportStatus, ExportError> {
+        self.start_with(request, segments, Some(options))
+    }
+
+    fn start_with(
+        &self,
+        request: &ExportRequest,
+        segments: Vec<PlaybackSegment>,
+        timelapse: Option<TimelapseOptions>,
+    ) -> Result<ExportStatus, ExportError> {
+        if let Some(options) = timelapse {
+            options.validate(request.start_ms, request.end_ms)?;
+        } else {
+            validate_range(request.start_ms, request.end_ms)?;
+        }
         if segments.is_empty() {
             return Err(ExportError::NoRecordings);
         }
@@ -472,6 +530,7 @@ impl ExportService {
                 end_ms: request.end_ms,
                 path,
                 created_ms: now_ms(),
+                timelapse,
                 cancel: AtomicBool::new(false),
                 progress: AtomicU32::new(0),
                 state: Mutex::new(JobState::Running),
@@ -576,14 +635,25 @@ fn run(job: &Job, segments: &[PlaybackSegment]) {
         let scaled = (fraction.clamp(0.0, 0.999) * PROGRESS_SCALE) as u32;
         job.progress.fetch_max(scaled, Ordering::Relaxed);
     };
-    let outcome = remux::remux(
-        segments,
-        job.start_ms,
-        job.end_ms,
-        &part,
-        &job.cancel,
-        &mut report,
-    )
+    let outcome = match job.timelapse {
+        Some(options) => remux::remux_timelapse(
+            segments,
+            job.start_ms,
+            job.end_ms,
+            &part,
+            options,
+            &job.cancel,
+            &mut report,
+        ),
+        None => remux::remux(
+            segments,
+            job.start_ms,
+            job.end_ms,
+            &part,
+            &job.cancel,
+            &mut report,
+        ),
+    }
     .and_then(|summary| {
         std::fs::rename(&part, &job.path)?;
         let size_bytes = std::fs::metadata(&job.path).map_or(0, |m| m.len());
@@ -795,6 +865,7 @@ mod tests {
                 end_ms: 1,
                 path: PathBuf::from(format!("/tmp/{n}.mp4")),
                 created_ms: 0,
+                timelapse: None,
                 cancel: AtomicBool::new(false),
                 progress: AtomicU32::new(0),
                 state: Mutex::new(if n == 0 {

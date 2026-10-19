@@ -6,11 +6,11 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QLabel,
     QSpinBox,
-    QVBoxLayout,
     QWidget,
 )
 
 from neurowatch.theme import apply_dialog_theme, set_label_role, style_button_box
+from neurowatch.widgets.window_chrome import install_dialog_chrome
 
 
 class CustomGridDialog(QDialog):
@@ -20,13 +20,9 @@ class CustomGridDialog(QDialog):
         self.setMinimumWidth(320)
         apply_dialog_theme(self)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 16)
+        layout = install_dialog_chrome(self, "Custom grid layout")
         layout.setSpacing(10)
 
-        title = QLabel("Custom grid layout")
-        title.setObjectName("dialogTitle")
-        layout.addWidget(title)
         subtitle = QLabel("Choose how many cameras each wall page shows.")
         subtitle.setObjectName("dialogSubtitle")
         subtitle.setWordWrap(True)

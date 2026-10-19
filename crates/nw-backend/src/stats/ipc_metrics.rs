@@ -6,6 +6,8 @@
 //! guarded by a `Mutex` so that reads (rare) and writes (per-request)
 //! never contend for long.
 
+use std::cell::Cell;
+use std::future::Future;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,6 +20,26 @@ const LATENCY_RING_CAP: usize = 256;
 // A count-only ring can preserve startup/lifecycle delays indefinitely on
 // lightly used control sockets. Diagnostics should describe recent activity.
 const LATENCY_WINDOW: Duration = Duration::from_secs(30);
+
+tokio::task_local! {
+    static INTENTIONAL_IDLE: Cell<Duration>;
+}
+
+/// Measure a handler independently of other connections and nested requests.
+/// Only explicitly observed event-wait time is excluded, never a method's
+/// entire duration or its requested timeout. Lock/query/send delays remain.
+pub(crate) async fn measure_handler<F: Future>(work: F) -> (F::Output, Duration) {
+    INTENTIONAL_IDLE
+        .scope(Cell::new(Duration::ZERO), async move {
+            let result = work.await;
+            (result, INTENTIONAL_IDLE.with(Cell::get))
+        })
+        .await
+}
+
+pub(crate) fn record_idle_wait(duration: Duration) {
+    let _ = INTENTIONAL_IDLE.try_with(|idle| idle.set(idle.get().saturating_add(duration)));
+}
 
 #[derive(Debug, Default)]
 struct Ring {
@@ -108,7 +130,7 @@ impl IpcMetricsSource for IpcMetricsRecorder {
             .shared
             .latencies
             .lock()
-            .expect("latency ring mutex not poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .summary(Instant::now());
         IpcMetrics {
             requests_total: self.shared.requests.load(Ordering::Relaxed),
@@ -155,16 +177,24 @@ pub struct IpcRequestSpan {
 }
 
 impl IpcRequestSpan {
-    pub fn complete(mut self, bytes_out: usize) {
+    pub fn complete(self, bytes_out: usize) {
+        self.complete_with_idle(bytes_out, Duration::ZERO);
+    }
+
+    pub(crate) fn complete_with_idle(mut self, bytes_out: usize, idle: Duration) {
         let completed_at = Instant::now();
-        let elapsed_ms = completed_at.duration_since(self.start).as_secs_f32() * 1000.0;
+        let elapsed_ms = completed_at
+            .duration_since(self.start)
+            .saturating_sub(idle)
+            .as_secs_f32()
+            * 1000.0;
         self.shared
             .bytes_out
             .fetch_add(bytes_out as u64, Ordering::Relaxed);
         self.shared
             .latencies
             .lock()
-            .expect("latency ring mutex not poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(elapsed_ms, completed_at);
         self.shared.inflight.fetch_sub(1, Ordering::Relaxed);
         self.completed = true;
@@ -183,6 +213,53 @@ impl Drop for IpcRequestSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planned_event_wait_is_not_backpressure_but_other_work_is_counted() {
+        let recorder = IpcMetricsRecorder::new();
+        let mut span = recorder.handle().begin_request(64);
+        span.start = Instant::now() - Duration::from_millis(1500);
+        span.complete_with_idle(128, Duration::from_millis(1450));
+        let snapshot = recorder.snapshot();
+        assert!(snapshot.p95_latency_ms < 100.0);
+        assert_eq!(snapshot.requests_total, 1);
+        assert_eq!(snapshot.bytes_out_total, 128);
+        assert_eq!(snapshot.inflight, 0);
+        assert_eq!(snapshot.drops_total, 0);
+        assert_eq!(snapshot.backpressure_events_total, 0);
+
+        let mut slow_control = recorder.handle().begin_request(32);
+        slow_control.start = Instant::now() - Duration::from_millis(750);
+        slow_control.complete(64);
+        assert!(recorder.snapshot().p95_latency_ms >= 750.0);
+    }
+
+    #[tokio::test]
+    async fn intentional_wait_accounting_is_scoped_to_each_request() {
+        let ((_, _), idle) = measure_handler(async {
+            record_idle_wait(Duration::from_millis(20));
+            let nested = measure_handler(async {
+                record_idle_wait(Duration::from_millis(30));
+            })
+            .await;
+            assert_eq!(nested.1, Duration::from_millis(30));
+            ((), ())
+        })
+        .await;
+        assert_eq!(idle, Duration::from_millis(20));
+        let (_, next_idle) = measure_handler(async { tokio::task::yield_now().await }).await;
+        assert_eq!(next_idle, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn actual_event_long_poll_records_only_its_idle_wait() {
+        let db = Arc::new(Mutex::new(crate::db::connection::open_in_memory().unwrap()));
+        let hub = crate::events::EventHub::new(db);
+        let (_, idle) = measure_handler(hub.wait(None, Some(0), Duration::from_millis(30))).await;
+        assert!(idle >= Duration::from_millis(25));
+        let (_, ready_idle) = measure_handler(hub.wait(None, None, Duration::ZERO)).await;
+        assert_eq!(ready_idle, Duration::ZERO);
+    }
 
     #[test]
     fn latency_window_keeps_recent_samples_and_expires_old_spikes() {

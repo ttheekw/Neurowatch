@@ -179,12 +179,13 @@ def test_search_results_feed_the_onvif_tab_and_the_saved_camera_remembers_its_id
     dlg._results_table.selectRow(0)
     assert dlg._use_btn.isEnabled()
     dlg._use_selected()
-    assert dlg._tabs.currentWidget() is dlg._simple_tab
+    assert dlg._tabs.currentWidget() is dlg._camera_tab
+    assert dlg._mode() == "onvif"
     assert dlg._s_host.text() == "192.168.1.64"
-    assert dlg._s_name.text() == "HIKVISION DS-2CD2143G2-I"
+    assert dlg._name.text() == "HIKVISION DS-2CD2143G2-I"
 
-    dlg._s_user.setText("admin")
-    dlg._s_pass.setText("secret")
+    dlg._user.setText("admin")
+    dlg._pass.setText("secret")
     dlg._on_discover_done(PROFILES)
     assert dlg._s_main_combo.currentText() == "mainStream · 2560×1440"
     assert dlg._s_sub_combo.currentText() == "subStream · 640×360"
@@ -226,7 +227,9 @@ def test_editing_a_camera_has_no_search_tab(qtbot: object) -> None:
     )
     qtbot.addWidget(dlg)  # type: ignore[attr-defined]
     assert dlg._search_tab is None
-    assert dlg._tabs.currentWidget() is dlg._advanced_tab
+    # Entered by hand: it opens on its URLs.
+    assert dlg._tabs.currentWidget() is dlg._camera_tab
+    assert dlg._mode() == "urls"
 
 
 def test_search_list_explains_itself_when_it_has_no_rows(qtbot: object) -> None:
@@ -254,9 +257,9 @@ def test_search_list_explains_itself_when_it_has_no_rows(qtbot: object) -> None:
     assert not dlg._use_row.isVisible()
 
     panel.lookup.click()
-    assert dlg._tabs.currentWidget() is dlg._simple_tab
+    assert (dlg._tabs.currentWidget(), dlg._mode()) == (dlg._camera_tab, "onvif")
     panel.manual.click()
-    assert dlg._tabs.currentWidget() is dlg._advanced_tab
+    assert (dlg._tabs.currentWidget(), dlg._mode()) == (dlg._camera_tab, "urls")
     dlg._tabs.setCurrentWidget(dlg._search_tab)
 
     dlg._on_scan_done(IpcError(-32000, "Discovery is not available"))

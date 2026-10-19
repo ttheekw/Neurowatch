@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Callable
 from typing import Any, ClassVar
 
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QWidget,
 )
@@ -37,6 +39,9 @@ from neurowatch.ipc.frame_reader import FrameReaderThread
 from neurowatch.ipc.sync_client import SyncIpcClient
 from neurowatch.models import clip_export
 from neurowatch.models.camera import CameraConfig
+from neurowatch.models.event_clips import event_clip
+from neurowatch.models.events import Event
+from neurowatch.models.playback_controls import enqueue_controls
 from neurowatch.theme import (
     apply_dialog_theme,
     set_button_variant,
@@ -44,6 +49,7 @@ from neurowatch.theme import (
     set_status_tone,
     style_calendar,
 )
+from neurowatch.utils.threads import Worker
 from neurowatch.widgets.cell_widget import CellWidget
 from neurowatch.widgets.trim_timeline import MIN_TRIM_MS, TrimTimeline
 from neurowatch.widgets.wheel_guard import guard_wheel
@@ -71,7 +77,7 @@ PREVIEW_MIN_WIDTH = 480
 _LIVE_WORKERS: set[QThread] = set()
 
 
-class _IpcCalls(QThread):
+class _IpcCalls(Worker):
     """IPC calls run in order off the GUI thread; emits the results, or the
     first exception."""
 
@@ -125,6 +131,7 @@ class ExportVideoDialog(QDialog):
         self._closed = False
         # The loaded camera and range, once recordings were found.
         self._loaded: tuple[str, int, int] | None = None
+        self._event_preset: tuple[Event, int, int, int] | None = None
         self._load_generation = 0
         self._session_id: str | None = None
         self._reader: FrameReaderThread | None = None
@@ -178,6 +185,7 @@ class ExportVideoDialog(QDialog):
         layout.addWidget(self.timeline)
 
         layout.addLayout(self._build_clip_row())
+        layout.addLayout(self._build_export_options())
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
@@ -269,6 +277,60 @@ class ExportVideoDialog(QDialog):
         row.addWidget(self.length_label)
         return row
 
+    def _build_export_options(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        self.export_mode = QComboBox()
+        self.export_mode.setAccessibleName("Export format")
+        self.export_mode.addItem("Video clip", "clip")
+        self.export_mode.addItem("Timelapse · keyframes", "timelapse")
+        row.addWidget(self.export_mode)
+        self.sample_interval = QSpinBox()
+        self.sample_interval.setRange(1, 3600)
+        self.sample_interval.setValue(10)
+        self.sample_interval.setSuffix(" s / picture")
+        self.sample_interval.setAccessibleName("Timelapse sampling interval")
+        self.output_fps = QSpinBox()
+        self.output_fps.setRange(1, 60)
+        self.output_fps.setValue(25)
+        self.output_fps.setSuffix(" fps")
+        self.output_fps.setAccessibleName("Timelapse output frame rate")
+        row.addWidget(self.sample_interval)
+        row.addWidget(self.output_fps)
+        self.timelapse_hint = QLabel()
+        self.timelapse_hint.setWordWrap(True)
+        set_label_role(self.timelapse_hint, "hint")
+        row.addWidget(self.timelapse_hint, stretch=1)
+        for control in (self.export_mode, self.sample_interval, self.output_fps):
+            if isinstance(control, QComboBox):
+                control.currentIndexChanged.connect(self._export_options_changed)
+            else:
+                control.valueChanged.connect(self._export_options_changed)
+        self.sample_interval.hide()
+        self.output_fps.hide()
+        self.timelapse_hint.hide()
+        return row
+
+    def _export_options_changed(self) -> None:
+        timelapse = self.export_mode.currentData() == "timelapse"
+        self.sample_interval.setVisible(timelapse)
+        self.output_fps.setVisible(timelapse)
+        self.timelapse_hint.setVisible(timelapse)
+        factor = self.sample_interval.value() * self.output_fps.value()
+        self.timelapse_hint.setText(
+            f"About {factor}× · silent MP4. Actual spacing depends on camera keyframes."
+        )
+        clip = self.clip()
+        if clip:
+            self._show_trim(*clip)
+        self._update_export_button()
+
+    def _clip_problem(self, start: int, end: int) -> str | None:
+        if self.export_mode.currentData() == "timelapse":
+            return clip_export.check_timelapse(
+                start, end, self.sample_interval.value(), self.output_fps.value()
+            )
+        return clip_export.check_clip(start, end)
+
     def _build_button_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         self.show_button = QPushButton("Show in Folder")
@@ -342,7 +404,7 @@ class ExportVideoDialog(QDialog):
         """A preview control, sent after every earlier one."""
         if self._session_id is None:
             return
-        self._controls.append((method, {"session_id": self._session_id, **params}))
+        enqueue_controls(self._controls, [(method, {"session_id": self._session_id, **params})])
         self._drain_controls()
 
     def _drain_controls(self) -> None:
@@ -368,6 +430,27 @@ class ExportVideoDialog(QDialog):
     def _camera(self, camera_id: str) -> CameraConfig | None:
         return next((c for c in self._cameras if c.id == camera_id), None)
 
+    def load_event(self, event: Event, *, now_ms: int | None = None) -> None:
+        """Prepare a padded event clip, leaving the normal save/export step explicit."""
+        camera = self._camera(event.camera_id or "")
+        if camera is None:
+            self._set_status("This event's camera is no longer configured.", "warning")
+            return
+        recording = camera.recording
+        pre = recording.event_pre_sec if recording.event_pre_sec is not None else 10
+        post = recording.event_post_sec if recording.event_post_sec is not None else 15
+        cutoff = now_ms if now_ms is not None else int(time.time() * 1000)
+        clip = event_clip(event, now_ms=cutoff, pre_sec=pre, post_sec=post)
+        if clip is None:
+            self._set_status("There is no elapsed event footage to export yet.", "warning")
+            return
+        self._event_preset = (event, cutoff, pre, post)
+        self.camera_combo.setCurrentIndex(self.camera_combo.findData(camera.id))
+        start, end = clip.bounds
+        self.from_edit.setDateTime(QDateTime.fromMSecsSinceEpoch(start - start % 60_000))
+        self.to_edit.setDateTime(QDateTime.fromMSecsSinceEpoch((end // 60_000 + 1) * 60_000))
+        self._on_load()
+
     def _on_load(self) -> None:
         camera_id = self.camera_combo.currentData()
         if not camera_id:
@@ -391,14 +474,24 @@ class ExportVideoDialog(QDialog):
         self.load_button.setEnabled(False)
         self._set_status("Loading recordings…", "muted")
         params = {"camera_id": camera_id, "start_ms": start, "end_ms": end}
+        # Apply a preset only to the load it initiated. A subsequent manual
+        # Load must remain the ordinary choose-any-footage workflow.
+        preset, self._event_preset = self._event_preset, None
 
         def _loaded(result: object) -> None:
-            self._on_timeline(result, generation, str(camera_id), start, end)
+            self._on_timeline(result, generation, str(camera_id), start, end, preset=preset)
 
         self._run([("playback.get_timeline", params)], _loaded)
 
     def _on_timeline(
-        self, result: object, generation: int, camera_id: str, start: int, end: int
+        self,
+        result: object,
+        generation: int,
+        camera_id: str,
+        start: int,
+        end: int,
+        *,
+        preset: tuple[Event, int, int, int] | None = None,
     ) -> None:
         if generation != self._load_generation:
             return
@@ -424,7 +517,39 @@ class ExportVideoDialog(QDialog):
             return
         first = min(s["start_ms"] for s in segments)
         last = max(s["end_ms"] for s in segments)
-        last = min(last, first + clip_export.MAX_CLIP_MS)
+        last = min(
+            last,
+            first
+            + (
+                clip_export.MAX_TIMELAPSE_MS
+                if self.export_mode.currentData() == "timelapse"
+                else clip_export.MAX_CLIP_MS
+            ),
+        )
+        preset_note = ""
+        if preset is not None and preset[0].camera_id == camera_id:
+            event, cutoff, pre, post = preset
+            event_preset = event_clip(
+                event,
+                now_ms=cutoff,
+                pre_sec=pre,
+                post_sec=post,
+                coverage=[(s["start_ms"], s["end_ms"]) for s in segments],
+            )
+            if event_preset is None:
+                self._set_status(
+                    "No saved recordings overlap this event and its padding.", "warning"
+                )
+                self._placeholder.setText("No event footage in this range.")
+                return
+            first, last = event_preset.bounds
+            preset_note = (
+                f"Event preset: {pre} s before / {post} s after. Review the trim, then Export."
+            )
+            if event_preset.ongoing:
+                preset_note += " Ongoing event: ends at the time this preset was requested."
+            if event_preset.adjusted:
+                preset_note += " Adjusted to available recordings or the 24-hour clip limit."
         self._loaded = (camera_id, start, end)
         for edit in (self.start_edit, self.end_edit):
             edit.setDateTimeRange(
@@ -435,7 +560,7 @@ class ExportVideoDialog(QDialog):
         self._show_trim(*trim)
         self.timeline.set_playhead(first)
         self._set_clip_enabled(True)
-        self._set_status("", "muted")
+        self._set_status(preset_note, "muted")
         self._placeholder.setText("Opening the preview…")
         if camera is not None:
             self._cell.set_camera(camera)
@@ -511,7 +636,7 @@ class ExportVideoDialog(QDialog):
             self.end_edit.setDateTime(QDateTime.fromMSecsSinceEpoch(int(end)))
         finally:
             self._syncing = False
-        problem = clip_export.check_clip(int(start), int(end))
+        problem = self._clip_problem(int(start), int(end))
         self.length_label.setText(problem or f"Length {clip_export.format_length(end - start)}")
         self._update_export_button()
 
@@ -551,7 +676,7 @@ class ExportVideoDialog(QDialog):
 
     def _update_export_button(self) -> None:
         clip = self.clip()
-        valid = clip is not None and clip_export.check_clip(*clip) is None
+        valid = clip is not None and self._clip_problem(*clip) is None
         self.export_button.setEnabled(valid and not self.export_running())
 
     # ------------------------------------------------------------------
@@ -571,16 +696,16 @@ class ExportVideoDialog(QDialog):
         clip = self.clip()
         if clip is None or self._loaded is None or self.export_running():
             return
-        problem = clip_export.check_clip(*clip)
+        problem = self._clip_problem(*clip)
         if problem:
             self._set_status(problem, "error")
             return
         camera_id = self._loaded[0]
         camera = self._camera(camera_id)
-        suggested = os.path.join(
-            self._save_folder(),
-            clip_export.default_clip_name(camera.name if camera else camera_id, clip[0]),
-        )
+        name = clip_export.default_clip_name(camera.name if camera else camera_id, clip[0])
+        if self.export_mode.currentData() == "timelapse":
+            name = f"{name[:-4]}_timelapse.mp4"
+        suggested = os.path.join(self._save_folder(), name)
         path, _ = QFileDialog.getSaveFileName(self, "Export Video", suggested, "MP4 video (*.mp4)")
         if not path:
             return
@@ -604,6 +729,9 @@ class ExportVideoDialog(QDialog):
             self._control("playback.set_playing", playing=False)
         self._starting = True
         self._job = None
+        self.export_mode.setEnabled(False)
+        self.sample_interval.setEnabled(False)
+        self.output_fps.setEnabled(False)
         self._poll_failures = 0
         self.show_button.hide()
         self.cancel_export_button.show()
@@ -613,6 +741,11 @@ class ExportVideoDialog(QDialog):
         self._set_status("Starting the export…", "muted")
         self._update_export_button()
         params = clip_export.start_params(camera_id, clip[0], clip[1], final, overwrite=True)
+        if self.export_mode.currentData() == "timelapse":
+            params["timelapse"] = {
+                "interval_sec": self.sample_interval.value(),
+                "fps": self.output_fps.value(),
+            }
         self._run([("export.start", params)], self._on_export_started)
 
     def _on_export_started(self, result: object) -> None:
@@ -667,6 +800,9 @@ class ExportVideoDialog(QDialog):
         self.show_button.setVisible(job.state == clip_export.DONE)
 
     def _end_export_ui(self) -> None:
+        self.export_mode.setEnabled(True)
+        self.sample_interval.setEnabled(True)
+        self.output_fps.setEnabled(True)
         self.progress.hide()
         self.cancel_export_button.hide()
         self._update_export_button()

@@ -20,10 +20,11 @@ DEFAULT_ENDPOINT = "tcp:127.0.0.1:7676" if os.name == "nt" else "unix:/run/neuro
 
 
 class IpcError(Exception):
-    def __init__(self, code: int, message: str) -> None:
+    def __init__(self, code: int, message: str, data: object = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.data = data
 
 
 class BackendOfflineError(Exception):
@@ -137,7 +138,7 @@ class SyncIpcClient:
                 err.get("code", -1),
                 err.get("message", "unknown"),
             )
-            raise IpcError(err.get("code", -1), err.get("message", "unknown"))
+            raise IpcError(err.get("code", -1), err.get("message", "unknown"), err.get("data"))
         return resp.get("result")
 
     def is_online(self) -> bool:

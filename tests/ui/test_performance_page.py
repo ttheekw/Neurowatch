@@ -4,6 +4,7 @@ These tests use pytest-qt to drive a real ``PerformancePage`` widget with a
 stubbed IPC client. Nothing here depends on a live backend, live camera, or
 real hardware — the client is a plain object with a ``call`` method.
 """
+
 from __future__ import annotations
 
 import threading
@@ -46,6 +47,40 @@ class _StubClient:
         if isinstance(head, Exception):
             raise head
         return head
+
+
+def test_motion_diagnostics_distinguish_analysis_from_desktop_decode(qtbot):
+    snapshot = _snapshot(
+        motion_decoders=1,
+        motion=[
+            {
+                "camera_id": "front-door",
+                "state": "running",
+                "low_cpu": True,
+                "using_substream": True,
+                "decoder": "avdec_h264",
+                "analysis_fps": 0.5,
+                "analysis_ms": 0.7,
+                "dropped_frames": 3,
+                "dropped_fps": 0,
+            }
+        ],
+        bottleneck={"kind": "motion", "severity": "warning", "explanation": "Analysis queue loss"},
+    )
+    page = PerformancePage(ipc_client=_StubClient(snapshot))
+    qtbot.addWidget(page)
+    _wait_render(qtbot, page)
+    text = page.snapshot_text()
+    for expected in (
+        "1 analysis decoder running",
+        "Keyframes only · substream",
+        "avdec_h264",
+        "0.5 fps",
+        "0.7 ms / picture",
+        "3 (0.0/s)",
+    ):
+        assert expected in text
+    assert "Motion detection" in page.bottleneck_text()
 
 
 def _snapshot(**overrides: Any) -> dict:
@@ -139,10 +174,9 @@ def test_performance_page_renders_gpu_when_available(qtbot):
     assert "hardware video decoding is active" in page.acceleration_text().lower()
     assert "border: none" in page._accel_badge_label.styleSheet()
     assert "background: transparent" in page._accel_badge_label.styleSheet()
-    assert (
-        page._gpu_container.sizePolicy().verticalPolicy()
-        == QSizePolicy.Policy.Maximum
-    ), "decoder summary must remain compact instead of stretching with camera health"
+    assert page._gpu_container.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Maximum, (
+        "decoder summary must remain compact instead of stretching with camera health"
+    )
 
 
 def test_performance_page_reports_blocked_local_live_view(qtbot):
@@ -182,7 +216,7 @@ def test_performance_page_shows_vaapi_available_with_unknown_counters(qtbot):
                 "memory_total_bytes": None,
                 "decoder_utilization_percent": None,
             },
-        }
+        },
     )
     client = _StubClient(snap)
     page = PerformancePage(ipc_client=client, refresh_interval_ms=0)
@@ -199,9 +233,7 @@ def test_performance_page_shows_vaapi_available_with_unknown_counters(qtbot):
 
 
 def test_performance_page_shows_gpu_unavailable_with_reason(qtbot):
-    snap = _snapshot(
-        gpu={"status": "unavailable", "reason": "no supported GPU counter source"}
-    )
+    snap = _snapshot(gpu={"status": "unavailable", "reason": "no supported GPU counter source"})
     client = _StubClient(snap)
     page = PerformancePage(ipc_client=client, refresh_interval_ms=0)
     qtbot.addWidget(page)
@@ -303,9 +335,7 @@ def test_performance_page_calls_client_with_stats_get_performance(qtbot):
 def test_performance_page_bottleneck_color_reflects_severity(
     qtbot, severity, expected_color_hex_substring
 ):
-    snap = _snapshot(
-        bottleneck={"kind": "cpu", "severity": severity, "explanation": "test"}
-    )
+    snap = _snapshot(bottleneck={"kind": "cpu", "severity": severity, "explanation": "test"})
     client = _StubClient(snap)
     page = PerformancePage(ipc_client=client, refresh_interval_ms=0)
     qtbot.addWidget(page)

@@ -16,7 +16,8 @@ from __future__ import annotations
 import shutil
 from collections.abc import Mapping
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
+from PySide6.QtGui import QColor, QPainter, QPaintEvent, QPen, QPolygonF
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QWidget
 
 from neurowatch import build_info
@@ -31,32 +32,139 @@ _TEXT_BRIGHT = "#a0a0c0"
 _SEP_COLOR = "#1a1a30"
 
 
+#: Every reading (extensions' indicators too): one size, centred, without
+#: the bar's own background and border. Scoped to the bar: a style sheet
+#: without a selector would give every label the bar's top border too,
+#: pushing its text a pixel down.
+_LABEL_RULE = (
+    "QWidget#statusBar QLabel { background: transparent; border: none;"
+    " font-size: 10px; padding: 0 6px; margin: 0; }"
+)
+
+
+def _bar_style(own_background: bool) -> str:
+    if own_background:
+        bar = (
+            f"QWidget#statusBar {{ background-color: {_BG}; border-top: 1px solid {_SEP_COLOR}; }}"
+        )
+    else:
+        bar = "QWidget#statusBar { background: transparent; border: none; }"
+    return bar + _LABEL_RULE
+
+
 def _stat(text: str, bright: bool = False) -> QLabel:
     lbl = QLabel(text)
-    lbl.setStyleSheet(
-        f"color: {'#a0a0c0' if bright else '#7878a0'}; font-size: 10px; padding: 0 6px;"
-    )
+    lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+    lbl.setStyleSheet(f"color: {_TEXT_BRIGHT if bright else _TEXT};")
     return lbl
 
 
 def _sep() -> QFrame:
+    """A short divider between readings, centred like the text."""
     f = QFrame()
-    f.setFrameShape(QFrame.Shape.VLine)
-    f.setFixedWidth(1)
-    f.setStyleSheet(f"color: {_SEP_COLOR};")
+    f.setObjectName("statusSeparator")
+    f.setFixedSize(1, 12)
+    f.setStyleSheet(f"QFrame#statusSeparator {{ background-color: {_SEP_COLOR}; border: none; }}")
     return f
+
+
+class StatusIndicator(QLabel):
+    """A reading led by a small mark (dot, square, diamond, ring, alert),
+    drawn here and centred on the text's capitals. Font symbols (●, ▣, ◌)
+    sit lower than the words, differently in every font, and some fonts
+    lack them. The mark takes the text's colour (``color:`` in a style
+    sheet). Extensions use it for their indicators too."""
+
+    MARKS = ("dot", "square", "diamond", "ring", "alert")
+    _MARK_WIDTH = 8
+    _GAP = 5
+
+    def __init__(self, text: str = "", mark: str = "dot", parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._mark = mark
+        self.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+
+    def mark(self) -> str:
+        return self._mark
+
+    def set_mark(self, mark: str) -> None:
+        if mark != self._mark:
+            self._mark = mark
+            self.update()
+
+    def sizeHint(self) -> QSize:
+        hint = super().sizeHint()
+        return QSize(hint.width() + self._MARK_WIDTH + self._GAP, hint.height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        hint = super().minimumSizeHint()
+        return QSize(hint.width() + self._MARK_WIDTH + self._GAP, hint.height())
+
+    def mark_center(self) -> QPointF:
+        """Where the mark is drawn: level with the middle of the capitals."""
+        area = self.contentsRect()
+        metrics = self.fontMetrics()
+        baseline = area.top() + (area.height() - metrics.height()) / 2 + metrics.ascent()
+        return QPointF(area.left() + self._MARK_WIDTH / 2, baseline - metrics.capHeight() / 2)
+
+    def paintEvent(self, _event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = self.palette().color(self.foregroundRole())
+        area = self.contentsRect()
+        text_area = area.adjusted(self._MARK_WIDTH + self._GAP, 0, 0, 0)
+        painter.setPen(color)
+        painter.setFont(self.font())
+        painter.drawText(
+            text_area,
+            int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+            self.text(),
+        )
+        center = self.mark_center()
+        r = self._MARK_WIDTH / 2
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        if self._mark == "square":
+            painter.drawRoundedRect(QRectF(center.x() - r, center.y() - r, 2 * r, 2 * r), 1.5, 1.5)
+        elif self._mark == "diamond":
+            painter.drawPolygon(
+                QPolygonF(
+                    [
+                        QPointF(center.x(), center.y() - r),
+                        QPointF(center.x() + r, center.y()),
+                        QPointF(center.x(), center.y() + r),
+                        QPointF(center.x() - r, center.y()),
+                    ]
+                )
+            )
+        elif self._mark == "ring":
+            painter.setPen(QPen(color, 1.4))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(center, r - 0.8, r - 0.8)
+        elif self._mark == "alert":
+            painter.drawEllipse(center, r, r)
+            painter.setPen(QPen(QColor(_BG), 1.5))  # the "!" cut out of the dot
+            painter.drawLine(
+                QPointF(center.x(), center.y() - r + 2), QPointF(center.x(), center.y() + 0.5)
+            )
+            painter.drawPoint(QPointF(center.x(), center.y() + r - 1.8))
+        else:
+            painter.drawEllipse(center, r - 1, r - 1)
 
 
 class StatusBarWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("statusBar")
         self.setFixedHeight(_HEIGHT)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
-        self.setStyleSheet(f"background-color: {_BG}; border-top: 1px solid {_SEP_COLOR};")
+        self.setStyleSheet(_bar_style(own_background=True))
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 0, 8, 0)
+        # 1 px at the top is the bar's border: centre the readings below it.
+        layout.setContentsMargins(8, 1, 8, 0)
         layout.setSpacing(0)
+        layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self._disk_lbl = _stat("Disk: --")
         layout.addWidget(self._disk_lbl)
@@ -85,18 +193,18 @@ class StatusBarWidget(QWidget):
 
         # Active backend decoder. This reports the accelerator Neurowatch
         # selected, which is distinct from whether utilization counters exist.
-        self._accel_lbl = QLabel("◌ Decoder: —")
+        self._accel_lbl = StatusIndicator("Decoder: —", "ring")
+        self._accel_shown: tuple[str, object] | None = None
         self._accel_lbl.setAccessibleName("Video acceleration unknown")
-        self._accel_lbl.setStyleSheet(
-            "color: #7878a0; background: transparent; border: none; "
-            "font-size: 10px; font-weight: 600; padding: 1px 7px;"
-        )
+        self._accel_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self._accel_lbl.setStyleSheet(f"color: {_TEXT}; font-weight: 600;")
         layout.addWidget(self._accel_lbl)
         layout.addWidget(_sep())
 
         # Backend status dot
-        self._backend_lbl = QLabel("● Backend")
-        self._backend_lbl.setStyleSheet("color: #22c55e; font-size: 10px; padding: 0 6px;")
+        self._backend_lbl = StatusIndicator("Backend", "dot")
+        self._backend_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self._backend_lbl.setStyleSheet("color: #22c55e;")
         layout.addWidget(self._backend_lbl)
         # Extensions' indicators go here, before the version (add_indicator).
         self._version_sep = _sep()
@@ -128,22 +236,22 @@ class StatusBarWidget(QWidget):
 
     def _set_layout(self, *, full: bool, own_background: bool) -> None:
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, own_background)
-        self.setStyleSheet(
-            f"background-color: {_BG}; border-top: 1px solid {_SEP_COLOR};"
-            if own_background
-            else "background: transparent;"
-        )
+        self.setStyleSheet(_bar_style(own_background))
+        # The top border, when the bar has one, takes 1 px above the readings.
+        layout = self.layout()
+        if layout is not None:
+            layout.setContentsMargins(8, 1 if own_background else 0, 8, 0)
         for widget in (self._version_sep, self._version_lbl):
             widget.setVisible(full)
         self._spacer.setVisible(full)
 
     def set_backend_status(self, online: bool) -> None:
         if online:
-            self._backend_lbl.setText("● Backend")
-            self._backend_lbl.setStyleSheet("color: #22c55e; font-size: 10px; padding: 0 6px;")
+            self._backend_lbl.setText("Backend")
+            self._backend_lbl.setStyleSheet("color: #22c55e;")
         else:
-            self._backend_lbl.setText("● Backend Offline")
-            self._backend_lbl.setStyleSheet("color: #ef4444; font-size: 10px; padding: 0 6px;")
+            self._backend_lbl.setText("Backend Offline")
+            self._backend_lbl.setStyleSheet("color: #ef4444;")
 
     def add_indicator(self, widget: QWidget) -> None:
         """Show an extension's indicator after the backend dot, before the version."""
@@ -154,37 +262,46 @@ class StatusBarWidget(QWidget):
         layout.insertWidget(index + 1, widget)
 
     def set_video_acceleration(self, acceleration: object) -> None:
-        """Render the decoder selected by the backend as a compact badge."""
-        info = acceleration if isinstance(acceleration, dict) else {}
-        kind = str(info.get("kind", "unknown")).lower()
+        """Render the decoder selected by the backend as a compact badge.
+
+        Called at load and with every performance reading: the backend picks
+        its decoder when it starts, and a backend started before sign-in
+        restarts itself once the graphics card is available."""
+        info = acceleration if isinstance(acceleration, Mapping) else {}
+        shown = (str(info.get("kind", "unknown")).lower(), info.get("reason"))
+        if shown == self._accel_shown:
+            return  # re-sent every poll: restyling is not free
+        self._accel_shown = shown
+        kind = shown[0]
         badges = {
-            "vaapi": ("▣", "VA-API", "#67e8f9", "#12303a", "Intel/AMD VA-API hardware decode"),
-            "nvdec": ("◆", "NVIDIA NVDEC", "#a3e635", "#243415", "NVIDIA hardware decode"),
-            "d3d11": ("▣", "Direct3D 11", "#67e8f9", "#12303a", "Direct3D 11 hardware decode"),
-            "v4l2_m2m": ("▤", "V4L2 M2M", "#c4b5fd", "#29213d", "V4L2 hardware decode"),
-            "software": ("◌", "CPU Decode", "#fbbf24", "#3a2b12", "Software video decode"),
+            "vaapi": ("square", "VA-API", "#67e8f9", "Intel/AMD VA-API hardware decode"),
+            "nvdec": ("diamond", "NVIDIA NVDEC", "#a3e635", "NVIDIA hardware decode"),
+            "d3d11": ("square", "Direct3D 11", "#67e8f9", "Direct3D 11 hardware decode"),
+            "v4l2_m2m": ("square", "V4L2 M2M", "#c4b5fd", "V4L2 hardware decode"),
+            "software": (
+                "ring",
+                "CPU Decode",
+                "#fbbf24",
+                str(info.get("reason") or "Software video decode"),
+            ),
             "blocked": (
-                "!",
+                "alert",
                 "Update GStreamer",
                 "#ff8b81",
-                "#3a1717",
                 str(
                     info.get("reason")
                     or "Local live view is unavailable until GStreamer is updated"
                 ),
             ),
         }
-        icon, label, color, _background, tooltip = badges.get(
-            kind,
-            ("◌", "Decoder: —", "#7878a0", "#151522", "Video decoder is unknown"),
+        icon, label, color, tooltip = badges.get(
+            kind, ("ring", "Decoder: —", _TEXT, "Video decoder is unknown")
         )
-        self._accel_lbl.setText(f"{icon} {label}")
+        self._accel_lbl.setText(label)
+        self._accel_lbl.set_mark(icon)
         self._accel_lbl.setAccessibleName(f"Video acceleration: {label}")
         self._accel_lbl.setToolTip(tooltip)
-        self._accel_lbl.setStyleSheet(
-            f"color: {color}; background: transparent; border: none; "
-            "font-size: 10px; font-weight: 600; padding: 1px 7px;"
-        )
+        self._accel_lbl.setStyleSheet(f"color: {color}; font-weight: 600;")
 
     def _update_disk(self) -> None:
         try:
@@ -197,6 +314,8 @@ class StatusBarWidget(QWidget):
     def set_performance(self, snapshot: object) -> None:
         """Show the backend's CPU, memory and network readings (the
         ``stats.get_performance`` result); None while the backend is offline."""
+        if isinstance(snapshot, Mapping) and "video_acceleration" in snapshot:
+            self.set_video_acceleration(snapshot["video_acceleration"])
         process = snapshot.get("process") if isinstance(snapshot, Mapping) else None
         process = process if isinstance(process, Mapping) else {}
         cpu = process.get("system_cpu_percent")

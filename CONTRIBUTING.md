@@ -9,32 +9,24 @@ Thanks for helping. Bug reports, ideas and pull requests are welcome.
 - **Security problems:** do not open a public issue. Report them privately
   through GitHub: **Security → Report a vulnerability**.
 
-## Contributor License Agreement
+## Licence of contributions
 
-Every contributor signs the [Contributor License Agreement](CLA.md) once. It
-lets us ship your contribution both in the open-source app (AGPL-3.0-or-later)
-and in our official builds, which also contain proprietary parts such as
-NeuroWatch Cloud. You keep the copyright in your work.
-
-On your first pull request a bot asks you to sign by replying:
-
-> I have read the CLA Document and I hereby sign the CLA
-
-A pull request cannot be merged until its author has signed.
+NeuroWatch is licensed under the [Apache License 2.0](LICENSE). As section 5
+of the License says, a contribution you submit is licensed under the same
+terms, unless you clearly state otherwise. You keep the copyright in your work.
 
 ## The open-source app and NeuroWatch Cloud
 
-This repository is the complete open-source app: live view, recording,
-playback, export, discovery and headless mode, with no camera limit.
-NeuroWatch Cloud is a separate, proprietary product; its code is not here.
-Official builds add it through two extension points that anyone can use:
+This repository is the whole of NeuroWatch: live view, recording, playback,
+export, discovery and headless mode, with no camera limit, and the NeuroWatch
+Cloud client: `crates/nw-backend/src/cloud` in the backend and
+`ui/neurowatch/cloud` in the desktop app (Settings → Cloud, the status bar
+light, the tray's cloud state and the `neurowatch cloud` commands).
+`crates/nw-cloud-protocol` holds the types shared with the cloud server
+(`crates/nw-api`).
 
-- the backend's `nw_backend::extension` (Rust: frame and keyframe taps,
-  extra IPC methods, startup and shutdown hooks);
-- the desktop app's `neurowatch.extensions` (Python: menu entries, status
-  indicators, tray details, headless commands).
-
-Keep the app working without any extension: never assume one is installed.
+Keep the app working without the cloud: it must never be required for local
+recording, live view or playback.
 
 ## Development setup
 

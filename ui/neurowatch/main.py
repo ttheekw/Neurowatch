@@ -12,13 +12,13 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, replace
+from typing import Any
 
 from PySide6.QtCore import (
     QEvent,
     QEventLoop,
     QFileSystemWatcher,
     Qt,
-    QThread,
     QTimer,
     Signal,
 )
@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neurowatch import build_info, extensions, windows_icon
+from neurowatch import build_info, windows_icon
 from neurowatch.app_launch import (
     LaunchOptions,
     SingleInstance,
@@ -45,26 +45,38 @@ from neurowatch.app_launch import (
     start_tray,
     stop_service,
 )
+from neurowatch.cloud import desktop as cloud_desktop
 from neurowatch.dialogs.about_dialog import AboutDialog
 from neurowatch.dialogs.camera_dialog import AddEditCameraDialog
 from neurowatch.dialogs.confirm import confirm_action
 from neurowatch.dialogs.custom_grid_dialog import CustomGridDialog
 from neurowatch.dialogs.export_video_dialog import ExportVideoDialog
-from neurowatch.dialogs.message import show_message
+from neurowatch.dialogs.message import ask, show_message
 from neurowatch.dialogs.new_window_dialog import NewWindowDialog, PageSummary, WindowSummary
 from neurowatch.dialogs.settings_dialog import SettingsDialog
+from neurowatch.ipc.alert_feed import AlertFeedWorker
+from neurowatch.ipc.event_feed import EventFeedWorker
 from neurowatch.ipc.quality_dispatcher import CameraQualityDispatcher
 from neurowatch.ipc.sync_client import BackendOfflineError, IpcError, SyncIpcClient
 from neurowatch.ipc.view_lease import ViewLeaseWorker
 from neurowatch.ipc.viewer_client import NativeViewerClient
 from neurowatch.models.camera import CameraConfig, WallPosition
+from neurowatch.models.edition import CAMERA_LIMIT_REACHED, Edition, limit_message
+from neurowatch.models.events import ACTIVITY_KINDS, SYSTEM_KINDS, ActivityTracker, Event
+from neurowatch.models.preview_fps import PreviewFps
 from neurowatch.models.wall_layout import Placement
 from neurowatch.models.window_session import saved_windows
+from neurowatch.service.manager import ServiceController
+from neurowatch.service.paths import service_endpoint
+from neurowatch.service.startup import StartupPrefs, load_prefs
 from neurowatch.theme import app_icon, apply_app_theme, icon_path
-from neurowatch.utils.threads import wait_for_retired
+from neurowatch.utils.threads import Worker, retire, wait_for_retired
+from neurowatch.widgets.alert_toasts import AlertToasts
 from neurowatch.widgets.camera_panel import CameraPanel
 from neurowatch.widgets.compact_bar import CompactTitleBar
 from neurowatch.widgets.detached_wall import DEFAULT_CYCLE_INTERVAL, DetachedWallWindow
+from neurowatch.widgets.edition_notice import EditionNotice, open_unlimited
+from neurowatch.widgets.events_view import EventsView
 from neurowatch.widgets.page_strip import PageStripWidget
 from neurowatch.widgets.performance_page import PerformancePage
 from neurowatch.widgets.playback_view import PlaybackView
@@ -113,7 +125,7 @@ class BackendUnavailableError(RuntimeError):
         self.endpoint = endpoint
 
 
-class _IpcCallWorker(QThread):
+class _IpcCallWorker(Worker):
     """Run one synchronous IPC call in a background thread."""
 
     result = Signal(object)  # RPC result dict/object or Exception
@@ -134,7 +146,40 @@ class _IpcCallWorker(QThread):
             self.result.emit(e)
 
 
-class _SettingsSaveWorker(QThread):
+class _StartupApplyWorker(Worker):
+    """Register what starts at sign-in and at boot (``systemctl``,
+    ``loginctl``, login items) off the GUI thread."""
+
+    done = Signal(list)  # what could not be done, in plain words
+
+    def __init__(self, endpoint: str, prefs: StartupPrefs) -> None:
+        super().__init__()
+        self._endpoint = endpoint
+        self._prefs = prefs
+
+    def run(self) -> None:
+        try:
+            problems = ServiceController(endpoint=self._endpoint).apply_startup(self._prefs)
+        except Exception as exc:  # reported, never raised in Qt
+            logger.exception("Applying the startup choices failed")
+            problems = [str(exc)]
+        self.done.emit(problems)
+
+
+def _startup_note() -> str | None:
+    """Why Settings → Startup cannot change anything here, if it cannot."""
+    if os.environ.get("NW_SERVICE") == "external":
+        return "NeuroWatch's background service is managed outside this app (NW_SERVICE=external)."
+    if service_follows_ui():
+        return (
+            "Running from source: NeuroWatch starts with this window and stops when it"
+            " closes, so it does not start at sign-in (NW_DEV_KEEP_SERVICE=1 behaves as"
+            " installed builds do)."
+        )
+    return None
+
+
+class _SettingsSaveWorker(Worker):
     """Persist settings without freezing Qt during pipeline reconfiguration.
 
     A recording drive picked in Settings is prepared first (``storage.select``
@@ -169,7 +214,7 @@ class _SettingsSaveWorker(QThread):
             self.result.emit(exc)
 
 
-class _PollWorker(QThread):
+class _PollWorker(Worker):
     """Background thread that polls camera states every 2 s without blocking the UI."""
 
     poll_done = Signal(dict, dict, dict, bool)  # states, stream_infos, recording_states, backend_ok
@@ -215,6 +260,26 @@ class _PollWorker(QThread):
                 self.msleep(200)
 
 
+def _delete_after_use(dialog: QDialog) -> None:
+    """A dialog shown with ``exec()`` is the window's child: without this it
+    stays alive, hidden, until the application quits, and its chrome gets
+    events while Python shuts down. Deletion waits for the event loop, so the
+    caller still reads the dialog's values after ``exec()`` returns."""
+    dialog.finished.connect(dialog.deleteLater)
+
+
+def tray_running() -> bool:
+    """Whether the tray (which shows desktop alerts itself) runs for this user."""
+    from neurowatch.service.lock import InstanceLock
+    from neurowatch.service.paths import lock_path
+
+    lock = InstanceLock(lock_path("tray"))
+    if lock.acquire():
+        lock.release()
+        return False
+    return True
+
+
 class MainWindow(QMainWindow):
     """Neurowatch main window — frameless with custom title bar."""
 
@@ -233,7 +298,11 @@ class MainWindow(QMainWindow):
         self._config: dict = {}
         self._backend_online: bool = True
         self._add_worker: _IpcCallWorker | None = None
+        self._edit_workers: dict[str, _IpcCallWorker] = {}
+        self._ptz_dialogs: dict[str, Any] = {}
+        self._talk_dialogs: dict[str, Any] = {}
         self._settings_worker: _SettingsSaveWorker | None = None
+        self._startup_worker: _StartupApplyWorker | None = None
         # One camera.set_positions save at a time; a later edit re-saves.
         self._positions_worker: _IpcCallWorker | None = None
         self._positions_pending = False
@@ -265,7 +334,7 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if isinstance(app, QApplication):
             apply_app_theme(app, "dark")
-        extensions.call_each("install", self)
+        cloud_desktop.install(self, lambda: self._open_settings(tab="cloud"))
         self._progress(StartupStage.LOADING_CAMERAS, "")
         # Startup load errors are deferred until the welcome screen is gone.
         self._startup_load_error: tuple[bool, str, str] | None = None
@@ -321,15 +390,22 @@ class MainWindow(QMainWindow):
         self._title_bar.export_video_requested.connect(self._on_export_video)
         self._title_bar.import_config_requested.connect(self._on_import_config)
         self._title_bar.settings_requested.connect(self._open_settings)
+        self._title_bar.alerts_requested.connect(self._open_alerts)
+        self._title_bar.users_requested.connect(self._open_users)
+        self._title_bar.change_password_requested.connect(self._change_password)
+        self._title_bar.sign_out_requested.connect(self._sign_out)
+        self._title_bar.apply_role()
         self._title_bar.about_requested.connect(self._on_about)
         self._title_bar.hide_panels_requested.connect(lambda: self._set_compact(True))
         layout.addWidget(self._title_bar)
 
         # Toolbar — use safe defaults until config loaded from backend
         self._toolbar = ToolBar()
+        self._toolbar.apply_role()
         self._toolbar.grid_changed.connect(self._on_grid_changed)
         self._toolbar.add_camera.connect(self._on_add_camera)
         self._toolbar.edit_camera.connect(self._on_edit_camera_selected)
+        self._toolbar.ptz_requested.connect(lambda: self._on_ptz(self._selected_cam_id))
         self._toolbar.remove_camera.connect(self._on_remove_camera_selected)
         self._toolbar.prev_page.connect(self._on_prev_page)
         self._toolbar.next_page.connect(self._on_next_page)
@@ -357,6 +433,9 @@ class MainWindow(QMainWindow):
         self._wall.drag_page_changed.connect(lambda _page: self._update_page_display())
         self._wall.camera_quality_requested.connect(self._on_camera_quality_requested)
         self._wall.cell_edit_requested.connect(self._on_edit_camera)
+        self._wall.cell_ptz_requested.connect(self._on_ptz)
+        self._wall.cell_bookmark_requested.connect(self._on_bookmark)
+        self._wall.cell_talk_requested.connect(self._on_talk)
         self._wall.cell_remove_requested.connect(self._on_remove_camera)
         self._wall.set_auto_fit(True)
         self._wall.set_grid(_DEFAULT_ROWS, _DEFAULT_COLS)
@@ -374,6 +453,7 @@ class MainWindow(QMainWindow):
         live_layout.addWidget(self._camera_panel)
 
         self._playback_view = PlaybackView(self._ipc, self._cameras)
+        self._playback_view.export_requested.connect(self._export_event)
 
         endpoint = str(getattr(self._ipc, "endpoint", getattr(self._ipc, "_endpoint", "")))
         self._performance_page = PerformancePage(
@@ -381,10 +461,15 @@ class MainWindow(QMainWindow):
             refresh_interval_ms=2000,
         )
 
+        self._events_view = EventsView(endpoint or None, self._cameras)
+        self._events_view.play_requested.connect(self._play_event)
+        self._events_view.export_requested.connect(self._export_event)
+
         self._content_stack = QStackedWidget()
         self._content_stack.addWidget(live_content)  # index 0 — live
         self._content_stack.addWidget(self._playback_view)  # index 1 — playback
         self._content_stack.addWidget(self._performance_page)  # index 2 — diagnostics
+        self._content_stack.addWidget(self._events_view)  # index 3 — events
 
         layout.addWidget(self._content_stack, stretch=1)
 
@@ -401,6 +486,8 @@ class MainWindow(QMainWindow):
 
         # Status bar
         self._status_bar = StatusBarWidget()
+        self._edition = Edition()
+        self._edition_notice: EditionNotice | None = None
         layout.addWidget(self._status_bar)
         # Holds the status readings over the wall while the fullscreen strip
         # of the compact view is hidden (ui.fullscreen_status).
@@ -437,6 +524,32 @@ class MainWindow(QMainWindow):
         self._poll_worker.poll_done.connect(self._on_poll_done)
         self._poll_worker.performance.connect(self._status_bar.set_performance)
         self._poll_worker.start()
+
+        # Events as they happen: tiles show MOTION while a camera reports it,
+        # the Events tab lists them and counts new ones while it is not shown.
+        self._activity = ActivityTracker()
+        self._motion_cameras: set[str] = set()
+        self._pending_motion_cameras: set[str] = set()
+        self._motion_ack_workers: dict[str, _IpcCallWorker] = {}
+        self._wall.motion_acknowledge_requested.connect(self._acknowledge_motion)
+        self._unseen_events = 0
+        self._event_feed = EventFeedWorker(endpoint or None)
+        self._event_feed.started_over.connect(self._on_events_started_over)
+        self._event_feed.pending_over.connect(self._on_pending_events)
+        self._event_feed.notices.connect(self._on_event_notices)
+        self._event_feed.start()
+        # Desktop alerts: the tray shows them as system notifications; when
+        # no tray runs (a source checkout), toasts in this window do.
+        self._alert_toasts = AlertToasts(self.centralWidget())
+        self._alert_toasts.opened.connect(lambda _alert: self._title_bar.select_tab("events"))
+        self._alert_feed = AlertFeedWorker(endpoint or None)
+        self._alert_feed.alert.connect(self._on_desktop_alert)
+        self._alert_feed.start()
+        # Events without duration (a line crossed) show for a few seconds.
+        self._activity_timer = QTimer(self)
+        self._activity_timer.setInterval(1000)
+        self._activity_timer.timeout.connect(self._apply_activity)
+        self._activity_timer.start()
 
         # The one page clock: the main wall's auto-scroll and every extra
         # window change pages on it, at the same interval and moment.
@@ -507,6 +620,7 @@ class MainWindow(QMainWindow):
         logger.info("Camera list loaded from backend: %d camera(s)", len(self._cameras))
         if isinstance(backend_status, dict):
             self._status_bar.set_video_acceleration(backend_status.get("video_acceleration", {}))
+        self._set_edition(Edition.from_status(backend_status))
         self._apply_settings()
         self._refresh_all()
 
@@ -533,10 +647,16 @@ class MainWindow(QMainWindow):
             window.update_cameras(self._cameras)
         self._camera_panel.set_cameras(self._cameras)
         self._playback_view.refresh_camera_list(self._cameras)
+        self._events_view.set_cameras(self._cameras)
+        self._performance_page.set_camera_names({c.id: c.name or c.id for c in self._cameras})
 
     def _refresh_walls(self, page: int | None = None) -> None:
         """Re-lay this window's wall only: the camera list itself is unchanged
-        (cameras moved between windows), so the sidebar keeps its rows."""
+        (cameras moved between windows), so the sidebar keeps its rows.
+        Without ``page`` the wall stays on its page (a saved, added or removed
+        camera, a reload): it used to jump back to the first."""
+        if page is None:
+            page = self._wall.page
         self._wall.set_cameras(self._main_wall_cameras(), page=page)
         self._update_page_display()
 
@@ -553,6 +673,7 @@ class MainWindow(QMainWindow):
             ipc_endpoint=self._ipc_endpoint() or None,
             existing_names=[c.name for c in self._cameras],
         )
+        _delete_after_use(dlg)
         accepted = dlg.exec() == AddEditCameraDialog.DialogCode.Accepted
         # Cameras added from the search (the backend already has them), also
         # when the dialog was closed after adding some.
@@ -585,6 +706,16 @@ class MainWindow(QMainWindow):
                 "Lost connection to nw-backend. Please restart the backend.",
                 kind="error",
             )
+            return
+        if isinstance(result, IpcError) and result.code == CAMERA_LIMIT_REACHED:
+            if ask(
+                self,
+                "Camera Limit Reached",
+                limit_message(result.data),
+                yes_text="Get NeuroWatch Unlimited",
+                no_text="Close",
+            ):
+                open_unlimited(self._edition)
             return
         if isinstance(result, IpcError):
             show_message(self, "Backend Error", result.message, kind="warning")
@@ -621,6 +752,26 @@ class MainWindow(QMainWindow):
                 logger.exception("An extension's shutdown callback failed")
         self._poll_worker.requestInterruption()
         self._poll_worker.wait()
+        # Its long poll ends within seconds; it must not hold up closing.
+        self._event_feed.requestInterruption()
+        retire(self._event_feed)
+        self._alert_feed.requestInterruption()
+        retire(self._alert_feed)
+        self._events_view.shutdown()
+        for dialog in list(self._ptz_dialogs.values()):
+            dialog.close()
+        self._ptz_dialogs.clear()
+        for dialog in list(self._talk_dialogs.values()):
+            dialog.close()
+        self._talk_dialogs.clear()
+        for edit_worker in self._edit_workers.values():
+            edit_worker.result.disconnect()
+            retire(edit_worker)
+        self._edit_workers.clear()
+        for ack_worker in self._motion_ack_workers.values():
+            ack_worker.result.disconnect()
+            retire(ack_worker)
+        self._motion_ack_workers.clear()
         self._view_lease.stop()
         self._quality_dispatcher.shutdown()
         worker = self._add_worker
@@ -631,6 +782,10 @@ class MainWindow(QMainWindow):
         if settings_worker is not None and settings_worker.isRunning():
             settings_worker.wait()
         self._settings_worker = None
+        startup_worker = self._startup_worker
+        if startup_worker is not None and startup_worker.isRunning():
+            startup_worker.wait()
+        self._startup_worker = None
         windows_worker = self._windows_worker
         if windows_worker is not None and windows_worker.isRunning():
             windows_worker.wait()
@@ -660,11 +815,109 @@ class MainWindow(QMainWindow):
         # destroying one still running at exit would abort the application.
         wait_for_retired(8000)
 
+    def _on_ptz(self, cam_id: str | None) -> None:
+        from neurowatch.dialogs.ptz_dialog import PtzDialog
+
+        camera = next((cam for cam in self._cameras if cam.id == cam_id), None)
+        if camera is None:
+            return
+        if camera.id not in self._ptz_dialogs:
+            dialog = PtzDialog(self._ipc_endpoint(), camera.id, camera.name, self)
+            self._ptz_dialogs[camera.id] = dialog
+            dialog.closed.connect(lambda: self._ptz_dialogs.pop(camera.id, None))
+        dialog = self._ptz_dialogs[camera.id]
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _open_alerts(self) -> None:
+        from neurowatch.dialogs.alerts_dialog import AlertsDialog
+
+        cameras = [(cam.id, cam.name) for cam in self._cameras]
+        dialog = AlertsDialog(self._ipc_endpoint(), cameras, self)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def _open_users(self) -> None:
+        from neurowatch.dialogs.users_dialog import UsersDialog
+
+        cameras = [(cam.id, cam.name) for cam in self._cameras]
+        dialog = UsersDialog(self._ipc_endpoint(), cameras, self)
+        dialog.exec()
+        dialog.deleteLater()
+        if dialog.requires_sign_in_now:
+            self._sign_in_again("Sign-in is now required. Sign in with an admin account.")
+
+    def _change_password(self) -> None:
+        from neurowatch.dialogs.users_dialog import ChangePasswordDialog
+
+        dialog = ChangePasswordDialog(self._ipc_endpoint(), self)
+        changed = dialog.exec()
+        dialog.deleteLater()
+        if changed:
+            self._sign_in_again("Your password was changed. Sign in with the new one.")
+
+    def _sign_out(self) -> None:
+        from neurowatch.dialogs.sign_in import sign_out
+
+        sign_out(self._ipc_endpoint())
+        self._sign_in_again("Signed out.")
+
+    def _sign_in_again(self, note: str) -> None:
+        """Sign in (perhaps as someone else) or quit; then reload what this
+        account may see."""
+        from neurowatch.dialogs.sign_in import SignInPrompt
+
+        if SignInPrompt(self._ipc_endpoint(), note=note).choose() != "sign_in":
+            QApplication.quit()
+            return
+        self._title_bar.apply_role()
+        self._toolbar.apply_role()
+        self._load_from_backend()
+
+    def _on_desktop_alert(self, alert: dict) -> None:
+        from neurowatch.ipc.auth import current_user
+
+        # The tray cannot read alerts of a recorder that requires sign-in.
+        if not tray_running() or current_user() is not None:
+            self._alert_toasts.show_alert(alert)
+
+    def _on_talk(self, cam_id: str) -> None:
+        """Talk through a camera's speaker (push-to-talk window)."""
+        from neurowatch.dialogs.talk_dialog import TalkDialog
+
+        camera = next((cam for cam in self._cameras if cam.id == cam_id), None)
+        if camera is None:
+            return
+        if camera.id not in self._talk_dialogs:
+            dialog = TalkDialog(self._ipc_endpoint(), camera.id, camera.name, self)
+            self._talk_dialogs[camera.id] = dialog
+            dialog.closed.connect(lambda: self._talk_dialogs.pop(camera.id, None))
+        dialog = self._talk_dialogs[camera.id]
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_bookmark(self, cam_id: str) -> None:
+        """Bookmark this moment of a live camera."""
+        from neurowatch.dialogs.bookmark_dialog import BookmarkDialog
+
+        camera = next((cam for cam in self._cameras if cam.id == cam_id), None)
+        if camera is None:
+            return
+        at_ms = int(time.time() * 1000)
+        dialog = BookmarkDialog(self._ipc_endpoint(), [(camera.id, camera.name)], at_ms, self)
+        dialog.exec()
+        dialog.deleteLater()
+
     def _on_edit_camera_selected(self) -> None:
         if self._selected_cam_id:
             self._on_edit_camera(self._selected_cam_id)
 
     def _on_edit_camera(self, cam_id: str) -> None:
+        if cam_id in self._edit_workers:
+            show_message(self, "Save camera", "This camera is still being saved.")
+            return
         cam = next((c for c in self._cameras if c.id == cam_id), None)
         if cam is None:
             return
@@ -675,33 +928,41 @@ class MainWindow(QMainWindow):
             parent=self,
             ipc_endpoint=self._ipc_endpoint() or None,
         )
+        dlg.recording_policy_copied.connect(self._on_recording_policy_copied)
+        _delete_after_use(dlg)
         if dlg.exec() != AddEditCameraDialog.DialogCode.Accepted:
             return
         updated = dlg.get_config()
-        new_local_enabled = updated.recording.local.enabled
-        logger.info("Requesting supervisor restart for cam_id=%s ('%s')", cam_id, updated.name)
-        try:
-            # Stop recording before updating config so the pipeline restarts cleanly.
-            if was_recording and not new_local_enabled:
-                self._ipc.call("recording.stop", {"id": cam_id})
-            self._ipc.call("camera.update", updated.to_dict())
-            # Start recording after the updated config (storage path etc.) is in effect.
-            if not was_recording and new_local_enabled:
-                self._ipc.call("recording.start", {"id": cam_id})
-            raw = self._ipc.call("camera.list")
-            self._cameras = [CameraConfig.from_dict(c) for c in raw]
-        except BackendOfflineError:
-            show_message(
-                self,
-                "Backend Offline",
-                "Lost connection to nw-backend. Please restart the backend.",
-                kind="error",
-            )
+        # camera.update reconciles automatic recording. Explicit Start/Stop
+        # here would create a manual override and bypass an Off schedule.
+        # The reply carries the saved camera: the config file it rewrites needs
+        # no reload (a full reload of every setting and camera; see
+        # `_on_config_file_changed`).
+        self._ignore_config_changes_until = time.monotonic() + 2.0
+        worker = _IpcCallWorker("camera.update", updated.to_dict(), self._ipc_endpoint())
+        worker.result.connect(self._on_camera_updated)
+        worker.finished.connect(lambda: self._edit_workers.pop(cam_id, None))
+        worker.finished.connect(worker.deleteLater)
+        self._edit_workers[cam_id] = worker
+        worker.start()
+
+    def _on_camera_updated(self, result: object) -> None:
+        self._ignore_config_changes_until = time.monotonic() + 2.0
+        if isinstance(result, Exception):
+            show_message(self, "Save camera", str(result), kind="warning")
             return
-        except IpcError as e:
-            show_message(self, "Backend Error", e.message, kind="warning")
-            return
-        self._refresh_all()
+        if isinstance(result, dict):
+            updated = CameraConfig.from_dict(result)
+            self._cameras = [updated if cam.id == updated.id else cam for cam in self._cameras]
+            self._refresh_all()
+
+    def _on_recording_policy_copied(self, target_ids: list[str], policy: dict) -> None:
+        # The copy is already persisted, including when the source dialog is
+        # canceled. Keep later edits from submitting stale target policies.
+        for cam in self._cameras:
+            if cam.id in target_ids:
+                for key, value in policy.items():
+                    setattr(cam.recording, key, deepcopy(value))
 
     def _on_remove_camera_selected(self) -> None:
         if self._selected_cam_id:
@@ -724,6 +985,8 @@ class MainWindow(QMainWindow):
             self._ipc.call("camera.remove", {"id": cam_id})
             raw = self._ipc.call("camera.list")
             self._cameras = [CameraConfig.from_dict(c) for c in raw]
+            # A camera held over the free limit may run now.
+            self._set_edition(Edition.from_status(self._ipc.call("system.status")))
         except BackendOfflineError:
             show_message(
                 self,
@@ -788,6 +1051,7 @@ class MainWindow(QMainWindow):
         dlg = CustomGridDialog(
             grid.get("rows", _DEFAULT_ROWS), grid.get("cols", _DEFAULT_COLS), self
         )
+        _delete_after_use(dlg)
         if dlg.exec() == CustomGridDialog.DialogCode.Accepted:
             self._on_grid_changed(dlg.rows, dlg.cols)
 
@@ -897,6 +1161,7 @@ class MainWindow(QMainWindow):
         windows = [WindowSummary(w.number, w.page_count, len(w.camera_ids)) for w in self._detached]
         chosen = target.number if isinstance(target, DetachedWallWindow) else None
         dlg = NewWindowDialog(pages, rows, cols, self, windows=windows, destination=chosen)
+        _delete_after_use(dlg)
         if dlg.exec() != QDialog.DialogCode.Accepted or dlg.selected_page is None:
             return
         window = next((w for w in self._detached if w.number == dlg.selected_window), None)
@@ -977,7 +1242,14 @@ class MainWindow(QMainWindow):
         self._schedule_windows_save()
         return window
 
+    def _preview_fps(self) -> PreviewFps:
+        return PreviewFps.from_config(self._config.get("ui", {}))
+
     def _connect_window(self, window: DetachedWallWindow) -> None:
+        window.wall.set_preview_fps(self._preview_fps())
+        window.wall.set_motion_cameras(self._motion_cameras)
+        window.wall.set_pending_motion_cameras(self._pending_motion_cameras)
+        window.wall.motion_acknowledge_requested.connect(self._acknowledge_motion)
         window.closed.connect(self._on_detached_closed)
         window.add_page_requested.connect(self._on_new_window)
         window.return_page_requested.connect(self._return_window_page)
@@ -992,6 +1264,9 @@ class MainWindow(QMainWindow):
         window.layout_changed.connect(self._schedule_windows_save)
         window.wall.camera_quality_requested.connect(self._on_camera_quality_requested)
         window.wall.cell_edit_requested.connect(self._on_edit_camera)
+        window.wall.cell_ptz_requested.connect(self._on_ptz)
+        window.wall.cell_bookmark_requested.connect(self._on_bookmark)
+        window.wall.cell_talk_requested.connect(self._on_talk)
         window.wall.cell_remove_requested.connect(self._on_remove_camera)
         self._detached.append(window)
 
@@ -1294,6 +1569,9 @@ class MainWindow(QMainWindow):
         # we never poll the backend while the user cannot see the page.
         if tab != "diagnostics":
             self._performance_page.stop_refresh()
+        if tab != "playback":
+            # Nobody watches it now: stop the video (the position stays).
+            self._playback_view.pause()
         if tab == "live":
             self._content_stack.setCurrentIndex(0)
             self._toolbar.show()
@@ -1308,12 +1586,105 @@ class MainWindow(QMainWindow):
             self._toolbar.hide()
             self._page_strip.hide()
             self._performance_page.start_refresh()
+        elif tab == "events":
+            self._content_stack.setCurrentIndex(3)
+            self._toolbar.hide()
+            self._page_strip.hide()
+            self._unseen_events = 0
+            self._title_bar.set_tab_badge("events", 0)
+            self._events_view.reload()
         else:
             logger.info("Tab: %s (not yet implemented)", tab)
 
     # ------------------------------------------------------------------
     # Backend sync / polling
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Events
+    # ------------------------------------------------------------------
+
+    def _on_events_started_over(self, open_events: list) -> None:
+        """Connected (again) to the backend: the events going on now."""
+        events = [Event.from_dict(e) for e in open_events if isinstance(e, dict)]
+        self._activity.reset(e for e in events if e is not None)
+        self._apply_activity()
+
+    def _on_event_notices(self, notices: list) -> None:
+        events_shown = self._content_stack.currentIndex() == 3
+        new = 0
+        for notice in notices:
+            raw = notice.get("event") if isinstance(notice, dict) else None
+            event = Event.from_dict(raw) if isinstance(raw, dict) else None
+            if event is None:
+                continue
+            phase = str(notice.get("phase"))
+            self._activity.apply(phase, event)
+            worth_counting = event.kind in ACTIVITY_KINDS or (
+                event.kind in SYSTEM_KINDS and event.kind != "backend_started"
+            )
+            if phase == "start" and worth_counting and not events_shown:
+                new += 1
+        self._events_view.add_notices(notices)
+        self._playback_view.add_notices(notices)
+        if new:
+            self._unseen_events += new
+            self._title_bar.set_tab_badge("events", self._unseen_events)
+        self._apply_activity()
+
+    def _on_pending_events(self, raw_events: list) -> None:
+        events = [Event.from_dict(raw) for raw in raw_events if isinstance(raw, dict)]
+        self._activity.restore_pending(event for event in events if event is not None)
+        self._apply_activity()
+
+    def _acknowledge_motion(self, camera_id: str) -> None:
+        if camera_id in self._motion_ack_workers:
+            return
+        ids = self._activity.pending_ids(camera_id)
+        if not ids:
+            return
+        worker = _IpcCallWorker("events.acknowledge", {"ids": ids}, self._ipc_endpoint())
+        self._motion_ack_workers[camera_id] = worker
+
+        def done(result: object) -> None:
+            if isinstance(result, Exception):
+                logger.warning("Could not acknowledge motion for %s: %s", camera_id, result)
+                show_message(
+                    self,
+                    "Motion Alert",
+                    "Could not clear the motion alert. Click it to retry.",
+                    kind="warning",
+                )
+                return
+            self._activity.acknowledge(camera_id, ids)
+            self._apply_activity()
+
+        def finished() -> None:
+            self._motion_ack_workers.pop(camera_id, None)
+            worker.deleteLater()
+
+        worker.result.connect(done)
+        worker.finished.connect(finished)
+        worker.start()
+
+    def _apply_activity(self) -> None:
+        active = self._activity.active()
+        if active != self._motion_cameras:
+            self._motion_cameras = active
+            for wall in self._walls():
+                wall.set_motion_cameras(active)
+            self._camera_panel.set_motion_cameras(active)
+        pending = self._activity.pending()
+        if pending != self._pending_motion_cameras:
+            self._pending_motion_cameras = pending
+            for wall in self._walls():
+                wall.set_pending_motion_cameras(pending)
+
+    def _play_event(self, camera_id: str, ts_ms: int) -> None:
+        """An event's Play Recording: that moment of that camera in Playback."""
+        self._title_bar.show_tab("playback")
+        self._playback_view.refresh_camera_list(self._cameras)
+        self._playback_view.show_moment(camera_id, ts_ms)
 
     def _sync_view_demand(self, *_args: object) -> None:
         """Ask the backend to decode the wall's visible cameras, or none while
@@ -1357,6 +1728,7 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event: QEvent) -> None:
         if event.type() == QEvent.Type.WindowStateChange:
             self._sync_view_demand()
+            self._title_bar.sync_window_state()
             self._compact_bar.sync_window_state()
             if self._compact and not self.isFullScreen():
                 self._compact_bar.show()
@@ -1484,6 +1856,7 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if isinstance(app, QApplication):
             apply_app_theme(app, theme)
+        self._events_view.apply_theme(theme)
         root = self.centralWidget()
         if root is not None:
             root.setStyleSheet(
@@ -1498,6 +1871,9 @@ class MainWindow(QMainWindow):
         self._toolbar.set_auto_fit(auto_fit)
         self._wall.set_grid(rows, cols)
         self._wall.set_auto_fit(auto_fit)
+        for wall in self._walls():
+            wall.set_preview_fps(self._preview_fps())
+        self._playback_view.set_preview_fps(self._preview_fps())
         self._apply_autoscroll()
         self._sync_status_overlay()
         interval = int(grid.get("page_interval_sec", 0))
@@ -1535,12 +1911,24 @@ class MainWindow(QMainWindow):
         self._wall.set_page(new_page)
         self._update_page_display()
 
-    def _open_settings(self) -> None:
+    def _open_settings(self, tab: str | None = None) -> None:
         if self._settings_worker is not None and self._settings_worker.isRunning():
             show_message(self, "Settings", "Settings are still being saved.")
             return
-        dlg = SettingsDialog(self._config, self, ipc_endpoint=self._ipc_endpoint() or None)
+        startup = load_prefs()
+        dlg = SettingsDialog(
+            self._config,
+            self,
+            ipc_endpoint=self._ipc_endpoint() or None,
+            tab=tab,
+            startup=startup,
+            startup_note=_startup_note(),
+        )
+        _delete_after_use(dlg)
         if dlg.exec() == SettingsDialog.DialogCode.Accepted:
+            wanted = dlg.startup_prefs()
+            if wanted is not None and wanted != startup:
+                self._apply_startup(wanted)
             updated = dlg.get_config()
             drive = dlg.selected_drive()
             # Apply visual settings immediately; backend persistence may restart
@@ -1556,6 +1944,18 @@ class MainWindow(QMainWindow):
             worker.finished.connect(self._clear_settings_worker)
             self._settings_worker = worker
             worker.start()
+
+    def _apply_startup(self, prefs: StartupPrefs) -> None:
+        worker = _StartupApplyWorker(self._ipc_endpoint() or service_endpoint(), prefs)
+        worker.done.connect(self._on_startup_applied)
+        worker.finished.connect(worker.deleteLater)
+        self._startup_worker = worker
+        worker.start()
+
+    def _on_startup_applied(self, problems: list) -> None:
+        self._startup_worker = None
+        if problems:
+            show_message(self, "Startup", "\n\n".join(str(p) for p in problems), kind="warning")
 
     def _on_settings_saved(self, result: object) -> None:
         # A save that restarted cameras can outlast the window set when it began.
@@ -1616,6 +2016,19 @@ class MainWindow(QMainWindow):
             dialog.shutdown()
             dialog.deleteLater()
 
+    def _export_event(self, event: object) -> None:
+        """Use the existing export dialog; preparing a preset starts no export job."""
+        if not isinstance(event, Event) or event.camera_id is None:
+            return
+        endpoint = str(getattr(self._ipc, "endpoint", ""))
+        dialog = ExportVideoDialog(self._cameras, endpoint, self, camera_id=event.camera_id)
+        try:
+            dialog.load_event(event)
+            dialog.exec()
+        finally:
+            dialog.shutdown()
+            dialog.deleteLater()
+
     def _on_import_config(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Import Config", "", "JSON Files (*.json)")
         if not path:
@@ -1631,20 +2044,32 @@ class MainWindow(QMainWindow):
 
     def _on_about(self) -> None:
         dlg = AboutDialog(self)
+        _delete_after_use(dlg)
         dlg.exec()
 
     # ------------------------------------------------------------------
-    # Extensions (see neurowatch.extensions)
+    # Status bar, menu and shutdown hooks (NeuroWatch Cloud uses them)
     # ------------------------------------------------------------------
 
     @property
     def ipc_endpoint(self) -> str:
-        """The backend endpoint, for an extension's own background workers."""
-        return str(self._ipc.endpoint)
+        """The backend endpoint, for background workers of their own."""
+        return self._ipc_endpoint()
 
     def add_menu_action(self, text: str, callback: Callable[[], object]) -> None:
         """Add an entry to the ≡ menu."""
         self._title_bar.add_menu_action(text, callback)
+
+    def _set_edition(self, edition: Edition) -> None:
+        """Remember the recorder's edition; show the camera-limit notice
+        while it holds cameras back."""
+        self._edition = edition
+        if self._edition_notice is None:
+            if not edition.notice:
+                return
+            self._edition_notice = EditionNotice()
+            self.add_status_indicator(self._edition_notice)
+        self._edition_notice.set_edition(edition)
 
     def add_status_indicator(self, widget: QWidget) -> None:
         """Show a widget in the bottom status bar, before the version."""
@@ -1995,6 +2420,12 @@ def _start_main_window(
             sys.exit(1)
         if not follows_ui:
             start_tray()
+        # A recorder with local accounts asks who is using it first.
+        from neurowatch.dialogs.sign_in import SignInPrompt, sign_in_required
+
+        if sign_in_required() and SignInPrompt().choose() != "sign_in":
+            welcome.dismiss()
+            sys.exit(0)
     try:
         window = MainWindow(progress=welcome.set_stage)
     except BackendUnavailableError as exc:
@@ -2066,7 +2497,7 @@ def main() -> None:
 
         sys.exit(service_main(list(launch.rest)))
     if launch.mode == "command":
-        # An extension's command, e.g. `neurowatch NAME ...` (see neurowatch.extensions).
+        # `neurowatch events ...` or `neurowatch cloud ...`.
         from neurowatch.headless import main as headless_main
 
         sys.exit(headless_main(list(launch.rest)))

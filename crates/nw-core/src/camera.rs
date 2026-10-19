@@ -48,6 +48,22 @@ pub struct CameraConfig {
     /// it as already added. Absent for cameras entered by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery: Option<crate::camera_discovery::DiscoveryIdentity>,
+    /// The camera's ONVIF device service, once known: filled when the camera
+    /// is added from a network search or found later (camera events, PTZ).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onvif: Option<OnvifEndpoint>,
+}
+
+/// Where a camera answers ONVIF. URLs are pinned to the camera's address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnvifEndpoint {
+    pub device_url: String,
+    /// Event service, from the device's capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events_url: Option<String>,
+    /// PTZ service, from the device's capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ptz_url: Option<String>,
 }
 
 /// Stream selectors that name a role rather than a listed stream.
@@ -139,6 +155,7 @@ impl CameraConfig {
             motion: CameraMotionConfig::default(),
             streams: Vec::new(),
             discovery: None,
+            onvif: None,
         }
     }
 }
@@ -160,30 +177,159 @@ pub struct LocalRecordingDest {
 /// A legacy `s3` object from a pre-removal config file is silently ignored by
 /// serde (no `deny_unknown_fields`); see the `serde_ignores_legacy_s3_object`
 /// test below.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CameraRecordingConfig {
+    /// Retained for old clients/configs; never interpreted as cron.
     pub schedule: Option<String>,
     #[serde(default)]
     pub local: LocalRecordingDest,
+    pub mode: RecordingMode,
+    pub weekly_rules: Vec<ScheduleRule>,
+    pub event_pre_sec: u32,
+    pub event_post_sec: u32,
+    pub non_event_keep_hours: u32,
+}
+impl Default for CameraRecordingConfig {
+    fn default() -> Self {
+        Self {
+            schedule: None,
+            local: LocalRecordingDest::default(),
+            mode: RecordingMode::Continuous,
+            weekly_rules: Vec::new(),
+            event_pre_sec: 10,
+            event_post_sec: 15,
+            non_event_keep_hours: 0,
+        }
+    }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingMode {
+    #[default]
+    Continuous,
+    Events,
+    Off,
+}
+/// Monday=0 through Sunday=6; node-local HH:MM boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleRule {
+    pub days: Vec<u8>,
+    pub start: String,
+    pub end: String,
+    pub mode: RecordingMode,
+}
+
+/// Which motion detection a camera uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionSource {
+    #[default]
+    Off,
+    /// NeuroWatch's own detector, on decoded pictures.
+    Builtin,
+    /// The camera's own detection, reported as ONVIF events.
+    Onvif,
+    Both,
+}
+
+impl MotionSource {
+    pub fn uses_onvif(self) -> bool {
+        matches!(self, Self::Onvif | Self::Both)
+    }
+
+    pub fn uses_builtin(self) -> bool {
+        matches!(self, Self::Builtin | Self::Both)
+    }
+}
+
+/// Whether a zone is watched or ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ZoneKind {
+    #[default]
+    Include,
+    Exclude,
+}
+
+/// A polygon on the picture, in coordinates normalised to 0..1, so it
+/// survives a change of stream resolution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MotionZone {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: ZoneKind,
+    pub points: Vec<[f32; 2]>,
+}
+
+impl MotionZone {
+    /// At least three points, every one inside the picture.
+    pub fn is_valid(&self) -> bool {
+        !self.id.is_empty()
+            && self.points.len() >= 3
+            && self
+                .points
+                .iter()
+                .all(|[x, y]| (0.0..=1.0).contains(x) && (0.0..=1.0).contains(y))
+    }
+}
+
+/// Fields left out take their defaults, so a client may send only what it sets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CameraMotionConfig {
+    /// Legacy switch for the built-in detector; [`Self::source`] decides.
     pub enabled: bool,
+    pub source: MotionSource,
     pub sensitivity: u8,
     pub cooldown_sec: f32,
     pub min_duration_sec: f32,
-    pub exclusion_zones: Vec<serde_json::Value>,
+    /// Decode independently decodable pictures only. Short movements between
+    /// keyframes may be missed; normal analysis remains the default.
+    pub low_cpu: bool,
+    /// Include and exclude zones. Untyped entries from older configs (never
+    /// written by any release) are dropped.
+    #[serde(alias = "exclusion_zones", deserialize_with = "deserialize_zones")]
+    pub zones: Vec<MotionZone>,
+}
+
+impl CameraMotionConfig {
+    /// The detection in use: [`Self::source`], or the built-in detector for
+    /// a config that only set the legacy `enabled` switch.
+    pub fn effective_source(&self) -> MotionSource {
+        match self.source {
+            MotionSource::Off if self.enabled => MotionSource::Builtin,
+            source => source,
+        }
+    }
+}
+
+fn deserialize_zones<'de, D>(deserializer: D) -> Result<Vec<MotionZone>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<MotionZone>(value).ok())
+        .filter(MotionZone::is_valid)
+        .collect())
 }
 
 impl Default for CameraMotionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            source: MotionSource::Off,
             sensitivity: 5,
             cooldown_sec: 10.0,
             min_duration_sec: 0.5,
-            exclusion_zones: vec![],
+            low_cpu: false,
+            zones: vec![],
         }
     }
 }
@@ -191,6 +337,21 @@ impl Default for CameraMotionConfig {
 #[cfg(test)]
 mod tests {
     use super::{CameraConfig, CameraRecordingConfig, CameraStream, MAIN_STREAM, SUB_STREAM};
+
+    #[test]
+    fn recording_policy_defaults_preserve_continuous_capture_and_accept_weekly_rules() {
+        let old: CameraRecordingConfig =
+            serde_json::from_value(serde_json::json!({"local":{"enabled":true}})).unwrap();
+        assert_eq!(old.mode, super::RecordingMode::Continuous);
+        assert!(old.weekly_rules.is_empty());
+        assert_eq!(old.event_pre_sec, 10);
+        assert_eq!(old.event_post_sec, 15);
+        let configured: CameraRecordingConfig = serde_json::from_value(serde_json::json!({
+            "mode":"events", "weekly_rules":[{"days":[0,1,2,3,4],"start":"08:00","end":"18:00","mode":"continuous"}]
+        })).unwrap();
+        assert_eq!(configured.mode, super::RecordingMode::Events);
+        assert_eq!(configured.weekly_rules.len(), 1);
+    }
 
     #[test]
     fn serde_missing_protocol_defaults_to_auto() {
@@ -377,5 +538,62 @@ impl WallPosition {
 
     fn single_span() -> u32 {
         1
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::{CameraConfig, MotionSource, ZoneKind};
+
+    #[test]
+    fn old_motion_config_loads_with_source_off_and_no_zones() {
+        let raw = serde_json::json!({
+            "id": "cam-1", "name": "Cam 1", "url": "rtsp://example/stream",
+            "sub_url": null, "username": null, "password_b64": null,
+            "transport": "tcp", "notes": "", "wall_position": null,
+            "motion": {"enabled": false, "sensitivity": 5, "cooldown_sec": 10.0,
+                       "min_duration_sec": 0.5, "exclusion_zones": [{"junk": 1}]}
+        });
+        let cam: CameraConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(cam.motion.source, MotionSource::Off);
+        assert!(cam.motion.zones.is_empty());
+        assert!(!cam.motion.low_cpu);
+        assert_eq!(cam.motion.effective_source(), MotionSource::Off);
+        assert!(cam.onvif.is_none());
+    }
+
+    #[test]
+    fn a_partial_motion_object_takes_defaults() {
+        let motion: super::CameraMotionConfig =
+            serde_json::from_value(serde_json::json!({"source": "onvif"})).unwrap();
+        assert_eq!(motion.source, MotionSource::Onvif);
+        assert_eq!(motion.sensitivity, 5);
+    }
+
+    #[test]
+    fn legacy_enabled_switch_means_the_builtin_detector() {
+        let mut cam = CameraConfig::new("Cam", "rtsp://example/stream");
+        cam.motion.enabled = true;
+        assert_eq!(cam.motion.effective_source(), MotionSource::Builtin);
+        cam.motion.source = MotionSource::Onvif;
+        assert_eq!(cam.motion.effective_source(), MotionSource::Onvif);
+    }
+
+    #[test]
+    fn zones_keep_valid_polygons_only() {
+        let raw = serde_json::json!({"sensitivity": 5, "cooldown_sec": 10.0, "min_duration_sec": 0.5,
+        "source": "both",
+        "zones": [
+            {"id": "z1", "name": "Gate", "kind": "exclude", "points": [[0.0,0.0],[0.5,0.0],[0.5,0.5]]},
+            {"id": "z2", "points": [[0.0,0.0],[0.5,0.0]]},
+            {"id": "z3", "points": [[0.0,0.0],[1.5,0.0],[0.5,0.5]]}
+        ]});
+        let motion: super::CameraMotionConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(motion.source, MotionSource::Both);
+        assert_eq!(motion.zones.len(), 1);
+        assert_eq!(motion.zones[0].kind, ZoneKind::Exclude);
+        let saved = serde_json::to_value(&motion).unwrap();
+        assert!(saved.get("exclusion_zones").is_none());
+        assert_eq!(saved["zones"][0]["id"], "z1");
     }
 }

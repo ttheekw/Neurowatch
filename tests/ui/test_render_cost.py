@@ -8,10 +8,15 @@ every status poll.
 
 from __future__ import annotations
 
+from itertools import pairwise
+
+import pytest
+from PySide6.QtCore import Qt
+
 from neurowatch.models.camera import CameraConfig
 from neurowatch.widgets import cell_widget as cell_widget_module
 from neurowatch.widgets.camera_panel import CameraPanel
-from neurowatch.widgets.cell_widget import CellWidget
+from neurowatch.widgets.cell_widget import AUDIO_AVAILABLE, CellWidget
 
 _FRAME = bytes(16 * 9 * 3)  # black 16x9 RGB frame
 
@@ -81,6 +86,59 @@ def test_tile_overlays_are_still_painted(qtbot, monkeypatch):
 
     assert has_overlay(2, 2, 160, 18), "name label and LIVE badge"
     assert has_overlay(140, 250, 340, 268), "clock / codec / fps strip"
+
+
+@pytest.mark.parametrize("size", [(120, 68), (320, 180), (1920, 1080)])
+def test_overlay_controls_share_a_row_and_remain_clickable_after_resize(qtbot, monkeypatch, size):
+    cell = _streaming_cell(qtbot, monkeypatch)
+    cell.set_camera(CameraConfig(id="cam-1", name="Front door overlooking the driveway and road"))
+    cell.set_audio(AUDIO_AVAILABLE)
+    cell.set_motion(True)
+    cell.set_motion_pending(True)
+    cell._zoom = 2.0
+    cell.resize(*size)
+    cell.grab()
+    boxes = cell._top_control_rects()
+    label = cell._overlay_cache["label"][1]
+    assert len({box.top() for box in boxes.values()}) == 1
+    assert {box.height() for box in boxes.values()} == {
+        round(label.height() / label.devicePixelRatioF())
+    }
+    ordered = sorted(boxes.values(), key=lambda box: box.left())
+    assert ordered[0].left() >= 0
+    assert ordered[-1].right() < cell.width()
+    assert all(a.right() < b.left() for a, b in pairwise(ordered))
+    assert round(label.width() / label.devicePixelRatioF()) + ordered[0].top() < ordered[0].left()
+
+    acknowledged: list[str] = []
+    listening: list[str] = []
+    cell.motion_acknowledge_requested.connect(acknowledged.append)
+    cell.audio_toggle_requested.connect(listening.append)
+    qtbot.mouseClick(cell, Qt.MouseButton.LeftButton, pos=boxes["motion"].center())
+    qtbot.mouseClick(cell, Qt.MouseButton.LeftButton, pos=boxes["audio"].center())
+    qtbot.mouseClick(cell, Qt.MouseButton.LeftButton, pos=boxes["zoom"].center())
+    assert acknowledged == ["cam-1"] and listening == ["cam-1"]
+    assert cell._zoom == 1.0
+
+
+def test_vector_alert_renders_at_native_density_and_reuses_its_cached_pixels(qtbot, monkeypatch):
+    cell = _streaming_cell(qtbot, monkeypatch)
+    cell.set_motion_pending(True)
+    calls: list[str] = []
+    original = cell._render_top_button
+
+    def render(kind, width, dpr):
+        calls.append(kind)
+        return original(kind, width, dpr)
+
+    monkeypatch.setattr(cell, "_render_top_button", render)
+    monkeypatch.setattr(cell, "devicePixelRatioF", lambda: 2.0)
+    for _ in range(5):
+        cell.grab()
+    alert = cell._overlay_cache["motion"][1]
+    assert alert.devicePixelRatioF() == 2.0
+    assert alert.width() == cell.motion_alert_rect().width() * 2
+    assert calls == ["motion"], "the icon must not be rebuilt for each video frame"
 
 
 def test_camera_list_rows_are_not_restyled_when_nothing_changed(qtbot, monkeypatch):

@@ -4,11 +4,21 @@
 //! plugins, then selects an available decoder family. Factory presence alone
 //! does not prove a driver can decode a particular stream.
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const VA_UPDATE_REQUIRED: &str =
     "local live view requires a GStreamer VA plugin with the 1.24.6 DMA-BUF fix or later";
 static LIVE_VIEW_BLOCK_REASON: OnceLock<&'static str> = OnceLock::new();
+
+/// Why hardware decoding is not in use although a graphics card is there.
+pub const GPU_NOT_ACCESSIBLE: &str = "The graphics card is not available to NeuroWatch yet: it \
+     started before you signed in. It switches to hardware decoding once you sign in. Installing \
+     the .deb, .rpm or Arch package gives your account the graphics card from boot (the render \
+     and video groups, after a restart); with the portable download: sudo usermod -aG \
+     render,video $USER.";
+/// The decoder devices that could not be opened when the backend started.
+static GPU_PENDING: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HwAccelKind {
@@ -70,8 +80,122 @@ pub fn probe() -> HwAccelKind {
         tracing::info!("Hardware acceleration: V4L2 M2M");
         return HwAccelKind::V4l2M2m;
     }
+    // A decoder this user may not open yet: a GPU's render node (VA-API) or
+    // an SoC's V4L2 decoder (Raspberry Pi, Rockchip: ARM boards). Without
+    // the `render` / `video` group, logind grants them only to a signed-in
+    // session, and a service started at boot (lingering) or early in the
+    // sign-in runs before that. GStreamer then registers no hardware
+    // decoders, for the life of this process.
+    let blocked = blocked_nodes(&accelerator_nodes());
+    if !blocked.is_empty() {
+        tracing::warn!(nodes = ?blocked, "Decoder devices cannot be opened yet");
+        let _ = GPU_PENDING.set(blocked);
+        tracing::warn!(
+            "Hardware acceleration: Software (avdec_h264) for now: the graphics card or video \
+             decoder cannot be opened yet (started before sign-in); the backend restarts itself \
+             once it can"
+        );
+        return HwAccelKind::Software;
+    }
     tracing::info!("Hardware acceleration: Software (avdec_h264)");
     HwAccelKind::Software
+}
+
+const DRI_DIR: &str = "/dev/dri";
+const V4L2_SYSFS: &str = "/sys/class/video4linux";
+const DEV_DIR: &str = "/dev";
+/// How often a backend waiting for the graphics card checks for it.
+pub const GPU_ACCESS_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The DRM render nodes (`renderD*`) in `dir`; none off Linux.
+fn render_nodes(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
+        .map(|entry| entry.path())
+        .collect();
+    nodes.sort();
+    nodes
+}
+
+/// V4L2 video decoders (`/dev/videoN`), told from cameras by their driver's
+/// name in sysfs: Raspberry Pi's `bcm2835-codec-decode`, Rockchip's
+/// `rkvdec`, Hantro and Allwinner VPUs. None off Linux.
+fn v4l2_decoder_nodes(sysfs: &Path, dev: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(sysfs) else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("video"))
+        .filter(|entry| {
+            std::fs::read_to_string(entry.path().join("name"))
+                .is_ok_and(|name| is_decoder_name(&name))
+        })
+        .map(|entry| dev.join(entry.file_name()))
+        .collect();
+    nodes.sort();
+    nodes
+}
+
+fn is_decoder_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["codec", "dec", "vpu", "hantro", "cedrus"]
+        .iter()
+        .any(|word| name.contains(word))
+}
+
+/// Every hardware decoder device: GPU render nodes and V4L2 decoders.
+fn accelerator_nodes() -> Vec<PathBuf> {
+    let mut nodes = render_nodes(Path::new(DRI_DIR));
+    nodes.extend(v4l2_decoder_nodes(
+        Path::new(V4L2_SYSFS),
+        Path::new(DEV_DIR),
+    ));
+    nodes
+}
+
+fn openable(node: &Path) -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(node)
+        .is_ok()
+}
+
+/// The decoder devices this process cannot open.
+fn blocked_nodes(nodes: &[PathBuf]) -> Vec<PathBuf> {
+    nodes
+        .iter()
+        .filter(|node| !openable(node))
+        .cloned()
+        .collect()
+}
+
+/// Hardware decoding fell back to software only because the graphics card
+/// could not be opened yet ([`GPU_NOT_ACCESSIBLE`]).
+pub fn waiting_for_gpu_access() -> bool {
+    GPU_PENDING.get().is_some()
+}
+
+/// Resolves once one of the devices that could not be opened at start can
+/// be: the moment a restart would find its decoders. Never resolves if none
+/// ever can (or none was waited for), so a device that stays closed never
+/// restarts the backend, and one that opens restarts it once.
+pub async fn gpu_accessible() {
+    let Some(nodes) = GPU_PENDING.get() else {
+        return std::future::pending().await;
+    };
+    let mut tick = tokio::time::interval(GPU_ACCESS_POLL);
+    loop {
+        tick.tick().await;
+        if nodes.iter().any(|node| openable(node)) {
+            return;
+        }
+    }
 }
 
 /// Apply to the process registry, not just our explicit H.264 preference:
@@ -145,6 +269,26 @@ fn exclude_plugin_features(registry: &gstreamer::Registry, name: &str) -> usize 
     count
 }
 
+/// Remove every hardware decoder plugin from this process's registry, so
+/// `decodebin` decodes in software (measurements that must not depend on the
+/// machine's GPU). Irreversible for the process: only for a test run alone.
+#[cfg(test)]
+pub(crate) fn remove_hardware_decoders() -> usize {
+    let registry = gstreamer::Registry::get();
+    [
+        "va",
+        "vaapi",
+        "nvcodec",
+        "v4l2codecs",
+        "qsv",
+        "d3d11",
+        "d3d12",
+    ]
+    .into_iter()
+    .map(|plugin| exclude_plugin_features(&registry, plugin))
+    .sum()
+}
+
 /// Rank `factories` above the software decoders (`avdec_*`, primary), so the
 /// `decodebin` of live view and playback picks them too, not only the explicit
 /// `h264_decoder` choice.
@@ -194,7 +338,68 @@ pub fn color_converter(kind: HwAccelKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{h264_decoder, prefer_over_software, HwAccelKind};
+    use super::{
+        blocked_nodes, h264_decoder, is_decoder_name, openable, prefer_over_software, render_nodes,
+        v4l2_decoder_nodes, HwAccelKind,
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn a_decoder_that_cannot_be_opened_yet_is_told_apart_from_no_decoder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nw-dri-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (dri, sysfs, dev) = (dir.join("dri"), dir.join("sysfs"), dir.join("dev"));
+        for folder in [&dri, &sysfs, &dev] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        assert!(render_nodes(&dri).is_empty() && v4l2_decoder_nodes(&sysfs, &dev).is_empty());
+        assert!(
+            blocked_nodes(&[]).is_empty(),
+            "no decoder: nothing to wait for"
+        );
+
+        std::fs::write(dri.join("card1"), b"").unwrap();
+        let render = dri.join("renderD128");
+        std::fs::write(&render, b"").unwrap();
+        assert_eq!(
+            render_nodes(&dri),
+            vec![render.clone()],
+            "only render nodes"
+        );
+
+        // An ARM board: a V4L2 decoder beside a camera.
+        for (node, name) in [
+            ("video0", "Integrated_Webcam_HD: Integrate"),
+            ("video10", "bcm2835-codec-decode"),
+        ] {
+            std::fs::create_dir_all(sysfs.join(node)).unwrap();
+            std::fs::write(sysfs.join(node).join("name"), format!("{name}\n")).unwrap();
+            std::fs::write(dev.join(node), b"").unwrap();
+        }
+        let decoder = dev.join("video10");
+        assert_eq!(
+            v4l2_decoder_nodes(&sysfs, &dev),
+            vec![decoder.clone()],
+            "cameras are not decoders"
+        );
+        assert!(
+            is_decoder_name("rkvdec")
+                && is_decoder_name("hantro-vpu")
+                && !is_decoder_name("USB2.0 Camera")
+        );
+
+        let nodes = [render.clone(), decoder.clone()];
+        assert!(blocked_nodes(&nodes).is_empty(), "openable: not waiting");
+        std::fs::set_permissions(&decoder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let root = openable(&decoder); // root opens anything; the check is moot then
+        assert_eq!(
+            blocked_nodes(&nodes),
+            if root { vec![] } else { vec![decoder.clone()] },
+            "only the decoder that cannot be opened is waited for"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn va_leak_version_boundaries() {

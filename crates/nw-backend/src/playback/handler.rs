@@ -57,6 +57,8 @@ WHERE camera_id = ?1 \
 ORDER BY start_ts DESC \
 LIMIT 1";
 
+type ResolvedPlaylist = ((i64, i64, String, i64), Vec<PlaybackSegment>);
+
 pub struct PlaybackHandler {
     /// Cameras whose whole archive [`Self::index_segments`] has already read.
     archive_indexed: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -101,26 +103,25 @@ impl PlaybackHandler {
             .ok_or_else(|| RpcError::invalid_params("Missing 'end_ms'"))?;
 
         self.refresh_local_segments(camera_id).await;
-        let db = self.db_handle().await;
-        let conn = db
-            .lock()
-            .map_err(|_| RpcError::internal("DB lock poisoned"))?;
-
-        let mut stmt = conn
-            .prepare(GET_TIMELINE_SQL)
-            .map_err(|e| RpcError::internal(e.to_string()))?;
-
-        let rows: Vec<Value> = stmt
-            .query_map(rusqlite::params![camera_id, start_ms, end_ms], |r| {
-                Ok(json!({
-                    "start_ms": r.get::<_, i64>(0)?,
-                    "end_ms":   r.get::<_, Option<i64>>(1)?,
-                    "path":     r.get::<_, String>(2)?,
-                }))
+        let query_camera = camera_id.to_owned();
+        let rows: Vec<Value> = self
+            .read_db(move |conn| {
+                let mut stmt = conn.prepare(GET_TIMELINE_SQL).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(rusqlite::params![query_camera, start_ms, end_ms], |r| {
+                        Ok(json!({
+                            "start_ms": r.get::<_, i64>(0)?,
+                            "end_ms": r.get::<_, Option<i64>>(1)?,
+                            "path": r.get::<_, String>(2)?,
+                        }))
+                    })
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(rows)
             })
-            .map_err(|e| RpcError::internal(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .await
+            .map_err(RpcError::internal)?;
 
         tracing::debug!(
             camera_id = %camera_id,
@@ -157,21 +158,16 @@ impl PlaybackHandler {
         };
 
         // Find the best segment for this timestamp.
-        let ((seg_start, seg_end, _path, open_ts), segments) = {
-            let db = self.db_handle().await;
-            let conn = db
-                .lock()
-                .map_err(|_| RpcError::internal("DB lock poisoned"))?;
-            let resolved = resolve_segment_for_ts(&conn, &camera_id, ts_ms, segment_duration_ms)
-                .ok_or_else(|| {
-                    RpcError::internal(format!(
-                        "No segment found for camera '{}' near ts {}",
-                        camera_id, ts_ms
-                    ))
-                })?;
-            let segments = playlist_from_segment(&conn, &camera_id, &resolved, segment_duration_ms);
-            (resolved, segments)
-        };
+        let ((seg_start, seg_end, _path, open_ts), segments) = self
+            .resolve_playlist(&camera_id, ts_ms, segment_duration_ms)
+            .await
+            .map_err(RpcError::internal)?
+            .ok_or_else(|| {
+                RpcError::internal(format!(
+                    "No segment found for camera '{}' near ts {}",
+                    camera_id, ts_ms
+                ))
+            })?;
 
         let initial_seek_ms = (open_ts - seg_start).max(0);
         let session_id = Uuid::new_v4().to_string();
@@ -255,17 +251,10 @@ impl PlaybackHandler {
             (st.config.recording.segment_minutes as i64) * 60_000
         };
 
-        let maybe_target = {
-            let db = self.db_handle().await;
-            let conn = db
-                .lock()
-                .map_err(|_| RpcError::internal("DB lock poisoned"))?;
-            resolve_segment_for_ts(&conn, &camera_id, ts_ms, segment_duration_ms).map(|resolved| {
-                let segments =
-                    playlist_from_segment(&conn, &camera_id, &resolved, segment_duration_ms);
-                (resolved, segments)
-            })
-        };
+        let maybe_target = self
+            .resolve_playlist(&camera_id, ts_ms, segment_duration_ms)
+            .await
+            .map_err(RpcError::internal)?;
 
         let Some(((seg_start, seg_end, _path, open_ts), segments)) = maybe_target else {
             tracing::debug!(
@@ -514,14 +503,10 @@ impl PlaybackHandler {
             let st = self.state.read().await;
             (st.config.recording.segment_minutes as i64) * 60_000
         };
-        let ((seg_start, _seg_end, _path, open_ts), segments) = {
-            let db = self.db_handle().await;
-            let conn = db.lock().map_err(|_| "DB lock poisoned".to_owned())?;
-            let resolved = resolve_segment_for_ts(&conn, camera_id, ts_ms, segment_duration_ms)
-                .ok_or_else(|| "no recording at that time".to_owned())?;
-            let segments = playlist_from_segment(&conn, camera_id, &resolved, segment_duration_ms);
-            (resolved, segments)
-        };
+        let ((seg_start, _seg_end, _path, open_ts), segments) = self
+            .resolve_playlist(camera_id, ts_ms, segment_duration_ms)
+            .await?
+            .ok_or_else(|| "no recording at that time".to_owned())?;
         Ok((segments, (open_ts - seg_start).max(0)))
     }
 
@@ -538,15 +523,51 @@ impl PlaybackHandler {
             let st = self.state.read().await;
             (st.config.recording.segment_minutes as i64) * 60_000
         };
+        let camera_id = camera_id.to_owned();
+        self.read_db(move |conn| {
+            Ok(segments_in_range(
+                conn,
+                &camera_id,
+                start_ms,
+                end_ms,
+                segment_duration_ms,
+            ))
+        })
+        .await
+    }
+
+    async fn read_db<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&rusqlite::Connection) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
         let db = self.db_handle().await;
-        let conn = db.lock().map_err(|_| "DB lock poisoned".to_owned())?;
-        Ok(segments_in_range(
-            &conn,
-            camera_id,
-            start_ms,
-            end_ms,
-            segment_duration_ms,
-        ))
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().map_err(|_| "DB lock poisoned".to_owned())?;
+            work(&conn)
+        })
+        .await
+        .map_err(|error| format!("Playback database worker failed: {error}"))?
+    }
+
+    async fn resolve_playlist(
+        &self,
+        camera_id: &str,
+        ts_ms: i64,
+        segment_duration_ms: i64,
+    ) -> Result<Option<ResolvedPlaylist>, String> {
+        let camera_id = camera_id.to_owned();
+        self.read_db(move |conn| {
+            Ok(
+                resolve_segment_for_ts(conn, &camera_id, ts_ms, segment_duration_ms).map(
+                    |resolved| {
+                        let segments =
+                            playlist_from_segment(conn, &camera_id, &resolved, segment_duration_ms);
+                        (resolved, segments)
+                    },
+                ),
+            )
+        })
+        .await
     }
 
     async fn db_handle(&self) -> Arc<std::sync::Mutex<rusqlite::Connection>> {
@@ -561,7 +582,7 @@ impl PlaybackHandler {
     /// Index a camera's segment files; only date folders from `since_day` on
     /// when given.
     async fn scan_segments(&self, camera_id: &str, since_day: Option<&str>) {
-        let (db, camera_roots, segment_duration_ms) = {
+        let (db, camera_roots, segment_duration_ms, archive_root) = {
             let st = self.state.read().await;
             let cam = st.config.cameras.iter().find(|c| c.id == camera_id);
             let mut camera_roots = Vec::new();
@@ -578,8 +599,25 @@ impl PlaybackHandler {
                     }
                 }
             }
+            // Recordings moved to the archive (`recording::archive`): read
+            // there too, while it is there.
+            let archive = &st.config.recording.archive;
+            let archive_root = (cam.is_some() && !archive.path.trim().is_empty())
+                .then(|| expand_user_path(&archive.path))
+                .filter(|root| st.storage.is_ready(root))
+                .map(|root| root.join(camera_id));
+            if let Some(root) = &archive_root {
+                if !camera_roots.contains(root) {
+                    camera_roots.push(root.clone());
+                }
+            }
             let segment_duration_ms = (st.config.recording.segment_minutes as i64) * 60_000;
-            (Arc::clone(&st.db), camera_roots, segment_duration_ms)
+            (
+                Arc::clone(&st.db),
+                camera_roots,
+                segment_duration_ms,
+                archive_root,
+            )
         };
 
         if camera_roots.is_empty() {
@@ -608,6 +646,11 @@ impl PlaybackHandler {
                         ),
                     }
                 }
+            }
+            // Archived files indexed anew (the index was lost or rebuilt).
+            // The archive itself indexes what it moves, so a full read only.
+            if let (Some(root), None, Ok(conn)) = (archive_root, &since_day, db.lock()) {
+                crate::recording::archive::mark_archived(&conn, &cam_id, &root);
             }
         })
         .await;
@@ -835,7 +878,7 @@ fn resolve_segment_for_ts(
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use nw_core::camera::CameraConfig;
     use nw_core::ipc::RpcError;
@@ -915,6 +958,41 @@ mod tests {
         let mut cam = CameraConfig::new("Camera", "rtsp://example.invalid/stream");
         cam.id = id.to_owned();
         cam
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeline_db_contention_does_not_block_other_async_requests() {
+        let (config, root) = isolated_config("ipc-db-contention");
+        let fixture = fixture(config, &root);
+        let db = Arc::clone(&fixture.db);
+        let (locked, acquired) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = db.lock().unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        acquired.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = std::time::Instant::now();
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let params = json!({"camera_id":"missing", "start_ms":0, "end_ms":1000});
+        let query = async {
+            entered.send(()).unwrap();
+            fixture
+                .handler
+                .dispatch("playback.get_timeline", &params)
+                .await
+        };
+        let heartbeat = async {
+            entered_rx.await.unwrap();
+            started.elapsed()
+        };
+        let (result, scheduling_delay) = tokio::join!(query, heartbeat);
+        assert_eq!(result.unwrap(), json!([]));
+        holder.join().unwrap();
+        assert!(
+            scheduling_delay < Duration::from_millis(300),
+            "timeline database wait blocked async requests for {scheduling_delay:?}"
+        );
     }
 
     fn insert_segment(

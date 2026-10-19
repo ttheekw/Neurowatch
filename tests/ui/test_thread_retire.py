@@ -41,3 +41,40 @@ def test_a_retired_worker_is_kept_until_it_finishes(qtbot) -> None:
     idle = _Sleeper()
     threads.retire(idle)  # never started: nothing to keep
     assert threads.retired_count() == 0
+
+
+def test_a_worker_dropped_by_its_result_slot_while_still_running_survives(qtbot) -> None:
+    """The camera dialog's Motion tab set ``self._worker = None`` in the slot
+    of the worker's result signal; when the GUI thread got there before
+    ``run`` returned, Python destroyed a running QThread and Qt aborted the
+    app ("QThread: Destroyed while thread '' is still running")."""
+    import gc
+
+    from PySide6.QtCore import Signal
+
+    from neurowatch.utils.threads import Worker, alive_count
+
+    class Slow(Worker):
+        done = Signal(object)
+
+        def run(self) -> None:
+            self.done.emit("result")
+            self.msleep(300)  # still running after its result was handled
+
+    holder: dict[str, Worker | None] = {}
+    results: list[object] = []
+
+    def on_done(result: object) -> None:
+        results.append(result)
+        holder["worker"] = None  # the last reference, dropped mid-run
+        gc.collect()
+
+    before = alive_count()
+    worker = Slow()
+    worker.done.connect(on_done)
+    holder["worker"] = worker
+    worker.start()
+    del worker
+    qtbot.waitUntil(lambda: results == ["result"], timeout=2000)
+    assert alive_count() == before + 1, "kept alive while its thread runs"
+    qtbot.waitUntil(lambda: alive_count() == before, timeout=3000)

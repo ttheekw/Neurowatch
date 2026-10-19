@@ -28,15 +28,19 @@ from PySide6.QtCore import QEventLoop, QObject, QThread, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
-from neurowatch import extensions
 from neurowatch.service import probe
 from neurowatch.service.lock import InstanceLock
 from neurowatch.service.manager import DESKTOP, ServiceController, ServiceError, running_mode
 from neurowatch.service.paths import IS_WINDOWS, dev_mode, lock_path, log_path, python_command
+from neurowatch.utils.threads import Worker
 
 logger = logging.getLogger(__name__)
 
 _ACTIVATE = b"activate\n"
+
+
+#: Commands of ``neurowatch.headless`` the launcher passes on as they are.
+CORE_COMMANDS = ("events", "cloud")
 
 
 @dataclass(frozen=True)
@@ -52,13 +56,13 @@ class LaunchOptions:
 def parse_launch_args(argv: list[str]) -> LaunchOptions:
     """``neurowatch-ui [--no-autostart] | --tray | --headless ... | service ... | COMMAND ...``.
 
-    ``COMMAND`` is one an extension adds (``neurowatch.extensions.commands``);
-    its arguments go to ``neurowatch.headless`` as they are.
+    ``COMMAND`` is ``events`` or ``cloud``; its arguments go to
+    ``neurowatch.headless`` as they are.
     """
     args = argv[1:]
     if args and args[0] == "service":
         return LaunchOptions(mode="service", rest=tuple(args[1:]))
-    if args and args[0] in extensions.commands():
+    if args and args[0] in CORE_COMMANDS:
         return LaunchOptions(mode="command", rest=tuple(args))
     if "--headless" in args:
         return LaunchOptions(mode="headless", rest=tuple(a for a in args if a != "--headless"))
@@ -76,7 +80,7 @@ def parse_launch_args(argv: list[str]) -> LaunchOptions:
 # ---------------------------------------------------------------------------
 
 
-class _ServiceStart(QThread):
+class _ServiceStart(Worker):
     """``ServiceController.ensure_running`` (desktop mode) off the GUI thread."""
 
     def __init__(self, controller: ServiceController, autostart: bool) -> None:

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import argparse
 import io
-from types import SimpleNamespace
 from typing import Any
 
-from neurowatch import extensions, headless
+from neurowatch import headless
 from neurowatch.headless import Snapshot, describe_changes, monitor
 
 
@@ -196,65 +194,135 @@ def test_headless_starts_the_service_in_headless_mode_and_outlives_ctrl_c(monkey
     assert calls == [(False, "headless")]
 
 
-def _example_extension(said_before: list[str]) -> SimpleNamespace:
-    """An extension with every headless hook (see neurowatch.extensions)."""
-
-    def add_monitor_arguments(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("--example", action="store_true")
-
-    def before_monitor(args: argparse.Namespace, _rpc: Any, say: Any) -> int | None:
-        said_before.append("before")
-        return 2 if args.example else None
-
-    def add_commands(subparsers: Any) -> None:
-        subparsers.add_parser("example").add_argument("value")
-
-    def run_command(args: argparse.Namespace, _rpc: Any, say: Any) -> int | None:
-        if args.command != "example":
-            return None
-        say(f"example {args.value}")
-        return 0
-
-    return SimpleNamespace(
-        commands=("example",),
-        status_line=lambda rpc: f"Example: {rpc('example.status', {}, 1.0)}",
-        add_monitor_arguments=add_monitor_arguments,
-        before_monitor=before_monitor,
-        add_commands=add_commands,
-        run_command=run_command,
-    )
-
-
-def test_extensions_add_status_lines_monitor_options_and_commands(monkeypatch):
-    calls: list[str] = []
-    extension = _example_extension(calls)
-    monkeypatch.setattr(extensions, "load", lambda: (extension,))
-    backend = _monitor_backend([{"a": "streaming"}] + [ConnectionError("gone")] * 3)
-    backend.answers["example.status"] = "on"
+def test_the_cloud_adds_its_status_line_link_options_and_command(monkeypatch):
+    # Two status reads (status, cloud status), then the recorder is gone.
+    backend = _monitor_backend([{"a": "streaming"}] * 2 + [ConnectionError("gone")] * 3)
+    backend.answers["cloud.status"] = {"phase": "unlinked", "cloud_configured": True}
     monkeypatch.setattr(headless, "client_rpc", lambda _endpoint: backend)
 
     out = io.StringIO()
     assert headless.main(["status"], out=out) == 0
-    assert out.getvalue().splitlines()[-1].endswith("Example: on")
+    assert "Cloud: not linked" in out.getvalue().splitlines()[-1]
 
     out = io.StringIO()
-    assert headless.main(["example", "42"], out=out) == 0
-    assert out.getvalue().strip().endswith("example 42")
-    assert extensions.commands() == {"example"}
+    assert headless.main(["cloud", "status"], out=out) == 0
+    assert "Cloud: not linked" in out.getvalue()
 
-    # A monitor option can stop before monitoring; otherwise the monitor runs.
-    assert headless.main(["monitor", "--example"], out=io.StringIO()) == 2
+    # --name without --link stops before monitoring; otherwise the monitor runs.
+    assert headless.main(["monitor", "--name", "Lab"], out=io.StringIO()) == 2
     assert headless.main(["monitor", "--interval", "0"], out=io.StringIO()) == 1
-    assert calls == ["before", "before"]
 
 
-def test_a_failing_extension_does_not_stop_the_status(monkeypatch):
+def test_a_failing_cloud_line_does_not_stop_the_status(monkeypatch):
+    from neurowatch.cloud import headless as cloud_cli
+
     def broken(_rpc: Any) -> str:
-        raise RuntimeError("broken extension")
+        raise RuntimeError("broken cloud line")
 
-    monkeypatch.setattr(extensions, "load", lambda: (SimpleNamespace(status_line=broken),))
+    monkeypatch.setattr(cloud_cli, "status_line", broken)
     backend = _monitor_backend([{"a": "streaming"}])
 
     snapshot = headless.poll(backend, {})
 
     assert snapshot.statuses == {"a": "streaming"} and snapshot.extras == ()
+
+
+# ── Events ─────────────────────────────────────────────────────────────────
+
+
+def _notice(seq: int, phase: str, kind: str, camera: str | None = "a", **extra: Any) -> dict:
+    return {
+        "seq": seq,
+        "phase": phase,
+        "event": {"id": seq, "kind": kind, "camera_id": camera, "start_ms": 0, **extra},
+    }
+
+
+def test_event_lines_name_the_camera_and_skip_uninteresting_ends():
+    names = {"a": "Front Door"}
+    line = headless.event_line
+    assert line({"kind": "motion", "camera_id": "a"}, names) == "Motion · Front Door"
+    assert line({"kind": "motion", "camera_id": "a"}, names, "end") is None
+    assert line({"kind": "camera_offline", "camera_id": "a"}, names, "end") == (
+        "Camera back online · Front Door"
+    )
+    # The health monitor's detail is the camera's name: said once.
+    assert line({"kind": "camera_offline", "camera_id": "a", "detail": "Front Door"}, names) == (
+        "Camera offline · Front Door"
+    )
+    assert line(
+        {"kind": "disk_low", "camera_id": None, "detail": "1.5 GB free on /rec"}, names
+    ) == ("Recording drive almost full · 1.5 GB free on /rec")
+    assert line({"kind": "motion"}, names, "update") is None
+
+
+def test_event_feed_starts_from_now_and_follows_the_cursor():
+    calls: list[dict] = []
+    answers = iter(
+        [
+            {"boot": "b1", "seq": 5, "reset": False, "notices": []},
+            {"boot": "b1", "seq": 6, "reset": False, "notices": [_notice(6, "start", "motion")]},
+            {"boot": "b2", "seq": 1, "reset": True, "notices": []},
+        ]
+    )
+
+    def wait(params: dict) -> dict:
+        calls.append(params)
+        return next(answers)
+
+    feed = headless.EventFeed(FakeBackend({"events.wait": wait}))
+    assert feed.poll() == []
+    assert [n["seq"] for n in feed.poll(1000)] == [6]
+    assert calls[1] == {"timeout_ms": 1000, "after": 5, "boot": "b1"}
+    assert feed.poll() == []  # a restarted backend: start over, quietly
+    assert feed._seq == 1
+
+
+def test_monitor_prints_new_events():
+    backend = _monitor_backend([{"a": "streaming"}, {"a": "streaming"}])
+    answers = iter(
+        [
+            {"boot": "b", "seq": 0, "notices": []},
+            {
+                "boot": "b",
+                "seq": 2,
+                "notices": [_notice(1, "start", "motion"), _notice(2, "end", "motion")],
+            },
+        ]
+    )
+    backend.answers["events.wait"] = lambda _params: next(answers)
+    said: list[str] = []
+
+    monitor(backend, said.append, interval=0, sleep=lambda _s: None, max_polls=2)
+
+    assert said.count("Motion · Front Door") == 1
+
+
+def test_events_command_lists_oldest_first_and_filters_by_camera():
+    seen: list[dict] = []
+
+    def listed(params: dict) -> dict:
+        seen.append(params)
+        return {
+            "events": [
+                {"kind": "motion", "camera_id": "a", "start_ms": 2_000, "end_ms": 5_000},
+                {"kind": "camera_offline", "camera_id": "a", "start_ms": 1_000, "end_ms": None},
+            ]
+        }
+
+    backend = FakeBackend(
+        {"camera.list": [{"id": "a", "name": "Front Door"}], "events.list": listed}
+    )
+    said: list[str] = []
+    assert headless.print_events(backend, said.append, camera="Front Door", limit=5) == 0
+    assert seen == [{"limit": 5, "camera_ids": ["a"]}]
+    assert said[0].endswith("Camera offline · Front Door  (going on)")
+    assert said[1].endswith("Motion · Front Door  (3 s)")
+    assert headless.print_events(backend, said.append, camera="Nope") == 2
+
+
+def test_events_is_a_launcher_command():
+    from neurowatch.app_launch import parse_launch_args
+
+    launch = parse_launch_args(["neurowatch-ui", "events", "--follow"])
+    assert (launch.mode, launch.rest) == ("command", ("events", "--follow"))

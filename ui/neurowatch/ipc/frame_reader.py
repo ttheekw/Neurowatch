@@ -12,7 +12,9 @@ import threading
 import time
 from collections.abc import Iterator
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Signal
+
+from neurowatch.utils.threads import Worker
 
 # Must match nw-core/src/frame.rs shm constants
 SLOT_COUNT = 8
@@ -58,7 +60,7 @@ def _windows_mapping_exists(name: str) -> bool:
     return True
 
 
-class FrameReaderThread(QThread):
+class FrameReaderThread(Worker):
     """Copy the latest negotiated RGB24/NV12 frame from shared memory.
 
     RGB remains the default. Only a GPU-capable wall requests NV12, whose

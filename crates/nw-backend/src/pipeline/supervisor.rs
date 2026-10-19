@@ -50,7 +50,7 @@ pub(super) const OFFLINE_AFTER_FAILURES: u32 = 3;
 /// A running pipeline that delivers no decoded frame for this long (at start
 /// or mid-stream) is treated as failed, so a source that accepts the
 /// connection but sends no video does not sit in `connecting` forever.
-pub(super) const NO_FRAME_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const NO_FRAME_TIMEOUT: Duration = Duration::from_secs(20);
 /// Upper bound for the cheap reachability probe before a pipeline build.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Cap on elements visited while walking upstream from the live sink.
@@ -142,7 +142,27 @@ pub struct PipelineSupervisor {
     reconnect_attempt: u32,
     /// Decoded input frames, before optional preview pacing.
     frame_counter: Arc<AtomicU64>,
+    /// Shared camera connections: an RTSP/RTMP view decodes its stream's
+    /// hub instead of connecting itself (`crate::streams`).
+    hubs: Option<Arc<crate::streams::StreamHubs>>,
+    /// Decode any shareable source through its hub, whatever
+    /// `NW_STREAM_HUB` says (tests: files).
+    shared_any: bool,
+    /// Kept across decoder rebuilds and backoffs: a decoder failure does not
+    /// reconnect the camera.
+    subscription: Option<crate::streams::Subscription>,
+    feed: Option<crate::streams::feed::VideoFeed>,
+    /// The unit at which the stream's format changed: the rebuilt decoder
+    /// starts with it.
+    pending_unit: Option<crate::streams::SharedUnit>,
+    hub_seen: u64,
+    /// The hub lost the camera since the last decoded frame.
+    hub_lost: bool,
 }
+
+/// Most bytes waiting in a shared view's `appsrc` before units are left in
+/// its subscription (whose bound then skips to the next keyframe).
+const VIEW_BACKLOG_BYTES: u64 = 8 * 1024 * 1024;
 
 impl PipelineSupervisor {
     pub fn new(
@@ -176,7 +196,28 @@ impl PipelineSupervisor {
             reachability: None,
             reconnect_attempt: 0,
             frame_counter: Arc::new(AtomicU64::new(0)),
+            hubs: None,
+            shared_any: false,
+            subscription: None,
+            feed: None,
+            pending_unit: None,
+            hub_seen: u64::MAX,
+            hub_lost: false,
         }
+    }
+
+    /// Decode RTSP/RTMP cameras from their shared connection (`hubs`).
+    pub fn with_stream_hubs(mut self, hubs: Arc<crate::streams::StreamHubs>) -> Self {
+        self.hubs = Some(hubs);
+        self
+    }
+
+    /// Whether this view decodes the camera's shared connection. Tests force
+    /// it (`shared_any`) whatever `NW_STREAM_HUB` says.
+    fn uses_hub(&self) -> bool {
+        self.hubs.is_some()
+            && ((self.shared_any && crate::streams::shareable(&self.config))
+                || (crate::streams::enabled() && builder::shared_view_supported(&self.config.url)))
     }
 
     /// Attach health counters that will be incremented as frames flow.
@@ -275,6 +316,7 @@ impl PipelineSupervisor {
                 }
                 State::Stopped => {
                     if self.destroy_pipeline() {
+                        self.subscription = None;
                         // A replacement is allowed to proceed only after the
                         // pipeline is NULL and appsink callbacks are gone.
                         if let Some(lease) = self.active_assignment.take() {
@@ -311,9 +353,32 @@ impl PipelineSupervisor {
         if attempt > 0 {
             tracing::warn!(cam_id = %self.cam_id, attempt, "Reconnect attempt");
         }
-        if let Err(reason) = probe_source(&self.config.url) {
-            self.state = State::Error { reason };
-            return;
+        let shared = self.uses_hub();
+        // A shared connection checks the camera itself.
+        if !shared {
+            if let Err(reason) = probe_source(&self.config.url) {
+                self.state = State::Error { reason };
+                return;
+            }
+        }
+        if shared && self.subscription.is_none() {
+            let Some(hubs) = &self.hubs else {
+                return;
+            };
+            match hubs.subscribe(
+                &self.config,
+                crate::streams::SubscriberPolicy::desktop_view(),
+                self.reachability.clone(),
+            ) {
+                Ok(subscription) => {
+                    self.subscription = Some(subscription);
+                    self.hub_seen = u64::MAX;
+                }
+                Err(reason) => {
+                    self.state = State::Error { reason };
+                    return;
+                }
+            }
         }
         if self.reconnect_attempt < OFFLINE_AFTER_FAILURES {
             // Once offline, stay offline until frames prove otherwise.
@@ -327,7 +392,11 @@ impl PipelineSupervisor {
         tracing::info!(cam_id = %self.cam_id, state = "connecting", "Supervisor state changed");
         self.stream_info_complete = false;
         self.publish_stream_info(StreamInfo::default());
-        let pipeline_str = builder::select_pipeline(&self.config, self.hwaccel);
+        let pipeline_str = if shared {
+            builder::shared_view_pipeline_str(self.hwaccel)
+        } else {
+            builder::select_pipeline(&self.config, self.hwaccel)
+        };
         tracing::info!(
             cam_id = %self.cam_id,
             pipeline_len = pipeline_str.len(),
@@ -346,6 +415,18 @@ impl PipelineSupervisor {
 
         // Wire appsink → SHM ring buffer before going to PLAYING
         let (shm_writer, frames_counted) = self.wire_appsink(&pipeline);
+        if shared {
+            let Some(input) = pipeline
+                .by_name(builder::VIEW_INPUT)
+                .and_then(|e| e.downcast::<gstreamer_app::AppSrc>().ok())
+            else {
+                self.state = State::Error {
+                    reason: "the view pipeline has no input".into(),
+                };
+                return;
+            };
+            self.feed = Some(crate::streams::feed::VideoFeed::new(input));
+        }
 
         if !self.assignment_is_current() {
             self.state = State::Stopped;
@@ -401,7 +482,11 @@ impl PipelineSupervisor {
 
     /// Headless: no SHM ring, and the RGB conversion runs only for frames a
     /// consumer demands. Returns whether decoded frames are counted.
-    fn wire_headless_appsink(&self, appsink: &gstreamer_app::AppSink) -> bool {
+    fn wire_headless_appsink(
+        &self,
+        appsink: &gstreamer_app::AppSink,
+        decoded: Option<crate::streams::decoded::Publisher>,
+    ) -> bool {
         self.frame_counter.store(0, AtomicOrdering::Relaxed);
         let counted = super::preview_rate::install_demand_gate(
             appsink,
@@ -417,6 +502,9 @@ impl PipelineSupervisor {
                     let sample = sink
                         .pull_sample()
                         .map_err(|_| gstreamer::FlowError::Error)?;
+                    if let Some(decoded) = &decoded {
+                        decoded.publish(&sample);
+                    }
                     if let Some(tap) = &frame_tap {
                         tap.submit_sample(&cam_id, &sample);
                     }
@@ -440,8 +528,11 @@ impl PipelineSupervisor {
         else {
             return (None, false);
         };
+        let decoded = self.subscription.as_ref().map(|subscription| {
+            crate::streams::decoded::Publisher::new(subscription.decoded(), pipeline)
+        });
         if self.headless {
-            return (None, self.wire_headless_appsink(&appsink));
+            return (None, self.wire_headless_appsink(&appsink, decoded));
         }
 
         let writer = match ShmRingBufferWriter::create(&self.cam_id) {
@@ -480,6 +571,9 @@ impl PipelineSupervisor {
                         gstreamer_video::VideoFormat::Rgb | gstreamer_video::VideoFormat::Nv12
                     ) {
                         return Err(gstreamer::FlowError::Error);
+                    }
+                    if let Some(decoded) = &decoded {
+                        decoded.publish(&sample);
                     }
                     if let Some(tap) = &frame_tap {
                         tap.submit_sample(&cam_id_cb, &sample);
@@ -583,13 +677,22 @@ impl PipelineSupervisor {
                 self.state = State::Stopped;
                 return;
             }
+            let waiting_for_camera = self.follow_hub();
             if self.frames_counted {
                 let frames = self.frame_counter.load(AtomicOrdering::Relaxed);
                 if frames != last_frames {
-                    if last_frames == 0 {
+                    // Frames decoded from what arrived before a loss do not
+                    // mean the camera is back; the shared connection streaming
+                    // again does.
+                    let back = self.hub_lost && !waiting_for_camera;
+                    if last_frames == 0 || back {
+                        self.hub_lost = false;
                         self.mark_streaming();
                     }
                     last_frames = frames;
+                    last_progress = Instant::now();
+                } else if waiting_for_camera {
+                    // The shared connection is reconnecting: no decoder fault.
                     last_progress = Instant::now();
                 } else if last_progress.elapsed() >= NO_FRAME_TIMEOUT {
                     let reason = if frames == 0 {
@@ -604,6 +707,23 @@ impl PipelineSupervisor {
                 }
             }
 
+            if self.feed.is_some() {
+                if let Some(next) = self.pump_shared() {
+                    self.state = next;
+                    return;
+                }
+                while let Some(msg) = bus.pop() {
+                    if let Some(next) = self.on_message(&msg, &pipeline) {
+                        self.state = next;
+                        return;
+                    }
+                }
+                if !self.stream_info_complete {
+                    self.try_publish_stream_info(&pipeline);
+                }
+                continue;
+            }
+
             let Some(msg) = bus.timed_pop(gstreamer::ClockTime::from_mseconds(500)) else {
                 if !self.stream_info_complete {
                     self.try_publish_stream_info(&pipeline);
@@ -614,7 +734,20 @@ impl PipelineSupervisor {
             if !self.stream_info_complete {
                 self.try_publish_stream_info(&pipeline);
             }
+            if let Some(next) = self.on_message(&msg, &pipeline) {
+                self.state = next;
+                return;
+            }
+        }
+    }
 
+    /// A bus message of the running pipeline: `Some` state to move to.
+    fn on_message(
+        &mut self,
+        msg: &gstreamer::Message,
+        pipeline: &gstreamer::Pipeline,
+    ) -> Option<State> {
+        {
             use gstreamer::MessageView;
             match msg.view() {
                 MessageView::Error(e) => {
@@ -624,25 +757,103 @@ impl PipelineSupervisor {
                         e.debug().unwrap_or_default()
                     ));
                     tracing::error!(cam_id = %self.cam_id, %reason, "Pipeline error");
-                    self.state = State::Error { reason };
-                    return;
+                    return Some(State::Error { reason });
                 }
                 MessageView::Eos(_) => {
-                    if builder::is_local_file_url(&self.config.url) {
+                    if self.feed.is_none() && builder::is_local_file_url(&self.config.url) {
                         let _ = pipeline.seek_simple(
                             gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
                             gstreamer::ClockTime::ZERO,
                         );
-                        continue;
+                        return None;
                     }
                     tracing::warn!(cam_id = %self.cam_id, "Stream ended (EOS)");
-                    self.state = State::Error {
+                    return Some(State::Error {
                         reason: "Stream ended (EOS)".into(),
-                    };
-                    return;
+                    });
                 }
                 _ => {}
             }
+        }
+        None
+    }
+
+    /// Mirror the shared connection's state into the view's; whether the
+    /// view waits for the camera (the hub is not streaming).
+    fn follow_hub(&mut self) -> bool {
+        let Some(subscription) = &self.subscription else {
+            return false;
+        };
+        let state = subscription.state();
+        if state.generation != self.hub_seen {
+            self.hub_seen = state.generation;
+            if state.phase == crate::streams::Phase::Retrying {
+                self.hub_lost = true;
+                self.reconnect_attempt = state.failures;
+                let status = failure_status(state.failures);
+                let reason = state.reason.unwrap_or_default();
+                tracing::warn!(cam_id = %self.cam_id, attempt = state.failures, reason = %reason, "Camera connection lost; the shared connection reconnects");
+                self.publish_state(status);
+                self.notify_state(status, Some(&reason));
+            }
+        }
+        state.phase != crate::streams::Phase::Streaming
+    }
+
+    /// Move units from the subscription into the decoder; `Some` state to
+    /// move to.
+    fn pump_shared(&mut self) -> Option<State> {
+        use crate::streams::feed::Pushed;
+        use crate::streams::{Delivery, Phase};
+        let feed = self.feed.as_mut()?;
+        if feed.backlog_bytes() > VIEW_BACKLOG_BYTES {
+            // The decoder is behind: its subscription's bound decides what
+            // is lost (it skips to the next keyframe), never the camera.
+            std::thread::sleep(Duration::from_millis(20));
+            return None;
+        }
+        let item = match self.pending_unit.take() {
+            Some(unit) => Some(Delivery::Unit {
+                unit,
+                after_gap: false,
+            }),
+            None => self.subscription.as_ref()?.recv(Duration::from_millis(100)),
+        };
+        match item {
+            Some(Delivery::Unit { unit, after_gap }) => match feed.push(&unit, after_gap, false) {
+                Ok(Pushed::FormatChanged) => {
+                    tracing::info!(cam_id = %self.cam_id, "Camera stream format changed; rebuilding the decoder");
+                    self.pending_unit = Some(unit);
+                    if !self.destroy_pipeline() {
+                        return Some(State::Stopped);
+                    }
+                    Some(State::Reconnecting {
+                        attempt: self.reconnect_attempt,
+                    })
+                }
+                Ok(_) | Err(gstreamer::FlowError::Flushing) => None,
+                Err(error) => Some(State::Error {
+                    reason: format!("the decoder did not take the camera's video: {error:?}"),
+                }),
+            },
+            Some(Delivery::Discontinuity { .. }) => {
+                feed.restart();
+                None
+            }
+            None if self
+                .subscription
+                .as_ref()
+                .is_some_and(|s| s.state().phase == Phase::Closed) =>
+            {
+                self.subscription = None;
+                if !self.destroy_pipeline() {
+                    return Some(State::Stopped);
+                }
+                Some(State::Reconnecting {
+                    attempt: self.reconnect_attempt,
+                })
+            }
+            None => None,
         }
     }
 
@@ -667,6 +878,7 @@ impl PipelineSupervisor {
             tracing::debug!(cam_id = %self.cam_id, "Pipeline destroyed");
         }
         // Drop after pipeline so callback is unregistered first.
+        self.feed = None;
         self.shm_writer = None;
         self.frames_counted = false;
         true
@@ -752,14 +964,14 @@ impl PipelineSupervisor {
     }
 }
 
-pub(super) fn backoff_duration(attempt: u32) -> Duration {
+pub(crate) fn backoff_duration(attempt: u32) -> Duration {
     let secs = (1u64 << attempt.min(5)).min(MAX_BACKOFF_SECS);
     Duration::from_secs(secs)
 }
 
 /// Spread a backoff by ±20% so cameras that failed together (a switch or
 /// NVR-side outage) do not all retry in the same instant.
-pub(super) fn jittered(base: Duration, cam_id: &CameraId, attempt: u32) -> Duration {
+pub(crate) fn jittered(base: Duration, cam_id: &CameraId, attempt: u32) -> Duration {
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
     hasher.write(cam_id.as_bytes());
     hasher.write_u32(attempt);
@@ -813,7 +1025,7 @@ fn source_endpoint(url: &str) -> Option<(String, u16)> {
 
 /// Cheap reachability check before building a full pipeline. A refused or
 /// timed-out TCP connect fails the attempt without touching GStreamer.
-pub(super) fn probe_source(url: &str) -> Result<(), String> {
+pub(crate) fn probe_source(url: &str) -> Result<(), String> {
     let Some((host, port)) = source_endpoint(url) else {
         return Ok(());
     };
@@ -834,7 +1046,7 @@ pub(super) fn probe_source(url: &str) -> Result<(), String> {
 }
 
 /// Next sleep while waiting for a backoff deadline, or `None` once it passed.
-pub(super) fn backoff_slice(until: Instant, now: Instant) -> Option<Duration> {
+pub(crate) fn backoff_slice(until: Instant, now: Instant) -> Option<Duration> {
     let remaining = until.saturating_duration_since(now);
     (!remaining.is_zero()).then(|| remaining.min(BACKOFF_POLL_SLICE))
 }
@@ -945,7 +1157,7 @@ fn normalize_codec(raw: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
     use nw_core::camera::CameraId;
@@ -1065,6 +1277,295 @@ mod tests {
             !prod_code.contains(forbidden.as_str()),
             "teardown must keep owned pipeline, SHM, and lease objects recoverable"
         );
+    }
+
+    impl super::PipelineSupervisor {
+        /// Decode any shareable source (a file) through its hub, even with
+        /// `NW_STREAM_HUB=0`.
+        pub(crate) fn with_shared_any(mut self) -> Self {
+            self.shared_any = true;
+            self
+        }
+    }
+
+    /// A local assignment fence for a supervisor run in a test.
+    pub(crate) fn fenced(
+        camera: &nw_core::camera::CameraConfig,
+    ) -> (
+        nw_core::control_plane::CameraAssignment,
+        std::sync::Arc<dyn crate::assignment::AssignmentRegistry>,
+    ) {
+        use crate::assignment::AssignmentRegistry as _;
+        let now = time::OffsetDateTime::now_utc();
+        let at = |t: time::OffsetDateTime| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let assignment = nw_core::control_plane::CameraAssignment {
+            protocol_version: nw_core::control_plane::CONTROL_PROTOCOL_VERSION,
+            assignment_id: format!("test-{}", camera.id),
+            camera_id: camera.id.clone(),
+            node_id: "local-standalone".to_owned(),
+            lease: nw_core::control_plane::Lease {
+                token: format!("test-{}", camera.id),
+                issued_at_utc: at(now),
+                expires_at_utc: at(now + time::Duration::hours(1)),
+                duration_seconds: 3600,
+            },
+            fencing_generation: 1,
+            assigned_at_utc: at(now),
+        };
+        let registry = std::sync::Arc::new(crate::assignment::LocalAssignmentRegistry::new());
+        registry.install(assignment.clone()).unwrap();
+        (assignment, registry)
+    }
+
+    /// Shared-streams stage 3 gate: a desktop view decodes the camera's
+    /// shared connection (here held open by a recorder) instead of opening
+    /// its own, reports the stream, and starting or stopping it never
+    /// interrupts the recorder's units.
+    #[test]
+    fn a_desktop_view_decodes_the_shared_connection_without_one_of_its_own() {
+        use gstreamer::prelude::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        use crate::streams::{Delivery, StreamHubs, SubscriberPolicy};
+
+        /// Wants every frame, and counts them.
+        #[derive(Default)]
+        struct Count(AtomicU64);
+        impl crate::taps::FrameTap for Count {
+            fn wants(&self, _camera_id: &str) -> bool {
+                true
+            }
+            fn submit_sample(&self, _camera_id: &str, _sample: &gstreamer::Sample) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        gstreamer::init().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("nw-hub-view-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("camera.mkv");
+        // 6 s of H.264 with B-frames, a keyframe every second.
+        let make = crate::pipeline::builder::build(&format!(
+            "videotestsrc num-buffers=150 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 \
+             ! x264enc key-int-max=25 bframes=2 ! h264parse ! matroskamux ! filesink location=\"{}\"",
+            path.display()
+        ))
+        .unwrap();
+        make.set_state(gstreamer::State::Playing).unwrap();
+        make.bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gstreamer::ClockTime::from_seconds(30),
+                &[gstreamer::MessageType::Eos],
+            )
+            .unwrap();
+        make.set_state(gstreamer::State::Null).unwrap();
+
+        let hubs = Arc::new(StreamHubs::default());
+        let camera = nw_core::camera::CameraConfig::new("Door", path.to_str().unwrap());
+        let recorder = hubs
+            .subscribe(&camera, SubscriberPolicy::recorder(), None)
+            .unwrap();
+        let (assignment, registry) = fenced(&camera);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (state_tx, state_rx) = tokio::sync::watch::channel(String::new());
+        let (info_tx, info_rx) = tokio::sync::watch::channel(super::StreamInfo::default());
+        let frames = Arc::new(Count::default());
+        let supervisor = super::PipelineSupervisor::new(
+            camera,
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+            Arc::new(nw_core::traits::LogEventBus),
+            stop_rx,
+            state_tx,
+            info_tx,
+        )
+        .with_assignment(assignment, registry)
+        .with_headless(true)
+        .with_frame_tap(frames.clone())
+        .with_stream_hubs(Arc::clone(&hubs))
+        .with_shared_any();
+        // Let the recorder get going first: the view joins mid-stream.
+        std::thread::sleep(Duration::from_millis(700));
+        let view = std::thread::spawn(move || supervisor.run());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_rx.borrow().as_str() != "streaming" && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(state_rx.borrow().as_str(), "streaming");
+        assert_eq!(hubs.open_count(), 1, "one camera connection");
+        assert_eq!(hubs.summary()[0].1, 2, "the recorder and the view share it");
+        std::thread::sleep(Duration::from_millis(1500));
+        let info = info_rx.borrow().clone();
+        assert_eq!(info.codec, "H264");
+        assert_eq!(info.resolution, Some((320, 240)));
+        stop_tx.send(true).unwrap();
+        view.join().unwrap();
+        let decoded = frames.0.load(Ordering::Relaxed);
+        assert!(decoded >= 25, "the view decoded only {decoded} frames");
+        assert_eq!(state_rx.borrow().as_str(), "offline");
+
+        // The recorder saw the whole file once, from its first keyframe,
+        // without a gap or a discontinuity while the view came and went.
+        let mut units = 0;
+        let until = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < until {
+            match recorder.recv(Duration::from_millis(200)) {
+                Some(Delivery::Unit { after_gap, .. }) => {
+                    assert!(!after_gap, "the recorder lost units");
+                    units += 1;
+                }
+                Some(Delivery::Discontinuity { .. }) => break, // the file ended
+                None => {}
+            }
+        }
+        assert_eq!(units, 150, "every unit of the file reached the recorder");
+        assert_eq!(recorder.dropped(), 0);
+        drop(recorder);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// When the shared connection loses the camera and reconnects (here a
+    /// 2 s file ends and is opened again), the view says `reconnecting`,
+    /// keeps its decoder, and goes on decoding the new stream: `streaming`.
+    #[test]
+    fn a_desktop_view_follows_its_shared_connection_through_a_reconnect() {
+        use gstreamer::prelude::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct Count(AtomicU64);
+        impl crate::taps::FrameTap for Count {
+            fn wants(&self, _camera_id: &str) -> bool {
+                true
+            }
+            fn submit_sample(&self, _camera_id: &str, _sample: &gstreamer::Sample) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        gstreamer::init().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "nw-hub-view-loss-{}.mkv",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let make = crate::pipeline::builder::build(&format!(
+            "videotestsrc num-buffers=50 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 \
+             ! x264enc key-int-max=25 ! h264parse ! matroskamux ! filesink location=\"{}\"",
+            path.display()
+        ))
+        .unwrap();
+        make.set_state(gstreamer::State::Playing).unwrap();
+        make.bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gstreamer::ClockTime::from_seconds(30),
+                &[gstreamer::MessageType::Eos],
+            )
+            .unwrap();
+        make.set_state(gstreamer::State::Null).unwrap();
+
+        let hubs = Arc::new(crate::streams::StreamHubs::default());
+        let camera = nw_core::camera::CameraConfig::new("Door", path.to_str().unwrap());
+        let (assignment, registry) = fenced(&camera);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(String::new());
+        let (info_tx, _info_rx) = tokio::sync::watch::channel(super::StreamInfo::default());
+        let frames = Arc::new(Count::default());
+        let supervisor = super::PipelineSupervisor::new(
+            camera,
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+            Arc::new(nw_core::traits::LogEventBus),
+            stop_rx,
+            state_tx,
+            info_tx,
+        )
+        .with_assignment(assignment, registry)
+        .with_headless(true)
+        .with_frame_tap(frames.clone())
+        .with_stream_hubs(Arc::clone(&hubs))
+        .with_shared_any();
+        let view = std::thread::spawn(move || supervisor.run());
+        let mut states = Vec::new();
+        let mut frames_at_reconnect = None;
+        let deadline = Instant::now() + Duration::from_secs(9);
+        while Instant::now() < deadline {
+            if state_rx.has_changed().unwrap_or(false) {
+                let state = state_rx.borrow_and_update().clone();
+                if state == "reconnecting" && frames_at_reconnect.is_none() {
+                    frames_at_reconnect = Some(frames.0.load(Ordering::Relaxed));
+                }
+                if states.last() != Some(&state) {
+                    states.push(state);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop_tx.send(true).unwrap();
+        view.join().unwrap();
+        let _ = std::fs::remove_file(path);
+        let before = frames_at_reconnect.expect("the view said reconnecting");
+        let after = frames.0.load(Ordering::Relaxed);
+        assert!(
+            states
+                .windows(2)
+                .any(|w| w == ["reconnecting", "streaming"]),
+            "back to streaming after the reconnect: {states:?}"
+        );
+        assert!(
+            after > before + 20,
+            "decoding went on: {before} then {after}"
+        );
+    }
+
+    /// Against a real RTSP camera (`NW_RTSP_TEST_URL`): the desktop view and
+    /// a recorder share one camera connection.
+    #[test]
+    #[ignore = "requires an RTSP H.264 stream at NW_RTSP_TEST_URL"]
+    fn a_desktop_view_shares_a_real_cameras_connection() {
+        use std::sync::Arc;
+        gstreamer::init().unwrap();
+        let url = std::env::var("NW_RTSP_TEST_URL").expect("NW_RTSP_TEST_URL");
+        let hubs = Arc::new(crate::streams::StreamHubs::default());
+        let camera = nw_core::camera::CameraConfig::new("Cam", &url);
+        let recorder = hubs
+            .subscribe(&camera, crate::streams::SubscriberPolicy::recorder(), None)
+            .unwrap();
+        let (assignment, registry) = fenced(&camera);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (state_tx, state_rx) = tokio::sync::watch::channel(String::new());
+        let (info_tx, info_rx) = tokio::sync::watch::channel(super::StreamInfo::default());
+        let supervisor = super::PipelineSupervisor::new(
+            camera,
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+            Arc::new(nw_core::traits::LogEventBus),
+            stop_rx,
+            state_tx,
+            info_tx,
+        )
+        .with_assignment(assignment, registry)
+        .with_headless(true)
+        .with_stream_hubs(Arc::clone(&hubs));
+        let view = std::thread::spawn(move || supervisor.run());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while state_rx.borrow().as_str() != "streaming" && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(state_rx.borrow().as_str(), "streaming");
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(hubs.open_count(), 1, "one camera connection");
+        assert_eq!(hubs.summary()[0].1, 2);
+        assert_eq!(info_rx.borrow().codec, "H264");
+        assert!(info_rx.borrow().resolution.is_some());
+        stop_tx.send(true).unwrap();
+        view.join().unwrap();
+        assert_eq!(recorder.dropped(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

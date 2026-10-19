@@ -13,6 +13,10 @@ pub struct AppConfig {
     pub site_name: String,
     pub wall: WallConfig,
     pub cameras: Vec<CameraConfig>,
+    /// Cameras beyond this build's camera limit, kept as they were but not
+    /// run (`crate::edition`). Empty in an unlimited build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cameras_over_limit: Vec<CameraConfig>,
     pub ui: UiConfig,
     #[serde(default)]
     pub debug: DebugConfig,
@@ -21,10 +25,51 @@ pub struct AppConfig {
     #[serde(default)]
     pub motion: MotionGlobalConfig,
     #[serde(default)]
+    pub events: EventsConfig,
+    /// Alert notifications: channels and rules (`crate::alerts`).
+    #[serde(default, skip_serializing_if = "is_default_alerts")]
+    pub alerts: crate::alerts::AlertsConfig,
+    /// Local accounts and the sign-in requirement (`crate::accounts`).
+    #[serde(default, skip_serializing_if = "is_default_accounts")]
+    pub accounts: crate::accounts::AccountsConfig,
+    #[serde(default)]
     pub monitors: MonitorsConfig,
     /// The desktop UI's extra windows, reopened when the app starts again.
     #[serde(default)]
     pub desktop: DesktopConfig,
+}
+
+#[cfg(test)]
+mod recording_policy_tests {
+    use super::*;
+
+    #[test]
+    fn v4_migration_keeps_continuous_defaults_fullscreen_choice_and_legacy_string() {
+        let path =
+            std::env::temp_dir().join(format!("nw-policy-config-{}.json", uuid::Uuid::new_v4()));
+        let mut config = AppConfig {
+            version: 3,
+            ..AppConfig::default()
+        };
+        config.ui.fullscreen = false;
+        let mut camera = nw_core::camera::CameraConfig::new("Gate", "rtsp://example.invalid/1");
+        camera.recording.schedule = Some("0 8 * * 1-5".into());
+        config.cameras.push(camera);
+        config.save(&path).unwrap();
+        let loaded = AppConfig::load_or_default(&path).unwrap();
+        assert_eq!(loaded.version, 4);
+        assert!(!loaded.ui.fullscreen);
+        assert_eq!(
+            loaded.cameras[0].recording.mode,
+            nw_core::camera::RecordingMode::Continuous
+        );
+        assert_eq!(
+            loaded.cameras[0].recording.schedule.as_deref(),
+            Some("0 8 * * 1-5")
+        );
+        assert!(loaded.cameras[0].recording.weekly_rules.is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +91,56 @@ pub struct UiConfig {
     /// Opacity of that overlay's background, in percent (0–100).
     #[serde(default = "default_status_opacity")]
     pub fullscreen_status_opacity: u8,
+    /// Desktop live-preview frame-rate limits.
+    #[serde(default)]
+    pub preview_fps: PreviewFpsConfig,
+}
+
+/// Frames per second the desktop wall paints, by what is on screen. Only the
+/// desktop preview: the camera, recording and browser viewing are never
+/// limited by these. Missing fields take the defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PreviewFpsConfig {
+    /// One camera fills the wall (single view).
+    pub single: u32,
+    /// Each tile of a page showing up to 16 cameras.
+    pub wall: u32,
+    /// Each tile of a page showing more than 16 cameras.
+    pub dense: u32,
+    /// Cameras on pages not shown, kept warm for an instant page change.
+    pub hidden: u32,
+}
+
+/// Upper bounds of [`PreviewFpsConfig`] (the lower bound is 1).
+pub const MAX_PREVIEW_FPS: u32 = 60;
+pub const MAX_HIDDEN_PREVIEW_FPS: u32 = 30;
+
+impl Default for PreviewFpsConfig {
+    fn default() -> Self {
+        Self {
+            single: 25,
+            wall: 15,
+            dense: 4,
+            hidden: 2,
+        }
+    }
+}
+
+impl PreviewFpsConfig {
+    /// `self` with the fields `value` sets, each clamped to its range.
+    pub fn updated(mut self, value: &serde_json::Value) -> Self {
+        let field = |name: &str, current: u32, top: u32| {
+            value[name]
+                .as_u64()
+                .map_or(current, |v| v.clamp(1, u64::from(top)) as u32)
+        };
+        self.single = field("single", self.single, MAX_PREVIEW_FPS);
+        self.wall = field("wall", self.wall, MAX_PREVIEW_FPS);
+        self.dense = field("dense", self.dense, MAX_PREVIEW_FPS);
+        self.hidden = field("hidden", self.hidden, MAX_HIDDEN_PREVIEW_FPS);
+        self
+    }
 }
 
 pub const DEFAULT_STATUS_OPACITY: u8 = 50;
@@ -78,6 +173,170 @@ pub struct RecordingGlobalConfig {
     /// this percentage of its size. `0` turns it off.
     #[serde(default = "default_disk_threshold_percent")]
     pub disk_threshold_percent: u8,
+    /// Each recording location's identity (expanded path → the id in its
+    /// `.neurowatch-storage` marker, `crate::storage_guard`): recordings go
+    /// there only while that marker is present, so an unmounted drive or
+    /// share never fills the empty mount point on the local disk.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub storage_ids: std::collections::BTreeMap<String, String>,
+    /// Move older recordings to a second location (`crate::recording::archive`).
+    #[serde(default, skip_serializing_if = "ArchiveConfig::is_default")]
+    pub archive: ArchiveConfig,
+}
+
+/// The archive tier: finished recordings older than `after_days` move from
+/// the recording location to `path` (typically a NAS), where playback and
+/// export still find them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub path: String,
+    /// Recordings older than this many days are moved.
+    #[serde(default = "default_archive_after_days")]
+    pub after_days: u32,
+    /// Most the archive keeps, in GB; the oldest archived recordings (those
+    /// without events first) are deleted beyond it. `None`: no limit.
+    #[serde(default)]
+    pub quota_gb: Option<u32>,
+    /// Local hours ("HH:MM") archiving may run in; `None`: any time. An end
+    /// before the start runs overnight.
+    #[serde(default)]
+    pub hours: Option<ArchiveHours>,
+    /// Copy speed limit in megabits per second; `None`: no limit.
+    #[serde(default)]
+    pub max_mbps: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveHours {
+    pub start: String,
+    pub end: String,
+}
+
+pub const DEFAULT_ARCHIVE_AFTER_DAYS: u32 = 7;
+pub const MAX_ARCHIVE_AFTER_DAYS: u32 = 3650;
+
+fn default_archive_after_days() -> u32 {
+    DEFAULT_ARCHIVE_AFTER_DAYS
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: String::new(),
+            after_days: DEFAULT_ARCHIVE_AFTER_DAYS,
+            quota_gb: None,
+            hours: None,
+            max_mbps: None,
+        }
+    }
+}
+
+impl ArchiveConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Minutes after midnight of an "HH:MM" time.
+    pub fn minute_of(time: &str) -> Option<u32> {
+        let (hours, minutes) = time.split_once(':')?;
+        let (hours, minutes) = (hours.parse::<u32>().ok()?, minutes.parse::<u32>().ok()?);
+        (hours < 24 && minutes < 60 && time.len() == 5).then_some(hours * 60 + minutes)
+    }
+
+    /// `current` with the fields of `changes` applied (a `config.set`
+    /// `recording.archive` object), or why they cannot be. Nothing changes on
+    /// error.
+    pub fn changed(current: &Self, changes: &serde_json::Value) -> anyhow::Result<Self> {
+        let mut next = current.clone();
+        if let Some(value) = changes.get("enabled") {
+            next.enabled = value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("archive 'enabled' is true or false"))?;
+        }
+        if let Some(value) = changes.get("path") {
+            next.path = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("archive 'path' is a folder"))?
+                .trim()
+                .to_owned();
+        }
+        if let Some(value) = changes.get("after_days") {
+            next.after_days = value
+                .as_u64()
+                .filter(|days| (1..=u64::from(MAX_ARCHIVE_AFTER_DAYS)).contains(days))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("recordings move to the archive after 1 to 3650 days")
+                })? as u32;
+        }
+        if let Some(value) = changes.get("quota_gb") {
+            next.quota_gb = match value {
+                serde_json::Value::Null => None,
+                value => Some(
+                    value
+                        .as_u64()
+                        .filter(|gb| (1..=1_000_000).contains(gb))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("archive size limit is 1 to 1000000 GB, or none")
+                        })? as u32,
+                ),
+            };
+        }
+        if let Some(value) = changes.get("max_mbps") {
+            next.max_mbps = match value {
+                serde_json::Value::Null => None,
+                value => Some(
+                    value
+                        .as_u64()
+                        .filter(|mbps| (1..=100_000).contains(mbps))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("archive speed limit is 1 to 100000 Mbit/s, or none")
+                        })? as u32,
+                ),
+            };
+        }
+        if let Some(value) = changes.get("hours") {
+            next.hours = match value {
+                serde_json::Value::Null => None,
+                value => {
+                    let time = |field: &str| {
+                        value[field]
+                            .as_str()
+                            .filter(|time| Self::minute_of(time).is_some())
+                            .map(str::to_owned)
+                            .ok_or_else(|| anyhow::anyhow!("archive hours are \"HH:MM\" times"))
+                    };
+                    Some(ArchiveHours {
+                        start: time("start")?,
+                        end: time("end")?,
+                    })
+                }
+            };
+        }
+        if next.enabled && next.path.is_empty() {
+            anyhow::bail!("choose a folder for the archive");
+        }
+        Ok(next)
+    }
+
+    /// Whether archiving may run at `minute` (local minutes after midnight).
+    pub fn allows(&self, minute: u32) -> bool {
+        let Some(hours) = &self.hours else {
+            return true;
+        };
+        let (Some(start), Some(end)) = (Self::minute_of(&hours.start), Self::minute_of(&hours.end))
+        else {
+            return true;
+        };
+        match start.cmp(&end) {
+            std::cmp::Ordering::Less => (start..end).contains(&minute),
+            std::cmp::Ordering::Greater => minute >= start || minute < end,
+            std::cmp::Ordering::Equal => true,
+        }
+    }
 }
 
 /// Recording drives are kept at most this full unless configured otherwise.
@@ -89,20 +348,29 @@ fn default_disk_threshold_percent() -> u8 {
     DEFAULT_DISK_THRESHOLD_PERCENT
 }
 
+/// `~/Videos/neurowatch`. Unit tests record (and mark recording locations)
+/// under a temporary folder instead, never in the developer's home.
+fn default_storage_root() -> PathBuf {
+    if cfg!(test) {
+        return std::env::temp_dir().join("nw-test-recordings");
+    }
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join("Videos")
+        .join("neurowatch")
+}
+
 impl Default for RecordingGlobalConfig {
     fn default() -> Self {
-        let path = dirs::home_dir()
-            .unwrap_or_default()
-            .join("Videos")
-            .join("neurowatch")
-            .to_string_lossy()
-            .into_owned();
+        let path = default_storage_root().to_string_lossy().into_owned();
         Self {
             storage_path: path,
             segment_minutes: 1,
             pre_buffer_sec: 10,
             local_all_cameras: false,
             disk_threshold_percent: DEFAULT_DISK_THRESHOLD_PERCENT,
+            storage_ids: std::collections::BTreeMap::new(),
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -120,6 +388,74 @@ impl Default for MotionGlobalConfig {
             default_sensitivity: 5,
             default_cooldown_sec: 10.0,
             default_min_duration_sec: 0.5,
+        }
+    }
+}
+
+/// Stored events (`crate::events`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventsConfig {
+    /// Finished events are deleted after this many days; `0` keeps them.
+    #[serde(default = "default_event_retention_days")]
+    pub retention_days: u32,
+    /// TCP port cameras send their events to (push); `0`: never listen, ask
+    /// the cameras for their events instead (pull).
+    #[serde(default = "default_push_port")]
+    pub push_port: u16,
+}
+
+pub const DEFAULT_PUSH_PORT: u16 = 7681;
+/// Longest event history that can be kept (ten years); `0` keeps it all.
+pub const MAX_EVENT_RETENTION_DAYS: u32 = 3650;
+
+impl EventsConfig {
+    /// `current` with the fields of `changes` applied (a `config.set`
+    /// `events` object), or why they cannot be. Nothing changes on error.
+    pub fn changed(current: &Self, changes: &serde_json::Value) -> anyhow::Result<Self> {
+        let mut next = current.clone();
+        if let Some(value) = changes.get("retention_days") {
+            next.retention_days = value
+                .as_u64()
+                .filter(|days| *days <= u64::from(MAX_EVENT_RETENTION_DAYS))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("event history must be kept 0 (forever) to 3650 days")
+                })? as u32;
+        }
+        if let Some(value) = changes.get("push_port") {
+            next.push_port = value
+                .as_u64()
+                .filter(|port| *port == 0 || (1024..=65535).contains(port))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("camera event port must be 0 (off) or 1024 to 65535")
+                })? as u16;
+        }
+        Ok(next)
+    }
+}
+
+fn is_default_accounts(accounts: &crate::accounts::AccountsConfig) -> bool {
+    !accounts.enabled && accounts.users.is_empty()
+}
+
+fn is_default_alerts(alerts: &crate::alerts::AlertsConfig) -> bool {
+    alerts.channels.is_empty() && alerts.rules.is_empty()
+}
+
+fn default_push_port() -> u16 {
+    DEFAULT_PUSH_PORT
+}
+
+pub const DEFAULT_EVENT_RETENTION_DAYS: u32 = 30;
+
+fn default_event_retention_days() -> u32 {
+    DEFAULT_EVENT_RETENTION_DAYS
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: DEFAULT_EVENT_RETENTION_DAYS,
+            push_port: DEFAULT_PUSH_PORT,
         }
     }
 }
@@ -246,7 +582,7 @@ impl DesktopConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            version: 3,
+            version: 4,
             runtime_mode: RuntimeMode::LocalStandalone,
             site_name: "My Site".into(),
             wall: WallConfig {
@@ -256,15 +592,20 @@ impl Default for AppConfig {
                 page_interval_sec: 0,
             },
             cameras: Vec::new(),
+            cameras_over_limit: Vec::new(),
             ui: UiConfig {
                 theme: "dark".into(),
                 fullscreen: true,
                 fullscreen_status: true,
                 fullscreen_status_opacity: DEFAULT_STATUS_OPACITY,
+                preview_fps: PreviewFpsConfig::default(),
             },
             debug: DebugConfig::default(),
             recording: RecordingGlobalConfig::default(),
             motion: MotionGlobalConfig::default(),
+            events: EventsConfig::default(),
+            alerts: crate::alerts::AlertsConfig::default(),
+            accounts: crate::accounts::AccountsConfig::default(),
             monitors: MonitorsConfig::default(),
             desktop: DesktopConfig::default(),
         }
@@ -285,13 +626,44 @@ impl AppConfig {
         // Fullscreen was previously persisted but ignored by the UI. Since it
         // could not represent a real user choice, enable the new working
         // fullscreen startup once during the v3 migration.
-        if config.version < 3 {
-            config.version = 3;
+        let old_version = config.version;
+        if old_version < 3 {
             config.ui.fullscreen = true;
+        }
+        for camera in config.cameras.iter().chain(&config.cameras_over_limit) {
+            crate::recording::policy::validate_settings(&camera.recording).map_err(|message| {
+                anyhow::anyhow!(
+                    "Invalid recording policy for camera {}: {message}",
+                    camera.id
+                )
+            })?;
+            if old_version < 4
+                && camera
+                    .recording
+                    .schedule
+                    .as_deref()
+                    .is_some_and(|schedule| !schedule.is_empty() && schedule != "always")
+            {
+                tracing::warn!(camera_id=%camera.id,"Legacy cron schedule was never enforced; preserved for reference, use weekly_rules");
+            }
+        }
+        let held_before = config.cameras_over_limit.len();
+        crate::edition::apply(&mut config);
+        if config.cameras_over_limit.len() > held_before {
+            tracing::warn!(
+                running = config.cameras.len(),
+                held = config.cameras_over_limit.len(),
+                limit = ?crate::edition::CAMERA_LIMIT,
+                downloads = crate::edition::DOWNLOADS_URL,
+                "Camera limit of this free version reached; the other cameras are kept but not run"
+            );
+        }
+        if old_version < 4 {
+            config.version = 4;
             if let Err(e) = config.save(path) {
-                tracing::warn!(error = %e, "Failed to write migrated v3 config");
+                tracing::warn!(error = %e, "Failed to write migrated v4 config");
             } else {
-                tracing::info!("Config migrated to v3");
+                tracing::info!("Config migrated to v4");
             }
         }
         Ok(config)

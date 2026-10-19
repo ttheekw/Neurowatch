@@ -42,7 +42,7 @@ def parent(qtbot) -> QMainWindow:
 def _shell(dialog: QDialog) -> QWidget:
     overlay = card_overlay(dialog)
     assert overlay is not None
-    return overlay._shell  # noqa: SLF001 - the card under test
+    return overlay._shell
 
 
 def _chrome_dialog(parent: QWidget, *, resizable: bool = False) -> QDialog:
@@ -258,3 +258,97 @@ def test_card_overlay_is_a_direct_child_of_its_dialog(qtbot, wayland, parent):
     qtbot.addWidget(dialog)
     overlays = dialog.findChildren(CardOverlay)
     assert len(overlays) == 1 and overlays[0].parent() is dialog
+
+
+def test_chrome_filters_ignore_events_once_their_python_side_is_gone(qtbot, wayland, parent):
+    """At exit Python clears objects while Qt still delivers events (hide,
+    resize) to dialogs it has not destroyed yet; the filters must not raise
+    ("'CardOverlay' object has no attribute '_dialog'")."""
+    dialog = _chrome_dialog(parent, resizable=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    overlay = card_overlay(dialog)
+    assert overlay is not None
+    resizers = dialog.findChildren(window_chrome.EdgeResizer)
+    # As during interpreter shutdown: the attributes are already gone.
+    del overlay._dialog
+    for resizer in resizers:
+        del resizer._surface
+    QApplication.sendEvent(dialog, QEvent(QEvent.Type.Resize))
+    QApplication.sendEvent(_shell(dialog), QEvent(QEvent.Type.Resize))
+    dialog.hide()
+
+
+def test_dialogs_opened_from_the_window_are_deleted_after_use(qtbot, monkeypatch):
+    """A dialog shown with exec() and left as the window's child stays alive,
+    hidden, until exit (and gets events there)."""
+    from PySide6.QtCore import QCoreApplication
+
+    from neurowatch import main
+    from neurowatch.dialogs.about_dialog import AboutDialog
+    from neurowatch.dialogs.custom_grid_dialog import CustomGridDialog
+
+    monkeypatch.setattr(AboutDialog, "exec", lambda self: self.done(0) or 0)
+    monkeypatch.setattr(CustomGridDialog, "exec", lambda self: self.done(0) or 0)
+    window = QWidget()
+    qtbot.addWidget(window)
+    window._config = {"wall": {}}  # type: ignore[attr-defined]
+    main.MainWindow._on_about(window)  # type: ignore[arg-type]
+    main.MainWindow._on_custom_grid(window)  # type: ignore[arg-type]
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert window.findChildren(QDialog) == []
+
+
+@pytest.mark.parametrize("on_wayland", [False, True])
+def test_a_dialog_opens_with_focus_in_its_content_not_on_the_header(
+    qtbot, monkeypatch, parent, on_wayland
+):
+    """The header's close button turns red when focused: a dialog opening
+    there looked like it was about to close."""
+    from PySide6.QtWidgets import QLineEdit, QPushButton
+
+    monkeypatch.setattr(window_chrome, "positions_windows", lambda: not on_wayland)
+    for content in (QLabel("No field, one button"), QLineEdit()):
+        dialog = QDialog(parent)
+        layout = install_dialog_chrome(dialog, "Focus")
+        layout.addWidget(content)
+        done = QPushButton("Done")
+        layout.addWidget(done)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        qtbot.waitUntil(lambda d=dialog: d.focusWidget() is not None)
+        QApplication.processEvents()
+        expected = content if isinstance(content, QLineEdit) else done
+        assert dialog.focusWidget() is expected
+        dialog.hide()
+
+
+@pytest.mark.parametrize("on_wayland", [True, False])
+def test_the_resize_cursor_clears_once_the_pointer_is_over_the_content(
+    qtbot, monkeypatch, parent, on_wayland
+) -> None:
+    """Children inherit the edge band's cursor and the surface gets no Leave
+    when the pointer moves on into them: the two-sided arrow stayed over the
+    whole dialog (Alert notifications, Users & permissions)."""
+    monkeypatch.setattr(window_chrome, "positions_windows", lambda: not on_wayland)
+    dialog = _chrome_dialog(parent, resizable=True)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitUntil(lambda: dialog.isVisible())
+    if on_wayland:
+        surface = _shell(dialog)
+    else:
+        resizer = dialog.findChild(window_chrome.EdgeResizer)
+        assert resizer is not None
+        surface = resizer._surface
+    content = surface.findChild(QLabel)
+    assert content is not None and surface.isAncestorOf(content)
+
+    _mouse(
+        surface, QEvent.Type.MouseMove, QPoint(1, surface.height() // 2), Qt.MouseButton.NoButton
+    )
+    assert surface.testAttribute(Qt.WidgetAttribute.WA_SetCursor), "the edge shows the arrow"
+    assert surface.cursor().shape() == Qt.CursorShape.SizeHorCursor
+
+    QApplication.sendEvent(content, QEvent(QEvent.Type.Enter))
+    assert not surface.testAttribute(Qt.WidgetAttribute.WA_SetCursor), "the content's own cursor"

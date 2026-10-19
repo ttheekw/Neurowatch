@@ -5,6 +5,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [string]$OutDir = '',
+    # free: runs up to 16 cameras; unlimited: no camera limit (edition.rs).
+    [ValidateSet('free', 'unlimited')][string]$Edition = 'free',
     [string]$GStreamerRoot = $env:GSTREAMER_1_0_ROOT_MSVC_X86_64,
     [string]$ISCC = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 )
@@ -46,20 +48,19 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $OutDir = (Resolve-Path $OutDir).Path
 
 Write-Host '[1/6] Building backend (release)'
-# NW_BACKEND_MANIFEST / NW_BACKEND_PACKAGE: build the `nw-backend` binary from
-# another Cargo workspace (one that adds a backend extension to this one).
+# The `nw-backend` binary, NeuroWatch Cloud included (a release build links
+# only to https://neurowatch.app). NW_BACKEND_MANIFEST / NW_BACKEND_PACKAGE: build it from another
+# Cargo workspace (one that adds other backend extensions to this one).
 $BackendManifest = if ($env:NW_BACKEND_MANIFEST) { $env:NW_BACKEND_MANIFEST } else { Join-Path $Root 'Cargo.toml' }
 $BackendPackage = if ($env:NW_BACKEND_PACKAGE) { $env:NW_BACKEND_PACKAGE } else { 'nw-backend' }
 $BackendTarget = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path (Split-Path -Parent $BackendManifest) 'target' }
-Invoke-Native 'cargo' @('build', '--manifest-path', $BackendManifest, '--release', '--locked', '-p', $BackendPackage)
+$CargoArgs = @('build', '--manifest-path', $BackendManifest, '--release', '--locked', '-p', $BackendPackage)
+if ($Edition -eq 'unlimited') { $CargoArgs += @('--features', 'nw-backend/unlimited') }
+Invoke-Native 'cargo' $CargoArgs
 Copy-Item (Join-Path $BackendTarget 'release/nw-backend.exe') (Join-Path $BundleDir 'bin/nw-backend.exe') -Force
-# The licence and notice ship with every artifact, and the terms of any
-# extensions built in (NW_EXTRA_LICENSE_FILE).
+# The licence and notice ship with every artifact.
 Copy-Item (Join-Path $Root 'LICENSE') (Join-Path $BundleDir 'LICENSE') -Force
 Copy-Item (Join-Path $Root 'NOTICE') (Join-Path $BundleDir 'NOTICE') -Force
-if ($env:NW_EXTRA_LICENSE_FILE) {
-    Copy-Item $env:NW_EXTRA_LICENSE_FILE (Join-Path $BundleDir 'LICENSE-EXTENSIONS') -Force
-}
 
 Write-Host '[2/6] Packaging UI from pyproject.toml with PyInstaller'
 $Python = if ($env:PYTHON) { $env:PYTHON } else { 'python' }
@@ -74,16 +75,6 @@ Invoke-Native (Join-Path $Venv 'Scripts/uv.exe') @(
 )
 Invoke-Native $VenvPython @('-m', 'pip', 'install', '--require-hashes', '-r', $Requirements)
 Invoke-Native $VenvPython @('-m', 'pip', 'install', '--no-deps', $Root)
-# NW_UI_EXTENSION_DIR / _DIST / _MODULE: bundle a UI extension (see
-# ui/neurowatch/extensions.py) with its entry-point metadata, so it is found.
-$ExtensionArgs = @()
-if ($env:NW_UI_EXTENSION_DIR) {
-    if (-not $env:NW_UI_EXTENSION_DIST -or -not $env:NW_UI_EXTENSION_MODULE) {
-        throw 'NW_UI_EXTENSION_DIR needs NW_UI_EXTENSION_DIST and NW_UI_EXTENSION_MODULE'
-    }
-    Invoke-Native $VenvPython @('-m', 'pip', 'install', '--no-deps', $env:NW_UI_EXTENSION_DIR)
-    $ExtensionArgs = @('--copy-metadata', $env:NW_UI_EXTENSION_DIST, '--collect-submodules', $env:NW_UI_EXTENSION_MODULE)
-}
 $AppIcon = Join-Path $Root 'ui/neurowatch/resources/icons/neurowatch.ico'
 Invoke-Native (Join-Path $Venv 'Scripts/pyinstaller.exe') (@(
     '--noconfirm', '--clean', '--windowed',
@@ -94,8 +85,8 @@ Invoke-Native (Join-Path $Venv 'Scripts/pyinstaller.exe') (@(
     '--workpath', (Join-Path $WorkDir 'pyinstaller-build'),
     '--specpath', $WorkDir,
     '--collect-data', 'neurowatch',
-    '--copy-metadata', 'neurowatch'
-) + $ExtensionArgs + @(
+    '--copy-metadata', 'neurowatch',
+    '--collect-submodules', 'neurowatch.cloud',
     (Join-Path $Root 'scripts/entrypoints/neurowatch_ui.py')
 ))
 Copy-Item -Recurse -Force (Join-Path $WorkDir 'pyinstaller-dist/neurowatch-ui') (Join-Path $BundleDir 'app/neurowatch-ui')

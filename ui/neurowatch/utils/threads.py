@@ -17,6 +17,40 @@ from PySide6.QtCore import QThread
 logger = logging.getLogger(__name__)
 
 _retired: set[QThread] = set()
+_alive: set[QThread] = set()
+
+
+class Worker(QThread):
+    """A ``QThread`` that keeps itself alive while it runs.
+
+    A worker's result signal is emitted from its thread just before ``run``
+    returns, and the slot that receives it (on the GUI thread) often drops
+    the last reference (``self._worker = None``). When the GUI thread gets
+    there first, Python destroyed a running thread and Qt aborted the app
+    ("QThread: Destroyed while thread '' is still running"; seen in the
+    camera dialog while the backend restarted). A ``Worker`` holds itself from
+    ``start`` until its thread has ended, so letting go of it is always safe.
+    """
+
+    def start(self, priority: QThread.Priority = QThread.Priority.InheritPriority) -> None:
+        if self not in _alive:
+            _alive.add(self)
+            self.finished.connect(self._release)
+        super().start(priority)
+
+    def _release(self) -> None:
+        # `finished` comes just before the thread ends: wait for that moment.
+        self.wait()
+        _alive.discard(self)
+        try:
+            self.finished.disconnect(self._release)
+        except (RuntimeError, TypeError):
+            pass
+
+
+def alive_count() -> int:
+    """Workers started and not yet ended (for tests)."""
+    return len(_alive)
 
 
 def retire(worker: QThread | None) -> None:

@@ -18,10 +18,10 @@ import threading
 import uuid
 from collections.abc import Callable, Iterable
 
-from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QWidget
 
 from neurowatch.ipc.sync_client import SyncIpcClient
+from neurowatch.utils.threads import Worker
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ LEASE_TTL_MS = 10_000
 RENEW_INTERVAL_S = 3.0
 
 
-class ViewLeaseWorker(QThread):
+class ViewLeaseWorker(Worker):
     """Keeps this UI's view lease current from a background thread."""
 
     def __init__(

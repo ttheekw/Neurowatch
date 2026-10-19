@@ -9,7 +9,7 @@
   <name>NeuroWatch</name>
   <summary>Watch and record your security cameras</summary>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>AGPL-3.0-or-later</project_license>
+  <project_license>Apache-2.0</project_license>
   <developer id="io.github.ttheekw">
     <name>NeuroWatch Project</name>
   </developer>

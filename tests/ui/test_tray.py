@@ -53,7 +53,7 @@ def test_status_from_the_backend() -> None:
     assert status.lines() == [
         "Running · Main Gate",
         "Cameras 2/3 online · 2 recording",
-        "VA-API",
+        "Cloud: not linked · VA-API",
         "⚠ 1 camera offline",
     ]
     assert status.tooltip() == "NeuroWatch\n" + "\n".join(status.lines())
@@ -61,28 +61,22 @@ def test_status_from_the_backend() -> None:
     assert status.menu_lines() == [
         "Running · Main Gate · up 2 h 5 min",
         "Cameras 2/3 online · 2 recording",
-        "VA-API",
+        "Cloud: not linked · VA-API",
         "⚠ 1 camera offline",
     ]
 
 
-def test_extensions_add_a_detail_and_problems(monkeypatch) -> None:
-    from types import SimpleNamespace
+def test_the_cloud_adds_its_state_and_an_unreachable_problem() -> None:
+    linked = {"phase": "linked", "cloud_configured": True, "cloud_reachable": False}
+    status = read_status(_backend(**{"cloud.status": linked}), endpoint="unix:/x")
 
-    from neurowatch import extensions
-
-    def tray_status(request: Any, endpoint: str) -> extensions.ExtensionStatus:
-        state = request("example.status", endpoint=endpoint)
-        return extensions.ExtensionStatus(
-            detail=f"Example: {state}", problems=(("Example down", "Example is down"),)
-        )
-
-    monkeypatch.setattr(extensions, "load", lambda: (SimpleNamespace(tray_status=tray_status),))
-
-    status = read_status(_backend(**{"example.status": "on"}), endpoint="unix:/x")
-
-    assert status.lines()[2] == "Example: on · VA-API"
-    assert [problem.label for problem in status.problems] == ["1 camera offline", "Example down"]
+    assert status.lines()[2].startswith("Cloud: ") and status.lines()[2].endswith(" · VA-API")
+    assert [problem.label for problem in status.problems] == [
+        "1 camera offline",
+        "Cloud unreachable",
+    ]
+    never_linked = read_status(_backend(), endpoint="unix:/x")
+    assert [p.label for p in never_linked.problems] == ["1 camera offline"], "optional"
 
 
 def test_problems_that_raise_the_badge() -> None:
@@ -105,9 +99,7 @@ def test_problems_that_raise_the_badge() -> None:
     assert problems(performance={"bottleneck": critical}) == ["High CPU load (critical)"]
     ok = {"kind": "none", "severity": "ok", "explanation": "all good"}
     assert problems(performance={"bottleneck": ok}) == []
-    found = find_problems(
-        cameras=1, online=1, recording={}, performance={"bottleneck": warning}
-    )
+    found = find_problems(cameras=1, online=1, recording={}, performance={"bottleneck": warning})
     assert found == (Problem("Memory running low", "Memory running low: memory high at 87%"),)
 
 
@@ -343,15 +335,10 @@ def test_launch_arguments(monkeypatch) -> None:
     assert headless.mode == "headless" and headless.rest == ("--foreground",)
     service = parse(["neurowatch-ui", "service", "stop"])
     assert service.mode == "service" and service.rest == ("stop",)
-    # An extension's command goes to the headless commands as it is.
-    from types import SimpleNamespace
-
-    from neurowatch import extensions
-
+    # The cloud's and events commands go to the headless commands as they are.
     assert parse(["neurowatch-ui", "example", "go"]).mode == "ui", "no such command"
-    monkeypatch.setattr(extensions, "load", lambda: (SimpleNamespace(commands=("example",)),))
-    command = parse(["neurowatch-ui", "example", "go", "--name", "Lab"])
-    assert command.mode == "command" and command.rest == ("example", "go", "--name", "Lab")
+    command = parse(["neurowatch-ui", "cloud", "link", "CODE", "--name", "Lab"])
+    assert command.mode == "command" and command.rest == ("cloud", "link", "CODE", "--name", "Lab")
 
 
 def test_opening_the_app_again_brings_the_window_forward(qapp, qtbot, tmp_path) -> None:

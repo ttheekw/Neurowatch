@@ -1,6 +1,6 @@
 [package]
 name        = "nw-backend"
-description = "Neurowatch backend service — GStreamer pipelines, IPC server, config"
+description = "Neurowatch backend service — GStreamer pipelines, IPC server, config, NeuroWatch Cloud"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
@@ -13,9 +13,13 @@ default = ["v1"]
 v1      = []
 # In-memory metric sources for tests of crates built on this one.
 test-support = []
+# NeuroWatch Unlimited: no camera limit (`edition.rs`). Without it a build
+# runs up to 16 cameras.
+unlimited = []
 
 [dependencies]
-nw-core            = { path = "../nw-core" }
+nw-core            = { workspace = true }
+nw-cloud-protocol  = { workspace = true }
 
 tokio              = { workspace = true }
 serde              = { workspace = true }
@@ -32,25 +36,59 @@ memmap2            = { workspace = true }
 dirs               = { workspace = true }
 image              = { version = "0.25", default-features = false, features = ["jpeg"] }
 base64             = "0.22"
+ring               = "0.17"
 rusqlite           = { workspace = true }
 time               = { version = "0.3", features = ["local-offset", "formatting", "parsing"] }
 getrandom          = "0.2"
 libc               = "0.2"
-reqwest            = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+reqwest            = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # Camera discovery: SOAP/WS-Discovery replies, multicast on a chosen interface,
 # and WS-Security UsernameToken digests.
 roxmltree          = "0.20"
 socket2            = { version = "0.5", features = ["all"] }
 sha1               = "0.10"
 
+# NeuroWatch Cloud (src/cloud).
+# Node signatures. Pinned to 2.1.x for the Rust 1.75 MSRV.
+ed25519-dalek      = { version = "=2.1.1", default-features = false, features = ["std"] }
+rustls             = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots       = "1"
+tokio-tungstenite  = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+futures-util       = { version = "0.3", features = ["sink"] }
+# Streams a clip file into an upload (web portal export).
+tokio-util         = { version = "0.7", features = ["io"] }
+# Sealed web-portal requests: X25519 (via the node identity key), HKDF-SHA256, AES-256-GCM.
+curve25519-dalek   = "4.1"
+hmac               = "0.12"
+sha2               = "0.10"
+md-5               = "0.10"
+aes-gcm            = "0.10"
+# Sourced from the upstream tag rather than crates.io: the published `livekit-protocol 0.7.13`
+# artifact was cut against prost 0.12 / pbjson 0.6, but `livekit 0.9.2` and `livekit-signaling
+# 0.1.3` call prost 0.14 `Message` methods on those types, so the registry tree cannot compile
+# (`no method named encode_to_vec found for struct SignalRequest`). At tag `livekit/v0.9.2` the
+# workspace pins `prost = "0.14"` for every member, so taking `livekit` from Git makes Cargo
+# resolve the sibling `livekit-*` crates through the upstream workspace's own path deps and
+# constraints instead of a floating registry mix. Pinned to the tag's exact commit -- `rev` and
+# not `tag`, so the checkout cannot move if the tag is ever repointed.
+livekit            = { git = "https://github.com/livekit/rust-sdks", rev = "5a656c4bc4bc5c4f7fad17ab69044db3b487dfeb" }
+# `media_publish.rs` mints the node's own participant token, so only the access-token half of
+# the server SDK is needed. The 0.9 client no longer depends on `livekit-api` at all, so this
+# stays on the crates.io 0.8.0 that nw-api resolves to. Its own (registry, prost 0.12)
+# `livekit-protocol` copy is a separate tree from the Git client's, which is harmless because
+# only `access_token` is enabled and no protocol type crosses between the two.
+livekit-api        = { version = "0.8.0", default-features = false, features = ["access-token"] }
+
 # Windows frame rings use named pagefile-backed sections (no /dev/shm); the
 # performance readings use the CPU time, memory and network adapter counters.
 [target.'cfg(windows)'.dependencies]
-windows-sys        = { version = "0.60", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys        = { version = "0.60", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 time = { workspace = true, features = ["formatting"] }
+rcgen        = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 [[test]]
 name = "test_runtime_mode"

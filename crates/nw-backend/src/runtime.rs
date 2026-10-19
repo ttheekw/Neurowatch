@@ -4,7 +4,7 @@
 //! - Initialize GStreamer
 //! - Load configuration
 //! - Wire up pipeline supervisors, IPC server, shared memory
-//! - Run an optional [`Extension`]
+//! - Run NeuroWatch Cloud ([`crate::cloud`])
 //! - Handle SIGTERM / SIGINT for graceful shutdown
 
 use anyhow::Context as _;
@@ -14,7 +14,7 @@ use tokio::sync::{broadcast, RwLock};
 use tracing_subscriber::EnvFilter;
 
 use crate::app_state::AppState;
-use crate::extension::{Extension, Services};
+use crate::cloud::{Cloud, Services};
 use crate::stats::gpu::{CachedGpuSource, SystemGpuProbe};
 use crate::stats::ipc_metrics::IpcMetricsRecorder;
 use crate::stats::system::ProcSystemCollector;
@@ -22,18 +22,18 @@ use crate::stats::{
     CameraHealthSource, GpuMetricsSource, IpcMetricsSource, PerformanceAggregator,
     SystemMetricsSource,
 };
-use crate::{discovery, ipc, pipeline, playback, recording, resource_limits, viewer};
+use crate::{discovery, events, ipc, pipeline, playback, recording, resource_limits, viewer};
 
-/// Run the backend until it is stopped, with an optional extension.
-pub fn main_with(extension: Option<Box<dyn Extension>>) -> anyhow::Result<()> {
+/// Run the backend until it is stopped.
+pub fn main() -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("Failed to start the async runtime")?
-        .block_on(run(extension))
+        .block_on(run())
 }
 
-async fn run(mut extension: Option<Box<dyn Extension>>) -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     let config_path = PathBuf::from(std::env::var("NW_CONFIG").unwrap_or_else(|_| {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -44,11 +44,7 @@ async fn run(mut extension: Option<Box<dyn Extension>>) -> anyhow::Result<()> {
     }));
 
     let cfg = crate::config::AppConfig::load_or_default(&config_path)?;
-    let extension_logs = extension
-        .as_ref()
-        .map(|extension| extension.log_directives())
-        .unwrap_or_default();
-    init_tracing(&cfg.debug.gst_log, &extension_logs);
+    init_tracing(&cfg.debug.gst_log);
     resource_limits::configure();
 
     // Initialize GStreamer — must happen before any gst:: calls
@@ -76,6 +72,20 @@ async fn run(mut extension: Option<Box<dyn Extension>>) -> anyhow::Result<()> {
     // Probe hardware acceleration once at startup
     let hwaccel = pipeline::hwaccel::probe();
     tracing::info!(?hwaccel, "Hardware acceleration probed");
+    if pipeline::hwaccel::waiting_for_gpu_access() {
+        // Started before sign-in: GStreamer registered no hardware decoders,
+        // and cannot for the life of this process. Once the graphics card can
+        // be opened, stop cleanly and start again in place (`restart_in_place`).
+        let restart = shutdown_tx.clone();
+        tokio::spawn(async move {
+            pipeline::hwaccel::gpu_accessible().await;
+            tracing::info!(
+                "The graphics card can be opened now; restarting the backend to decode video on it"
+            );
+            RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = restart.send(());
+        });
+    }
 
     // Build shared application state
     let mut initial_state = AppState::new(cfg.clone(), config_path.clone(), hwaccel);
@@ -85,10 +95,26 @@ async fn run(mut extension: Option<Box<dyn Extension>>) -> anyhow::Result<()> {
         tracing::info!("Headless: no desktop UI; camera frames are converted only on demand");
     }
     initial_state.set_headless(headless);
-    if let Some(extension) = extension.as_mut() {
-        extension.prepare(&mut initial_state);
-    }
+    let cloud = Cloud::new();
+    cloud.prepare(&mut initial_state);
     let state = Arc::new(RwLock::new(initial_state));
+    {
+        let policy_state = Arc::clone(&state);
+        let mut policy_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            );
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = policy_shutdown.recv() => break,
+                    _ = tick.tick() => policy_state.write().await.reconcile_recording_policies(),
+                }
+            }
+        });
+    }
     // Keep the segment index current in the background, so readers of it
     // (such as coverage reports) never wait for a scan; then delete the
     // oldest recordings beyond camera quotas or the disk threshold.
@@ -98,12 +124,57 @@ async fn run(mut extension: Option<Box<dyn Extension>>) -> anyhow::Result<()> {
         let mut retention = recording::retention::Retention::default();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut passes: u32 = 0;
         loop {
             tick.tick().await;
             indexer.index_segments().await;
             retention.run_once(&retention_state).await;
+            // Old events: every 10 minutes is plenty.
+            if passes % 20 == 0 {
+                events::prune_old(&retention_state).await;
+            }
+            passes = passes.wrapping_add(1);
         }
     });
+    // Recording locations that go missing (an unmounted drive or share)
+    // stop recording there, and resume it when they are back.
+    tokio::spawn(crate::storage_guard::watch(
+        Arc::clone(&state),
+        shutdown_tx.subscribe(),
+    ));
+    // Older recordings move to the archive tier, when one is configured.
+    tokio::spawn(crate::recording::archive::run(
+        Arc::clone(&state),
+        shutdown_tx.subscribe(),
+    ));
+    // Events: system health (camera offline, recording failed, disk low)
+    // and the cameras' own events over ONVIF.
+    {
+        let (hub, onvif) = {
+            let st = state.read().await;
+            (Arc::clone(&st.events), Arc::clone(&st.onvif_events))
+        };
+        tokio::spawn(events::health::run(
+            Arc::clone(&state),
+            Arc::clone(&hub),
+            shutdown_tx.subscribe(),
+        ));
+        tokio::spawn(onvif.run(Arc::clone(&state), hub, shutdown_tx.subscribe()));
+        let (hub, builtin) = {
+            let st = state.read().await;
+            (Arc::clone(&st.events), Arc::clone(&st.builtin_motion))
+        };
+        tokio::spawn(builtin.run(Arc::clone(&state), hub, shutdown_tx.subscribe()));
+        tokio::spawn(crate::snapshot::run(
+            Arc::clone(&state),
+            shutdown_tx.subscribe(),
+        ));
+        let (hub, alerts) = {
+            let st = state.read().await;
+            (Arc::clone(&st.events), Arc::clone(&st.alerts))
+        };
+        tokio::spawn(alerts.run(Arc::clone(&state), hub, shutdown_tx.subscribe()));
+    }
     // Spawn a pipeline supervisor for each configured camera
     {
         let mut st = state.write().await;
@@ -125,7 +196,10 @@ async fn run(mut extension: Option<Box<dyn Extension>>) -> anyhow::Result<()> {
         reason = ?viewer_caps.reason,
         "Native viewer capabilities probed"
     );
-    let viewer_manager = Arc::new(viewer::ViewerManager::new(hwaccel, viewer_caps));
+    let viewer_manager = Arc::new(
+        viewer::ViewerManager::new(hwaccel, viewer_caps)
+            .with_stream_hubs(Arc::clone(&state.read().await.streams)),
+    );
     // A desktop UI that stops renewing its view lease (closed or crashed)
     // must not leave decoders behind: drop lapsed leases, stop their views
     // and detach their native sessions.
@@ -175,16 +249,14 @@ async fn run(mut extension: Option<Box<dyn Extension>>) -> anyhow::Result<()> {
     // cache and its one-search-at-a-time limit.
     let discovery = Arc::new(discovery::DiscoveryService::new());
     let exports = Arc::clone(&state.read().await.exports);
-    let running_extension = extension.map(|extension| {
-        extension.start(Services {
-            state: Arc::clone(&state),
-            viewer_manager: Arc::clone(&viewer_manager),
-            stats: Arc::clone(&aggregator),
-            discovery: Arc::clone(&discovery),
-            exports,
-            config_path: config_path.clone(),
-            headless,
-        })
+    let running_cloud = cloud.start(Services {
+        state: Arc::clone(&state),
+        viewer_manager: Arc::clone(&viewer_manager),
+        stats: Arc::clone(&aggregator),
+        discovery: Arc::clone(&discovery),
+        exports,
+        config_path: config_path.clone(),
+        headless,
     });
 
     // Start IPC server
@@ -195,8 +267,8 @@ async fn run(mut extension: Option<Box<dyn Extension>>) -> anyhow::Result<()> {
     )
     .with_discovery(discovery)
     .with_shutdown(shutdown_tx.clone());
-    if let Some(rpc) = running_extension.as_ref().and_then(|running| running.rpc()) {
-        rpc_handler = rpc_handler.with_extension(rpc);
+    if let Some(cloud) = running_cloud.rpc() {
+        rpc_handler = rpc_handler.with_cloud(cloud);
     }
     let handler = Arc::new(rpc_handler);
     let ipc_shutdown = shutdown_tx.subscribe();
@@ -219,9 +291,7 @@ async fn run(mut extension: Option<Box<dyn Extension>>) -> anyhow::Result<()> {
     shutdown_tx.subscribe().recv().await.ok();
     shutdown_watchdog();
 
-    if let Some(running) = &running_extension {
-        running.shutdown().await;
-    }
+    running_cloud.shutdown().await;
 
     // Stop all camera supervisors, giving each time to finalize its recording.
     let supervisors = {
@@ -232,12 +302,49 @@ async fn run(mut extension: Option<Box<dyn Extension>>) -> anyhow::Result<()> {
     for task in supervisors {
         let _ = task.await;
     }
+    // Recordings are finished: close any camera connection still open.
+    state.read().await.streams.shutdown();
+    state.read().await.events.flush();
 
     tracing::info!("Neurowatch backend stopped");
     if ipc_failed.load(std::sync::atomic::Ordering::SeqCst) {
         anyhow::bail!("the IPC server could not run; see the log above");
     }
+    if RESTART_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+        restart_in_place();
+    }
     Ok(())
+}
+
+/// Set when the backend stops only to start again (`restart_in_place`).
+static RESTART_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Exit status asking a service manager to start the backend again, when it
+/// cannot replace itself (systemd `Restart=on-failure`, the dev supervisor).
+const RESTART_EXIT_CODE: i32 = 75;
+
+/// Replace this process with a fresh backend: same program, arguments,
+/// environment and PID, so the service manager (systemd, the dev supervisor,
+/// a detached start) sees no exit. Called after a graceful stop: recordings
+/// are finished and the IPC socket closed. Should that fail, exit non-zero so
+/// a service manager starts it again.
+fn restart_in_place() -> ! {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        match std::env::current_exe() {
+            Ok(program) => {
+                let error = std::process::Command::new(program)
+                    .args(std::env::args_os().skip(1))
+                    .exec();
+                tracing::error!(%error, "Could not restart the backend in place; exiting so it is started again");
+            }
+            Err(error) => {
+                tracing::error!(%error, "Could not find the backend program to restart; exiting so it is started again")
+            }
+        }
+    }
+    std::process::exit(RESTART_EXIT_CODE);
 }
 
 /// SIGINT (Ctrl+C) or, on Unix, SIGTERM — what the launchers send when the
@@ -263,6 +370,9 @@ fn shutdown_watchdog() {
             seconds = SHUTDOWN_DEADLINE.as_secs(),
             "Cameras did not stop in time; exiting anyway (their last recording segment may be incomplete)"
         );
+        if RESTART_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            restart_in_place();
+        }
         std::process::exit(0);
     });
 }
@@ -287,13 +397,9 @@ async fn wait_for_shutdown_signal() {
     tokio::signal::ctrl_c().await.ok();
 }
 
-fn init_tracing(default_level: &str, extension_directives: &[String]) {
+fn init_tracing(default_level: &str) {
     let gst_level = normalize_tracing_level(default_level);
-    let mut fallback_filter = default_log_filter(gst_level);
-    for directive in extension_directives {
-        fallback_filter.push(',');
-        fallback_filter.push_str(directive);
-    }
+    let fallback_filter = default_log_filter(gst_level);
     let env_filter = std::env::var("RUST_LOG")
         .ok()
         .map(|value| normalize_env_filter(&value))
@@ -319,7 +425,8 @@ fn init_tracing(default_level: &str, extension_directives: &[String]) {
 /// Default directives when `RUST_LOG` is unset: this crate's own target at
 /// info (it logs as `nw_backend::…`), with `neurowatch` kept for compatibility.
 pub fn default_log_filter(gst_level: &str) -> String {
-    format!("nw_backend=info,neurowatch=info,gstreamer={gst_level}")
+    // `cloud_ws` is the cloud's WebSocket control plane's own target.
+    format!("nw_backend=info,neurowatch=info,cloud_ws=info,gstreamer={gst_level}")
 }
 
 fn normalize_tracing_level(level: &str) -> &str {
