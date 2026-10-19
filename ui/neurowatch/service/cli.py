@@ -19,9 +19,11 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import replace
 
 from neurowatch.service.manager import DESKTOP, HEADLESS, ServiceController, ServiceError
 from neurowatch.service.paths import log_path, source_root
+from neurowatch.service.startup import load_prefs, save_prefs
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -94,6 +96,7 @@ def _run(service: ServiceController, args: argparse.Namespace) -> int:
         print(f"NeuroWatch service did not start; see {log_path('service')}", file=sys.stderr)
         return 1
     if args.command == "install":
+        save_prefs(replace(load_prefs(), at_login=True))
         service.install(autostart=True, mode=args.mode)
         info = service.describe()
         if info["mode"] == HEADLESS:
@@ -102,6 +105,7 @@ def _run(service: ServiceController, args: argparse.Namespace) -> int:
         else:
             print("NeuroWatch service and tray start at login")
         return 0
+    save_prefs(replace(load_prefs(), at_login=False))
     service.uninstall()
     print("NeuroWatch no longer starts at login (a running service keeps running)")
     return 0

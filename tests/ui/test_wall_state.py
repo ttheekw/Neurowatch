@@ -1,8 +1,6 @@
 """Tests for WallStateModel — grid layout and page overflow logic."""
 from __future__ import annotations
 
-import pytest
-
 from neurowatch.models.camera import CameraConfig
 from neurowatch.models.wall_state import WallStateModel
 

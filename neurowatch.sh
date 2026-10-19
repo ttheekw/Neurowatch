@@ -3,9 +3,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# A build that adds extensions runs this launcher with its own Python project
-# (which installs this app and the UI extension) and Cargo workspace (which
-# builds this backend with the backend extension).
+# NW_PYTHON_PROJECT, NW_BACKEND_WORKSPACE and NW_BACKEND_PACKAGE run another
+# Python project or Cargo workspace (a build that adds to this one).
 PYTHON_PROJECT="${NW_PYTHON_PROJECT:-$ROOT}"
 VENV="$PYTHON_PROJECT/.venv"
 BACKEND_WORKSPACE="${NW_BACKEND_WORKSPACE:-$ROOT}"
@@ -18,17 +17,18 @@ HEADLESS=0
 NO_AUTOSTART=0
 FOREGROUND=0
 SERVICE_ARGS=()
-# Options of --headless that extensions add (see ui/neurowatch/extensions.py),
-# and an extension's command with its arguments; both go to neurowatch.headless.
+# Further --headless options (the cloud's --link/--name) and a command with its
+# arguments (events, cloud); both go to neurowatch.headless.
 EXTRA_ARGS=()
 COMMAND_ARGS=()
 
 usage() {
     cat <<'USAGE'
 Usage: ./neurowatch.sh [--no-autostart]
-       ./neurowatch.sh --headless [--no-autostart | --foreground] [EXTENSION OPTIONS]
+       ./neurowatch.sh --headless [--no-autostart | --foreground] [--link CODE --name NAME]
        ./neurowatch.sh service (status | start | stop | restart | install | uninstall)
-       ./neurowatch.sh EXTENSION-COMMAND ...
+       ./neurowatch.sh events [--follow] [--camera NAME] [--limit N]
+       ./neurowatch.sh cloud (status | link CODE --name NAME | unlink --yes)
        ./neurowatch.sh [--check | --bootstrap [--system --yes]]
 
   (no arguments)  synchronize Python dependencies, build the backend, then
@@ -53,9 +53,13 @@ Usage: ./neurowatch.sh [--no-autostart]
   --foreground     with --headless: no service; run the backend in this
                    terminal and stop it with Ctrl+C (containers, or a system
                    service manager of your own)
-  EXTENSION OPTIONS, EXTENSION-COMMAND
-                   what installed extensions add, passed to the headless
-                   commands as they are (none in this open-source build)
+  events           list recent events (motion, camera events, cameras
+                   offline, recording failures); --follow then prints new
+                   ones until Ctrl+C
+  --link CODE --name NAME
+                   with --headless: link to NeuroWatch Cloud first (an
+                   enrollment code from the web portal)
+  cloud            NeuroWatch Cloud: status, link CODE --name NAME, unlink --yes
   --check          validate the local tools and GStreamer development files;
                   does not synchronize dependencies or start a service
   --bootstrap      synchronize locked Python project dependencies only
@@ -174,6 +178,34 @@ configure_local_gstreamer_va_runtime() {
     export GST_REGISTRY_1_0="$ROOT/.cache/gstreamer-registry-1.24.13.bin"
 }
 
+# The cloud's LiveKit publisher links libwebrtc, which is built against
+# Chromium's hermetic libc++ and must be compiled with clang >= 21.
+configure_cxx() {
+    [[ -z "${CXX:-}" ]] || return 0
+    local candidate
+    for candidate in clang++-21 clang++-22 clang++-23; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            export CXX="$candidate"
+            return 0
+        fi
+    done
+    printf '%s\n' 'missing clang >= 21 (the backend links libwebrtc): install clang-21 from apt.llvm.org (./neurowatch.sh --bootstrap --system --yes), or set CXX' >&2
+    return 1
+}
+
+# Development links to the local web portal, as scripts/dev_cloud.sh does:
+# its settings file names the cloud (http://127.0.0.1:8000) and LiveKit.
+# Settings already in the environment win; release builds ignore all of these.
+load_portal_settings() {
+    local portal_env="${NW_WEBAPP_DIR:-$ROOT/../Neurowatch-webapp}/.env.node-dev"
+    [[ -z "${NW_CLOUD_ENDPOINT:-}" && -f "$portal_env" ]] || return 0
+    set -a
+    # shellcheck disable=SC1090
+    . "$portal_env"
+    set +a
+    printf 'Cloud: %s (local web portal settings from %s)\n' "${NW_CLOUD_ENDPOINT:-not set}" "$portal_env" >&2
+}
+
 check_tools() {
     local failed=0
     require_command cargo || failed=1
@@ -187,6 +219,7 @@ check_tools() {
 check_dependencies() {
     local failed=0
     check_tools || failed=1
+    configure_cxx || failed=1
     if command -v pkg-config >/dev/null 2>&1; then
         if ! pkg-config --exists gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0; then
             printf '%s\n' 'missing GStreamer development packages (pkg-config gstreamer-1.0, gstreamer-app-1.0, gstreamer-video-1.0)' >&2
@@ -228,6 +261,14 @@ install_system() {
         gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-tools \
         libxcb-cursor0 libxcb1 libx11-xcb1 lsb-release wget gnupg
     git lfs install
+    if ! command -v clang++-21 >/dev/null 2>&1; then
+        printf '%s\n' '==> Installing clang 21 from apt.llvm.org (the backend links libwebrtc)'
+        local llvm_script
+        llvm_script="$(mktemp)"
+        curl -fsSL https://apt.llvm.org/llvm.sh -o "$llvm_script"
+        sudo bash "$llvm_script" 21
+        rm -f "$llvm_script"
+    fi
 }
 
 configure_ipc_endpoint() {
@@ -348,10 +389,10 @@ while (( $# )); do
             SERVICE_ARGS=("$@")
             break ;;
         --help|-h) usage; exit 0 ;;
-        -*) EXTRA_ARGS+=("$1") ;;  # an extension's --headless option
+        -*) EXTRA_ARGS+=("$1") ;;  # a further --headless option (--link, --name)
         *)
             if (( ${#EXTRA_ARGS[@]} )); then
-                EXTRA_ARGS+=("$1")  # the value of an extension's option
+                EXTRA_ARGS+=("$1")  # that option's value
             else
                 mode="command"; ((MODE_FLAGS += 1))
                 COMMAND_ARGS=("$@")
@@ -397,7 +438,7 @@ case "$MODE" in
         exec "$VENV/bin/python" -m neurowatch.service "${SERVICE_ARGS[@]}"
         ;;
     command)
-        # An extension's command; neurowatch.headless rejects unknown ones.
+        # `events` or `cloud`; neurowatch.headless rejects unknown ones.
         (( INSTALL_SYSTEM == 0 && CONFIRM_SYSTEM == 0 )) || fail '--system/--yes require --bootstrap'
         [[ -x "$VENV/bin/python" ]] || fail 'Python environment missing; run ./neurowatch.sh --bootstrap'
         configure_ipc_endpoint
@@ -407,7 +448,7 @@ case "$MODE" in
         (( INSTALL_SYSTEM == 0 && CONFIRM_SYSTEM == 0 )) || fail '--system/--yes require --bootstrap'
         printf '%s\n' '==> Checking local NeuroWatch prerequisites'
         check_dependencies
-        printf '%s\n' 'OK: cargo, uv, and GStreamer development packages are available.'
+        printf '%s\n' "OK: cargo, uv, $CXX and GStreamer development packages are available."
         ;;
     bootstrap)
         (( INSTALL_SYSTEM == 0 || CONFIRM_SYSTEM == 1 )) || fail '--system requires explicit --yes confirmation'
@@ -421,6 +462,7 @@ case "$MODE" in
         (( INSTALL_SYSTEM == 0 && CONFIRM_SYSTEM == 0 )) || fail '--system/--yes require --bootstrap'
         check_dependencies
         sync_python
+        load_portal_settings
         configure_ipc_endpoint
         if (( ! FOREGROUND )); then
             # Build here, where its output and errors are visible; the dev

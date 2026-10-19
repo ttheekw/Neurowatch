@@ -112,11 +112,16 @@ class CenteredPrompt(QDialog):
         set_label_role(self.detail_label, "hint")
         self.detail_label.setVisible(bool(detail))
         content.addWidget(self.detail_label)
+        self._content = content
         content.addSpacing(6)
         self._row = QHBoxLayout()
         self._row.setSpacing(8)
         self._row.addStretch(1)
         content.addLayout(self._row)
+
+    def add_content(self, widget: QWidget) -> None:
+        """Put ``widget`` (fields, a note) above the buttons."""
+        self._content.insertWidget(self._content.count() - 2, widget)
 
     def add_button(self, key: str, label: str, variant: str = "secondary") -> QPushButton:
         """A choice; variants are the app's (primary, secondary, danger)."""

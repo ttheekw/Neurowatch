@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -31,6 +31,7 @@ from neurowatch.theme import (
     set_status_tone,
     style_button_box,
 )
+from neurowatch.utils.threads import Worker
 from neurowatch.widgets.window_chrome import install_dialog_chrome
 
 DEFAULT_FOLDER = "nw-storage"
@@ -117,7 +118,7 @@ def describe_space(drive: Drive) -> str:
     return f"{format_bytes(drive.available_bytes)} free of {format_bytes(drive.total_bytes)}"
 
 
-class DriveScanWorker(QThread):
+class DriveScanWorker(Worker):
     """Asks the backend for its drives (``storage.list``, every drive)."""
 
     done = Signal(object)  # StorageScan, or Exception

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QMimeData, Qt, Signal
+from PySide6.QtCore import QMimeData, QSize, Qt, Signal
+from PySide6.QtGui import QResizeEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -83,6 +84,24 @@ class _CameraListWidget(QListWidget):
         return mime
 
 
+class _ElidedLabel(QLabel):
+    """A name that ends in "…" when the panel is too narrow, never widening it."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self._full = text
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(20)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        elided = self.fontMetrics().elidedText(
+            self._full, Qt.TextElideMode.ElideRight, max(0, self.width())
+        )
+        if elided != self.text():
+            self.setText(elided)
+
+
 class _CameraItem(QWidget):
     selected = Signal(str)
 
@@ -108,10 +127,10 @@ class _CameraItem(QWidget):
         self._recording_dot.hide()
         layout.addWidget(self._recording_dot)
 
-        name_lbl = QLabel(cam.name or cam.url)
+        name_lbl = _ElidedLabel(cam.name or cam.url)
         name_lbl.setStyleSheet(f"color: {_TEXT}; font-size: 11px;")
-        name_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        layout.addWidget(name_lbl)
+        name_lbl.setToolTip(cam.name or cam.url)
+        layout.addWidget(name_lbl, 1)
 
         self._badge = QLabel()
         self._badge.setFixedHeight(16)
@@ -120,6 +139,19 @@ class _CameraItem(QWidget):
         )
         layout.addWidget(self._badge)
         self._set_badge("offline")
+
+        self._motion = QLabel("Motion")
+        self._motion.setFixedHeight(16)
+        self._motion.setToolTip("The camera reports motion now")
+        self._motion.setStyleSheet(
+            "background: #ea580c; color: #fff7ed; font-size: 9px; font-weight: bold;"
+            " padding: 0 5px; border-radius: 3px;"
+        )
+        self._motion.hide()
+        layout.addWidget(self._motion)
+
+    def set_motion(self, active: bool) -> None:
+        self._motion.setVisible(active)
 
     def set_status(self, status: str) -> None:
         # Status is re-sent on every poll; restyling a widget is expensive.
@@ -204,6 +236,7 @@ class CameraPanel(QWidget):
         self._selected_id: str | None = None
         self._camera_statuses: dict[str, str] = {}
         self._recording_states: dict[str, str] = {}
+        self._motion_ids: set[str] = set()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -246,6 +279,12 @@ class CameraPanel(QWidget):
         self._recording_states[cam_id] = state
         if widget := self._item_widgets.get(cam_id):
             widget.set_recording(state)
+
+    def set_motion_cameras(self, camera_ids: set[str]) -> None:
+        """Cameras with motion going on show a Motion badge in the list."""
+        self._motion_ids = set(camera_ids)
+        for cam_id, widget in self._item_widgets.items():
+            widget.set_motion(cam_id in camera_ids)
 
     @property
     def selected_id(self) -> str | None:
@@ -318,6 +357,7 @@ class CameraPanel(QWidget):
             f"QListWidget::item:hover {{ background: {_ITEM_HOVER}; }}"
         )
         self._list.setSpacing(0)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setDragEnabled(True)
         self._list.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -424,8 +464,10 @@ class CameraPanel(QWidget):
             item_widget = _CameraItem(cam)
             item_widget.set_status(status)
             item_widget.set_recording(self._recording_states.get(cam.id, "idle"))
+            item_widget.set_motion(cam.id in self._motion_ids)
             item = QListWidgetItem()
-            item.setSizeHint(item_widget.sizeHint())
+            # As wide as the panel, whatever the name's length.
+            item.setSizeHint(QSize(1, item_widget.sizeHint().height()))
             item.setData(Qt.ItemDataRole.UserRole, cam.id)
             self._list.addItem(item)
             self._list.setItemWidget(item, item_widget)

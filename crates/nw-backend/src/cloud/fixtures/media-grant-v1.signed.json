@@ -1,0 +1,23 @@
+{
+  "_comment": "Test-only key. Shared with crates/nw-backend/src/fixtures/media-grant-v1.signed.json in the node repository; both sides must accept this exact token.",
+  "signing_seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "public_key": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+  "grant": {
+    "audience": "sfu-eu-west-1",
+    "expires_at_utc": "2026-09-25T12:00:45Z",
+    "grant_id": "1f4f4f6c8c2a4e0fa1b6e1c2d3e4f506",
+    "issued_at_utc": "2026-09-25T12:00:00Z",
+    "max_bitrate_kbps": 2500,
+    "not_before_utc": "2026-09-25T12:00:00Z",
+    "protocol_version": 1,
+    "scope": {
+      "action": "live",
+      "camera_id": "cam-lobby-01",
+      "representation": "sub",
+      "site_id": "node-7c1e",
+      "tenant_id": "5f2b"
+    },
+    "session_id": "sess-9a2c"
+  },
+  "token": "nwg1.eyJhdWRpZW5jZSI6InNmdS1ldS13ZXN0LTEiLCJleHBpcmVzX2F0X3V0YyI6IjIwMjYtMDktMjVUMTI6MDA6NDVaIiwiZ3JhbnRfaWQiOiIxZjRmNGY2YzhjMmE0ZTBmYTFiNmUxYzJkM2U0ZjUwNiIsImlzc3VlZF9hdF91dGMiOiIyMDI2LTA5LTI1VDEyOjAwOjAwWiIsIm1heF9iaXRyYXRlX2ticHMiOjI1MDAsIm5vdF9iZWZvcmVfdXRjIjoiMjAyNi0wOS0yNVQxMjowMDowMFoiLCJwcm90b2NvbF92ZXJzaW9uIjoxLCJzY29wZSI6eyJhY3Rpb24iOiJsaXZlIiwiY2FtZXJhX2lkIjoiY2FtLWxvYmJ5LTAxIiwicmVwcmVzZW50YXRpb24iOiJzdWIiLCJzaXRlX2lkIjoibm9kZS03YzFlIiwidGVuYW50X2lkIjoiNWYyYiJ9LCJzZXNzaW9uX2lkIjoic2Vzcy05YTJjIn0.jgaJ0iJaee7cXSiNLACpEeuftSiG8gphsjyLNvjYevUcPb8ch9CAotR3SW85Jw2JuzSFDiO9DlVS_fzwLxzUDA"
+}

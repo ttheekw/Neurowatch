@@ -174,6 +174,7 @@ pub struct LiveAudio {
     camera: CameraConfig,
     stop_rx: watch::Receiver<bool>,
     output: AudioOutput,
+    streams: Option<Arc<crate::streams::StreamHubs>>,
 }
 
 impl LiveAudio {
@@ -182,12 +183,19 @@ impl LiveAudio {
             camera,
             stop_rx,
             output: AudioOutput::Speakers,
+            streams: None,
         }
     }
 
     /// Send the audio to `output` instead of this computer's speakers.
     pub fn with_output(mut self, output: AudioOutput) -> Self {
         self.output = output;
+        self
+    }
+
+    /// Reuse the camera's connection while the shared path is enabled.
+    pub fn with_stream_hubs(mut self, streams: Arc<crate::streams::StreamHubs>) -> Self {
+        self.streams = Some(streams);
         self
     }
 
@@ -200,6 +208,15 @@ impl LiveAudio {
             return;
         }
         tracing::info!(cam_id = %cam_id, "Live audio started");
+        if crate::streams::enabled() {
+            if let Some(streams) = &self.streams {
+                if let Err(reason) = self.play_shared(streams) {
+                    tracing::warn!(cam_id = %cam_id, reason = %super::sanitize_credentials(&reason), "Shared live audio stopped");
+                }
+                tracing::info!(cam_id = %cam_id, "Live audio stopped");
+                return;
+            }
+        }
         let mut failures = 0usize;
         while !self.stopped() {
             match self.play_once() {
@@ -224,6 +241,54 @@ impl LiveAudio {
 
     fn stopped(&self) -> bool {
         *self.stop_rx.borrow()
+    }
+
+    fn play_shared(&self, streams: &crate::streams::StreamHubs) -> Result<(), String> {
+        use crate::streams::{sound::SoundDecoder, Delivery, Phase, SubscriberPolicy};
+        let subscription = streams.subscribe(&self.camera, SubscriberPolicy::live_sound(), None)?;
+        let mut decoder: Option<SoundDecoder> = None;
+        let mut failures = 0usize;
+        while !self.stopped() {
+            match subscription.recv(POLL) {
+                Some(Delivery::Unit { unit, after_gap }) => {
+                    if !crate::streams::sound::at_live_edge(
+                        unit.arrived_us,
+                        crate::streams::sound::now_us(),
+                    ) {
+                        continue;
+                    }
+                    if after_gap || decoder.as_ref().is_some_and(|d| *d.caps() != unit.caps) {
+                        decoder = None;
+                    }
+                    let result = (|| {
+                        if decoder.is_none() {
+                            decoder = Some(SoundDecoder::live(&unit.caps, &self.output)?);
+                        }
+                        if let Some(decoder) = decoder.as_mut() {
+                            decoder.push(&unit)?;
+                        }
+                        Ok::<(), String>(())
+                    })();
+                    if let Err(reason) = result {
+                        decoder = None;
+                        let pause = RETRY[failures.min(RETRY.len() - 1)];
+                        failures = failures.saturating_add(1);
+                        tracing::warn!(cam_id = %self.camera.id, reason = %super::sanitize_credentials(&reason), retry_in_s = pause.as_secs(), "Live audio decoder failed");
+                        // A missing output must not create a decoder for every
+                        // sound unit. The subscription stays bounded meanwhile.
+                        if !self.rest(pause) {
+                            break;
+                        }
+                    } else {
+                        failures = 0;
+                    }
+                }
+                Some(Delivery::Discontinuity { .. }) => decoder = None,
+                None if subscription.state().phase == Phase::Closed => break,
+                None => {}
+            }
+        }
+        Ok(())
     }
 
     fn rest(&self, pause: Duration) -> bool {

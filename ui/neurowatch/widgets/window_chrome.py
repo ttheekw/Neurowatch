@@ -30,6 +30,7 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Callable
 from functools import cache
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer
@@ -54,6 +55,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from neurowatch.theme import active_colors
+from neurowatch.widgets.chrome_glyphs import GlyphButton
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +118,16 @@ def _x11_compositor_running() -> bool:
         return False
 
 
-_MAXIMIZE_GLYPH = "□"
-_RESTORE_GLYPH = "❐"
+def _glyph_color(role: str) -> Callable[[bool], str]:
+    """Stroke colours of a window button in the active theme."""
+
+    def color(active: bool) -> str:
+        c = active_colors()
+        if not active:
+            return c.text_muted
+        return c.on_danger if role == "close" else c.text
+
+    return color
 
 
 #: DwmSetWindowAttribute: DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND.
@@ -202,18 +214,18 @@ class ChromeTitleBar(QWidget):
         layout.addWidget(self._title, stretch=1)
         self._controls_at = layout.count()
 
-        self._max_btn: QPushButton | None = None
+        self._max_btn: GlyphButton | None = None
         if minimize:
-            layout.addWidget(self._button("–", "Minimise", "minimize", self._minimize))
+            layout.addWidget(self._button("minimize", "Minimise", "minimize", self._minimize))
         if maximize:
             self._max_btn = self._button(
-                _MAXIMIZE_GLYPH, "Maximise / Restore", "maximize", self._toggle_maximize
+                "maximize", "Maximise / Restore", "maximize", self._toggle_maximize
             )
             layout.addWidget(self._max_btn)
-        layout.addWidget(self._button("✕", "Close", "close", lambda: self.window().close()))
+        layout.addWidget(self._button("close", "Close", "close", lambda: self.window().close()))
 
-    def _button(self, text: str, tip: str, role: str, slot: object) -> QPushButton:
-        btn = QPushButton(text)
+    def _button(self, glyph: str, tip: str, role: str, slot: object) -> GlyphButton:
+        btn = GlyphButton(glyph, _glyph_color(role))
         btn.setObjectName("chromeButton")
         btn.setProperty("role", role)
         btn.setToolTip(tip)
@@ -236,9 +248,7 @@ class ChromeTitleBar(QWidget):
     def sync_window_state(self) -> None:
         """Show restore or maximize on the button for the window's state."""
         if self._max_btn is not None:
-            self._max_btn.setText(
-                _RESTORE_GLYPH if self.window().isMaximized() else _MAXIMIZE_GLYPH
-            )
+            self._max_btn.set_glyph("restore" if self.window().isMaximized() else "maximize")
 
     def _minimize(self) -> None:
         self.window().showMinimized()
@@ -293,6 +303,52 @@ class ChromeTitleBar(QWidget):
         super().mouseDoubleClickEvent(event)
 
 
+class _EdgeCursor(QObject):
+    """The resize cursor over a surface's edge band.
+
+    Child widgets inherit their parent's cursor, and the surface gets no
+    Leave when the pointer moves on into one of its children (it is still
+    under the pointer), so a cursor set on the surface stayed a two-sided
+    arrow over the whole content. While it is shown, any child the pointer
+    enters clears it (an application filter, only for that time)."""
+
+    def __init__(self, surface: QWidget) -> None:
+        super().__init__(surface)
+        self._surface = surface
+        self._watching = False
+
+    def show(self, cursor: Qt.CursorShape | None) -> None:
+        if cursor is None:
+            self.clear()
+            return
+        self._surface.setCursor(cursor)
+        app = QApplication.instance()
+        if not self._watching and app is not None:
+            app.installEventFilter(self)
+            self._watching = True
+
+    def clear(self) -> None:
+        surface = getattr(self, "_surface", None)
+        if surface is not None:
+            surface.unsetCursor()
+        app = QApplication.instance()
+        if getattr(self, "_watching", False) and app is not None:
+            app.removeEventFilter(self)
+        self._watching = False
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        surface = getattr(self, "_surface", None)
+        if (
+            surface is not None
+            and event.type() == QEvent.Type.Enter
+            and isinstance(watched, QWidget)
+            and watched is not surface
+            and surface.isAncestorOf(watched)
+        ):
+            self.clear()
+        return False
+
+
 class EdgeResizer(QObject):
     """Resizes a frameless window from a thin band along its edges.
 
@@ -312,6 +368,7 @@ class EdgeResizer(QObject):
         self._grip = max(1, grip)
         self._surface.setMouseTracking(True)
         self._surface.installEventFilter(self)
+        self._cursor = _EdgeCursor(self._surface)
 
     def edges_at(self, pos: QPoint) -> Qt.Edge:
         """The edges a press at ``pos`` (window coordinates) resizes."""
@@ -353,15 +410,14 @@ class EdgeResizer(QObject):
         return None
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched is not self._surface:
+        # At exit Qt still delivers events while Python has already cleared
+        # this object's attributes: ignore them rather than raise.
+        surface = getattr(self, "_surface", None)
+        if surface is None or watched is not surface:
             return False
         if event.type() == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
             if not event.buttons():
-                cursor = self.cursor_for(self.edges_at(self._window_pos(event)))
-                if cursor is None:
-                    self._surface.unsetCursor()
-                else:
-                    self._surface.setCursor(cursor)
+                self._cursor.show(self.cursor_for(self.edges_at(self._window_pos(event))))
         elif event.type() == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
             edges = self.edges_at(self._window_pos(event))
             handle = self._window.windowHandle()
@@ -374,7 +430,7 @@ class EdgeResizer(QObject):
                     return False
                 return True
         elif event.type() == QEvent.Type.Leave:
-            self._surface.unsetCursor()
+            self._cursor.clear()
         return False
 
 
@@ -588,6 +644,7 @@ class CardOverlay(QObject):
         dialog.setProperty(_GUARDED, True)
         dialog.installEventFilter(self)
         shell.installEventFilter(self)
+        self._cursor = _EdgeCursor(shell)
         if resizable:
             shell.setMouseTracking(True)
 
@@ -648,6 +705,10 @@ class CardOverlay(QObject):
     # -- events ------------------------------------------------------------
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        # At exit Qt still delivers events (hide, resize) while Python has
+        # already cleared this object's attributes: ignore them, never raise.
+        if getattr(self, "_dialog", None) is None or getattr(self, "_shell", None) is None:
+            return False
         kind = event.type()
         if watched is self._dialog:
             if kind == QEvent.Type.Show:
@@ -662,7 +723,7 @@ class CardOverlay(QObject):
         elif self._resizable and isinstance(event, QMouseEvent):
             return self._edge_resize(event)
         elif kind == QEvent.Type.Leave and self._resize_from is None:
-            self._shell.unsetCursor()
+            self._cursor.clear()
         return False
 
     def _edges_at(self, pos: QPoint) -> Qt.Edge:
@@ -690,11 +751,7 @@ class CardOverlay(QObject):
             return True
         if kind == QEvent.Type.MouseMove:
             if self._resize_from is None:
-                cursor = EdgeResizer.cursor_for(self._edges_at(pos))
-                if cursor is None:
-                    self._shell.unsetCursor()
-                else:
-                    self._shell.setCursor(cursor)
+                self._cursor.show(EdgeResizer.cursor_for(self._edges_at(pos)))
                 return False
             start, rect = self._resize_from
             delta = event.globalPosition().toPoint() - start
@@ -749,6 +806,74 @@ def guard_window_of(window: QWindow | None) -> None:
         if widget.windowHandle() is window:
             guard_window_size(widget)
             return
+
+
+class _ContentFirstFocus(QObject):
+    """A dialog opens with the keyboard in its content, not on the header:
+    the header's close button turns red when focused, as if about to close.
+    Escape still closes and Tab still reaches the header's buttons."""
+
+    def __init__(self, dialog: QDialog, body: QWidget) -> None:
+        super().__init__(dialog)
+        self._body = body
+        dialog.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Show and isinstance(watched, QDialog):
+            # Qt picks the first focus after the show event: correct it after.
+            QTimer.singleShot(0, lambda dialog=watched: self._focus_content(dialog))
+        return False
+
+    def _focus_content(self, dialog: QDialog) -> None:
+        body = getattr(self, "_body", None)
+        if body is None or not dialog.isVisible():
+            return
+        focused = dialog.focusWidget()
+        if focused is not None and focused.objectName() != "chromeButton":
+            return  # the dialog or the user chose already
+        target = first_content_focus(body)
+        if target is not None:
+            target.setFocus(Qt.FocusReason.TabFocusReason)
+
+
+def first_content_focus(body: QWidget) -> QWidget | None:
+    """Where the keyboard starts in a dialog's content: the first enabled
+    field, else the default button, else the first control that is not a
+    destructive (danger) button."""
+    from PySide6.QtWidgets import (
+        QAbstractSpinBox,
+        QComboBox,
+        QLineEdit,
+        QPlainTextEdit,
+        QTextEdit,
+    )
+
+    controls: list[QWidget] = []
+    widget = body.nextInFocusChain()
+    seen: set[int] = set()
+    while widget is not None and id(widget) not in seen:
+        seen.add(id(widget))
+        if (
+            body.isAncestorOf(widget)
+            and widget.isVisibleTo(body)
+            and widget.isEnabled()
+            and widget.focusPolicy() & Qt.FocusPolicy.TabFocus
+        ):
+            controls.append(widget)
+        widget = widget.nextInFocusChain()
+        if widget is body:
+            break
+    fields = (QLineEdit, QAbstractSpinBox, QTextEdit, QPlainTextEdit, QComboBox)
+    for control in controls:
+        if isinstance(control, fields) and not getattr(control, "isReadOnly", lambda: False)():
+            return control
+    for control in controls:
+        if isinstance(control, QPushButton) and control.isDefault():
+            return control
+    for control in controls:
+        if control.property("variant") != "danger":
+            return control
+    return controls[0] if controls else None
 
 
 def install_dialog_chrome(dialog: QDialog, title: str, *, resizable: bool = False) -> QVBoxLayout:
@@ -817,4 +942,5 @@ def install_dialog_chrome(dialog: QDialog, title: str, *, resizable: bool = Fals
     content = QVBoxLayout(body)
     content.setContentsMargins(20, 2, 20, 16)
     content.setSpacing(10)
+    _ContentFirstFocus(dialog, body)
     return content

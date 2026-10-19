@@ -10,8 +10,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PKG_NAME="neurowatch"
 PKG_RELEASE="1"
 PKG_SUMMARY="NeuroWatch - watch and record your security cameras (NVR)"
-# Builds that add proprietary extensions name their terms too (NW_PACKAGE_LICENSE).
-PKG_LICENSE="${NW_PACKAGE_LICENSE:-AGPL-3.0-or-later}"
+PKG_LICENSE="Apache-2.0"
 PKG_URL="https://github.com/ttheekw/Neurowatch"
 # AppStream id (scripts/installer/linux/neurowatch.metainfo.xml).
 APP_ID="io.github.ttheekw.neurowatch"
@@ -73,11 +72,12 @@ ARCH_OPTDEPENDS=("mesa: AMD VA-API drivers" "intel-media-driver: Intel VA-API dr
 usage() {
     cat <<'USAGE'
 Usage: scripts/package_release_linux.sh --version VERSION --arch ARCH --format FORMAT[,FORMAT...]
-                                        [--out-dir DIR] [--dry-run]
+                                        [--edition free|unlimited] [--out-dir DIR] [--dry-run]
 
   --version   release version; a leading "v" is stripped (v1.2.3 -> 1.2.3)
   --arch      x86_64 | arm64 (aliases: amd64, aarch64); must match the host
   --format    deb | rpm | arch (x86_64 only) | portable; comma separated or repeated
+  --edition   free (default; runs up to 16 cameras) | unlimited (no camera limit)
   --out-dir   output directory (default: dist/release)
   --dry-run   validate arguments and print the artifact paths without building
 USAGE
@@ -93,6 +93,7 @@ ARCH=""
 FORMATS=()
 OUT_DIR="$ROOT/dist/release"
 DRY_RUN=0
+EDITION="free"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -102,6 +103,8 @@ while [[ $# -gt 0 ]]; do
         --arch=*) ARCH="${1#*=}"; shift ;;
         --format) IFS=, read -r -a parts <<< "${2:-}"; FORMATS+=("${parts[@]}"); shift 2 ;;
         --format=*) IFS=, read -r -a parts <<< "${1#*=}"; FORMATS+=("${parts[@]}"); shift ;;
+        --edition) EDITION="${2:-}"; shift 2 ;;
+        --edition=*) EDITION="${1#*=}"; shift ;;
         --out-dir) OUT_DIR="${2:-}"; shift 2 ;;
         --out-dir=*) OUT_DIR="${1#*=}"; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -113,6 +116,11 @@ done
 [[ -n "$VERSION" ]] || { usage >&2; fail '--version is required'; }
 [[ -n "$ARCH" ]] || { usage >&2; fail '--arch is required'; }
 [[ ${#FORMATS[@]} -gt 0 ]] || { usage >&2; fail '--format is required'; }
+case "$EDITION" in
+    free) BACKEND_FEATURES=() ;;
+    unlimited) BACKEND_FEATURES=(--features nw-backend/unlimited) ;;
+    *) usage >&2; fail "--edition must be free or unlimited, not: $EDITION" ;;
+esac
 
 VERSION="${VERSION#v}"
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]] \
@@ -214,19 +222,18 @@ cp -a "$WORK_DIR/gstreamer-sdk/lib/gstreamer-1.0" "$BUNDLE_DIR/gstreamer/lib/"
 cp -a "$WORK_DIR/gstreamer-sdk/lib/nettle3" "$BUNDLE_DIR/gstreamer/lib/"
 
 echo "[2/5] Building backend (release)"
-# NW_BACKEND_MANIFEST / NW_BACKEND_PACKAGE: build the `nw-backend` binary from
-# another Cargo workspace (one that adds a backend extension to this one).
+# The `nw-backend` binary, NeuroWatch Cloud included (a release build links
+# only to https://neurowatch.app). NW_BACKEND_MANIFEST / NW_BACKEND_PACKAGE: build it from another
+# Cargo workspace (one that adds other backend extensions to this one).
 BACKEND_MANIFEST="${NW_BACKEND_MANIFEST:-$ROOT/Cargo.toml}"
 BACKEND_TARGET="${CARGO_TARGET_DIR:-$(dirname "$BACKEND_MANIFEST")/target}"
-cargo build --manifest-path "$BACKEND_MANIFEST" --release --locked -p "${NW_BACKEND_PACKAGE:-nw-backend}"
+# --edition unlimited: no camera limit (the `unlimited` feature, edition.rs).
+cargo build --manifest-path "$BACKEND_MANIFEST" --release --locked -p "${NW_BACKEND_PACKAGE:-nw-backend}" \
+    "${BACKEND_FEATURES[@]}"
 install -m 0755 "$BACKEND_TARGET/release/nw-backend" "$BUNDLE_DIR/bin/nw-backend"
-# The licence and notice ship with every artifact, and the terms of any
-# extensions built in (NW_EXTRA_LICENSE_FILE).
+# The licence and notice ship with every artifact.
 install -m 0644 "$ROOT/LICENSE" "$BUNDLE_DIR/LICENSE"
 install -m 0644 "$ROOT/NOTICE" "$BUNDLE_DIR/NOTICE"
-if [[ -n "${NW_EXTRA_LICENSE_FILE:-}" ]]; then
-    install -m 0644 "$NW_EXTRA_LICENSE_FILE" "$BUNDLE_DIR/LICENSE-EXTENSIONS"
-fi
 
 echo "[3/5] Packaging UI from pyproject.toml with PyInstaller"
 "$PYTHON" -m venv "$VENV"
@@ -236,15 +243,6 @@ echo "[3/5] Packaging UI from pyproject.toml with PyInstaller"
     --format requirements-txt --output-file "$WORK_DIR/requirements.txt"
 "$VENV/bin/python" -m pip install --require-hashes -r "$WORK_DIR/requirements.txt"
 "$VENV/bin/python" -m pip install --no-deps "$ROOT"
-# NW_UI_EXTENSION_DIR / _DIST / _MODULE: bundle a UI extension (see
-# ui/neurowatch/extensions.py) with its entry-point metadata, so it is found.
-extension_args=()
-if [[ -n "${NW_UI_EXTENSION_DIR:-}" ]]; then
-    [[ -n "${NW_UI_EXTENSION_DIST:-}" && -n "${NW_UI_EXTENSION_MODULE:-}" ]] \
-        || fail 'NW_UI_EXTENSION_DIR needs NW_UI_EXTENSION_DIST and NW_UI_EXTENSION_MODULE'
-    "$VENV/bin/python" -m pip install --no-deps "$NW_UI_EXTENSION_DIR"
-    extension_args=(--copy-metadata "$NW_UI_EXTENSION_DIST" --collect-submodules "$NW_UI_EXTENSION_MODULE")
-fi
 "$VENV/bin/pyinstaller" \
     --noconfirm \
     --clean \
@@ -254,7 +252,7 @@ fi
     --specpath "$WORK_DIR" \
     --collect-data neurowatch \
     --copy-metadata neurowatch \
-    "${extension_args[@]}" \
+    --collect-submodules neurowatch.cloud \
     "$ROOT/scripts/entrypoints/neurowatch_ui.py"
 cp -a "$WORK_DIR/pyinstaller-dist/neurowatch-ui" "$BUNDLE_DIR/app/neurowatch-ui"
 
@@ -326,10 +324,14 @@ INSTALLED_SIZE_KB="$(du -sk "$STAGE" | cut -f1)"
 # What the software centre shows on the install screen (deb, rpm).
 LONG_DESCRIPTION="NeuroWatch is a network video recorder for your computer. It shows
 your IP cameras on a live video wall, records them in the background,
-and lets you play back and export recordings. No camera limit; free
-and open source. Provided as is, without any warranty (see NOTICE)."
+and lets you play back and export recordings. Free and open source;
+the free version runs up to 16 cameras. Provided as is, without any warranty (see NOTICE)."
 # Debian continuation lines start with a space.
 LONG_DESCRIPTION_DEB="$(printf '%s\n' "$LONG_DESCRIPTION" | sed '2,$s/^/ /')"
+
+# Package scripts: the `render` group, so recording can use the graphics card
+# from boot (scripts/installer/linux/gpu-access.sh). Same functions in every format.
+GPU_ACCESS="$(cat "$LINUX_FILES/gpu-access.sh")"
 
 join_by() {
     local separator="$1"
@@ -372,6 +374,15 @@ Homepage: $PKG_URL
 Description: $PKG_SUMMARY
  $LONG_DESCRIPTION_DEB
 CONTROL
+    {
+        printf '#!/bin/sh\nset -e\n%s\n' "$GPU_ACCESS"
+        printf 'case "$1" in\n    configure) neurowatch_grant_gpu_access ;;\nesac\nexit 0\n'
+    } > "$root/DEBIAN/postinst"
+    {
+        printf '#!/bin/sh\nset -e\n%s\n' "$GPU_ACCESS"
+        printf 'case "$1" in\n    remove|purge) neurowatch_revoke_gpu_access ;;\nesac\nexit 0\n'
+    } > "$root/DEBIAN/postrm"
+    chmod 0755 "$root/DEBIAN/postinst" "$root/DEBIAN/postrm"
     dpkg-deb --root-owner-group --build "$root" "$output" >/dev/null
     echo "  deb: $output"
 }
@@ -406,6 +417,19 @@ $LONG_DESCRIPTION
 %install
 mkdir -p %{buildroot}
 cp -a "$STAGE/." %{buildroot}/
+
+%post
+$GPU_ACCESS
+neurowatch_grant_gpu_access
+exit 0
+
+%postun
+$GPU_ACCESS
+# 0: removed (not upgraded).
+if [ "\$1" -eq 0 ]; then
+    neurowatch_revoke_gpu_access
+fi
+exit 0
 
 %files
 %defattr(-,root,root,-)
@@ -456,14 +480,20 @@ build_arch() {
             echo "optdepend = $dep"
         done
     } > "$root/.PKGINFO"
+    {
+        printf '%s\n\n' "$GPU_ACCESS"
+        printf 'post_install() {\n    neurowatch_grant_gpu_access\n}\n\n'
+        printf 'post_upgrade() {\n    neurowatch_grant_gpu_access\n}\n\n'
+        printf 'post_remove() {\n    neurowatch_revoke_gpu_access\n}\n'
+    } > "$root/.INSTALL"
     # Same metadata layout makepkg produces: .PKGINFO, .MTREE, then the payload.
     (
         cd "$root"
         LANG=C bsdtar -czf .MTREE --format=mtree --uid 0 --gid 0 --uname root --gname root \
             --options='!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link' \
-            .PKGINFO opt usr
+            .PKGINFO .INSTALL opt usr
         LANG=C bsdtar -cf - --uid 0 --gid 0 --uname root --gname root \
-            .PKGINFO .MTREE opt usr | zstd -q -19 -T0 -o "$output" -f
+            .PKGINFO .INSTALL .MTREE opt usr | zstd -q -19 -T0 -o "$output" -f
     )
     echo "  arch: $output"
 }

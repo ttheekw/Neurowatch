@@ -8,8 +8,9 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use crate::app_state::AppState;
+use crate::cloud::cloud_handler::CloudHandler;
 use crate::discovery::{self, DiscoveryService};
-use crate::extension::RpcExtension;
+use crate::ipc::events_handler::EventsHandler;
 use crate::ipc::export_handler::ExportHandler;
 use crate::ipc::recording_handler::RecordingHandler;
 use crate::ipc::storage_handler::StorageHandler;
@@ -38,21 +39,29 @@ pub struct RpcHandler {
     storage: StorageHandler,
     playback: PlaybackHandler,
     export: ExportHandler,
+    alerts: super::alerts_handler::AlertsHandler,
+    accounts: super::accounts_handler::AccountsHandler,
+    events: EventsHandler,
     viewer: ViewerHandler,
     viewer_manager: Arc<ViewerManager>,
     stats: Arc<PerformanceAggregator>,
-    /// IPC methods served by extensions (see [`crate::extension`]).
-    extensions: Vec<Arc<dyn RpcExtension>>,
+    /// `cloud.*` methods (see [`crate::cloud`]); None when the cloud node
+    /// could not start, and in the web portal's own handler.
+    cloud: Option<Arc<CloudHandler>>,
     discovery: Arc<DiscoveryService>,
     /// Stops the whole backend (`system.shutdown`); None in tests.
     shutdown: Option<tokio::sync::broadcast::Sender<()>>,
     started: std::time::Instant,
 }
 
+/// JSON-RPC error codes of the accounts gate.
+pub const SIGN_IN_REQUIRED: i64 = -32001;
+pub const NOT_ALLOWED: i64 = -32003;
+
 /// How long `system.shutdown` waits before stopping, so its answer is sent.
 const SHUTDOWN_REPLY_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// Who can reach a request's connection. Extension methods (the cloud) are
+/// Who can reach a request's connection. Cloud methods (`cloud.*`) are
 /// served only to `Protected` callers: the Unix socket (owner-only, peer uid
 /// checked), or TCP with this user's token (`ipc::token`; Windows uses TCP).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +80,9 @@ impl RpcHandler {
         let storage = StorageHandler::new(Arc::clone(&state));
         let playback = PlaybackHandler::new(Arc::clone(&state));
         let export = ExportHandler::new(Arc::clone(&state));
+        let alerts = super::alerts_handler::AlertsHandler::new(Arc::clone(&state));
+        let accounts = super::accounts_handler::AccountsHandler::new(Arc::clone(&state));
+        let events = EventsHandler::new(Arc::clone(&state));
         let viewer = ViewerHandler::new(Arc::clone(&state), Arc::clone(&viewer_manager));
         Self {
             state,
@@ -78,10 +90,13 @@ impl RpcHandler {
             storage,
             playback,
             export,
+            alerts,
+            accounts,
+            events,
             viewer,
             viewer_manager,
             stats,
-            extensions: Vec::new(),
+            cloud: None,
             discovery: Arc::new(DiscoveryService::new()),
             shutdown: None,
             started: std::time::Instant::now(),
@@ -102,9 +117,9 @@ impl RpcHandler {
         self
     }
 
-    /// Serve an extension's IPC methods (local socket only).
-    pub fn with_extension(mut self, extension: Arc<dyn RpcExtension>) -> Self {
-        self.extensions.push(extension);
+    /// Serve the `cloud.*` methods (local socket only).
+    pub fn with_cloud(mut self, cloud: Arc<CloudHandler>) -> Self {
+        self.cloud = Some(cloud);
         self
     }
 
@@ -141,33 +156,206 @@ impl RpcHandler {
             "camera.set_positions" => self.camera_set_positions(params).await,
             "stats.get_performance" => self.stats_get_performance().await,
             m if m.starts_with("camera.discovery.") => self.discovery_dispatch(m, params).await,
+            m if m.starts_with("ptz.") => {
+                async {
+                    let id = params["camera_id"]
+                        .as_str()
+                        .ok_or_else(|| RpcError::invalid_params("Missing camera_id"))?;
+                    let (camera, ptz, hub) = {
+                        let st = self.state.read().await;
+                        let camera = st
+                            .config
+                            .cameras
+                            .iter()
+                            .find(|cam| cam.id == id)
+                            .cloned()
+                            .ok_or_else(|| RpcError::invalid_params("Camera not found"))?;
+                        (camera, Arc::clone(&st.ptz), Arc::clone(&st.events))
+                    };
+                    ptz.execute(&camera, hub, m, params)
+                        .await
+                        .map_err(|error| RpcError::invalid_params(error.to_string()))
+                }
+                .await
+            }
             m if m.starts_with("recording.") => self.recording.dispatch(m, params).await,
             m if m.starts_with("storage.") => self.storage.dispatch(m, params).await,
             m if m.starts_with("playback.") => self.playback.dispatch(m, params).await,
             m if m.starts_with("export.") => self.export.dispatch(m, params).await,
+            m if m.starts_with("alerts.") => self.alerts.dispatch(m, params).await,
+            m if m.starts_with("talk.") => self.talk_dispatch(m, params).await,
+            m if m.starts_with("auth.") || m.starts_with("accounts.") => {
+                self.accounts.dispatch(m, params).await
+            }
             m if m.starts_with("viewer.") => self.viewer.dispatch(m, params).await,
-            m if m.starts_with("motion.") => self.v2_not_implemented(m).await,
-            m if m.starts_with("events.") => self.v2_not_implemented(m).await,
-            m => match self
-                .extensions
-                .iter()
-                .find(|e| m.starts_with(e.namespace()))
-            {
-                // Extension methods are for local callers on the protected socket only.
-                Some(_) if transport != IpcTransport::Protected => {
-                    Err(RpcError::method_not_found())
+            m if m.starts_with("motion.") || m.starts_with("events.") => {
+                self.events.dispatch(m, params).await
+            }
+            "camera.onvif.detect" | "snapshot.capture" => {
+                self.events.dispatch(method, params).await
+            }
+            // Cloud methods are for local callers on the protected socket only.
+            m if m.starts_with("cloud.") => match &self.cloud {
+                Some(cloud) if transport == IpcTransport::Protected => {
+                    cloud.dispatch(m, params).await
                 }
-                Some(extension) => extension.dispatch(m, params).await,
-                None => Err(RpcError::method_not_found()),
+                _ => Err(RpcError::method_not_found()),
             },
+            _ => Err(RpcError::method_not_found()),
         };
 
         match result {
             Ok(val) => json!({"jsonrpc":"2.0","id":id,"result":val}),
             Err(ref e) => {
                 tracing::warn!(method = %method, code = e.code, error = %e.message, "IPC error response sent");
-                json!({"jsonrpc":"2.0","id":id,"error":{"code":e.code,"message":e.message}})
+                let mut error = json!({"code": e.code, "message": e.message});
+                if let Some(data) = &e.data {
+                    error["data"] = data.clone();
+                }
+                json!({"jsonrpc":"2.0","id":id,"error":error})
             }
+        }
+    }
+
+    /// A request from the IPC server: with local accounts on, only for a
+    /// signed-in user whose role and cameras allow it, with other cameras
+    /// left out of what it returns (see [`crate::accounts::access`]).
+    pub async fn dispatch_gated(&self, mut req: Value, transport: IpcTransport) -> Value {
+        use crate::accounts::access;
+        let method = req["method"].as_str().unwrap_or("").to_owned();
+        let id = req["id"].clone();
+        let refuse = |code: i64, message: String| json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}});
+        let session = {
+            let st = self.state.read().await;
+            if !st.config.accounts.enabled || access::open(&method) {
+                None
+            } else {
+                match req["session"]
+                    .as_str()
+                    .and_then(|token| st.sessions.session(&st.config.accounts, token))
+                {
+                    Some(session) => Some(session),
+                    None => return refuse(SIGN_IN_REQUIRED, "Sign in to use NeuroWatch".into()),
+                }
+            }
+        };
+        let Some(session) = session else {
+            return self.dispatch_from(&req, transport).await;
+        };
+        if session.role < access::required_role(&method) {
+            tracing::info!(username = %session.username, method = %method, "Refused: role");
+            return refuse(
+                NOT_ALLOWED,
+                format!("Your account ({}) may not do this", session.role.label()),
+            );
+        }
+        if let Err(message) = access::check_cameras(&session, &method, &mut req["params"]) {
+            return refuse(NOT_ALLOWED, message);
+        }
+        if let Err(error) = self
+            .events
+            .authorize_ids(&session, &method, &req["params"])
+            .await
+        {
+            return refuse(i64::from(error.code), error.message);
+        }
+        if let Err(error) = self
+            .export
+            .authorize_job(&session, &method, &req["params"])
+            .await
+        {
+            return refuse(i64::from(error.code), error.message);
+        }
+        let mut response = self.dispatch_from(&req, transport).await;
+        if let Some(result) = response.get_mut("result") {
+            match access::filter_result(&session, &method, result.take()) {
+                Ok(filtered) => *result = filtered,
+                Err(message) => return refuse(NOT_ALLOWED, message),
+            }
+        }
+        response
+    }
+
+    /// Two-way audio (`crate::talk`):
+    ///   talk.start  — {camera_id, client_id, source?: "microphone" | "tone"} → {codec}
+    ///   talk.renew  — {client_id} → {} (within `talk::LEASE` while the button is held)
+    ///   talk.stop   — {client_id} → {}
+    ///   talk.status — {} → {camera_id, client_id} or null
+    ///   talk.probe  — {camera_id} → {codec} when the camera has a usable speaker
+    async fn talk_dispatch(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+        let talk = Arc::clone(&self.state.read().await.talk);
+        let client = || {
+            params["client_id"]
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 64)
+                .ok_or_else(|| RpcError::invalid_params("Missing 'client_id'"))
+        };
+        match method {
+            "talk.start" => {
+                let client_id = client()?;
+                let source = match params["source"].as_str().unwrap_or("microphone") {
+                    "microphone" => crate::talk::TalkSource::Microphone,
+                    "tone" => crate::talk::TalkSource::Tone,
+                    _ => return Err(RpcError::invalid_params("'source' is microphone or tone")),
+                };
+                let (camera, headless) = {
+                    let st = self.state.read().await;
+                    let id = params["camera_id"]
+                        .as_str()
+                        .ok_or_else(|| RpcError::invalid_params("Missing 'camera_id'"))?;
+                    let camera = st
+                        .config
+                        .cameras
+                        .iter()
+                        .find(|c| c.id == id)
+                        .cloned()
+                        .ok_or_else(|| RpcError::invalid_params("Camera not found"))?;
+                    (camera, st.headless())
+                };
+                if headless && matches!(source, crate::talk::TalkSource::Microphone) {
+                    return Err(RpcError::invalid_params(
+                        "this recorder runs without a desktop, so it has no microphone",
+                    ));
+                }
+                let codec = talk
+                    .start(&camera, client_id, source)
+                    .await
+                    .map_err(RpcError::invalid_params)?;
+                Ok(json!({ "codec": codec }))
+            }
+            "talk.probe" => {
+                let camera = {
+                    let st = self.state.read().await;
+                    let id = params["camera_id"]
+                        .as_str()
+                        .ok_or_else(|| RpcError::invalid_params("Missing 'camera_id'"))?;
+                    st.config
+                        .cameras
+                        .iter()
+                        .find(|c| c.id == id)
+                        .cloned()
+                        .ok_or_else(|| RpcError::invalid_params("Camera not found"))?
+                };
+                let codec = crate::talk::TalkService::probe(&camera)
+                    .await
+                    .map_err(RpcError::invalid_params)?;
+                Ok(json!({ "codec": codec }))
+            }
+            "talk.renew" => {
+                talk.renew(client()?).map_err(RpcError::invalid_params)?;
+                Ok(json!({}))
+            }
+            "talk.stop" => {
+                talk.stop(client()?);
+                Ok(json!({}))
+            }
+            "talk.status" => Ok(match talk.status() {
+                Some((camera_id, client_id)) => {
+                    json!({"camera_id": camera_id, "client_id": client_id})
+                }
+                None => Value::Null,
+            }),
+            _ => Err(RpcError::method_not_found()),
         }
     }
 
@@ -176,14 +364,6 @@ impl RpcHandler {
             "version": env!("CARGO_PKG_VERSION"),
             "features": ["v1", "v2"],
         }))
-    }
-
-    async fn v2_not_implemented(&self, method: &str) -> Result<Value, RpcError> {
-        tracing::debug!(method = %method, "V2 stub called — not yet implemented");
-        Err(RpcError::internal(format!(
-            "V2 method '{}' not yet implemented",
-            method
-        )))
     }
 
     async fn system_status(&self) -> Result<Value, RpcError> {
@@ -197,6 +377,15 @@ impl RpcHandler {
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_sec": self.started.elapsed().as_secs(),
             "headless": st.headless(),
+            "edition": crate::edition::EDITION,
+            "camera_limit": crate::edition::CAMERA_LIMIT,
+            "cameras_over_limit": st
+                .config
+                .cameras_over_limit
+                .iter()
+                .map(|c| json!({ "id": c.id, "name": c.name }))
+                .collect::<Vec<_>>(),
+            "downloads_url": crate::edition::DOWNLOADS_URL,
         }))
     }
 
@@ -222,8 +411,13 @@ impl RpcHandler {
     }
 
     async fn camera_add(&self, params: &Value) -> Result<Value, RpcError> {
+        if let Some(motion) = params.get("motion") {
+            crate::motion::validate_settings(motion).map_err(RpcError::invalid_params)?;
+        }
         let cam: CameraConfig = serde_json::from_value(params.clone())
             .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        crate::recording::policy::validate_settings(&cam.recording)
+            .map_err(RpcError::invalid_params)?;
         self.add_camera(cam).await
     }
 
@@ -233,8 +427,23 @@ impl RpcHandler {
     async fn add_camera(&self, mut cam: CameraConfig) -> Result<Value, RpcError> {
         cam.normalize_stream_ids();
         let mut st = self.state.write().await;
-        if st.config.cameras.iter().any(|c| c.id == cam.id) {
+        if st
+            .config
+            .cameras
+            .iter()
+            .chain(&st.config.cameras_over_limit)
+            .any(|c| c.id == cam.id)
+        {
             return Err(RpcError::invalid_params("Camera ID already exists"));
+        }
+        if let Some(limit) = crate::edition::CAMERA_LIMIT {
+            if st.config.cameras.len() >= limit {
+                tracing::info!(
+                    limit,
+                    "Camera add refused: camera limit of this free version"
+                );
+                return Err(crate::edition::limit_reached(limit));
+            }
         }
         if let Some(existing) = discovery::matchers::duplicate_of(&st.config.cameras, &cam) {
             tracing::info!(cam_id = %existing.id, "Camera add rejected: same stream already added");
@@ -257,6 +466,14 @@ impl RpcHandler {
             .ok_or_else(|| RpcError::invalid_params("Missing 'id'"))?
             .to_string();
         let mut st = self.state.write().await;
+        if let Some(held) = st.config.cameras_over_limit.iter().position(|c| c.id == id) {
+            // Over the camera limit: never started, so nothing to stop.
+            tracing::info!(cam_id = %id, "Camera removed (over the camera limit)");
+            st.config.cameras_over_limit.remove(held);
+            st.save_config()
+                .map_err(|e| RpcError::internal(e.to_string()))?;
+            return Ok(json!({ "removed": true }));
+        }
         let idx = st
             .config
             .cameras
@@ -268,6 +485,11 @@ impl RpcHandler {
         st.clear_live_stream(&id);
         st.stream_health.forget(&id);
         st.config.cameras.remove(idx);
+        // A camera held over the limit takes the freed place.
+        for camera in crate::edition::apply(&mut st.config) {
+            tracing::info!(cam_id = %camera.id, "Camera runs again: within the camera limit");
+            st.spawn_supervisor(&camera);
+        }
         st.save_config()
             .map_err(|e| RpcError::internal(e.to_string()))?;
         Ok(json!({ "removed": true }))
@@ -392,6 +614,9 @@ impl RpcHandler {
     }
 
     async fn camera_update(&self, params: &Value) -> Result<Value, RpcError> {
+        if let Some(motion) = params.get("motion") {
+            crate::motion::validate_settings(motion).map_err(RpcError::invalid_params)?;
+        }
         let mut cam: CameraConfig = serde_json::from_value(params.clone())
             .map_err(|e| RpcError::invalid_params(e.to_string()))?;
         cam.normalize_stream_ids();
@@ -402,6 +627,66 @@ impl RpcHandler {
             .iter()
             .position(|c| c.id == cam.id)
             .ok_or_else(|| RpcError::invalid_params("Camera not found"))?;
+        // Settings a client does not edit here (`motion.configure`, the ONVIF
+        // service found later) stay unless the request carries them.
+        if params.get("motion").is_none() {
+            cam.motion = st.config.cameras[idx].motion.clone();
+        }
+        let old = &st.config.cameras[idx];
+        // The wall layout (`camera.set_positions`) places cameras; editing one
+        // never moves it (the camera dialog sends none, which put the edited
+        // camera last on the wall).
+        if params.get("wall_position").map_or(true, Value::is_null) {
+            cam.wall_position = old.wall_position.clone();
+        }
+        // Old clients must not erase modes/rules/padding they do not know.
+        let mut recording =
+            serde_json::to_value(&old.recording).map_err(|e| RpcError::internal(e.to_string()))?;
+        if let Some(changes) = params.get("recording").and_then(Value::as_object) {
+            for (key, value) in changes {
+                if key == "local" && value.is_object() {
+                    for (key, value) in value.as_object().into_iter().flatten() {
+                        recording["local"][key] = value.clone();
+                    }
+                } else {
+                    recording[key] = value.clone();
+                }
+            }
+        }
+        cam.recording = serde_json::from_value(recording)
+            .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        crate::recording::policy::validate_settings(&cam.recording)
+            .map_err(RpcError::invalid_params)?;
+        let same_host =
+            crate::onvif_events::url_host(&old.url) == crate::onvif_events::url_host(&cam.url);
+        if params.get("onvif").is_none() && same_host {
+            cam.onvif = old.onvif.clone();
+        }
+        let mut pipeline_config = cam.clone();
+        pipeline_config.recording.mode = old.recording.mode;
+        pipeline_config
+            .recording
+            .weekly_rules
+            .clone_from(&old.recording.weekly_rules);
+        pipeline_config.recording.event_pre_sec = old.recording.event_pre_sec;
+        pipeline_config.recording.event_post_sec = old.recording.event_post_sec;
+        pipeline_config.recording.non_event_keep_hours = old.recording.non_event_keep_hours;
+        // Motion settings are picked up by motion detection's own check every
+        // second, and the wall position is the UI's: neither needs the
+        // camera's connection and recording restarted.
+        pipeline_config.motion = old.motion.clone();
+        pipeline_config.wall_position = old.wall_position.clone();
+        if pipeline_config == *old {
+            // A policy-only edit needs the scheduler, not a new connection.
+            // Persist first so a failed Save leaves memory and ingest alone.
+            let mut next = st.config.clone();
+            next.cameras[idx] = cam.clone();
+            next.save(&st.config_path)
+                .map_err(|e| RpcError::internal(e.to_string()))?;
+            st.config = next;
+            st.reconcile_recording_policies();
+            return serde_json::to_value(&cam).map_err(|e| RpcError::internal(e.to_string()));
+        }
         tracing::info!(cam_id = %cam.id, name = %cam.name, "Camera updated");
         st.stop_supervisor(&cam.id);
         st.clear_live_stream(&cam.id);
@@ -516,6 +801,7 @@ impl RpcHandler {
                 "fullscreen": cfg.ui.fullscreen,
                 "fullscreen_status": cfg.ui.fullscreen_status,
                 "fullscreen_status_opacity": cfg.ui.fullscreen_status_opacity,
+                "preview_fps": cfg.ui.preview_fps,
             },
             "recording": {
                 "storage_path": cfg.recording.storage_path,
@@ -523,9 +809,14 @@ impl RpcHandler {
                 "pre_buffer_sec": cfg.recording.pre_buffer_sec,
                 "local_all_cameras": cfg.recording.local_all_cameras,
                 "disk_threshold_percent": cfg.recording.disk_threshold_percent,
+                "archive": cfg.recording.archive,
             },
             "debug": {
                 "gst_log": cfg.debug.gst_log,
+            },
+            "events": {
+                "retention_days": cfg.events.retention_days,
+                "push_port": cfg.events.push_port,
             },
             "desktop": cfg.desktop,
         }))
@@ -550,17 +841,28 @@ impl RpcHandler {
     }
 
     async fn stats_get_performance(&self) -> Result<Value, RpcError> {
-        let snap = self.stats.snapshot();
+        let mut snap = self.stats.snapshot();
+        let (hwaccel, views, motion) = {
+            let st = self.state.read().await;
+            (
+                st.hwaccel,
+                st.active_views(),
+                Arc::clone(&st.builtin_motion),
+            )
+        };
+        let motion = motion.metrics();
+        snap.bottleneck = crate::stats::bottleneck::with_motion(snap.bottleneck, &motion);
         let mut value =
             serde_json::to_value(snap).map_err(|e| RpcError::internal(e.to_string()))?;
-        let (hwaccel, views) = {
-            let st = self.state.read().await;
-            (st.hwaccel, st.active_views())
-        };
         value["video_acceleration"] = acceleration_json(hwaccel);
+        // Additive runtime details, like desktop_decoders below. Keep the
+        // shared snapshot's existing Rust construction contract compatible
+        // with external extensions as well as older JSON consumers.
+        value["motion_decoders"] = json!(motion.iter().filter(|m| m.decoder_running).count());
+        value["motion"] = json!(motion);
         // Video decoders the node runs right now: one per camera a desktop
-        // view shows, and one per native overlay session. Nothing else decodes
-        // live video (recording, browser live view and thumbnails do not).
+        // view shows, and one per native overlay session. Opt-in analysis is
+        // counted independently in motion_decoders; snapshots are one-shot.
         value["desktop_decoders"] = json!(views + self.viewer_manager.session_count());
         Ok(value)
     }
@@ -744,16 +1046,21 @@ pub fn acceleration_json(kind: crate::pipeline::hwaccel::HwAccelKind) -> Value {
             "reason": reason,
         });
     }
-    json!({
+    let mut value = json!({
         "kind": kind.wire_kind(),
         "label": kind.to_string(),
         "hardware": kind.is_hardware(),
         "available": true,
-    })
+    });
+    if !kind.is_hardware() && crate::pipeline::hwaccel::waiting_for_gpu_access() {
+        value["reason"] = json!(crate::pipeline::hwaccel::GPU_NOT_ACCESSIBLE);
+    }
+    value
 }
 
 #[cfg(test)]
 mod tests {
+    include!("access_tests.rs");
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -934,6 +1241,8 @@ mod tests {
         assert_eq!(result["video_acceleration"]["kind"], json!("software"));
         assert_eq!(result["video_acceleration"]["hardware"], json!(false));
         assert_eq!(result["bottleneck"]["severity"], json!("ok"));
+        assert_eq!(result["motion_decoders"], json!(0));
+        assert_eq!(result["motion"], json!([]));
     }
 
     #[tokio::test]
@@ -1042,6 +1351,145 @@ mod tests {
     async fn teardown(state: &Arc<RwLock<AppState>>, cfg_path: &std::path::Path) {
         state.write().await.stop_all();
         let _ = std::fs::remove_file(cfg_path);
+    }
+
+    #[tokio::test]
+    async fn with_accounts_on_requests_need_a_session_a_role_and_their_cameras() {
+        use super::{NOT_ALLOWED, SIGN_IN_REQUIRED};
+        use crate::accounts::{AccountsConfig, LocalUser, PasswordHash, Role};
+        let mut cfg = config_with_camera("cam-1", "rtsp://127.0.0.1:1/a");
+        let mut other = nw_core::camera::CameraConfig::new("cam-2", "rtsp://127.0.0.1:1/b");
+        other.id = "cam-2".into();
+        cfg.cameras.push(other);
+        let user = |name: &str, role: Role, cameras: Vec<String>| LocalUser {
+            username: name.into(),
+            role,
+            cameras,
+            password: PasswordHash::new("password-1").unwrap(),
+        };
+        cfg.accounts = AccountsConfig {
+            enabled: true,
+            users: vec![
+                user("root", Role::Admin, vec![]),
+                user("guard", Role::Viewer, vec!["cam-1".into()]),
+            ],
+        };
+        let (state, handler, cfg_path) = handler_with_config("accounts-gate", cfg);
+        let call = |method: &str, params: Value, session: Option<&str>| {
+            let mut request =
+                json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+            if let Some(session) = session {
+                request["session"] = json!(session);
+            }
+            handler.dispatch_gated(request, IpcTransport::Protected)
+        };
+        let anonymous = call("camera.list", json!({}), None).await;
+        assert_eq!(anonymous["error"]["code"], SIGN_IN_REQUIRED);
+        assert_eq!(
+            call("system.status", json!({}), None).await["result"]["status"],
+            "running"
+        );
+        let wrong = call(
+            "auth.login",
+            json!({"username": "guard", "password": "nope-nope"}),
+            None,
+        )
+        .await;
+        assert!(wrong["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("wrong"));
+        let login = call(
+            "auth.login",
+            json!({"username": "guard", "password": "password-1"}),
+            None,
+        )
+        .await;
+        let guard = login["result"]["token"].as_str().unwrap().to_owned();
+        assert_eq!(login["result"]["user"]["role"], "viewer");
+        let cameras = call("camera.list", json!({}), Some(&guard)).await;
+        let ids: Vec<_> = cameras["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![json!("cam-1")],
+            "a camera-limited user sees their cameras only"
+        );
+        let refused = call("config.set", json!({"site_name": "X"}), Some(&guard)).await;
+        assert_eq!(refused["error"]["code"], NOT_ALLOWED);
+        let other_camera = call(
+            "playback.open",
+            json!({"camera_id": "cam-2", "ts_ms": 0}),
+            Some(&guard),
+        )
+        .await;
+        assert_eq!(other_camera["error"]["code"], NOT_ALLOWED);
+        let status = call("auth.status", json!({"token": guard}), None).await;
+        assert_eq!(status["result"]["user"]["username"], "guard");
+
+        let root = call(
+            "auth.login",
+            json!({"username": "root", "password": "password-1"}),
+            None,
+        )
+        .await;
+        let root = root["result"]["token"].as_str().unwrap().to_owned();
+        let accounts = call("accounts.get", json!({}), Some(&root)).await;
+        assert!(!accounts.to_string().contains("salt") && !accounts.to_string().contains("hash"));
+        let demoted = call(
+            "accounts.set_user",
+            json!({"username": "root", "role": "viewer"}),
+            Some(&root),
+        )
+        .await;
+        assert!(
+            demoted["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("admin"),
+            "the last admin stays"
+        );
+        let added = call(
+            "accounts.set_user",
+            json!({"username": "op", "role": "operator", "password": "password-2"}),
+            Some(&root),
+        )
+        .await;
+        assert_eq!(added["result"]["users"].as_array().unwrap().len(), 3);
+        assert!(
+            call(
+                "accounts.set_user",
+                json!({"username": "nopass", "role": "viewer"}),
+                Some(&root)
+            )
+            .await["error"]
+                .is_object(),
+            "a new user needs a password"
+        );
+        // Removing the guard ends their session.
+        call(
+            "accounts.remove_user",
+            json!({"username": "guard"}),
+            Some(&root),
+        )
+        .await;
+        assert_eq!(
+            call("camera.list", json!({}), Some(&guard)).await["error"]["code"],
+            SIGN_IN_REQUIRED
+        );
+        // Turned off, everything is open again.
+        call(
+            "accounts.set_enabled",
+            json!({"enabled": false}),
+            Some(&root),
+        )
+        .await;
+        assert!(call("camera.list", json!({}), None).await["result"].is_array());
+        teardown(&state, &cfg_path).await;
     }
 
     fn config_with_camera(id: &str, url: &str) -> AppConfig {
@@ -1174,17 +1622,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn camera_add_has_no_camera_limit() {
-        let (state, handler, cfg_path) = handler_with_config("no-limit", config_with_cameras(40));
+    async fn a_free_build_refuses_a_camera_beyond_its_limit() {
+        let limit = crate::edition::FREE_CAMERA_LIMIT;
+        let (state, handler, cfg_path) =
+            handler_with_config("camera-limit", config_with_cameras(limit));
 
-        let response = dispatch(&handler, "camera.add", new_camera_params("cam-41")).await;
-        let caps = dispatch(&handler, "system.capabilities", json!({})).await;
+        let response = dispatch(&handler, "camera.add", new_camera_params("cam-extra")).await;
+        let status = dispatch(&handler, "system.status", json!({})).await;
         let cameras = state.read().await.config.cameras.len();
         teardown(&state, &cfg_path).await;
 
-        assert!(response.get("error").is_none(), "{response}");
-        assert_eq!(cameras, 41);
-        assert!(caps["result"].get("entitlement").is_none(), "{caps}");
+        if cfg!(feature = "unlimited") {
+            assert!(response.get("error").is_none(), "{response}");
+            assert_eq!(cameras, limit + 1);
+            assert_eq!(status["result"]["edition"], "unlimited");
+            assert!(status["result"]["camera_limit"].is_null());
+        } else {
+            assert_eq!(
+                response["error"]["code"],
+                crate::edition::CAMERA_LIMIT_REACHED,
+                "{response}"
+            );
+            assert_eq!(
+                response["error"]["data"]["downloads_url"],
+                crate::edition::DOWNLOADS_URL
+            );
+            assert_eq!(cameras, limit);
+            assert_eq!(status["result"]["edition"], "free");
+            assert_eq!(status["result"]["camera_limit"], limit);
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_a_camera_lets_a_held_one_run_and_held_ones_can_be_removed() {
+        let mut config = config_with_cameras(crate::edition::FREE_CAMERA_LIMIT);
+        for id in ["held-1", "held-2"] {
+            let mut camera =
+                nw_core::camera::CameraConfig::new(id, format!("rtsp://example.invalid/{id}"));
+            camera.id = id.into();
+            config.cameras_over_limit.push(camera);
+        }
+        let first = config.cameras[0].id.clone();
+        let (state, handler, cfg_path) = handler_with_config("held-cameras", config);
+
+        let status = dispatch(&handler, "system.status", json!({})).await;
+        let removed = dispatch(&handler, "camera.remove", json!({"id": first})).await;
+        let held_removed = dispatch(&handler, "camera.remove", json!({"id": "held-2"})).await;
+        let (running, held) = {
+            let st = state.read().await;
+            (
+                st.config
+                    .cameras
+                    .iter()
+                    .map(|c| c.id.clone())
+                    .collect::<Vec<_>>(),
+                st.config.cameras_over_limit.len(),
+            )
+        };
+        teardown(&state, &cfg_path).await;
+
+        assert_eq!(status["result"]["cameras_over_limit"][0]["id"], "held-1");
+        assert!(removed.get("error").is_none(), "{removed}");
+        assert!(held_removed.get("error").is_none(), "{held_removed}");
+        assert!(running.contains(&"held-1".to_string()), "{running:?}");
+        assert_eq!(running.len(), crate::edition::FREE_CAMERA_LIMIT);
+        assert_eq!(held, 0);
     }
 
     #[tokio::test]
@@ -1297,22 +1799,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn motion_and_events_methods_are_unimplemented_stubs() {
-        let (state, handler, cfg_path) = handler_with_config("stubs", AppConfig::default());
+    async fn motion_and_events_methods_are_served() {
+        let (state, handler, cfg_path) = handler_with_config(
+            "events",
+            config_with_camera("cam-ev", "rtsp://example.invalid/a"),
+        );
 
         let motion = dispatch(&handler, "motion.configure", json!({})).await;
         let events = dispatch(&handler, "events.list", json!({})).await;
+        let status = dispatch(&handler, "motion.status", json!({})).await;
+        let unknown = dispatch(&handler, "events.nope", json!({})).await;
         teardown(&state, &cfg_path).await;
 
-        assert_eq!(error_code(&motion), -32603);
+        assert_eq!(error_code(&motion), -32602, "camera_id is required");
+        assert!(events["result"]["events"].is_array(), "{events}");
+        assert_eq!(status["result"]["cameras"]["cam-ev"]["source"], "off");
+        assert_eq!(error_code(&unknown), -32601);
+    }
+
+    #[tokio::test]
+    async fn camera_update_keeps_motion_and_onvif_settings_it_does_not_carry() {
+        let mut config = config_with_camera("cam-keep", "rtsp://example.invalid/a");
+        config.cameras[0].motion.source = nw_core::camera::MotionSource::Onvif;
+        config.cameras[0].onvif = Some(nw_core::camera::OnvifEndpoint {
+            device_url: "http://192.0.2.1/onvif/device_service".into(),
+            events_url: None,
+            ptz_url: None,
+        });
+        let (state, handler, cfg_path) = handler_with_config("keep", config);
+        let mut edited = serde_json::to_value(&state.read().await.config.cameras[0]).unwrap();
+        edited["name"] = json!("Renamed");
+        edited.as_object_mut().unwrap().remove("motion");
+        edited.as_object_mut().unwrap().remove("onvif");
+        let reply = dispatch(&handler, "camera.update", edited).await;
+        let cam = state.read().await.config.cameras[0].clone();
+        teardown(&state, &cfg_path).await;
+
+        assert!(reply["result"].is_object(), "{reply}");
+        assert_eq!(cam.name, "Renamed");
+        assert_eq!(cam.motion.source, nw_core::camera::MotionSource::Onvif);
+        assert!(cam.onvif.is_some());
+    }
+
+    #[tokio::test]
+    async fn editing_a_camera_keeps_its_place_on_the_wall_and_saves_motion() {
+        let mut config = config_with_camera("cam-place", "rtsp://example.invalid/a");
+        config.cameras[0].wall_position = Some(nw_core::camera::WallPosition {
+            page: 1,
+            row: 2,
+            col: 3,
+            row_span: 1,
+            col_span: 1,
+        });
+        let placed = config.cameras[0].wall_position.clone();
+        let (state, handler, cfg_path) = handler_with_config("place", config);
+        let stored = serde_json::to_value(&state.read().await.config.cameras[0]).unwrap();
+
+        // The camera dialog sends no position (or a null one) with its edit.
+        let mut edited = stored.clone();
+        edited["name"] = json!("Renamed");
+        edited["wall_position"] = Value::Null;
+        dispatch(&handler, "camera.update", edited).await;
+        let mut motion_only = stored.clone();
+        motion_only.as_object_mut().unwrap().remove("wall_position");
+        motion_only["name"] = json!("Renamed");
+        motion_only["motion"]["source"] = json!("builtin");
+        let reply = dispatch(&handler, "camera.update", motion_only).await;
+        let after = state.read().await.config.cameras[0].clone();
+        // An explicit position still applies.
+        let mut moved = serde_json::to_value(&after).unwrap();
+        moved["wall_position"] = json!({"page": 0, "row": 0, "col": 0});
+        dispatch(&handler, "camera.update", moved).await;
+        let last = state.read().await.config.cameras[0].clone();
+        teardown(&state, &cfg_path).await;
+
+        assert!(reply["result"].is_object(), "{reply}");
+        assert_eq!(after.wall_position, placed, "edits never move a camera");
+        assert_eq!(after.motion.source, nw_core::camera::MotionSource::Builtin);
+        assert_eq!(after.name, "Renamed");
         assert_eq!(
-            motion["error"]["message"],
-            "V2 method 'motion.configure' not yet implemented"
-        );
-        assert_eq!(error_code(&events), -32603);
-        assert_eq!(
-            events["error"]["message"],
-            "V2 method 'events.list' not yet implemented"
+            last.wall_position.map(|p| (p.page, p.row, p.col)),
+            Some((0, 0, 0))
         );
     }
 
@@ -1683,6 +2250,10 @@ mod tests {
         assert_eq!(result["ui"]["fullscreen"], true);
         assert_eq!(result["ui"]["fullscreen_status"], true);
         assert_eq!(result["ui"]["fullscreen_status_opacity"], 50);
+        assert_eq!(
+            result["ui"]["preview_fps"],
+            json!({"single": 25, "wall": 15, "dense": 4, "hidden": 2})
+        );
         assert!(result["ui"]["theme"].is_string());
         for key in [
             "storage_path",
@@ -1697,8 +2268,97 @@ mod tests {
             );
         }
         assert!(result["debug"].get("gst_log").is_some());
+        assert_eq!(result["events"]["retention_days"], 30);
+        assert_eq!(result["events"]["push_port"], 7681);
         assert!(result.get("cameras").is_none());
         assert!(!response.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn event_settings_change_within_bounds_only() {
+        let (state, handler, cfg_path) =
+            handler_with_config("event-settings", AppConfig::default());
+        let changed = dispatch(
+            &handler,
+            "config.set",
+            json!({"events": {"retention_days": 90, "push_port": 8100}}),
+        )
+        .await;
+        let pull_only = dispatch(&handler, "config.set", json!({"events": {"push_port": 0}})).await;
+        let privileged =
+            dispatch(&handler, "config.set", json!({"events": {"push_port": 80}})).await;
+        let too_long = dispatch(
+            &handler,
+            "config.set",
+            json!({"events": {"retention_days": 4000}}),
+        )
+        .await;
+        let events = state.read().await.config.events.clone();
+        teardown(&state, &cfg_path).await;
+
+        assert!(changed.get("result").is_some(), "{changed}");
+        assert!(pull_only.get("result").is_some(), "{pull_only}");
+        assert!(privileged.get("error").is_some(), "{privileged}");
+        assert!(too_long.get("error").is_some(), "{too_long}");
+        assert_eq!(events.retention_days, 90);
+        assert_eq!(events.push_port, 0);
+    }
+
+    #[tokio::test]
+    async fn archive_settings_are_validated_and_kept_apart_from_recordings() {
+        let mut cfg = AppConfig::default();
+        cfg.recording.storage_path = "/srv/nw-recordings".into();
+        let (state, handler, cfg_path) = handler_with_config("archive-settings", cfg);
+        let set = |archive: Value| {
+            dispatch(
+                &handler,
+                "config.set",
+                json!({"recording": {"archive": archive}}),
+            )
+        };
+        let inside = set(json!({"enabled": true, "path": "/srv/nw-recordings/archive"})).await;
+        let no_folder = set(json!({"enabled": true})).await;
+        let bad_hours = set(json!({"hours": {"start": "25:00", "end": "06:00"}})).await;
+        let saved = set(json!({
+            "enabled": true, "path": "/mnt/nas/nw-archive", "after_days": 14,
+            "quota_gb": 500, "hours": {"start": "22:00", "end": "06:00"}, "max_mbps": 100
+        }))
+        .await;
+        // Other recording settings sent without `archive` leave it alone.
+        let other = dispatch(
+            &handler,
+            "config.set",
+            json!({"recording": {"disk_threshold_percent": 80}}),
+        )
+        .await;
+        let got = dispatch(&handler, "config.get", json!({})).await;
+        let status = dispatch(&handler, "recording.archive_status", json!({})).await;
+        teardown(&state, &cfg_path).await;
+
+        for refused in [&inside, &no_folder, &bad_hours] {
+            assert!(refused.get("error").is_some(), "{refused}");
+        }
+        assert!(inside
+            .to_string()
+            .contains("outside the recording location"));
+        assert!(saved.get("result").is_some(), "{saved}");
+        assert!(other.get("result").is_some(), "{other}");
+        let archive = &got["result"]["recording"]["archive"];
+        assert_eq!(archive["path"], "/mnt/nas/nw-archive");
+        assert_eq!(archive["after_days"], 14);
+        assert_eq!(archive["quota_gb"], 500);
+        assert_eq!(archive["hours"]["end"], "06:00");
+        assert_eq!(archive["max_mbps"], 100);
+        let status = &status["result"];
+        assert_eq!(status["state"], "idle", "on, no pass ran yet");
+        for key in [
+            "pending_files",
+            "archived_bytes",
+            "moved_files",
+            "missing_locations",
+        ] {
+            assert!(status.get(key).is_some(), "archive status missing '{key}'");
+        }
     }
 
     #[tokio::test]
@@ -1740,27 +2400,18 @@ mod tests {
         assert!(!persisted);
     }
 
-    /// Serves `example.echo`, answering with its params.
-    struct Echo;
-    impl crate::extension::RpcExtension for Echo {
-        fn namespace(&self) -> &str {
-            "example."
-        }
-        fn dispatch<'a>(
-            &'a self,
-            method: &'a str,
-            params: &'a Value,
-        ) -> crate::extension::BoxFuture<'a, Result<Value, nw_core::ipc::RpcError>> {
-            Box::pin(async move { Ok(json!({ "method": method, "params": params })) })
-        }
-    }
-
     #[tokio::test]
-    async fn extension_methods_are_served_on_the_protected_socket_only() {
+    async fn cloud_methods_are_served_on_the_protected_socket_only() {
         let (state, handler, cfg_path) =
-            handler_with_config("extension-transport", AppConfig::default());
-        let handler = handler.with_extension(Arc::new(Echo));
-        let request = json!({"jsonrpc":"2.0","id":1,"method":"example.echo","params":{"a":1}});
+            handler_with_config("cloud-transport", AppConfig::default());
+        let without_cloud = dispatch(&handler, "cloud.status", json!({})).await;
+        let node_dir =
+            std::env::temp_dir().join(format!("nw-cloud-transport-{}", uuid::Uuid::new_v4()));
+        let node = crate::cloud::link::CloudNode::open(node_dir.clone()).expect("node opens");
+        let handler = handler.with_cloud(Arc::new(crate::cloud::cloud_handler::CloudHandler::new(
+            node,
+        )));
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"cloud.status","params":{}});
 
         let local = handler
             .dispatch_from(&request, IpcTransport::Protected)
@@ -1768,12 +2419,11 @@ mod tests {
         let tcp = handler.dispatch_from(&request, IpcTransport::Tcp).await;
         let unknown = dispatch(&handler, "other.method", json!({})).await;
         teardown(&state, &cfg_path).await;
+        let _ = std::fs::remove_dir_all(node_dir);
 
-        assert_eq!(
-            local["result"],
-            json!({"method": "example.echo", "params": {"a": 1}})
-        );
-        assert_eq!(tcp["error"]["code"], -32601);
+        assert_eq!(local["result"]["phase"], "unlinked");
+        assert_eq!(tcp["error"]["code"], -32601, "never over plain TCP");
+        assert_eq!(error_code(&without_cloud), -32601);
         assert_eq!(error_code(&unknown), -32601);
     }
 }

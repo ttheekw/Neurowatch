@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import sys
 from copy import deepcopy
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt, QTime, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -10,13 +12,19 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
+    QStackedWidget,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -29,28 +37,110 @@ from neurowatch.dialogs.drive_picker import (
     describe_space,
     format_bytes,
 )
-from neurowatch.ipc.sync_client import IpcError
+from neurowatch.dialogs.message import ask, show_message
+from neurowatch.ipc.sync_client import IpcError, SyncIpcClient
+from neurowatch.models.archive import (
+    MAX_AFTER_DAYS,
+    ArchiveSettings,
+    ArchiveStatus,
+    MissingLocation,
+)
+from neurowatch.models.preview_fps import (
+    DENSE_WALL_TILES,
+    MAX_HIDDEN_FPS,
+    MAX_VISIBLE_FPS,
+    PreviewFps,
+)
+from neurowatch.service.startup import StartupPrefs
 from neurowatch.theme import (
     apply_dialog_theme,
     set_button_variant,
     set_label_role,
+    set_status_tone,
     style_button_box,
 )
-from neurowatch.utils.threads import retire
-from neurowatch.widgets.window_chrome import install_dialog_chrome
+from neurowatch.utils.threads import Worker, retire
+from neurowatch.widgets.form_parts import settings_card
+from neurowatch.widgets.window_chrome import install_dialog_chrome, resize_window
 
 #: Disk threshold shown when it is off or not set (the backend's default).
 DEFAULT_DISK_THRESHOLD_PERCENT = 90
 
 
+class _ArchiveStatusWorker(Worker):
+    """Reads ``recording.archive_status`` off the UI thread."""
+
+    done = Signal(object)  # ArchiveStatus, or Exception
+
+    def __init__(self, endpoint: str) -> None:
+        super().__init__()
+        self._endpoint = endpoint
+
+    def run(self) -> None:
+        try:
+            result = SyncIpcClient(endpoint=self._endpoint).call("recording.archive_status", {})
+            self.done.emit(ArchiveStatus.from_json(result))
+        except Exception as exc:
+            self.done.emit(exc)
+
+
+class _UseLocationWorker(Worker):
+    """Asks the recorder to record to a missing location again
+    (``recording.use_location``) off the UI thread."""
+
+    done = Signal(object)  # None on success, or Exception
+
+    def __init__(self, endpoint: str, path: str) -> None:
+        super().__init__()
+        self._endpoint = endpoint
+        self._path = path
+
+    def run(self) -> None:
+        try:
+            SyncIpcClient(endpoint=self._endpoint).call(
+                "recording.use_location", {"path": self._path}
+            )
+            self.done.emit(None)
+        except Exception as exc:
+            self.done.emit(exc)
+
+
+#: The tabs, in order: key → title (``SettingsDialog(tab=key)`` opens one).
+TABS = {
+    "general": "General",
+    "wall": "Video Wall",
+    "recording": "Recording",
+    "archive": "Archive",
+    "startup": "Startup",
+    "cloud": "Cloud",
+    "debug": "Debug",
+}
+
+
+#: The window opens at this share of the screen (under GNOME's 75%, past which
+#: it maximizes a new window), and resizes from its edges down to the minimum.
+_WIDTH_SHARE = 0.72
+_HEIGHT_SHARE = 0.62
+_MIN_WIDTH = 900
+#: The pages' least height (long pages scroll).
+_MIN_PAGE_HEIGHT = 480
+#: Each sidebar row's height.
+_NAV_ROW_HEIGHT = 38
+
+
 class SettingsDialog(QDialog):
-    """Site, wall, recording and debug settings, in two columns: General,
-    Video Wall and Debug on the left; Recording and the Storage Calculator on
-    the right.
+    """Settings pages (``TABS``), picked in a sidebar: General, Video Wall
+    (with the live preview frame rates), Recording (with the storage
+    calculator), Archive, Startup (what starts at sign-in and at boot,
+    fullscreen), Cloud (link to NeuroWatch Cloud) and Debug. Each page is a
+    column of titled cards (``widgets.form_parts.settings_card``).
 
     With ``ipc_endpoint`` the recording drive can be picked from the
     backend's drive scan (``storage.list``); the choice is applied on save
-    (``selected_drive``).
+    (``selected_drive``). ``startup`` is the user's saved startup choice
+    (``startup_prefs`` returns the edited one); ``startup_note`` says why it
+    cannot be changed here (a source checkout, where the service follows
+    the window), and disables it.
     """
 
     def __init__(
@@ -59,28 +149,69 @@ class SettingsDialog(QDialog):
         parent: QWidget | None = None,
         *,
         ipc_endpoint: str | None = None,
+        tab: str | None = None,
+        startup: StartupPrefs | None = None,
+        startup_note: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(860)
+        screen = (parent.screen() if parent is not None else None) or (
+            QGuiApplication.primaryScreen()
+        )
+        available = screen.availableGeometry() if screen is not None else None
+        minimum = _MIN_WIDTH
+        self._opening_size = QSize(_MIN_WIDTH, _MIN_PAGE_HEIGHT + 140)
+        if available is not None:
+            minimum = min(_MIN_WIDTH, int(available.width() * 0.95))  # a small screen
+            self._opening_size = QSize(
+                max(minimum, int(available.width() * _WIDTH_SHARE)),
+                max(_MIN_PAGE_HEIGHT + 140, int(available.height() * _HEIGHT_SHARE)),
+            )
+        self.setMinimumWidth(minimum)
         self._config = deepcopy(config)
         self._endpoint = ipc_endpoint or None
         self._scan: StorageScan | None = None
         self._scan_worker: DriveScanWorker | None = None
+        self._archive_worker: _ArchiveStatusWorker | None = None
+        self._use_worker: _UseLocationWorker | None = None
         self._chosen_drive: Drive | None = None
         apply_dialog_theme(self)
 
-        layout = install_dialog_chrome(self, "Settings")
-        columns = QHBoxLayout()
-        columns.setSpacing(16)
-        left = QVBoxLayout()
-        right = QVBoxLayout()
-        columns.addLayout(left, stretch=1)
-        columns.addLayout(right, stretch=1)
-        layout.addLayout(columns)
+        layout = install_dialog_chrome(self, "Settings", resizable=True)
+        body = QHBoxLayout()
+        body.setSpacing(20)
+        self._nav = QListWidget()
+        self._nav.setObjectName("settingsNav")
+        self._nav.setAccessibleName("Settings sections")
+        self._nav.setFixedWidth(190)
+        self._stack = QStackedWidget()
+        self._stack.setMinimumHeight(_MIN_PAGE_HEIGHT)
+        self._pages: dict[str, QVBoxLayout] = {}
+        for key, title in TABS.items():
+            self._nav.addItem(title)
+            item = self._nav.item(self._nav.count() - 1)
+            item.setSizeHint(QSize(0, _NAV_ROW_HEIGHT))
+            page = QWidget()
+            page.setObjectName("settingsPage")
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 0, 12, 0)
+            page_layout.setSpacing(14)
+            heading = QLabel(title)
+            heading.setObjectName("settingsPageTitle")
+            page_layout.addWidget(heading)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setWidget(page)
+            self._stack.addWidget(scroll)
+            self._pages[key] = page_layout
+        body.addWidget(self._nav)
+        body.addWidget(self._stack, stretch=1)
+        layout.addLayout(body, stretch=1)
 
-        general = QGroupBox("General")
-        general_form = QFormLayout(general)
+        general, general_form = self._card(
+            "Site and appearance", "The name shown in the title bar, and how NeuroWatch looks."
+        )
         self._site_name = QLineEdit(self._config.get("site_name", "My Site"))
         general_form.addRow("Site Name:", self._site_name)
 
@@ -95,9 +226,6 @@ class SettingsDialog(QDialog):
         )
         general_form.addRow("Theme:", self._theme)
 
-        self._start_fullscreen = QCheckBox("Start in fullscreen")
-        self._start_fullscreen.setChecked(bool(self._config.get("ui", {}).get("fullscreen", True)))
-        general_form.addRow("", self._start_fullscreen)
         self._fullscreen_status = QCheckBox("Show status over video in fullscreen")
         self._fullscreen_status.setToolTip(
             "With Hide panels in fullscreen, keep the status readings (disk, CPU, memory,"
@@ -139,11 +267,10 @@ class SettingsDialog(QDialog):
         self._fullscreen_status.toggled.connect(opacity_row.setEnabled)
         opacity_row.setEnabled(self._fullscreen_status.isChecked())
         general_form.addRow("Overlay opacity:", opacity_row)
-        left.addWidget(general)
+        self._pages["general"].addWidget(general)
 
         wall_cfg = self._config.get("wall", {})
-        wall = QGroupBox("Video Wall")
-        wall_form = QFormLayout(wall)
+        wall, wall_form = self._card("Layout", "How the wall arranges and pages your cameras.")
         self._interval = QSpinBox()
         self._interval.setRange(0, 300)
         self._interval.setValue(int(wall_cfg.get("page_interval_sec", 0)))
@@ -153,6 +280,7 @@ class SettingsDialog(QDialog):
         wall_form.addRow("", hint)
 
         rc = QHBoxLayout()
+        rc.setSpacing(8)
         self._rows = QSpinBox()
         self._rows.setRange(1, 10)
         self._rows.setValue(int(wall_cfg.get("rows", 4)))
@@ -164,15 +292,73 @@ class SettingsDialog(QDialog):
         rc.addWidget(self._rows)
         rc.addWidget(QLabel("×"))
         rc.addWidget(self._cols)
+        rc.addStretch(1)
         wall_form.addRow("Default Grid:", rc)
-        left.addWidget(wall)
+        self._pages["wall"].addWidget(wall)
+
+        # Live preview frame rates: what the desktop wall paints, per case.
+        preview = PreviewFps.from_config(self._config.get("ui", {}))
+        preview_box, preview_form = self._card(
+            "Live preview frame rate",
+            "The most frames per second the desktop shows, live and in Playback, by how"
+            " many cameras are on screen.",
+        )
+
+        def fps_box(value: int, top: int, name: str, tip: str) -> QSpinBox:
+            box = QSpinBox()
+            box.setRange(1, top)
+            box.setValue(value)
+            box.setSuffix(" fps")
+            box.setAccessibleName(name)
+            box.setToolTip(tip)
+            return box
+
+        self._fps_single = fps_box(
+            preview.single,
+            MAX_VISIBLE_FPS,
+            "Preview frame rate, one camera",
+            "Single view: one camera fills the wall",
+        )
+        self._fps_wall = fps_box(
+            preview.wall,
+            MAX_VISIBLE_FPS,
+            f"Preview frame rate, up to {DENSE_WALL_TILES} tiles",
+            f"Each tile of a page showing up to {DENSE_WALL_TILES} cameras",
+        )
+        self._fps_dense = fps_box(
+            preview.dense,
+            MAX_VISIBLE_FPS,
+            f"Preview frame rate, more than {DENSE_WALL_TILES} tiles",
+            f"Each tile of a page showing more than {DENSE_WALL_TILES} cameras",
+        )
+        self._fps_hidden = fps_box(
+            preview.hidden,
+            MAX_HIDDEN_FPS,
+            "Preview frame rate, hidden pages",
+            "Cameras on pages not shown keep a slow preview, so their page"
+            " opens on a recent picture",
+        )
+        preview_form.addRow("One camera:", self._fps_single)
+        preview_form.addRow(f"Up to {DENSE_WALL_TILES} tiles:", self._fps_wall)
+        preview_form.addRow(f"More than {DENSE_WALL_TILES}:", self._fps_dense)
+        preview_form.addRow("Hidden pages:", self._fps_hidden)
+        preview_hint = QLabel(
+            "Upper limits for the desktop preview; a camera never shows more than it"
+            " sends. Recording and web viewing always get every frame. Higher values"
+            " use more CPU."
+        )
+        preview_hint.setWordWrap(True)
+        set_label_role(preview_hint, "hint")
+        preview_form.addRow(preview_hint)
+        self._pages["wall"].addWidget(preview_box)
 
         # ------------------------------------------------------------------
         # Recording
         # ------------------------------------------------------------------
         rec_cfg = self._config.get("recording", {})
-        recording = QGroupBox("Recording")
-        rec_form = QFormLayout(recording)
+        recording, rec_form = self._card(
+            "Storage", "Where recordings are saved, and when the oldest are deleted."
+        )
 
         storage_row = QWidget()
         storage_hl = QHBoxLayout(storage_row)
@@ -255,13 +441,15 @@ class SettingsDialog(QDialog):
         self._rec_storage.textChanged.connect(self._update_threshold_hint)
         self._update_threshold_hint()
 
-        right.addWidget(recording)
+        self._pages["recording"].addWidget(recording)
+        self._pages["archive"].addWidget(self._build_archive(rec_cfg.get("archive")))
 
         # ------------------------------------------------------------------
         # Storage Calculator
         # ------------------------------------------------------------------
-        calc = QGroupBox("Storage Calculator")
-        calc_form = QFormLayout(calc)
+        calc, calc_form = self._card(
+            "Storage calculator", "Estimate how much space your recordings need."
+        )
 
         self._calc_cams = QSpinBox()
         self._calc_cams.setRange(1, 256)
@@ -288,13 +476,12 @@ class SettingsDialog(QDialog):
         set_label_role(self._calc_result, "emphasis")
         calc_form.addRow("Estimated:", self._calc_result)
         self._update_calc()
-        right.addWidget(calc)
+        self._pages["recording"].addWidget(calc)
 
         # ------------------------------------------------------------------
         # Debug
         # ------------------------------------------------------------------
-        debug = QGroupBox("Debug")
-        debug_form = QFormLayout(debug)
+        debug, debug_form = self._card("Logging", "How much the recorder's media engine logs.")
         self._gst_log = QComboBox()
         self._gst_log.addItems(["error", "warning", "info", "debug"])
         gst_level = self._config.get("debug", {}).get("gst_log", "warning")
@@ -304,9 +491,22 @@ class SettingsDialog(QDialog):
         if idx >= 0:
             self._gst_log.setCurrentIndex(idx)
         debug_form.addRow("GStreamer Log Level:", self._gst_log)
-        left.addWidget(debug)
-        left.addStretch(1)
-        right.addStretch(1)
+        self._pages["debug"].addWidget(debug)
+
+        self._build_startup(startup or StartupPrefs(), startup_note)
+        self._build_cloud()
+        for page_layout in self._pages.values():
+            page_layout.addStretch(1)
+        # Fields keep their own width; only text and folder fields stretch.
+        for form in self.findChildren(QFormLayout):
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        for label in self.findChildren(QLabel):
+            if label.wordWrap():  # notes use the card's width, not their own
+                policy = label.sizePolicy()
+                policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
+                label.setSizePolicy(policy)
+        self._nav.currentRowChanged.connect(self._on_tab_changed)
+        self._nav.setCurrentRow(list(TABS).index(tab) if tab in TABS else 0)
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -316,7 +516,340 @@ class SettingsDialog(QDialog):
         btns.rejected.connect(self.reject)
         style_button_box(btns)
         layout.addWidget(btns)
+        resize_window(self, self._opening_size.expandedTo(self.minimumSizeHint()))
         self._scan_drives()
+        self._read_archive_status()
+
+    @staticmethod
+    def _card(title: str, subtitle: str = "") -> tuple[QFrame, QFormLayout]:
+        """A titled card with a form for its rows."""
+        card, body, _ = settings_card(title, subtitle)
+        form = QFormLayout()
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
+        body.addLayout(form)
+        return card, form
+
+    # ------------------------------------------------------------------
+    # Startup
+    # ------------------------------------------------------------------
+
+    def _build_startup(self, prefs: StartupPrefs, note: str | None) -> None:
+        page = self._pages["startup"]
+        login, login_layout, _ = settings_card("When you sign in")
+        self._at_login = QCheckBox("Start NeuroWatch when I sign in")
+        self._at_login.setToolTip(
+            "Start the recorder in the background when you sign in to this computer"
+        )
+        self._at_login.setChecked(prefs.at_login)
+        login_layout.addWidget(self._at_login)
+        self._open_tray = QRadioButton("Stay in the background (tray icon only)")
+        self._open_window = QRadioButton("Open the NeuroWatch window")
+        self._open_window.setChecked(prefs.open_window)
+        self._open_tray.setChecked(not prefs.open_window)
+        choices = QWidget()
+        choices_layout = QVBoxLayout(choices)
+        choices_layout.setContentsMargins(24, 0, 0, 0)
+        choices_layout.addWidget(self._open_tray)
+        choices_layout.addWidget(self._open_window)
+        login_layout.addWidget(choices)
+        self._at_login.toggled.connect(choices.setEnabled)
+        choices.setEnabled(prefs.at_login)
+        page.addWidget(login)
+
+        boot, boot_layout, _ = settings_card("Before anyone signs in")
+        self._at_boot = QCheckBox("Record from boot")
+        self._at_boot.setChecked(prefs.at_boot and prefs.at_login)
+        self._at_boot.setEnabled(prefs.at_login)
+        self._at_login.toggled.connect(self._at_boot.setEnabled)
+        boot_layout.addWidget(self._at_boot)
+        boot_hint = QLabel(
+            "Cameras record as soon as the computer starts, even before you sign in."
+            " Linux only; it may ask for an administrator's permission once."
+        )
+        boot_hint.setWordWrap(True)
+        set_label_role(boot_hint, "hint")
+        boot_layout.addWidget(boot_hint)
+        boot.setVisible(sys.platform.startswith("linux"))
+        page.addWidget(boot)
+
+        window, window_layout, _ = settings_card("Window")
+        self._start_fullscreen = QCheckBox("Open the window in fullscreen")
+        self._start_fullscreen.setChecked(bool(self._config.get("ui", {}).get("fullscreen", True)))
+        window_layout.addWidget(self._start_fullscreen)
+        page.addWidget(window)
+
+        self._startup_managed = note is None
+        if note is not None:
+            for box in (login, boot):
+                box.setEnabled(False)
+            why = QLabel(note)
+            why.setWordWrap(True)
+            set_label_role(why, "hint")
+            page.insertWidget(1, why)  # under the page's title
+
+    def startup_prefs(self) -> StartupPrefs | None:
+        """The startup choice as edited (save it with the service manager);
+        None when it cannot be changed here (``startup_note``)."""
+        if not self._startup_managed:
+            return None
+        at_login = self._at_login.isChecked()
+        return StartupPrefs(
+            at_login=at_login,
+            open_window=self._open_window.isChecked(),
+            at_boot=at_login and self._at_boot.isChecked(),
+        )
+
+    # ------------------------------------------------------------------
+    # Cloud
+    # ------------------------------------------------------------------
+
+    def _build_cloud(self) -> None:
+        """The link panel is made when the tab is first shown (it asks the
+        recorder for ``cloud.status``); without a recorder, a hint."""
+        self._cloud_panel: QWidget | None = None
+        if self._endpoint is None:
+            hint = QLabel("Connect to the recorder to link it to NeuroWatch Cloud.")
+            hint.setWordWrap(True)
+            set_label_role(hint, "hint")
+            self._pages["cloud"].addWidget(hint)
+
+    def current_page(self) -> str:
+        """The key (``TABS``) of the page shown."""
+        return list(TABS)[self._stack.currentIndex()]
+
+    def _on_tab_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        self._stack.setCurrentIndex(index)
+        if list(TABS)[index] != "cloud" or self._cloud_panel is not None:
+            return
+        if self._endpoint is None:
+            return
+        from neurowatch.cloud.link_panel import CloudLinkPanel
+
+        self._cloud_panel = CloudLinkPanel(endpoint=self._endpoint)
+        self._pages["cloud"].insertWidget(1, self._cloud_panel)  # under the page's title
+
+    # ------------------------------------------------------------------
+    # Archive
+    # ------------------------------------------------------------------
+
+    def _build_archive(self, raw: object) -> QFrame:
+        """Older recordings move to another folder (usually a network share),
+        where playback and export still find them."""
+        settings = ArchiveSettings.from_json(raw)
+        box, form = self._card(
+            "Archive older recordings",
+            "Move recordings to another folder, usually a network share, where Playback"
+            " and Export still find them.",
+        )
+        self._archive_on = QCheckBox("Move older recordings to an archive folder")
+        self._archive_on.setToolTip(
+            "Each recording is copied, checked against the original and only then "
+            "removed from the recording drive. Playback and export find it in either place."
+        )
+        self._archive_on.setChecked(settings.enabled)
+        form.addRow(self._archive_on)
+
+        fields = QWidget()
+        fields_form = QFormLayout(fields)
+        fields_form.setContentsMargins(0, 0, 0, 0)
+        folder_row = QWidget()
+        folder_hl = QHBoxLayout(folder_row)
+        folder_hl.setContentsMargins(0, 0, 0, 0)
+        folder_hl.setSpacing(6)
+        self._archive_path = QLineEdit(settings.path)
+        self._archive_path.setPlaceholderText("/mnt/nas/neurowatch-archive")
+        self._archive_path.setAccessibleName("Archive folder")
+        folder_hl.addWidget(self._archive_path)
+        browse = QPushButton("Browse…")
+        browse.setAccessibleName("Browse for the archive folder")
+        set_button_variant(browse, "secondary")
+        browse.clicked.connect(self._browse_archive)
+        folder_hl.addWidget(browse)
+        fields_form.addRow("Folder:", folder_row)
+
+        self._archive_after = QSpinBox()
+        self._archive_after.setRange(1, MAX_AFTER_DAYS)
+        self._archive_after.setSuffix(" days")
+        self._archive_after.setAccessibleName("Move recordings older than")
+        self._archive_after.setValue(settings.after_days)
+        fields_form.addRow("Move after:", self._archive_after)
+
+        def optional_row(
+            label: str, spin: QSpinBox | None, *, value: int | None
+        ) -> tuple[QWidget, QCheckBox, QHBoxLayout]:
+            row = QWidget()
+            hl = QHBoxLayout(row)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setSpacing(6)
+            check = QCheckBox(label)
+            hl.addWidget(check)
+            if spin is not None:
+                check.setChecked(value is not None)
+                if value is not None:
+                    spin.setValue(value)
+                spin.setEnabled(check.isChecked())
+                check.toggled.connect(spin.setEnabled)
+                hl.addWidget(spin)
+            hl.addStretch(1)
+            return row, check, hl
+
+        self._archive_quota = QSpinBox()
+        self._archive_quota.setRange(1, 1_000_000)
+        self._archive_quota.setValue(1000)
+        self._archive_quota.setSuffix(" GB")
+        self._archive_quota.setAccessibleName("Archive size limit")
+        quota_row, self._archive_quota_on, _ = optional_row(
+            "Delete oldest above", self._archive_quota, value=settings.quota_gb
+        )
+        self._archive_quota_on.setToolTip(
+            "Archived recordings without events go first; footage a kept bookmark"
+            " covers is never deleted"
+        )
+        fields_form.addRow("Size limit:", quota_row)
+
+        hours_row, self._archive_hours_on, hours_hl = optional_row("Only from", None, value=None)
+        start, end = settings.hours or ("22:00", "06:00")
+        self._archive_start = QTimeEdit(QTime.fromString(start, "HH:mm"))
+        self._archive_end = QTimeEdit(QTime.fromString(end, "HH:mm"))
+        for edit, name in ((self._archive_start, "start"), (self._archive_end, "end")):
+            edit.setDisplayFormat("HH:mm")
+            edit.setAccessibleName(f"Archive hours {name}")
+            edit.setEnabled(settings.hours is not None)
+            self._archive_hours_on.toggled.connect(edit.setEnabled)
+        self._archive_hours_on.setChecked(settings.hours is not None)
+        hours_hl.insertWidget(hours_hl.count() - 1, self._archive_start)
+        hours_hl.insertWidget(hours_hl.count() - 1, QLabel("to"))
+        hours_hl.insertWidget(hours_hl.count() - 1, self._archive_end)
+        fields_form.addRow("Hours:", hours_row)
+
+        self._archive_speed = QSpinBox()
+        self._archive_speed.setRange(1, 100_000)
+        self._archive_speed.setValue(100)
+        self._archive_speed.setSuffix(" Mbit/s")
+        self._archive_speed.setAccessibleName("Archive copy speed limit")
+        speed_row, self._archive_speed_on, _ = optional_row(
+            "Limit to", self._archive_speed, value=settings.max_mbps
+        )
+        fields_form.addRow("Speed:", speed_row)
+        fields.setEnabled(self._archive_on.isChecked())
+        self._archive_on.toggled.connect(fields.setEnabled)
+        form.addRow(fields)
+
+        self._archive_status = QLabel("")
+        self._archive_status.setWordWrap(True)
+        set_label_role(self._archive_status, "hint")
+        form.addRow(self._archive_status)
+        self._archive_status.setVisible(False)
+        self._missing_locations = QLabel("")
+        self._missing_locations.setWordWrap(True)
+        set_status_tone(self._missing_locations, "error")
+        form.addRow(self._missing_locations)
+        self._missing_locations.setVisible(False)
+        # One "Record Here Anyway…" per missing location, for a plain folder
+        # whose marker was deleted (it looks like an unmounted drive).
+        self._missing_actions = QWidget()
+        self._missing_actions_layout = QVBoxLayout(self._missing_actions)
+        self._missing_actions_layout.setContentsMargins(0, 0, 0, 0)
+        form.addRow(self._missing_actions)
+        self._missing_actions.setVisible(False)
+        return box
+
+    def _browse_archive(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select Archive Folder")
+        if path:
+            self._archive_path.setText(path)
+
+    def archive_settings(self) -> ArchiveSettings:
+        hours = None
+        if self._archive_hours_on.isChecked():
+            hours = (
+                self._archive_start.time().toString("HH:mm"),
+                self._archive_end.time().toString("HH:mm"),
+            )
+        return ArchiveSettings(
+            enabled=self._archive_on.isChecked(),
+            path=self._archive_path.text().strip(),
+            after_days=int(self._archive_after.value()),
+            quota_gb=int(self._archive_quota.value())
+            if self._archive_quota_on.isChecked()
+            else None,
+            hours=hours,
+            max_mbps=int(self._archive_speed.value())
+            if self._archive_speed_on.isChecked()
+            else None,
+        )
+
+    def _read_archive_status(self) -> None:
+        if self._endpoint is None:
+            return
+        worker = _ArchiveStatusWorker(self._endpoint)
+        worker.done.connect(self._on_archive_status)
+        worker.finished.connect(worker.deleteLater)
+        self._archive_worker = worker
+        worker.start()
+
+    def _on_archive_status(self, result: object) -> None:
+        self._archive_worker = None
+        if not isinstance(result, ArchiveStatus):
+            # An older recorder without the archive: say nothing.
+            return
+        self._archive_status.setText(result.summary())
+        self._archive_status.setVisible(True)
+        missing = result.missing_text()
+        self._missing_locations.setText(f"Not available now:\n{missing}" if missing else "")
+        self._missing_locations.setVisible(bool(missing))
+        self._show_missing_actions(result.missing_locations)
+
+    def _show_missing_actions(self, locations: tuple[MissingLocation, ...]) -> None:
+        layout = self._missing_actions_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        for location in locations:
+            button = QPushButton(f"Record Here Anyway: {location.path}…")
+            button.setToolTip(
+                "Use this folder although its NeuroWatch marker file is missing,"
+                " for example a folder on this computer"
+            )
+            set_button_variant(button, "secondary")
+            button.clicked.connect(lambda _=False, path=location.path: self._use_location(path))
+            layout.addWidget(button)
+        self._missing_actions.setVisible(bool(locations) and self._endpoint is not None)
+
+    def _use_location(self, path: str) -> None:
+        if self._endpoint is None or self._use_worker is not None:
+            return
+        if not ask(
+            self,
+            "Record Here Anyway?",
+            f"NeuroWatch stopped recording to {path} because its marker file"
+            " (.neurowatch-storage) is missing. That is what an unmounted drive or"
+            " network share looks like: its empty folder is left on this computer's"
+            " disk.\n\nContinue only if this is the right folder, for example a folder"
+            " on this computer whose marker was deleted. If it is a drive or network"
+            " share, connect it instead.",
+            yes_text="Record Here",
+            no_text="Cancel",
+        ):
+            return
+        worker = _UseLocationWorker(self._endpoint, path)
+        worker.done.connect(self._on_location_used)
+        worker.finished.connect(worker.deleteLater)
+        self._use_worker = worker
+        worker.start()
+
+    def _on_location_used(self, result: object) -> None:
+        self._use_worker = None
+        if isinstance(result, Exception):
+            show_message(self, "Cannot Record There", str(result), kind="error")
+        self._read_archive_status()
 
     # ------------------------------------------------------------------
     # Recording drive
@@ -392,17 +925,26 @@ class SettingsDialog(QDialog):
         return drive.mount_point
 
     def _stop_scan(self) -> None:
-        worker = self._scan_worker
-        if worker is None:
-            return
-        try:
-            worker.done.disconnect(self._on_drives)
-        except (RuntimeError, TypeError):
-            pass
-        if worker.isRunning():
-            worker.wait(2000)
-        retire(worker)  # still running: kept until it finishes, never destroyed running
+        workers: tuple[
+            tuple[DriveScanWorker | _ArchiveStatusWorker | _UseLocationWorker | None, object], ...
+        ] = (
+            (self._scan_worker, self._on_drives),
+            (self._archive_worker, self._on_archive_status),
+            (self._use_worker, self._on_location_used),
+        )
+        for worker, slot in workers:
+            if worker is None:
+                continue
+            try:
+                worker.done.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+            if worker.isRunning():
+                worker.wait(2000)
+            retire(worker)  # still running: kept until it finishes, never destroyed running
         self._scan_worker = None
+        self._archive_worker = None
+        self._use_worker = None
 
     def done(self, result: int) -> None:
         self._stop_scan()
@@ -432,6 +974,12 @@ class SettingsDialog(QDialog):
         cfg["ui"]["fullscreen"] = self._start_fullscreen.isChecked()
         cfg["ui"]["fullscreen_status"] = self._fullscreen_status.isChecked()
         cfg["ui"]["fullscreen_status_opacity"] = int(self._status_opacity.value())
+        cfg["ui"]["preview_fps"] = PreviewFps(
+            single=int(self._fps_single.value()),
+            wall=int(self._fps_wall.value()),
+            dense=int(self._fps_dense.value()),
+            hidden=int(self._fps_hidden.value()),
+        ).to_json()
         cfg.setdefault("wall", {})
         cfg["wall"]["page_interval_sec"] = int(self._interval.value())
         cfg["wall"]["rows"] = int(self._rows.value())
@@ -444,6 +992,7 @@ class SettingsDialog(QDialog):
         cfg["recording"]["disk_threshold_percent"] = (
             int(self._rec_threshold.value()) if self._rec_cleanup.isChecked() else 0
         )
+        cfg["recording"]["archive"] = self.archive_settings().to_json()
         cfg.setdefault("debug", {})
         cfg["debug"]["gst_log"] = self._gst_log.currentText()
         return cfg

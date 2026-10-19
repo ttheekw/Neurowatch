@@ -5,14 +5,16 @@
 //! view shows the camera) and of browser live view:
 //!
 //! - **Recording**: the camera's main stream is received, depayloaded and
-//!   parsed, and written as it is to segmented Matroska files
-//!   ([`super::builder::encoded_recording_pipeline`]) on a connection of its
-//!   own. Access units counted at `ingest_tap` are the camera's liveness, and
-//!   its caps give codec and size. An RTSP camera is described first: its
-//!   audio track, when Matroska stores it as it is, is recorded next to the
-//!   video. If a recording with audio fails before any segment opened (a
-//!   camera that describes audio but never sends it stalls the muxer), the
-//!   next attempts record video only.
+//!   parsed, and written as it is to segmented Matroska files. By default
+//!   the recorder subscribes to the camera's shared connection
+//!   (`crate::streams`, [`shared`]); `NW_STREAM_HUB=0` records on a
+//!   connection of its own ([`super::builder::encoded_recording_pipeline`]).
+//!   Access units counted at `ingest_tap` are the camera's liveness, and its
+//!   caps give codec and size. The camera's audio track, when Matroska
+//!   stores it as it is, is recorded next to the video. If a recording with
+//!   audio fails before any segment opened (a camera that describes audio
+//!   but never sends it stalls the muxer), the next attempts record video
+//!   only.
 //! - **Not recording**: no media is received. Every
 //!   [`METADATA_INTERVAL`] a metadata check asks the camera to describe its
 //!   stream (RTSP DESCRIBE and SETUP, no PLAY), or checks that a non-RTSP
@@ -38,6 +40,8 @@ use super::supervisor::{
     resolution_from_structure, StreamInfo, NO_FRAME_TIMEOUT, OFFLINE_AFTER_FAILURES,
 };
 use crate::stats::HealthCounters;
+
+mod shared;
 
 /// How often a camera that nobody records is asked to describe its stream.
 pub const METADATA_INTERVAL: Duration = Duration::from_secs(30);
@@ -83,6 +87,10 @@ pub struct IngestSupervisor {
     audio_failed: bool,
     /// Whether the current recording attempt opened a segment.
     segment_opened: bool,
+    /// Shared camera connections (the recording subscribes to one).
+    hubs: Arc<crate::streams::StreamHubs>,
+    /// Record through the shared connection (else a dedicated one).
+    shared: bool,
 }
 
 impl IngestSupervisor {
@@ -109,7 +117,21 @@ impl IngestSupervisor {
             audio: None,
             audio_failed: false,
             segment_opened: false,
+            hubs: Arc::default(),
+            shared: crate::streams::enabled(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_shared_connection(mut self, shared: bool) -> Self {
+        self.shared = shared;
+        self
+    }
+
+    /// Share camera connections through `hubs` (the backend's registry).
+    pub fn with_stream_hubs(mut self, hubs: Arc<crate::streams::StreamHubs>) -> Self {
+        self.hubs = hubs;
+        self
     }
 
     /// Record the main stream into `storage_path` in `segment_minutes` segments.
@@ -153,7 +175,9 @@ impl IngestSupervisor {
             if self.stopped() {
                 break;
             }
-            let attempt = if self.recording.is_some() {
+            let attempt = if self.recording.is_some() && self.shared {
+                self.record_shared()
+            } else if self.recording.is_some() {
                 self.record()
             } else {
                 self.check()
@@ -328,13 +352,24 @@ impl IngestSupervisor {
 
     /// Run a built recording pipeline until it fails or the ingest stops.
     fn run_recording(&mut self, pipeline: &gstreamer::Pipeline) -> Attempt {
-        let units = Arc::new(AtomicU64::new(0));
         let Some(tap) = pipeline.by_name("ingest_tap") else {
             return Attempt::Failed {
                 reason: "recording pipeline has no ingest tap".into(),
                 delivered: false,
             };
         };
+        let units = self.count_at_tap(&tap);
+        warn_when_the_writer_falls_behind(pipeline, &self.cam_id);
+        let outcome = self.watch_recording(pipeline, &tap, &units);
+        let _ = pipeline.set_state(gstreamer::State::Null);
+        let _ = pipeline.state(Some(gstreamer::ClockTime::from_seconds(5)));
+        outcome
+    }
+
+    /// Count units reaching the writer (the camera's liveness), and hand
+    /// each keyframe on (a reference, not a copy).
+    fn count_at_tap(&self, tap: &gstreamer::Element) -> Arc<AtomicU64> {
+        let units = Arc::new(AtomicU64::new(0));
         if let Some(src) = tap.static_pad("src") {
             let (counter, health) = (Arc::clone(&units), self.health.clone());
             let (keyframes, cam_id) = (self.keyframes.clone(), self.cam_id.clone());
@@ -353,11 +388,7 @@ impl IngestSupervisor {
                 gstreamer::PadProbeReturn::Ok
             });
         }
-        warn_when_the_writer_falls_behind(pipeline, &self.cam_id);
-        let outcome = self.watch_recording(pipeline, &tap, &units);
-        let _ = pipeline.set_state(gstreamer::State::Null);
-        let _ = pipeline.state(Some(gstreamer::ClockTime::from_seconds(5)));
-        outcome
+        units
     }
 
     fn watch_recording(
@@ -779,6 +810,191 @@ mod tests {
         std::fs::remove_file(file).unwrap();
     }
 
+    /// Every video unit of a Matroska file: payload and timestamps.
+    fn units_of(path: &std::path::Path) -> Vec<(Vec<u8>, Option<u64>, Option<u64>)> {
+        let pipeline = builder::build(&format!(
+            "filesrc location=\"{}\" ! matroskademux ! video/x-h264 ! appsink name=out sync=false",
+            path.display()
+        ))
+        .unwrap();
+        let sink = pipeline
+            .by_name("out")
+            .unwrap()
+            .downcast::<gstreamer_app::AppSink>()
+            .unwrap();
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let mut units = Vec::new();
+        while let Ok(sample) = sink.pull_sample() {
+            let buffer = sample.buffer().unwrap();
+            let map = buffer.map_readable().unwrap();
+            units.push((
+                map.to_vec(),
+                buffer.pts().map(gstreamer::ClockTime::mseconds),
+                buffer.dts().map(gstreamer::ClockTime::mseconds),
+            ));
+        }
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        units
+    }
+
+    /// The camera stand-in for recording tests: 2 s of H.264 with B-frames
+    /// (encoded once, here) in a Matroska file.
+    fn camera_file(dir: &std::path::Path) -> std::path::PathBuf {
+        let source = dir.join("camera.mkv");
+        let make = builder::build(&format!(
+            "videotestsrc num-buffers=50 ! video/x-raw,width=320,height=240,framerate=25/1 \
+             ! x264enc key-int-max=25 bframes=2 b-adapt=false ! h264parse \
+             ! matroskamux ! filesink location=\"{}\"",
+            source.display()
+        ))
+        .unwrap();
+        make.set_state(gstreamer::State::Playing).unwrap();
+        make.bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gstreamer::ClockTime::from_seconds(20),
+                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+            )
+            .unwrap();
+        make.set_state(gstreamer::State::Null).unwrap();
+        source
+    }
+
+    /// Record `source` (one pass of the file) shared or on a dedicated
+    /// connection; the first run's file, its epoch (from its name), and when
+    /// recording started.
+    fn record_once(
+        source: &std::path::Path,
+        dir: &std::path::Path,
+        shared: bool,
+    ) -> (std::path::PathBuf, i64, i64) {
+        let recordings = dir.join(if shared { "shared" } else { "dedicated" });
+        std::fs::create_dir_all(&recordings).unwrap();
+        let hubs = Arc::new(crate::streams::StreamHubs::default());
+        let camera = CameraConfig::new("Cam", source.to_str().unwrap());
+        let cam_id = camera.id.clone();
+        let started_ms = builder_now_ms();
+        let recorder = start(
+            |s| {
+                s.with_recording(recordings.to_string_lossy().into(), 1)
+                    .with_stream_hubs(Arc::clone(&hubs))
+                    .with_shared_connection(shared)
+            },
+            camera,
+        );
+        assert!(wait_for(
+            &recorder.states,
+            "recording_ready",
+            Duration::from_secs(10)
+        ));
+        assert_eq!(
+            hubs.open_count(),
+            usize::from(shared),
+            "one shared connection"
+        );
+        // The file plays at its own pace (2 s) and ends: the run is finished.
+        std::thread::sleep(Duration::from_millis(3500));
+        recorder.stop.send(true).unwrap();
+        recorder.task.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while hubs.open_count() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            hubs.open_count(),
+            0,
+            "the last subscriber leaving closes it"
+        );
+        let mut files: Vec<_> = std::fs::read_dir(&recordings)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        files.sort();
+        let first = files.first().expect("a recording").clone();
+        let name = first.file_name().unwrap().to_string_lossy().to_string();
+        let epoch_ms = name
+            .strip_prefix(&format!("{cam_id}_"))
+            .and_then(|rest| rest.split('_').next())
+            .and_then(|epoch| epoch.parse().ok())
+            .expect("{camera}_{epoch}_{run}_{fragment}.mkv");
+        (first, epoch_ms, started_ms)
+    }
+
+    /// Stage 1 gate of the shared-streams plan: a recording made through the
+    /// shared connection is the same, unit for unit and byte for byte, as one
+    /// made on a dedicated connection, and both are the camera's bitstream
+    /// (here H.264 with B-frames). The run's epoch plus the segment's first
+    /// timestamp is when that picture arrived.
+    #[test]
+    fn a_recording_through_the_shared_connection_is_the_cameras_bitstream() {
+        gstreamer::init().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("nw-hub-rec-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = camera_file(&dir);
+        let sent = units_of(&source);
+        assert_eq!(sent.len(), 50);
+        assert!(
+            sent.iter().any(|(_, pts, dts)| pts != dts),
+            "the stand-in has reordered (B) frames"
+        );
+
+        let (dedicated, _, _) = record_once(&source, &dir, false);
+        let (shared_run, epoch_ms, started_ms) = record_once(&source, &dir, true);
+        let before = units_of(&dedicated);
+        let recorded = units_of(&shared_run);
+        assert_eq!(recorded.len(), sent.len(), "every unit, no more");
+        assert!(
+            recorded == before,
+            "identical to the dedicated connection's recording"
+        );
+        for (index, ((got, got_pts, got_dts), (want, want_pts, want_dts))) in
+            recorded.iter().zip(&sent).enumerate()
+        {
+            // The parser repeats the stream's headers (SPS/PPS) in front of
+            // the first keyframe, as it always did; nothing else changes.
+            let same = if index == 0 {
+                got.ends_with(want)
+            } else {
+                got == want
+            };
+            assert!(
+                same,
+                "unit {index} differs: {} bytes recorded, {} sent",
+                got.len(),
+                want.len()
+            );
+            // Same spacing of presentation and decoding times.
+            let shift =
+                |a: &Option<u64>, b: &Option<u64>| a.zip(*b).map(|(a, b)| a as i64 - b as i64);
+            assert_eq!(
+                shift(got_pts, want_pts),
+                shift(&recorded[0].1, &sent[0].1),
+                "pts of unit {index}"
+            );
+            assert_eq!(
+                shift(got_dts, want_dts),
+                shift(&recorded[0].2, &sent[0].2),
+                "dts of unit {index}"
+            );
+        }
+        let timing = crate::recording::mkv_timing::read(&shared_run).expect("segment timing");
+        let first_picture_ms = epoch_ms + timing.start_ms;
+        assert!(
+            (started_ms..started_ms + 3000).contains(&first_picture_ms),
+            "the first picture is placed when it arrived: {first_picture_ms} vs start {started_ms}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn builder_now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+
     /// Against a real RTSP server (`NW_RTSP_TEST_URL`, e.g. MediaMTX fed by
     /// ffmpeg): records without decoding, and checks status by DESCRIBE only.
     #[test]
@@ -811,11 +1027,13 @@ mod tests {
         let keyframes = Arc::new(LatestKeyframe::default());
         let store: Arc<dyn crate::taps::KeyframeSink> = keyframes.clone();
         let cam_id = camera.id.clone();
+        let hubs = Arc::new(crate::streams::StreamHubs::default());
         let recorder = start(
             |s| {
                 s.with_recording(dir.to_string_lossy().into(), 1)
                     .with_health_counters(counters)
                     .with_keyframes(store)
+                    .with_stream_hubs(Arc::clone(&hubs))
             },
             camera,
         );
@@ -825,6 +1043,12 @@ mod tests {
             Duration::from_secs(15)
         ));
         std::thread::sleep(Duration::from_secs(3));
+        assert!(hubs.open_count() <= 1, "at most one shared connection");
+        assert_eq!(
+            recorder.infos.borrow().audio,
+            info.audio,
+            "the camera's sound is named"
+        );
         assert!(
             recorder.infos.borrow().resolution.is_some(),
             "size from the parser's caps"
@@ -860,6 +1084,43 @@ mod tests {
             files[0].metadata().unwrap().len() > 10_000,
             "a finalized segment"
         );
+        let tracks = tracks_of(&files[0].path());
+        let recordable = info
+            .audio
+            .as_deref()
+            .is_some_and(crate::pipeline::audio::recordable);
+        assert_eq!(
+            tracks.iter().any(|t| t.starts_with("audio")),
+            recordable,
+            "the camera's sound is recorded when Matroska keeps it as it is: {tracks:?}"
+        );
+        assert!(tracks.iter().any(|t| t.starts_with("video")), "{tracks:?}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The tracks (demuxer pads) of a Matroska file.
+    fn tracks_of(path: &std::path::Path) -> Vec<String> {
+        let pipeline = builder::build(&format!(
+            "filesrc location=\"{}\" ! matroskademux name=demux",
+            path.display()
+        ))
+        .unwrap();
+        let tracks: Arc<Mutex<Vec<String>>> = Arc::default();
+        let demux = pipeline.by_name("demux").unwrap();
+        {
+            let tracks = Arc::clone(&tracks);
+            demux.connect_pad_added(move |_, pad| {
+                tracks.lock().unwrap().push(pad.name().to_string());
+            });
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        demux.connect_no_more_pads(move |_| {
+            let _ = done_tx.send(());
+        });
+        let _ = pipeline.set_state(gstreamer::State::Paused);
+        let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        let found = tracks.lock().unwrap().clone();
+        found
     }
 }

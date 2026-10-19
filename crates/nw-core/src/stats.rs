@@ -21,6 +21,27 @@ pub struct PerformanceSnapshot {
     pub bottleneck: Bottleneck,
 }
 
+/// Independent motion work; no preview images, stream URLs or credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MotionMetrics {
+    pub camera_id: String,
+    pub state: String,
+    pub decoder_running: bool,
+    pub decoder: Option<String>,
+    pub low_cpu: bool,
+    pub using_substream: bool,
+    pub analysis_fps: f32,
+    pub input_fps: f32,
+    pub frames: u64,
+    /// Frames discarded by the bounded analysis queue, excluding intentional
+    /// rate limiting and compressed non-keyframe skips.
+    pub dropped_frames: u64,
+    pub dropped_fps: f32,
+    pub skipped_delta_frames: u64,
+    /// Mean detector CPU wall time per processed picture in the latest window.
+    pub analysis_ms: f32,
+}
+
 /// Backend process CPU/RAM metrics plus optional system-wide context.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ProcessMetrics {
@@ -102,7 +123,9 @@ pub struct IpcMetrics {
     pub messages_total: u64,
     pub bytes_in_total: u64,
     pub bytes_out_total: u64,
+    /// Request processing/send time, excluding observed event-long-poll idle.
     pub avg_latency_ms: f32,
+    /// Slow state locks, database work and response writes are still included.
     pub p95_latency_ms: f32,
     pub drops_total: u64,
     pub backpressure_events_total: u64,
@@ -158,6 +181,7 @@ pub enum BottleneckKind {
     Ram,
     Ipc,
     DecodeRender,
+    Motion,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

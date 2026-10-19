@@ -1,0 +1,1 @@
+{"audience":"sfu-eu-west-1","expires_at_utc":"2026-09-25T12:00:45Z","grant_id":"1f4f4f6c8c2a4e0fa1b6e1c2d3e4f506","issued_at_utc":"2026-09-25T12:00:00Z","max_bitrate_kbps":2500,"not_before_utc":"2026-09-25T12:00:00Z","protocol_version":1,"scope":{"action":"live","camera_id":"cam-lobby-01","representation":"sub","site_id":"node-7c1e","tenant_id":"5f2b"},"session_id":"sess-9a2c"}

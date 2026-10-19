@@ -66,7 +66,7 @@ def fake_readers(monkeypatch) -> type[_FakeFrameReaderThread]:
 
 @pytest.fixture
 def xcb(monkeypatch) -> None:
-    monkeypatch.setattr(QGuiApplication, "platformName", lambda: "xcb")
+    monkeypatch.setattr(QGuiApplication, "platformName", staticmethod(lambda: "xcb"))
 
 
 def _cams(n: int) -> list[CameraConfig]:
@@ -600,3 +600,18 @@ def test_home_end_keys_jump_to_first_and_last_page(qtbot, monkeypatch):
     finally:
         window.close()
         QApplication.processEvents()
+
+
+def test_saving_a_camera_keeps_the_wall_on_its_page() -> None:
+    """A saved, added or removed camera (and a settings reload) re-lays the
+    wall; it jumped back to the first page."""
+    from unittest.mock import MagicMock
+
+    from neurowatch.main import MainWindow
+
+    window = MagicMock()
+    window._wall.page = 2
+    MainWindow._refresh_walls(window)
+    assert window._wall.set_cameras.call_args.kwargs["page"] == 2
+    MainWindow._refresh_walls(window, page=0)  # a caller that picks a page still does
+    assert window._wall.set_cameras.call_args.kwargs["page"] == 0

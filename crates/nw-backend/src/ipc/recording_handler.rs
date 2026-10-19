@@ -3,11 +3,41 @@
 use std::sync::Arc;
 
 use nw_core::ipc::RpcError;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use crate::app_state::AppState;
 use crate::recording::{quota, segment_tracker};
+
+/// Copy only policy fields; destinations and legacy cron belong to each camera.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyCopy {
+    source_id: String,
+    target_ids: Vec<String>,
+    policy: CopyablePolicy,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CopyablePolicy {
+    mode: nw_core::camera::RecordingMode,
+    weekly_rules: Vec<nw_core::camera::ScheduleRule>,
+    event_pre_sec: u32,
+    event_post_sec: u32,
+    non_event_keep_hours: u32,
+}
+
+impl CopyablePolicy {
+    fn apply(&self, target: &mut nw_core::camera::CameraRecordingConfig) {
+        target.mode = self.mode;
+        target.weekly_rules.clone_from(&self.weekly_rules);
+        target.event_pre_sec = self.event_pre_sec;
+        target.event_post_sec = self.event_post_sec;
+        target.non_event_keep_hours = self.non_event_keep_hours;
+    }
+}
 
 pub struct RecordingHandler {
     state: Arc<RwLock<AppState>>,
@@ -23,10 +53,123 @@ impl RecordingHandler {
             "recording.start" => self.start(params).await,
             "recording.stop" => self.stop(params).await,
             "recording.status_all" => self.status_all().await,
+            "recording.policy_targets" => self.policy_targets().await,
+            "recording.copy_policy" => self.copy_policy(params).await,
+            "recording.policy_status" => self.policy_status().await,
             "recording.list_segments" => self.list_segments(params).await,
             "recording.set_config" => self.set_config(params).await,
+            "recording.archive_status" => self.archive_status().await,
+            "recording.use_location" => self.use_location(params).await,
             _ => Err(RpcError::method_not_found()),
         }
+    }
+
+    /// The archive tier (`recording::archive`) and missing locations.
+    /// Record to a missing location again, on the user's word that it is the
+    /// right folder (its marker was deleted): `{path}`.
+    async fn use_location(&self, params: &Value) -> Result<Value, RpcError> {
+        let path = params
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| RpcError::invalid_params("path is required"))?;
+        crate::storage_guard::use_location(&self.state, std::path::Path::new(path))
+            .await
+            .map_err(RpcError::invalid_params)?;
+        Ok(json!({"path": path, "ready": true}))
+    }
+
+    async fn archive_status(&self) -> Result<Value, RpcError> {
+        let (mut status, config, db, missing) = {
+            let st = self.state.read().await;
+            (
+                st.archive.status(),
+                st.config.recording.archive.clone(),
+                Arc::clone(&st.db),
+                st.storage.missing(),
+            )
+        };
+        let now_ms = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        let cutoff = crate::recording::archive::cutoff_ms(&config, now_ms);
+        // Before the first pass after a change, say what it will be.
+        if !config.enabled {
+            status.state = "off";
+        } else if status.state == "off" {
+            status.state = "idle";
+        }
+        let totals = tokio::task::spawn_blocking(move || {
+            db.lock()
+                .map(|conn| crate::recording::archive::totals(&conn, cutoff))
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        let mut result =
+            serde_json::to_value(status).map_err(|e| RpcError::internal(e.to_string()))?;
+        if let (Some(map), Value::Object(totals)) = (
+            result.as_object_mut(),
+            serde_json::to_value(totals).unwrap_or_default(),
+        ) {
+            map.extend(totals);
+            map.insert(
+                "missing_locations".into(),
+                json!(missing
+                    .into_iter()
+                    .map(|(path, reason)| json!({"path": path.to_string_lossy(), "reason": reason}))
+                    .collect::<Vec<_>>()),
+            );
+        }
+        Ok(result)
+    }
+
+    async fn policy_targets(&self) -> Result<Value, RpcError> {
+        let st = self.state.read().await;
+        Ok(json!(st.config.cameras.iter().map(|camera| json!({
+            "id": camera.id, "name": camera.name,
+            "recording_enabled": camera.recording.local.enabled || st.config.recording.local_all_cameras,
+            "manual_override": st.recording.has_manual_override(&camera.id),
+        })).collect::<Vec<_>>()))
+    }
+
+    async fn copy_policy(&self, params: &Value) -> Result<Value, RpcError> {
+        let request: PolicyCopy = serde_json::from_value(params.clone())
+            .map_err(|e| RpcError::invalid_params(format!("Invalid policy copy: {e}")))?;
+        let mut policy = nw_core::camera::CameraRecordingConfig::default();
+        request.policy.apply(&mut policy);
+        crate::recording::policy::validate_settings(&policy).map_err(RpcError::invalid_params)?;
+        let mut st = self.state.write().await;
+        if !st.config.cameras.iter().any(|c| c.id == request.source_id) {
+            return Err(RpcError::invalid_params("Source camera not found"));
+        }
+        let mut targets = std::collections::HashSet::new();
+        if request.target_ids.is_empty() {
+            return Err(RpcError::invalid_params(
+                "Select at least one target camera",
+            ));
+        }
+        for id in &request.target_ids {
+            if id == &request.source_id || !targets.insert(id) {
+                return Err(RpcError::invalid_params(
+                    "Targets must be unique and exclude the source",
+                ));
+            }
+            if !st.config.cameras.iter().any(|c| &c.id == id) {
+                return Err(RpcError::invalid_params("Target camera no longer exists"));
+            }
+        }
+        let mut next = st.config.clone();
+        for camera in &mut next.cameras {
+            if targets.contains(&camera.id) {
+                request.policy.apply(&mut camera.recording);
+            }
+        }
+        // Persist the complete batch before changing memory or runtime. A
+        // rejected write cannot leave only a subset of targets updated.
+        next.save(&st.config_path)
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+        st.config = next;
+        st.reconcile_recording_policies();
+        Ok(json!({"ok": true, "copied": request.target_ids}))
     }
 
     // ------------------------------------------------------------------
@@ -50,14 +193,14 @@ impl RecordingHandler {
             .cloned()
             .ok_or_else(|| RpcError::invalid_params("Camera not found"))?;
 
-        // Resolve storage path to: <base>/<camera_id>/<YYYY-MM-DD>.
+        // Resolve storage path to: <base>/<camera_id>/<YYYY-MM-DD>, only
+        // while that location is really there (not an empty mount point).
         let storage_dir = st.local_recording_output_dir(&cam);
-
-        if let Err(e) = std::fs::create_dir_all(&storage_dir) {
-            return Err(RpcError::internal(format!(
-                "Cannot create storage dir: {e}"
-            )));
-        }
+        let root = st.camera_storage_root(&cam);
+        st.prepare_recording_dir(&root, &storage_dir)
+            .map_err(|reason| {
+                RpcError::internal(format!("Recording location unavailable: {reason}"))
+            })?;
 
         st.recording.start(cam_id.clone(), storage_dir.clone());
 
@@ -103,6 +246,7 @@ impl RecordingHandler {
             .quota_gb
             .map(|q| q as i64 * 1024 * 1024 * 1024);
         let cam_id_clone = cam_id.clone();
+        let offline = st.storage.missing_roots();
         let segment_duration_ms = (st.config.recording.segment_minutes as i64) * 60_000;
 
         // Scan → local quota, off the IPC hot path.
@@ -123,7 +267,7 @@ impl RecordingHandler {
                     let db3 = Arc::clone(&db);
                     let cid3 = cam_id_clone.clone();
                     tokio::task::spawn_blocking(move || {
-                        quota::enforce(&db3, &cid3, lq, None);
+                        quota::enforce(&db3, &cid3, lq, None, &offline);
                     })
                     .await
                     .ok();
@@ -149,11 +293,52 @@ impl RecordingHandler {
                 .or_insert_with(|| "idle".to_owned());
             // Asked to record, but there is nothing compressed to keep (a
             // V4L2 device): recording fails explicitly; nothing transcodes.
-            if st.recording_unsupported(&cam.id) {
+            if st.recording_unsupported(&cam.id) || st.storage_blocked(&cam.id).is_some() {
                 map.insert(cam.id.clone(), "failed".to_owned());
             }
         }
         serde_json::to_value(map).map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    /// Additive endpoint: existing clients keep the status_all string map.
+    async fn policy_status(&self) -> Result<Value, RpcError> {
+        let st = self.state.read().await;
+        let calendar = crate::recording::policy::local_calendar();
+        let mut cameras = serde_json::Map::new();
+        for camera in &st.config.cameras {
+            let active_mode = crate::recording::policy::current_mode(camera);
+            let manual = st.recording.has_manual_override(&camera.id);
+            let cleanup_active = st.event_retention_since(&camera.id).is_some();
+            let next = calendar.and_then(|(day, minute)| {
+                crate::recording::policy::next_change(
+                    camera.recording.mode,
+                    &camera.recording.weekly_rules,
+                    day,
+                    minute,
+                )
+                .ok()
+                .flatten()
+            });
+            let detail = if manual {
+                "Manual Start/Stop overrides the saved policy until the recorder restarts."
+            } else if active_mode == nw_core::camera::RecordingMode::Off {
+                "Automatic recording is paused by the saved policy."
+            } else if active_mode == nw_core::camera::RecordingMode::Events {
+                if cleanup_active {
+                    "Continuous capture; non-event footage is trimmed after the retention and safety grace."
+                } else {
+                    "Event cleanup is paused; footage is kept until automatic recording and detection are healthy."
+                }
+            } else {
+                "Continuous recording policy; quota and drive limits still apply."
+            };
+            cameras.insert(
+                camera.id.clone(),
+                json!({"active_mode":active_mode,"manual_override":manual,
+                "cleanup_active":cleanup_active,"next_change_wall_minutes":next,"detail":detail}),
+            );
+        }
+        Ok(Value::Object(cameras))
     }
 
     // ------------------------------------------------------------------
@@ -245,13 +430,19 @@ impl RecordingHandler {
         };
 
         if cam.recording.local.enabled {
-            let storage_dir =
-                local_recording_output_dir_for(&st.config.recording.storage_path, &cam);
-            std::fs::create_dir_all(&storage_dir).map_err(|e| {
-                RpcError::internal(format!(
-                    "Cannot prepare local recording storage '{}': {e}",
-                    storage_dir.display()
-                ))
+            let global = st.config.recording.storage_path.clone();
+            let root = crate::app_state::expand_user_path(
+                cam.recording
+                    .local
+                    .storage_path
+                    .as_deref()
+                    .unwrap_or(&global),
+            );
+            let storage_dir = local_recording_output_dir_for(&global, &cam);
+            // Through mount protection: never a folder on an unmounted drive's
+            // empty mount point.
+            st.prepare_recording_dir(&root, &storage_dir).map_err(|e| {
+                RpcError::internal(format!("Cannot prepare local recording storage: {e}"))
             })?;
         }
 
@@ -339,6 +530,212 @@ mod tests {
             test_config_path("rpc"),
             HwAccelKind::Software,
         )))
+    }
+
+    #[tokio::test]
+    async fn policy_status_keeps_legacy_status_shape_and_explains_safety_pause() {
+        let mut config = AppConfig::default();
+        let mut cam = camera("policy-status");
+        cam.recording.mode = nw_core::camera::RecordingMode::Events;
+        cam.recording.local.enabled = true;
+        config.cameras.push(cam.clone());
+        let state = state_with_config(config);
+        let handler = RpcHandler::new(Arc::clone(&state), test_viewer_manager(), test_aggregator());
+        let legacy = rpc(&handler, "recording.status_all", json!({})).await;
+        assert_eq!(legacy[&cam.id], "idle");
+        let policy = rpc(&handler, "recording.policy_status", json!({})).await;
+        assert_eq!(policy[&cam.id]["active_mode"], "events");
+        assert_eq!(policy[&cam.id]["cleanup_active"], false);
+        assert_eq!(policy[&cam.id]["manual_override"], false);
+        assert!(policy[&cam.id]["detail"].as_str().unwrap().contains("kept"));
+        state
+            .write()
+            .await
+            .recording
+            .start(cam.id.clone(), std::path::PathBuf::from("/unused"));
+        let policy = rpc(&handler, "recording.policy_status", json!({})).await;
+        assert_eq!(policy[&cam.id]["manual_override"], true);
+    }
+
+    #[tokio::test]
+    async fn policy_copy_is_atomic_preserves_destinations_credentials_and_manual_override() {
+        let mut config = AppConfig::default();
+        let source = camera("source");
+        let mut target = camera("target");
+        target.url = "rtsp://user:secret@example.invalid/private".into();
+        target.recording.schedule = Some("legacy cron".into());
+        target.recording.local.storage_path = Some("/preserved-storage".into());
+        target.recording.local.quota_gb = Some(9);
+        config.cameras = vec![source.clone(), target.clone(), camera("other")];
+        let state = state_with_config(config);
+        let handler = super::RecordingHandler::new(Arc::clone(&state));
+        let params = json!({"source_id":"source", "target_ids":["target", "other"],
+            "policy":{"mode":"events", "weekly_rules":[
+                {"days":[6],"start":"22:15","end":"02:45","mode":"off"}],
+                "event_pre_sec":0,"event_post_sec":0,"non_event_keep_hours":2}});
+        let before = serde_json::to_value(&state.read().await.config).unwrap();
+        let mut invalid = params.clone();
+        invalid["target_ids"] = json!(["target", "missing"]);
+        assert!(handler
+            .dispatch("recording.copy_policy", &invalid)
+            .await
+            .is_err());
+        invalid["target_ids"] = json!(["target", "target"]);
+        assert!(handler
+            .dispatch("recording.copy_policy", &invalid)
+            .await
+            .is_err());
+        invalid["target_ids"] = json!(["source"]);
+        assert!(handler
+            .dispatch("recording.copy_policy", &invalid)
+            .await
+            .is_err());
+        invalid = params.clone();
+        invalid["policy"]["local"] = json!({"enabled":true});
+        assert!(handler
+            .dispatch("recording.copy_policy", &invalid)
+            .await
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(&state.read().await.config).unwrap(),
+            before
+        );
+        let real_path = state.read().await.config_path.clone();
+        // A directory cannot be atomically replaced by a config file.
+        let blocked = test_config_path("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        state.write().await.config_path = blocked.clone();
+        assert!(handler
+            .dispatch("recording.copy_policy", &params)
+            .await
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(&state.read().await.config).unwrap(),
+            before
+        );
+        state.write().await.config_path = real_path.clone();
+        state
+            .write()
+            .await
+            .recording
+            .start("target".to_owned(), std::path::PathBuf::from("/unused"));
+        state.write().await.recording.stop(&"target".to_owned());
+        let result = handler
+            .dispatch("recording.copy_policy", &params)
+            .await
+            .unwrap();
+        assert_eq!(result["copied"], json!(["target", "other"]));
+        let st = state.read().await;
+        assert!(st.recording.has_manual_override(&"target".to_owned()));
+        assert!(!st.recording.wants_recording(&"target".to_owned()));
+        let updated = &st.config.cameras[1];
+        assert_eq!(updated.url, target.url);
+        assert_eq!(
+            updated.recording.local.storage_path,
+            target.recording.local.storage_path
+        );
+        assert_eq!(updated.recording.local.quota_gb, Some(9));
+        assert!(!updated.recording.local.enabled);
+        assert_eq!(updated.recording.schedule, target.recording.schedule);
+        assert_eq!(updated.recording.event_pre_sec, 0);
+        assert_eq!(updated.recording.event_post_sec, 0);
+        assert_eq!(
+            serde_json::to_value(&st.config.cameras[0]).unwrap(),
+            serde_json::to_value(source).unwrap()
+        );
+        let saved = AppConfig::load_or_default(&real_path).unwrap();
+        assert_eq!(
+            serde_json::to_value(saved).unwrap(),
+            serde_json::to_value(&st.config).unwrap()
+        );
+        drop(st);
+        let targets = handler
+            .dispatch("recording.policy_targets", &json!({}))
+            .await
+            .unwrap();
+        assert!(targets.to_string().find("secret").is_none());
+        assert_eq!(targets[1]["manual_override"], true);
+        let _ = std::fs::remove_file(real_path);
+        let _ = std::fs::remove_file(format!("{}.tmp", blocked.display()));
+        let _ = std::fs::remove_dir(blocked);
+    }
+
+    #[tokio::test]
+    async fn saving_only_policy_does_not_start_camera_connections_or_manual_overrides() {
+        let mut config = AppConfig::default();
+        let mut cam = camera("edit-policy");
+        config.cameras.push(cam.clone());
+        let state = state_with_config(config);
+        let handler = RpcHandler::new(Arc::clone(&state), test_viewer_manager(), test_aggregator());
+        cam.recording.mode = nw_core::camera::RecordingMode::Events;
+        cam.recording.event_pre_sec = 0;
+        rpc(
+            &handler,
+            "camera.update",
+            serde_json::to_value(&cam).unwrap(),
+        )
+        .await;
+        let st = state.read().await;
+        assert!(st.supervisor_states().is_empty());
+        assert!(!st.recording.has_manual_override(&cam.id));
+        assert_eq!(st.config.cameras[0].recording.event_pre_sec, 0);
+        assert_eq!(
+            AppConfig::load_or_default(&st.config_path).unwrap().cameras[0],
+            cam
+        );
+        let _ = std::fs::remove_file(&st.config_path);
+    }
+
+    #[tokio::test]
+    async fn a_location_whose_marker_was_deleted_records_again_once_confirmed() {
+        use crate::storage_guard::{self, Readiness, MARKER_FILE};
+        let root = std::env::temp_dir().join(format!(
+            "neurowatch-use-location-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut config = AppConfig::default();
+        config.recording.storage_path = root.to_string_lossy().into_owned();
+        let state = state_with_config(config);
+        let handler = RpcHandler::new(Arc::clone(&state), test_viewer_manager(), test_aggregator());
+        storage_guard::ensure(&state, &root).await.unwrap();
+        let id = state.read().await.config.recording.storage_ids
+            [&root.to_string_lossy().into_owned()]
+            .clone();
+        // The marker is deleted from a plain folder: treated as missing.
+        std::fs::remove_file(root.join(MARKER_FILE)).unwrap();
+        state
+            .read()
+            .await
+            .storage
+            .set(&root, Readiness::Missing("gone".into()));
+
+        let refused = handler
+            .dispatch(
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "recording.use_location",
+                "params": {"path": "/somewhere/else"}}),
+            )
+            .await;
+        assert!(refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a recording location"));
+
+        let result = rpc(
+            &handler,
+            "recording.use_location",
+            json!({"path": root.to_string_lossy()}),
+        )
+        .await;
+        assert_eq!(result["ready"], true);
+        let st = state.read().await;
+        assert!(st.storage.is_ready(&root));
+        assert_eq!(
+            storage_guard::check(&root, &id),
+            Readiness::Ready,
+            "the marker is back with the remembered id"
+        );
+        drop(st);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     async fn rpc(handler: &RpcHandler, method: &str, params: Value) -> Value {
@@ -1160,7 +1557,7 @@ mod tests {
         let st = state.read().await;
         assert_eq!(code, INTERNAL_ERROR);
         assert!(
-            message.starts_with("Cannot create storage dir"),
+            message.starts_with("Recording location unavailable"),
             "unexpected message: {message}"
         );
         assert!(st.recording.recording_storage_path(&cam.id).is_none());

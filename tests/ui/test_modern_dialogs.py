@@ -4,12 +4,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from PySide6.QtCore import QDate, QDateTime
 from PySide6.QtWidgets import (
-    QCalendarWidget,
     QDialogButtonBox,
     QLabel,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -50,8 +47,17 @@ def test_about_dialog_is_themed_with_hierarchy(qtbot):
     qtbot.addWidget(dlg)
     _assert_themed(dlg)
     assert _no_inline_colors(dlg) == []
-    titles = [lbl for lbl in dlg.findChildren(QLabel) if lbl.objectName() == "dialogTitle"]
-    assert len(titles) == 1
+    # The application's window template: frameless, themed header with the
+    # title and a close button; the body does not repeat the heading.
+    from PySide6.QtCore import Qt
+
+    from neurowatch.widgets.window_chrome import ChromeTitleBar
+
+    assert dlg.windowFlags() & Qt.WindowType.FramelessWindowHint
+    bar = dlg.findChild(ChromeTitleBar)
+    assert bar is not None and bar._title.text() == "About NeuroWatch"
+    assert not [lbl for lbl in dlg.findChildren(QLabel) if lbl.objectName() == "dialogTitle"]
+    assert [lbl.text() for lbl in dlg.findChildren(QLabel) if lbl.objectName() == "aboutName"]
     close = _box_button(dlg, QDialogButtonBox.StandardButton.Close)
     assert close.property("variant") == "primary"
 
@@ -63,7 +69,7 @@ def test_about_dialog_shows_the_licence_and_no_warranty_notice(qtbot):
     qtbot.addWidget(dlg)
     texts = [label.text() for label in dlg.findChildren(QLabel)]
     assert NO_WARRANTY in texts
-    assert "WITHOUT ANY WARRANTY" in NO_WARRANTY and "AGPL" in NO_WARRANTY
+    assert "WITHOUT ANY WARRANTY" in NO_WARRANTY and "Apache License 2.0" in NO_WARRANTY
 
 
 def test_notice_carries_the_full_disclaimer():
@@ -88,6 +94,10 @@ def test_custom_grid_dialog_themed_and_previews_cell_count(qtbot):
     dlg = CustomGridDialog(3, 4)
     qtbot.addWidget(dlg)
     _assert_themed(dlg)
+    from neurowatch.widgets.window_chrome import ChromeTitleBar
+
+    bar = dlg.findChild(ChromeTitleBar)
+    assert bar is not None and bar._title.text() == "Custom grid layout"
     assert _no_inline_colors(dlg) == []
     assert (dlg.rows, dlg.cols) == (3, 4)
     assert "12" in dlg._summary.text()
@@ -155,7 +165,7 @@ def test_camera_dialog_status_uses_tones(qtbot):
 
     dlg = AddEditCameraDialog()
     qtbot.addWidget(dlg)
-    dlg._tabs.setCurrentWidget(dlg._advanced_tab)
+    dlg._show_camera_tab("urls")
     dlg._on_test()  # no URL
     assert dlg._status_label.property("tone") == "warning"
     dlg._on_discover()  # no host
@@ -183,20 +193,21 @@ def test_camera_dialog_edit_mode_preserves_config(qtbot):
 # ── Playback calendar ────────────────────────────────────────────────────
 
 
-def test_playback_calendar_dialog_themed(qtbot):
-    from neurowatch.widgets.playback_view import _CalendarDialog
+def test_every_dialog_uses_the_window_template():
+    """Each dialog gets the themed header, rounded card and Wayland placement
+    from ``install_dialog_chrome`` (or is a ``CenteredPrompt``)."""
+    import re
+    from pathlib import Path
 
-    initial = QDateTime(QDate(2026, 3, 14), QDateTime.currentDateTime().time())
-    dlg = _CalendarDialog(initial)
-    qtbot.addWidget(dlg)
-    _assert_themed(dlg)
-    assert _no_inline_colors(dlg) == []
-    cal = dlg.findChild(QCalendarWidget)
-    assert cal.objectName() == "playbackCalendar"
-    assert cal.isGridVisible() is False
-    assert cal.verticalHeaderFormat() == QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader
-    assert dlg.selected_date().date() == QDate(2026, 3, 14)
-    assert _box_button(dlg, QDialogButtonBox.StandardButton.Ok).property("variant") == "primary"
+    root = Path(__file__).resolve().parents[2] / "ui" / "neurowatch"
+    missing = []
+    for path in root.rglob("*.py"):
+        text = path.read_text()
+        if re.search(r"^class \w+\(QDialog\)", text, re.MULTILINE) and not (
+            "install_dialog_chrome(" in text or "CenteredPrompt" in text
+        ):
+            missing.append(str(path.relative_to(root)))
+    assert missing == []
 
 
 def test_playback_datetime_inputs_use_themed_calendar_popup():
@@ -274,16 +285,60 @@ def test_title_bar_file_menu_is_themed_and_accessible(qtbot):
         "Export Video…",
         "Import Config…",
         "Settings",
+        "Alert Notifications…",
+        "Users && Permissions…",  # "&&": a single "&" underlines the next letter
         "Diagnostics",
         "Example…",
         "About Neurowatch",
     ]
+    for label in labels:
+        # A lone "&" marks a shortcut letter: "Users & Permissions" showed "Users _Permissions".
+        assert "&" not in label.replace("&&", ""), label
     [example] = [a for a in menu.actions() if a.text() == "Example…"]
     example.trigger()
     assert picked == ["example"], "an extension's entry runs its callback"
     assert bar._menu_btn.accessibleName() == "Application menu"
     with qtbot.waitSignal(bar.about_requested, timeout=500):
         menu.actions()[-1].trigger()
+
+
+def test_window_buttons_paint_their_symbols_centred_not_font_glyphs(qtbot):
+    """Fonts put ≡, □ and ✕ at different heights: the bars paint them."""
+    from PySide6.QtGui import QColor
+
+    from neurowatch.widgets.chrome_glyphs import GlyphButton
+    from neurowatch.widgets.title_bar import TitleBar
+    from neurowatch.widgets.window_chrome import ChromeTitleBar
+
+    window = QWidget()
+    layout = QVBoxLayout(window)
+    bar = TitleBar(window)
+    chrome = ChromeTitleBar("Wall 2", window, minimize=True, maximize=True)
+    layout.addWidget(bar)
+    layout.addWidget(chrome)
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitExposed(window)
+    buttons = bar.findChildren(GlyphButton) + chrome.findChildren(GlyphButton)
+    assert [b.glyph() for b in buttons] == [
+        "menu", "minimize", "maximize", "close", "minimize", "maximize", "close"
+    ]
+    for button in buttons:
+        assert button.text() == ""
+        picture = button.grab().toImage()
+        background = QColor(picture.pixel(1, 1))
+        rows = [
+            y
+            for y in range(picture.height())
+            if any(QColor(picture.pixel(x, y)) != background for x in range(picture.width()))
+        ]
+        middle = (min(rows) + max(rows)) / 2
+        assert abs(middle - (picture.height() - 1) / 2) <= 0.5, button.glyph()
+    window.showMaximized()
+    qtbot.waitUntil(window.isMaximized)
+    bar.sync_window_state()
+    chrome.sync_window_state()
+    assert [b.glyph() for b in buttons].count("restore") == 2
 
 
 def test_title_bar_minimize_leaves_fullscreen_before_minimizing(qtbot):
@@ -348,3 +403,21 @@ def test_cell_context_menu_is_themed_without_changing_actions(qtbot):
     labels = [a.text() for a in menu.actions() if not a.isSeparator()]
     assert labels[:2] == ["Edit Camera", "Remove Camera"]
     assert labels[-1] == "Aspect Ratio"
+
+
+def test_applying_the_same_theme_again_restyles_nothing(qapp, monkeypatch) -> None:
+    """Every settings reload (after each camera save) applied the theme again,
+    restyling every widget of the app: 1.8 s with a full wall."""
+    from PySide6.QtWidgets import QApplication
+
+    theme.apply_app_theme(qapp, "dark")
+    calls: list[str] = []
+    original = QApplication.setStyleSheet
+    monkeypatch.setattr(
+        QApplication, "setStyleSheet", lambda self, s: (calls.append("sheet"), original(self, s))
+    )
+    theme.apply_app_theme(qapp, "dark")
+    assert calls == [], "unchanged: nothing re-applied"
+    theme.apply_app_theme(qapp, "light")
+    assert calls == ["sheet"], "a new theme still applies"
+    theme.apply_app_theme(qapp, "dark")

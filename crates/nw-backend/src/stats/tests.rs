@@ -72,6 +72,43 @@ fn classifier_reports_ok_when_all_sources_are_healthy() {
 }
 
 #[test]
+fn motion_pressure_uses_recent_queue_loss_and_keeps_critical_ipc_priority() {
+    use nw_core::stats::{Bottleneck, MotionMetrics};
+    let mut motion = MotionMetrics {
+        state: "running".into(),
+        input_fps: 5.0,
+        dropped_fps: 2.0,
+        ..Default::default()
+    };
+    let slow = super::bottleneck::with_motion(Bottleneck::ok("ok"), &[motion.clone()]);
+    assert_eq!(slow.kind, BottleneckKind::Motion);
+    assert_eq!(slow.severity, Severity::Critical);
+    let ipc = classify(
+        &fake_process(10.0, 20.0),
+        &GpuStatus::unavailable("none"),
+        &fake_ipc(3000.0, 0, 0),
+        &[],
+    );
+    assert_eq!(
+        super::bottleneck::with_motion(ipc, &[motion.clone()]).kind,
+        BottleneckKind::Ipc
+    );
+    motion.dropped_fps = 0.0;
+    motion.dropped_frames = 100_000;
+    motion.skipped_delta_frames = 100_000;
+    assert_eq!(
+        super::bottleneck::with_motion(Bottleneck::ok("ok"), &[motion.clone()]).kind,
+        BottleneckKind::None
+    );
+    motion.state = "backoff".into();
+    motion.dropped_fps = 2.0;
+    assert_eq!(
+        super::bottleneck::with_motion(Bottleneck::ok("ok"), &[motion]).kind,
+        BottleneckKind::None
+    );
+}
+
+#[test]
 fn classifier_promotes_cpu_when_saturated() {
     let process = fake_process(95.0, 30.0);
     let b = classify(

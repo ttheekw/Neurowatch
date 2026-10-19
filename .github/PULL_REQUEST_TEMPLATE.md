@@ -13,7 +13,7 @@
 <!-- Step-by-step instructions -->
 
 ## Pre-Merge Checklist
-- [ ] I have signed the [Contributor License Agreement](../CLA.md) (the CLA bot asks on your first pull request)
+- [ ] My contribution is licensed under the project's Apache License 2.0
 - [ ] `cargo fmt --all` passes
 - [ ] `cargo clippy -- -D warnings` passes
 - [ ] `cargo test --all-features` passes

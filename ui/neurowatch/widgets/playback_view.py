@@ -1,15 +1,15 @@
 """Multi-camera playback view.
 
 Layout:
-  QHBoxLayout
-    Left panel (260 px):
+  Page heading and two columns:
+    Camera sidebar (288 px):
       - Camera checklist with search
       - From / To date-time pickers
       - Load Recordings button
       - Stop All button
     Right area (QVBoxLayout):
       - PlaybackGrid  (QGridLayout of CellWidget)
-      - PlaybackTimeline (fixed height 140 px)
+      - PlaybackTimeline (resizable through the splitter)
 """
 
 from __future__ import annotations
@@ -19,13 +19,10 @@ import math
 import time
 from collections.abc import Callable
 
-from PySide6.QtCore import QDateTime, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDateTime, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut, QShowEvent
 from PySide6.QtWidgets import (
-    QCalendarWidget,
     QDateTimeEdit,
-    QDialog,
-    QDialogButtonBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -40,17 +37,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from neurowatch.ipc.event_feed import read_events
 from neurowatch.ipc.frame_reader import FrameReaderThread
 from neurowatch.ipc.sync_client import SyncIpcClient
 from neurowatch.models.camera import CameraConfig
+from neurowatch.models.events import PLAYBACK_KINDS, Event, zone_names
+from neurowatch.models.playback_controls import enqueue_controls
+from neurowatch.models.preview_fps import PreviewFps
 from neurowatch.theme import (
-    apply_dialog_theme,
     datetime_input_stylesheet,
-    icon_path,
-    style_button_box,
+    playback_stylesheet,
+    set_button_variant,
+    set_label_role,
     style_calendar,
 )
+from neurowatch.utils.threads import Worker, retire
 from neurowatch.widgets.cell_widget import AUDIO_AVAILABLE, AUDIO_NONE, AUDIO_ON, CellWidget
+from neurowatch.widgets.playback_events import PlaybackEventsPane
 from neurowatch.widgets.playback_timeline import PlaybackTimeline
 from neurowatch.widgets.wheel_guard import guard_wheel
 
@@ -84,7 +87,7 @@ AUDIO_STATUS_INTERVAL_MS = 3000
 AUDIO_FIRST_CHECK_MS = 800
 
 
-class _IpcWorker(QThread):
+class _IpcWorker(Worker):
     """Run a batch of IPC calls in a background thread, emit results."""
 
     done = Signal(object)  # list[result] or Exception
@@ -116,38 +119,36 @@ class _IpcWorker(QThread):
             self.done.emit(exc)
 
 
+class _MotionEventsWorker(Worker):
+    """Load every page of activity overlapping the selected recording range."""
+
+    done = Signal(object)
+
+    def __init__(self, endpoint: str, camera_ids: list[str], start_ms: int, end_ms: int) -> None:
+        super().__init__()
+        self._endpoint = endpoint
+        self._params = {
+            "camera_ids": camera_ids,
+            "kinds": sorted(PLAYBACK_KINDS),
+            "from_ms": start_ms,
+            "to_ms": end_ms,
+        }
+
+    def run(self) -> None:
+        try:
+            client = SyncIpcClient(endpoint=self._endpoint)
+            events = read_events(
+                client, self._params, self.isInterruptionRequested, max_events=20_000
+            )
+            if not self.isInterruptionRequested():
+                self.done.emit(events)
+        except Exception as exc:
+            self.done.emit(exc)
+
+
 # ---------------------------------------------------------------------------
 # Calendar popup helper
 # ---------------------------------------------------------------------------
-
-
-class _CalendarDialog(QDialog):
-    def __init__(self, initial: QDateTime, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Pick date/time")
-        apply_dialog_theme(self)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 14)
-        layout.setSpacing(12)
-        self._cal = QCalendarWidget()
-        self._cal.setObjectName("playbackCalendar")
-        self._cal.setAccessibleName("Playback date")
-        style_calendar(self._cal)
-        self._cal.setSelectedDate(initial.date())
-        layout.addWidget(self._cal)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Select Date")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        style_button_box(buttons)
-        layout.addWidget(buttons)
-
-    def selected_date(self) -> QDateTime:
-        dt = QDateTime()
-        dt.setDate(self._cal.selectedDate())
-        return dt
 
 
 # ---------------------------------------------------------------------------
@@ -155,8 +156,27 @@ class _CalendarDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 
+#: Minutes of recording loaded either side of a moment shown from an event.
+MOMENT_MARGIN_S = 10 * 60
+
+
+def _recorded_moment(segments: list[dict], ts_ms: int) -> int | None:
+    """``ts_ms`` if a segment covers it, else the start of the next recording
+    after it, else None."""
+    later = []
+    for segment in segments:
+        start, end = int(segment["start_ms"]), int(segment["end_ms"])
+        if start <= ts_ms < end:
+            return ts_ms
+        if start > ts_ms:
+            later.append(start)
+    return min(later) if later else None
+
+
 class PlaybackView(QWidget):
     """Top-level widget shown when the Playback tab is active."""
+
+    export_requested = Signal(object)
 
     def __init__(
         self,
@@ -170,7 +190,11 @@ class PlaybackView(QWidget):
 
         # Active playback state
         self._sessions: dict[str, dict] = {}  # cam_id → {session_id, shm_key, start_ts, end_ts}
+        # The cameras and range whose events the timeline shows.
+        self._event_scope: tuple[list[str], int, int] | None = None
         self._readers: dict[str, FrameReaderThread] = {}  # session_id → thread
+        # The frame-rate limits the live wall uses (Settings → Video Wall).
+        self._preview_fps = PreviewFps()
         self._cells: dict[str, CellWidget] = {}  # session_id → cell
         self._active_playhead_ms: int | None = None
         # session_id → (window start, frames in window): the shown frame rate.
@@ -178,6 +202,9 @@ class PlaybackView(QWidget):
 
         self._worker: _IpcWorker | None = None
         self._bg_workers: set[_IpcWorker] = set()
+        self._motion_worker: _MotionEventsWorker | None = None
+        self._motion_load_id = 0
+        self._motion_recent_updates: dict[int, Event] = {}
         # Seek, speed and play/pause reach the backend in the order they were
         # made: one control worker at a time, the rest wait here. Parallel
         # workers could deliver Pause before an earlier Play.
@@ -187,6 +214,8 @@ class PlaybackView(QWidget):
         # Audio: one session heard at a time. Which recordings have audio is
         # read from the backend (`playback.status`) while sessions are open.
         self._setting_range = False
+        # Set by show_moment: the time the next load opens at.
+        self._open_at_ms: int | None = None
         self._audio_session: str | None = None
         self._has_audio: set[str] = set()  # session ids
         self._audio_chosen = False  # the user picked (or muted): no auto pick
@@ -202,52 +231,72 @@ class PlaybackView(QWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        root_layout = QHBoxLayout(self)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
+        self.setObjectName("playbackPage")
+        self.setStyleSheet(playback_stylesheet())
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(16, 14, 16, 16)
+        root_layout.setSpacing(14)
+
+        heading = QHBoxLayout()
+        title_column = QVBoxLayout()
+        title_column.setSpacing(3)
+        title = QLabel("Playback")
+        set_label_role(title, "pageTitle")
+        title_column.addWidget(title)
+        subtitle = QLabel("Review recorded footage across your cameras")
+        set_label_role(subtitle, "muted")
+        title_column.addWidget(subtitle)
+        heading.addLayout(title_column)
+        heading.addStretch()
+        shortcut_hint = QLabel("Space  ·  Play / pause")
+        set_label_role(shortcut_hint, "muted")
+        heading.addWidget(shortcut_hint)
+        root_layout.addLayout(heading)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        root_layout.addLayout(body, stretch=1)
 
         # ── Left panel ──────────────────────────────────────────────────
         left = QWidget()
-        left.setFixedWidth(260)
-        left.setStyleSheet("background-color: #0e0e1a; border-right: 1px solid #1e1e36;")
+        left.setObjectName("playbackSidebar")
+        left.setFixedWidth(288)
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(8, 8, 8, 8)
-        left_layout.setSpacing(6)
+        left_layout.setContentsMargins(16, 16, 16, 16)
+        left_layout.setSpacing(12)
+
+        camera_heading = QHBoxLayout()
+        camera_title = QLabel("Cameras")
+        set_label_role(camera_title, "sectionTitle")
+        camera_heading.addWidget(camera_title)
+        camera_heading.addStretch()
+        self._selection_count = QLabel("0 selected")
+        self._selection_count.setObjectName("playbackSelectionCount")
+        camera_heading.addWidget(self._selection_count)
+        left_layout.addLayout(camera_heading)
 
         # Search box
         self._search = QLineEdit()
+        self._search.setAccessibleName("Search playback cameras")
         self._search.setPlaceholderText("Search cameras…")
-        self._search.setStyleSheet(
-            "background: #1a1a2e; color: #c8c8dc; border: 1px solid #2a2a4e;"
-            " border-radius: 3px; padding: 4px;"
-        )
+        self._search.setClearButtonEnabled(True)
         self._search.textChanged.connect(self._filter_camera_list)
         left_layout.addWidget(self._search)
 
         # Camera checklist
         self._cam_list = QListWidget()
-        # Style the check boxes explicitly: the default indicator is nearly
-        # invisible on this dark list.
-        self._cam_list.setStyleSheet(
-            "QListWidget { background: #0e0e1a; color: #c8c8dc; border: none; }"
-            "QListWidget::item { padding: 3px 2px; }"
-            "QListWidget::indicator { width: 14px; height: 14px; border: 1px solid #68758e;"
-            " border-radius: 3px; background: #121824; }"
-            "QListWidget::indicator:hover { border-color: #9aa5b8; }"
-            "QListWidget::indicator:checked { background: #2563eb; border-color: #2563eb;"
-            f' image: url("{icon_path("check.svg")}"); }}'
-        )
+        self._cam_list.setObjectName("playbackCameras")
+        self._cam_list.setAccessibleName("Cameras to play back")
+        self._cam_list.itemChanged.connect(self._update_selection_count)
         self._cam_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         left_layout.addWidget(self._cam_list, stretch=1)
 
         # Date-time range
         dt_group = QGroupBox("Time range")
-        dt_group.setStyleSheet(
-            "QGroupBox { color: #808098; border: 1px solid #2a2a4e; margin-top: 8px; }"
-            "QGroupBox::title { subcontrol-origin: margin; padding: 0 4px; }"
-        )
+        dt_group.setObjectName("playbackRange")
         dt_layout = QVBoxLayout(dt_group)
-        dt_layout.setSpacing(4)
+        dt_layout.setContentsMargins(0, 10, 0, 0)
+        dt_layout.setSpacing(7)
 
         one_hour_ago, now = _default_range()
 
@@ -257,10 +306,11 @@ class PlaybackView(QWidget):
         self._from_dt.setStyleSheet(self._dt_style())
         self._from_dt.setAccessibleName("Playback range start")
         style_calendar(self._from_dt.calendarWidget())
-        from_row = QHBoxLayout()
-        from_row.addWidget(QLabel("From:"))
-        from_row.addWidget(self._from_dt)
-        dt_layout.addLayout(from_row)
+        from_label = QLabel("From")
+        set_label_role(from_label, "muted")
+        from_label.setBuddy(self._from_dt)
+        dt_layout.addWidget(from_label)
+        dt_layout.addWidget(self._from_dt)
 
         self._to_dt = QDateTimeEdit(now)
         self._to_dt.setCalendarPopup(True)
@@ -268,10 +318,15 @@ class PlaybackView(QWidget):
         self._to_dt.setStyleSheet(self._dt_style())
         self._to_dt.setAccessibleName("Playback range end")
         style_calendar(self._to_dt.calendarWidget())
-        to_row = QHBoxLayout()
-        to_row.addWidget(QLabel("To:"))
-        to_row.addWidget(self._to_dt)
-        dt_layout.addLayout(to_row)
+        to_label = QLabel("To")
+        set_label_role(to_label, "muted")
+        to_label.setBuddy(self._to_dt)
+        dt_layout.addWidget(to_label)
+        dt_layout.addWidget(self._to_dt)
+        local_time = QLabel("Times are shown in your local time zone")
+        set_label_role(local_time, "muted")
+        local_time.setWordWrap(True)
+        dt_layout.addWidget(local_time)
         # The scroll wheel over these fields changed them while scrolling the
         # panel (the end could move before the start unnoticed): only a field
         # clicked into takes the wheel.
@@ -284,12 +339,8 @@ class PlaybackView(QWidget):
 
         # Load button
         self._load_btn = QPushButton("▶ Load Recordings")
-        self._load_btn.setStyleSheet(
-            "QPushButton { background: #1a3a1a; color: #6ee86e; border: 1px solid #3a6a3a;"
-            " border-radius: 4px; padding: 6px; font-weight: bold; }"
-            "QPushButton:hover { background: #2a4a2a; }"
-            "QPushButton:disabled { background: #1a1a2a; color: #505060; }"
-        )
+        set_button_variant(self._load_btn, "primary")
+        self._load_btn.setMinimumHeight(36)
         self._load_btn.clicked.connect(self._on_load)
         # A clicked button keeps the keyboard focus, and Space clicks a focused
         # button: Space (play/pause) reloaded the recordings. Space is
@@ -301,20 +352,15 @@ class PlaybackView(QWidget):
         self._stop_btn = QPushButton("■ Stop All")
         self._stop_btn.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self._stop_btn.setEnabled(False)
-        self._stop_btn.setStyleSheet(
-            "QPushButton { background: #3a1a1a; color: #e86e6e; border: 1px solid #6a3a3a;"
-            " border-radius: 4px; padding: 6px; font-weight: bold; }"
-            "QPushButton:hover { background: #4a2a2a; }"
-            "QPushButton:disabled { background: #1a1a2a; color: #505060; }"
-        )
+        set_button_variant(self._stop_btn, "secondary")
+        self._stop_btn.setMinimumHeight(34)
         self._stop_btn.clicked.connect(self._stop_all)
         left_layout.addWidget(self._stop_btn)
 
-        root_layout.addWidget(left)
+        body.addWidget(left)
 
         # ── Right area ──────────────────────────────────────────────────
         right = QWidget()
-        right.setStyleSheet("background-color: #12121c;")
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
@@ -322,23 +368,37 @@ class PlaybackView(QWidget):
         self._right_splitter = QSplitter(Qt.Orientation.Vertical)
         self._right_splitter.setChildrenCollapsible(False)
         self._right_splitter.setHandleWidth(8)
-        self._right_splitter.setStyleSheet(
-            "QSplitter::handle { background: #1e1e32; }"
-            "QSplitter::handle:hover { background: #2a2a48; }"
-        )
 
         # Grid container
         self._grid_container = QWidget()
-        self._grid_container.setStyleSheet("background-color: #12121c;")
+        self._grid_container.setObjectName("playbackGrid")
+        self._grid_container.setStyleSheet(
+            "QWidget#playbackGrid { background: #0d121b; border: 1px solid #273146;"
+            " border-radius: 8px; }"
+        )
         self._grid_layout = QGridLayout(self._grid_container)
         self._grid_layout.setSpacing(2)
         self._grid_layout.setContentsMargins(2, 2, 2, 2)
-        self._right_splitter.addWidget(self._grid_container)
+        self._media_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._media_splitter.addWidget(self._grid_container)
+        self._events_pane = PlaybackEventsPane(self._ipc_endpoint())
+        self._events_pane.seek_requested.connect(self._review_event)
+        self._events_pane.export_requested.connect(self.export_requested)
+        self._events_pane.setMinimumWidth(260)
+        self._media_splitter.addWidget(self._events_pane)
+        self._media_splitter.setChildrenCollapsible(False)
+        self._media_splitter.setHandleWidth(10)
+        self._media_splitter.setStretchFactor(0, 3)
+        self._media_splitter.setStretchFactor(1, 1)
+        self._media_splitter.setSizes([800, 320])
+        self._events_pane.hide()
+        self._right_splitter.addWidget(self._media_splitter)
 
         # Placeholder label shown when no cameras loaded
         self._placeholder = QLabel("Select cameras and a time range, then click  ▶ Load Recordings")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._placeholder.setStyleSheet("color: #505070; font-size: 13px;")
+        self._placeholder.setObjectName("playbackPlaceholder")
+        self._placeholder.setWordWrap(True)
         self._grid_layout.addWidget(self._placeholder, 0, 0)
 
         # Timeline
@@ -352,14 +412,68 @@ class PlaybackView(QWidget):
         self._space.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self._space.activated.connect(self._toggle_play)
         self._timeline.speed_changed.connect(self._on_speed_all)
-        self._right_splitter.addWidget(self._timeline)
+        self._timeline_card = QWidget()
+        self._timeline_card.setObjectName("playbackTimelineCard")
+        timeline_layout = QVBoxLayout(self._timeline_card)
+        timeline_layout.setContentsMargins(1, 1, 1, 1)
+        timeline_layout.setSpacing(0)
+        timeline_heading = QHBoxLayout()
+        timeline_heading.setContentsMargins(14, 8, 14, 8)
+        timeline_heading.setSpacing(6)
+        timeline_title = QLabel("Timeline")
+        set_label_role(timeline_title, "sectionTitle")
+        timeline_heading.addWidget(timeline_title)
+        timeline_heading.addSpacing(10)
+        self._events_toggle = QPushButton("Event List")
+        self._events_toggle.setCheckable(True)
+        self._events_toggle.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self._events_toggle.setAccessibleName("Show events in the loaded playback range")
+        self._events_toggle.setToolTip("Show the events of the loaded range beside the video")
+        set_button_variant(self._events_toggle, "secondary")
+        self._events_toggle.toggled.connect(self._toggle_events)
+        timeline_heading.addWidget(self._events_toggle)
+        self._events_only = QPushButton("Events only")
+        self._events_only.setCheckable(True)
+        self._events_only.setEnabled(False)
+        self._events_only.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self._events_only.setAccessibleName("Events-only playback")
+        self._events_only.setToolTip(
+            "Skip quiet footage using each camera's pre/post padding. "
+            "Uses all loaded event types, independently of review-list filters. "
+            "Does not change recording."
+        )
+        set_button_variant(self._events_only, "secondary")
+        self._events_only.toggled.connect(self._toggle_event_review)
+        timeline_heading.addWidget(self._events_only)
+        self._bookmark_btn = QPushButton("Add Bookmark")
+        self._bookmark_btn.setEnabled(False)
+        self._bookmark_btn.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self._bookmark_btn.setAccessibleName("Bookmark the moment at the playhead")
+        self._bookmark_btn.setToolTip(
+            "Bookmark the moment at the playhead, with a note; optionally keep its footage"
+        )
+        set_button_variant(self._bookmark_btn, "secondary")
+        self._bookmark_btn.clicked.connect(self._add_bookmark)
+        from neurowatch.ipc.auth import may
+
+        self._bookmark_btn.setVisible(may("operator"))
+        timeline_heading.addWidget(self._bookmark_btn)
+        timeline_hint = QLabel("Scroll to zoom · Shift + scroll to pan")
+        timeline_hint.setMinimumWidth(0)
+        timeline_hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        timeline_hint.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        set_label_role(timeline_hint, "muted")
+        timeline_heading.addWidget(timeline_hint, 1)
+        timeline_layout.addLayout(timeline_heading)
+        timeline_layout.addWidget(self._timeline)
+        self._right_splitter.addWidget(self._timeline_card)
         self._right_splitter.setStretchFactor(0, 4)
         self._right_splitter.setStretchFactor(1, 2)
         # Keep timeline compact by default; user can drag handle up/down.
-        self._right_splitter.setSizes([820, 140])
+        self._right_splitter.setSizes([820, 180])
         right_layout.addWidget(self._right_splitter)
 
-        root_layout.addWidget(right, stretch=1)
+        body.addWidget(right, stretch=1)
 
         self._populate_camera_list()
 
@@ -385,6 +499,10 @@ class PlaybackView(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, cam.id)
             item.setCheckState(Qt.CheckState.Unchecked)
             self._cam_list.addItem(item)
+        self._update_selection_count()
+
+    def _update_selection_count(self) -> None:
+        self._selection_count.setText(f"{len(self._checked_camera_ids())} selected")
 
     def _filter_camera_list(self, text: str) -> None:
         q = text.lower()
@@ -434,7 +552,7 @@ class PlaybackView(QWidget):
 
     def _queue_controls(self, calls: list[tuple[str, dict]]) -> None:
         """Send playback controls after every earlier one, in order."""
-        self._control_queue.extend(calls)
+        enqueue_controls(self._control_queue, calls)
         self._drain_controls()
 
     def _drain_controls(self) -> None:
@@ -498,9 +616,30 @@ class PlaybackView(QWidget):
 
         self._start_worker(calls, _on_timelines_done, primary=True)
 
+    def show_moment(self, camera_id: str, ts_ms: int) -> None:
+        """Open one camera's recording at ``ts_ms`` (an event): only that
+        camera checked, a range around the moment, opened paused there."""
+        for i in range(self._cam_list.count()):
+            item = self._cam_list.item(i)
+            if item is not None:
+                checked = item.data(Qt.ItemDataRole.UserRole) == camera_id
+                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        moment = QDateTime.fromMSecsSinceEpoch(ts_ms)
+        self._setting_range = True
+        try:
+            self._from_dt.setDateTime(_to_minute(moment.addSecs(-MOMENT_MARGIN_S)))
+            self._to_dt.setDateTime(_to_minute(moment.addSecs(MOMENT_MARGIN_S + 60)))
+        finally:
+            self._setting_range = False
+        self._range_edited = True  # chosen: no longer follows the clock
+        self._open_at_ms = ts_ms
+        self._on_load()
+
     def _on_timeline_loaded(
         self, result: object, cam_ids: list[str], start_ms: int, end_ms: int
     ) -> None:
+        # A moment asked for (show_moment) applies to this load only.
+        open_at, self._open_at_ms = self._open_at_ms, None
         self._load_btn.setEnabled(True)
         if isinstance(result, Exception):
             logger.warning("Failed to load timeline: %s", result)
@@ -539,9 +678,12 @@ class PlaybackView(QWidget):
                 logger.debug("No segments found for camera %s in range", cam_id)
                 continue
             cams_with_segs.append(cam_id)
-            # Open session at the start of the available range for this camera
+            # Open session at the start of the available range for this camera,
+            # or at the moment asked for (an event), in the recording nearest it.
             first_seg_start = int(segs[0].get("start_ms", start_ms))
             open_ts = max(start_ms, first_seg_start)
+            if open_at is not None:
+                open_ts = _recorded_moment(row_segments, open_at) or open_ts
             open_start_by_cam[cam_id] = open_ts
             # Opened paused: each shows its first frame and waits for Play.
             open_calls.append(
@@ -552,6 +694,7 @@ class PlaybackView(QWidget):
         self._timeline.set_range(start_ms, end_ms)
         self._timeline.set_camera_rows(timeline_rows)
         self._ensure_timeline_visible()
+        self._load_motion_events(cam_ids, start_ms, end_ms)
 
         if not open_calls:
             logger.info("No recordings found in the selected range")
@@ -567,6 +710,124 @@ class PlaybackView(QWidget):
             self._on_sessions_opened(result, c, o)
 
         self._start_worker(open_calls, _on_open_done, primary=True)
+
+    def _add_bookmark(self) -> None:
+        """Bookmark the playhead's moment on one loaded camera (or all)."""
+        from neurowatch.dialogs.bookmark_dialog import BookmarkDialog
+
+        at_ms = self._active_playhead_ms
+        if at_ms is None or not self._sessions:
+            return
+        names = {cam.id: cam.name for cam in self._cameras}
+        cameras = [(cam_id, names.get(cam_id, cam_id)) for cam_id in self._sessions]
+        dialog = BookmarkDialog(
+            self._ipc_endpoint(), cameras, int(at_ms), self, allow_every_camera=True
+        )
+        dialog.saved.connect(lambda _event: self._reload_motion_events())
+        dialog.exec()
+        dialog.deleteLater()
+
+    def _reload_motion_events(self) -> None:
+        if self._event_scope is not None:
+            self._load_motion_events(*self._event_scope)
+
+    def _load_motion_events(self, camera_ids: list[str], start_ms: int, end_ms: int) -> None:
+        self._event_scope = (list(camera_ids), start_ms, end_ms)
+        self._events_only.setChecked(False)
+        self._events_only.setEnabled(False)
+        if self._motion_worker is not None:
+            self._motion_worker.requestInterruption()
+            retire(self._motion_worker)
+        self._motion_load_id += 1
+        load_id = self._motion_load_id
+        worker = _MotionEventsWorker(self._ipc_endpoint(), camera_ids, start_ms, end_ms)
+        self._motion_worker = worker
+        self._timeline.set_motion_status("Events: loading…")
+        self._events_pane.set_status("Loading events in this recording range…")
+
+        def done(result: object) -> None:
+            self._on_motion_loaded(result, load_id)
+
+        def finished() -> None:
+            if self._motion_worker is worker:
+                self._motion_worker = None
+            worker.deleteLater()
+
+        worker.done.connect(done)
+        worker.finished.connect(finished)
+        worker.start()
+
+    def _on_motion_loaded(self, result: object, load_id: int) -> None:
+        if load_id != self._motion_load_id:
+            return  # a response to an earlier selection must never paint this one
+        if isinstance(result, Exception):
+            logger.warning("Could not load motion history: %s", result)
+            self._timeline.set_motion_status("Motion history unavailable")
+            self._events_pane.set_status("Event history unavailable. Reload recordings to retry.")
+            self._events_only.setChecked(False)
+            self._events_only.setEnabled(False)
+            return
+        if isinstance(result, list):
+            events = [Event.from_dict(raw) for raw in result if isinstance(raw, dict)]
+            by_id = {event.id: event for event in events if event is not None}
+            # A snapshot taken before an end notice must not turn it back into
+            # an ongoing event, or lose an event received during the load.
+            by_id.update(self._motion_recent_updates)
+            self._timeline.set_motion_events(list(by_id.values()))
+            self._events_only.setEnabled(len(by_id) < 20_000)
+            self._events_pane.set_zone_names({c.id: zone_names(c.motion) for c in self._cameras})
+            self._events_pane.set_events(
+                list(by_id.values()),
+                {
+                    camera.id: camera.name
+                    for camera in self._cameras
+                    if camera.id in {row.get("camera_id") for row in self._timeline._segment_rows}
+                },
+            )
+            if len(by_id) >= 20_000:
+                self._events_pane.set_status(
+                    "Loaded 20,000 events. Narrow the recording range for more detail."
+                )
+
+    def add_notices(self, notices: list) -> None:
+        """Update activity shown on the loaded timeline as events end/change."""
+        for notice in notices:
+            raw = notice.get("event") if isinstance(notice, dict) else None
+            event = Event.from_dict(raw) if isinstance(raw, dict) else None
+            if event is not None and self._timeline.update_motion_event(event):
+                self._motion_recent_updates[event.id] = event
+                self._events_pane.update_event(event)
+
+    def _toggle_events(self, checked: bool) -> None:
+        self._events_pane.setVisible(checked)
+        if checked:
+            width = self._media_splitter.width()
+            side = min(360, max(280, width // 3))
+            self._media_splitter.setSizes([max(1, width - side), side])
+
+    def _toggle_event_review(self, checked: bool) -> None:
+        padding = {
+            camera.id: (
+                camera.recording.event_pre_sec
+                if camera.recording.event_pre_sec is not None
+                else 10,
+                camera.recording.event_post_sec
+                if camera.recording.event_post_sec is not None
+                else 15,
+            )
+            for camera in self._cameras
+        }
+        self._timeline.set_event_review(checked, padding=padding)
+
+    def _review_event(self, camera_id: str, at_ms: int) -> None:
+        if camera_id not in self._sessions:
+            self._events_pane.set_status(
+                "This camera has no recording session in the loaded range."
+            )
+            return
+        target = max(self._timeline._range_start_ms, min(at_ms, self._timeline._range_end_ms - 1))
+        self._timeline.set_playhead(target)
+        self._on_seek_all(target)
 
     def _on_sessions_opened(
         self, result: object, cam_ids: list[str], open_start_by_cam: dict[str, int]
@@ -626,6 +887,7 @@ class PlaybackView(QWidget):
                 self._timeline.set_playhead(min(loaded_playheads))
             # The sessions were opened paused, so nothing plays until Play.
             self._stop_btn.setEnabled(True)
+            self._bookmark_btn.setEnabled(bool(self._sessions))
             self._audio_timer.start()
             QTimer.singleShot(AUDIO_FIRST_CHECK_MS, self._poll_audio)
             return
@@ -846,6 +1108,16 @@ class PlaybackView(QWidget):
         return self._audio_session
 
     def _stop_all(self) -> None:
+        self._events_only.setChecked(False)
+        self._events_only.setEnabled(False)
+        self._timeline.set_event_review(False)
+        self._events_pane.stop()
+        self._motion_load_id += 1
+        self._motion_recent_updates.clear()
+        if self._motion_worker is not None:
+            worker, self._motion_worker = self._motion_worker, None
+            worker.requestInterruption()
+            retire(worker)
         self._timeline.stop_playback()
         self._audio_timer.stop()
         self._audio_session = None
@@ -886,28 +1158,42 @@ class PlaybackView(QWidget):
         self._show_placeholder("Select cameras and a time range, then click  ▶ Load Recordings")
 
         self._stop_btn.setEnabled(False)
+        self._bookmark_btn.setEnabled(False)
 
     def _ensure_timeline_visible(self) -> None:
         sizes = self._right_splitter.sizes()
         if len(sizes) != 2:
             return
         total = max(1, sizes[0] + sizes[1])
-        min_timeline = max(self._timeline.minimumHeight(), 96)
-        if sizes[1] >= min_timeline:
+        # Room for every camera's row when it fits, at most 45% of the height.
+        wanted = max(
+            self._timeline_card.minimumSizeHint().height(),
+            min(self._timeline_card.sizeHint().height(), int(total * 0.45)),
+            96,
+        )
+        if sizes[1] >= wanted:
             return
-        bottom = min(total - 80, min_timeline)
+        bottom = min(total - 80, wanted)
         top = max(80, total - bottom)
         self._right_splitter.setSizes([top, total - top])
 
     def _target_playback_fps(self, camera_count: int) -> float:
-        """Adaptive playback preview FPS to keep CPU in check for multi-camera loads."""
-        if camera_count <= 1:
-            return 18.0
-        if camera_count <= 4:
-            return 12.0
-        if camera_count <= 9:
-            return 8.0
-        return 6.0
+        """The most frames per second each camera shows: the live wall's
+        limits (``ui.preview_fps``), one camera as in single view."""
+        return self._preview_fps.visible(camera_count, single_view=camera_count <= 1)
+
+    def set_preview_fps(self, limits: PreviewFps) -> None:
+        """Use new frame-rate limits, retuning the open cameras' readers."""
+        if limits == self._preview_fps:
+            return
+        self._preview_fps = limits
+        target = self._target_playback_fps(len(self._readers))
+        for reader in self._readers.values():
+            reader.set_max_emit_fps(target)
+
+    def pause(self) -> None:
+        """Pause what plays (leaving the Playback tab); the position stays."""
+        self._timeline.pause()
 
     # ------------------------------------------------------------------
     # Cleanup

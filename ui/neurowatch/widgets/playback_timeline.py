@@ -3,6 +3,7 @@
 Shows:
   - Horizontal ruler with adaptive time labels
   - Green segment blocks for recorded coverage
+  - Orange motion/analytics marks per camera with timing details on hover
   - Red playhead line at the current position
   - Mouse-wheel zoom (preserves cursor position), any length of range
   - Sideways scroll (or Shift+wheel) and a scrollbar to pan when zoomed
@@ -14,46 +15,65 @@ Controls row below the timeline:
 
 from __future__ import annotations
 
+import bisect
 import datetime
 import logging
+import math
+import time
 
-from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
+    QFont,
+    QFontMetrics,
+    QHelpEvent,
     QMouseEvent,
     QPainter,
     QPaintEvent,
+    QPen,
     QResizeEvent,
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QPushButton,
     QScrollBar,
     QSizePolicy,
+    QToolTip,
     QWidget,
 )
 
-from neurowatch.theme import mono_font, ui_font
+from neurowatch.models.event_review import EventReviewPlan, event_review_plan
+from neurowatch.models.events import (
+    EVENT_COLORS,
+    EVENT_PRIORITY,
+    PLAYBACK_KINDS,
+    Event,
+    duration_text,
+    full_time_text,
+)
+from neurowatch.theme import COLORS, mono_font, playback_transport_stylesheet, ui_font
 
 logger = logging.getLogger(__name__)
 
-_BG = QColor(14, 14, 24)
-_DISABLED_BTN = (
-    "QPushButton:disabled { background: #16162a; color: #50506a; border-color: #26263e; }"
-)
-_RULER_BG = QColor(20, 20, 34)
-_RULER_TEXT = QColor(160, 160, 190)
+_BG = QColor(COLORS.surface_sunken)
+_RULER_BG = QColor(COLORS.surface)
+_RULER_TEXT = QColor(COLORS.text_muted)
 _SEGMENT_FILL = QColor(46, 228, 112, 190)
 _SEGMENT_BORDER = QColor(16, 140, 72, 230)
 _PLAYHEAD = QColor(239, 68, 68)  # red
-_GRID_LINE = QColor(30, 30, 50)
-_ROW_LABEL_BG = QColor(18, 18, 30)
-_ROW_LABEL_TEXT = QColor(150, 150, 180)
+_GRID_LINE = QColor(COLORS.border)
+_ROW_LABEL_BG = QColor(COLORS.surface_sunken)
+_ROW_LABEL_TEXT = QColor(COLORS.text_muted)
+_MOTION_FILL = QColor(249, 115, 22)
+_EVENT_FILLS = {kind: QColor(color) for kind, color in EVENT_COLORS.items()}
 
 _RULER_H = 22  # pixels for time ruler
+_DATE_BAND_H = 22
 _SCROLLBAR_H = 12
 # Ruler spacings, from close up to several days on screen.
 _RULER_STEPS_MS = (
@@ -74,6 +94,8 @@ _RULER_STEPS_MS = (
     86_400_000,
 )
 _MIN_TICK_SPACING_PX = 80
+_DAY_MS = 86_400_000
+_DAY_STEPS = (2, 3, 7, 14, 30, 60, 90, 180, 365)
 _SPEEDS = ((0.25, "×¼"), (0.5, "×½"), (1.0, "×1"), (2.0, "×2"), (4.0, "×4"))
 
 
@@ -90,11 +112,16 @@ def ruler_ticks(view_start_ms: int, view_end_ms: int, track_w: int) -> tuple[int
     """Ruler spacing and mark times for a view: on local clock boundaries
     (whole hours, local midnight), as close as about 80 px between labels allows."""
     duration = max(1, view_end_ms - view_start_ms)
-    max_ticks = max(2, int(track_w // _MIN_TICK_SPACING_PX))
-    step = next((s for s in _RULER_STEPS_MS if duration / s <= max_ticks), _RULER_STEPS_MS[-1])
+    max_ticks = max(1, int(track_w // _MIN_TICK_SPACING_PX))
+    step = next((s for s in _RULER_STEPS_MS if duration / s <= max_ticks), None)
+    if step is None:
+        days = math.ceil(duration / max_ticks / _DAY_MS)
+        step = next((d for d in _DAY_STEPS if d >= days), days) * _DAY_MS
     offset = _local_offset_ms(view_start_ms)
     first = -(-(view_start_ms + offset) // step) * step - offset
     ticks = list(range(first, view_end_ms + 1, step))
+    if not ticks:
+        ticks = [view_start_ms]
     return step, ticks
 
 
@@ -106,6 +133,10 @@ def tick_label(at_ms: int, step_ms: int) -> str:
         return _ms_to_hms(at_ms)
     if step_ms < 60_000:
         return local.strftime("%H:%M:%S")
+    if step_ms >= 180 * _DAY_MS:
+        return local.strftime("%b %Y")
+    if step_ms >= _DAY_MS:
+        return local.strftime("%b %d")
     if local.hour == 0 and local.minute == 0:
         return local.strftime("%b %d")
     return local.strftime("%H:%M")
@@ -136,38 +167,47 @@ class PlaybackTimeline(QWidget):
         self._playhead_ms: int = 0
         # [{label: str, segments: [{start_ms, end_ms}]}]
         self._segment_rows: list[dict] = []
+        self._motion_events: dict[str, list[Event]] = {}
         self._is_playing: bool = False
+        self._event_review = False
+        self._event_plan_dirty = True
+        self._event_padding: dict[str, tuple[int, int]] = {}
+        self._event_plan = EventReviewPlan(())
         self._speed: float = 1.0
         self._dragging: bool = False
         self._preferred_height: int = 150
 
         self.setMinimumHeight(80)
+        self._requested_minimum_height = 80
+        self._last_controls_minimum = 80
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.setMouseTracking(True)
 
         # Build controls row
         ctrl = QWidget(self)
-        ctrl_layout = QHBoxLayout(ctrl)
-        ctrl_layout.setContentsMargins(4, 2, 4, 2)
+        ctrl.setObjectName("playbackTransport")
+        ctrl.setStyleSheet(playback_transport_stylesheet())
+        self._ctrl_layout = QGridLayout(ctrl)
+        self._ctrl_layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+        self._ctrl_layout.setContentsMargins(8, 6, 8, 6)
+        self._ctrl_layout.setHorizontalSpacing(8)
+        self._ctrl_layout.setVerticalSpacing(6)
+        self._ctrl_layout.setColumnStretch(1, 1)
+        self._buttons = QWidget(ctrl)
+        ctrl_layout = QHBoxLayout(self._buttons)
+        ctrl_layout.setContentsMargins(0, 0, 0, 0)
         ctrl_layout.setSpacing(4)
-
-        button_style = (
-            "QPushButton { background: #1e1e38; color: #a0a0c0; border: 1px solid #3a3a5a;"
-            " border-radius: 3px; font-size: 11px; }"
-            "QPushButton:hover { background: #2a2a50; }"
-            "QPushButton:pressed { background: #3a3a70; }"
-            "QPushButton:checked { background: #34346a; color: #ffffff; border-color: #7070b0; }"
-            + _DISABLED_BTN
-        )
+        self._details = QWidget(ctrl)
+        details_layout = QHBoxLayout(self._details)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(8)
+        self._ctrl_layout.addWidget(self._buttons, 0, 0)
+        self._ctrl_layout.addWidget(self._details, 0, 1)
+        self._controls_wrapped = False
 
         self._play_btn = QPushButton("▶ Play")
-        self._play_btn.setFixedSize(64, 22)
-        self._play_btn.setStyleSheet(
-            "QPushButton { background: #1a3a1a; color: #6ee86e; border: 1px solid #3a6a3a;"
-            " border-radius: 3px; font-size: 11px; }"
-            "QPushButton:hover { background: #2a4a2a; }"
-            "QPushButton:pressed { background: #3a5a3a; }" + _DISABLED_BTN
-        )
+        self._play_btn.setObjectName("playbackPlay")
+        self._play_btn.setFixedSize(72, 30)
         self._play_btn.clicked.connect(self._on_play_pause)
         ctrl_layout.addWidget(self._play_btn)
 
@@ -178,8 +218,7 @@ class PlaybackTimeline(QWidget):
         for rate, label in _SPEEDS:
             btn = QPushButton(label)
             btn.setCheckable(True)
-            btn.setFixedSize(40, 22)
-            btn.setStyleSheet(button_style)
+            btn.setFixedSize(36, 30)
             btn.setToolTip("Normal speed" if rate == 1.0 else f"Play at {label}")
             btn.setAccessibleName("Normal speed" if rate == 1.0 else f"Speed {label}")
             btn.clicked.connect(lambda _checked=False, r=rate: self._on_speed(r))
@@ -189,17 +228,21 @@ class PlaybackTimeline(QWidget):
         self._speed_buttons[1.0].setChecked(True)
 
         self._fit_btn = QPushButton("⤢ Fit")
-        self._fit_btn.setFixedSize(52, 22)
-        self._fit_btn.setStyleSheet(button_style)
+        self._fit_btn.setFixedSize(52, 30)
         self._fit_btn.setToolTip("Show the whole loaded range (scroll on the timeline to zoom)")
         self._fit_btn.clicked.connect(self.fit_view)
         ctrl_layout.addWidget(self._fit_btn)
-        ctrl_layout.addStretch()
+        self._motion_legend = QLabel("■ Motion")
+        self._motion_legend.setObjectName("playbackMotionLegend")
+        self._motion_legend.setToolTip("Orange marks show motion, intrusion and line crossing")
+        self._motion_legend.hide()
+        details_layout.addWidget(self._motion_legend)
+        details_layout.addStretch()
 
         self._time_label = QLabel("--:--:--")
-        self._time_label.setStyleSheet("color: #a0a0c0; font-size: 11px;")
+        self._time_label.setObjectName("playbackClock")
         self._time_label.setFont(mono_font(8))
-        ctrl_layout.addWidget(self._time_label)
+        details_layout.addWidget(self._time_label)
 
         # Ticker that advances the playhead while playing
         self._ticker = QTimer(self)
@@ -229,6 +272,7 @@ class PlaybackTimeline(QWidget):
         """Set the total loadable time range."""
         self._range_start_ms = start_ms
         self._range_end_ms = max(end_ms, start_ms + 1000)
+        self._event_plan_dirty = True
         self._view_start_ms = start_ms
         self._view_end_ms = self._range_end_ms
         self._playhead_ms = start_ms
@@ -275,11 +319,121 @@ class PlaybackTimeline(QWidget):
                     continue
                 parsed.append({"start_ms": s, "end_ms": e})
             merged = self._merge_segments(parsed)
-            normalized_rows.append({"label": label, "segments": merged})
+            normalized_rows.append(
+                {"camera_id": row.get("camera_id"), "label": label, "segments": merged}
+            )
         self._segment_rows = normalized_rows
+        self._motion_events.clear()
+        self._event_plan_dirty = True
+        self._motion_legend.hide()
         self._set_controls_enabled(bool(normalized_rows))
         self._update_height()
         self.update()
+
+    def set_motion_events(self, events: list[Event]) -> None:
+        """Overlay stored activity without changing coverage or the playhead."""
+        self._motion_events.clear()
+        self._event_plan_dirty = True
+        camera_ids = {row.get("camera_id") for row in self._segment_rows}
+        for event in events:
+            if event.kind in PLAYBACK_KINDS and event.camera_id in camera_ids and event.camera_id:
+                self._motion_events.setdefault(event.camera_id, []).append(event)
+        for camera_events in self._motion_events.values():
+            camera_events.sort(key=lambda event: EVENT_PRIORITY.get(event.kind, 0))
+        self._motion_legend.setText("■ Events")
+        self._motion_legend.setToolTip(
+            "Orange: motion/analytics · Purple: tamper · Cyan: alarm input · "
+            "Red: camera/recording problems · Blue: bookmarks · Grey: other camera events"
+        )
+        self._motion_legend.setVisible(bool(self._segment_rows))
+        self._layout_controls()
+        self.update()
+
+    def set_motion_status(self, message: str) -> None:
+        """Explain when motion history is loading or could not be read."""
+        self._motion_legend.setText(message)
+        self._motion_legend.setToolTip(message)
+        self._motion_legend.setVisible(bool(self._segment_rows))
+        self._layout_controls()
+        self.update()
+
+    def update_motion_event(self, event: Event) -> bool:
+        """Keep an overlapping event's end/current state up to date from the feed."""
+        if (
+            event.kind not in PLAYBACK_KINDS
+            or not event.camera_id
+            or event.camera_id not in {row.get("camera_id") for row in self._segment_rows}
+            or event.start_ms > self._range_end_ms
+            or (event.end_ms is not None and event.end_ms < self._range_start_ms)
+        ):
+            return False
+        events = self._motion_events.setdefault(event.camera_id, [])
+        for i, previous in enumerate(events):
+            if previous.id == event.id:
+                events[i] = event
+                if (previous.kind, previous.start_ms, previous.end_ms) != (
+                    event.kind,
+                    event.start_ms,
+                    event.end_ms,
+                ):
+                    self._event_plan_dirty = True
+                if previous.kind != event.kind:
+                    events.sort(key=lambda event: EVENT_PRIORITY.get(event.kind, 0))
+                break
+        else:
+            bisect.insort_right(events, event, key=lambda event: EVENT_PRIORITY.get(event.kind, 0))
+            self._event_plan_dirty = True
+        self.update()
+        return True
+
+    def _review_plan(self) -> EventReviewPlan:
+        if self._event_plan_dirty:
+            self._event_plan = event_review_plan(
+                (event for events in self._motion_events.values() for event in events),
+                {
+                    str(row["camera_id"]): [
+                        (int(s["start_ms"]), int(s["end_ms"])) for s in row["segments"]
+                    ]
+                    for row in self._segment_rows
+                    if row.get("camera_id")
+                },
+                now_ms=int(time.time() * 1000),
+                bounds=(self._range_start_ms, self._range_end_ms),
+                padding=self._event_padding,
+            )
+            self._event_plan_dirty = False
+        return self._event_plan
+
+    def set_event_review(
+        self, enabled: bool, *, padding: dict[str, tuple[int, int]] | None = None
+    ) -> None:
+        """Skip quiet footage through existing seek/pause signals; default is off."""
+        self._event_review = enabled
+        if padding is not None:
+            self._event_padding = dict(padding)
+            self._event_plan_dirty = True
+        if enabled:
+            plan = self._review_plan()
+            if not plan.intervals:
+                self.set_motion_status("No recorded event footage in this range")
+            if self._is_playing:
+                self._advance_event_review(self._playhead_ms)
+        else:
+            self.set_motion_status("■ Events")
+
+    def _advance_event_review(self, at_ms: int) -> bool:
+        plan = self._review_plan()
+        target = plan.next_at(at_ms)
+        if target is None:
+            if plan.intervals:
+                self.set_playhead(plan.intervals[-1][1])
+            self._stop_at_end()
+            return True
+        if target != at_ms:
+            self.set_playhead(target)
+            self.seek_requested.emit(target)
+            return True
+        return False
 
     def set_playhead(self, ts_ms: int) -> None:
         """Move the playhead without emitting seek_requested (external update)."""
@@ -295,15 +449,61 @@ class PlaybackTimeline(QWidget):
         for button in self._ctrl.findChildren(QPushButton):
             button.setEnabled(enabled)
 
+    def pause(self) -> None:
+        """Pause, as the Pause button does, if playing."""
+        if self._is_playing:
+            self.stop_playback()
+            self.play_pause_toggled.emit(False)
+
     def stop_playback(self) -> None:
         """Stop the ticker and update button state."""
         self._is_playing = False
         self._ticker.stop()
         self._play_btn.setText("▶ Play")
 
+    def ruler_height(self) -> int:
+        """Keep a visible day header above hourly marks on a multi-day selection."""
+        _, _, width = self._track_bounds()
+        step, _ = ruler_ticks(self._view_start_ms, self._view_end_ms, width)
+        return _RULER_H + (_DATE_BAND_H if step < _DAY_MS and self._spans_days() else 0)
+
     # ------------------------------------------------------------------
     # Qt events
     # ------------------------------------------------------------------
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.ToolTip and isinstance(event, QHelpEvent):
+            found = self._motion_at(event.pos())
+            if found is not None:
+                row, motion = found
+                end = full_time_text(motion.end_ms) if motion.end_ms is not None else "ongoing"
+                text = f"{row['label']} · {motion.label}\n{full_time_text(motion.start_ms)} – {end}"
+                duration = duration_text(motion)
+                if duration:
+                    text += f"\nDuration: {duration}"
+                if motion.detail:
+                    text += f"\n{motion.detail}"
+                QToolTip.showText(event.globalPos(), text, self)
+            else:
+                left, right, _ = self._track_bounds()
+                track_h = self.height() - self._ctrl.height() - _SCROLLBAR_H - 2
+                at = self._x_to_ms(event.pos().x())
+                if (
+                    left <= event.pos().x() <= right
+                    and 0 <= event.pos().y() < track_h
+                    and at is not None
+                ):
+                    try:
+                        local = datetime.datetime.fromtimestamp(at / 1000)
+                        text = local.strftime("%a, %d %b %Y\n%H:%M:%S")
+                    except (ValueError, OverflowError, OSError):
+                        text = _ms_to_hms(at)
+                    QToolTip.showText(event.globalPos(), text, self)
+                else:
+                    QToolTip.hideText()
+            event.accept()
+            return True
+        return super().event(event)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         self._layout_controls()
@@ -319,13 +519,28 @@ class PlaybackTimeline(QWidget):
 
         # Background
         painter.fillRect(0, 0, w, track_h, _BG)
+        if not self._segment_rows:
+            # Nothing loaded: no ruler of a range nobody chose.
+            painter.setPen(_RULER_TEXT)
+            painter.setFont(ui_font(9))
+            painter.drawText(
+                0,
+                0,
+                w,
+                track_h,
+                Qt.AlignmentFlag.AlignCenter,
+                "Load recordings to see their timeline",
+            )
+            painter.end()
+            return
 
         # Ruler strip
-        painter.fillRect(0, 0, w, _RULER_H, _RULER_BG)
+        painter.fillRect(0, 0, w, self.ruler_height(), _RULER_BG)
         self._draw_ruler(painter, w)
 
         # Segment blocks
         self._draw_segments(painter, w, track_h)
+        self._draw_day_boundaries(painter, track_h)
 
         # Playhead
         self._draw_playhead(painter, w, track_h)
@@ -396,6 +611,7 @@ class PlaybackTimeline(QWidget):
         finally:
             self._syncing_scrollbar = False
         self._scrollbar.setVisible(zoomed)
+        self._layout_controls()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -437,19 +653,118 @@ class PlaybackTimeline(QWidget):
     def _draw_ruler(self, painter: QPainter, w: int) -> None:
         view_dur = max(1, self._view_end_ms - self._view_start_ms)
         track_left, _, track_w = self._track_bounds(w)
-        step, ticks = ruler_ticks(self._view_start_ms, self._view_end_ms, track_w)
+        _, ticks = ruler_ticks(self._view_start_ms, self._view_end_ms, track_w)
 
         painter.setFont(mono_font(8))
         painter.setPen(_RULER_TEXT)
+        painter.save()
+        ruler_h = self.ruler_height()
+        painter.setClipRect(QRect(track_left, 0, track_w + 1, ruler_h))
+        if ruler_h > _RULER_H:
+            painter.fillRect(track_left, 0, track_w, _DATE_BAND_H, QColor(COLORS.surface_raised))
+            painter.setFont(ui_font(8, QFont.Weight.DemiBold))
+            for _start, _end, box, text in self._day_bands(w):
+                painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+            painter.setFont(mono_font(8))
 
         for tick in ticks:
             x = int(track_left + (tick - self._view_start_ms) / view_dur * track_w)
-            painter.drawLine(x, _RULER_H - 6, x, _RULER_H)
+            painter.drawLine(x, ruler_h - 6, x, ruler_h)
+        for _, rect, text in self._ruler_labels(w):
             painter.drawText(
-                QRect(x + 2, 2, _MIN_TICK_SPACING_PX - 4, _RULER_H - 2),
+                rect,
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                tick_label(tick, step),
+                text,
             )
+        painter.restore()
+
+    def _ruler_labels(self, width: int | None = None) -> list[tuple[int, QRect, str]]:
+        """Only draw measured labels that fit without colliding or crossing the gutter."""
+        left, right, track_w = self._track_bounds(width)
+        duration = max(1, self._view_end_ms - self._view_start_ms)
+        step, ticks = ruler_ticks(self._view_start_ms, self._view_end_ms, track_w)
+        metrics = QFontMetrics(mono_font(8))
+        labels: list[tuple[int, QRect, str]] = []
+        previous_right = left - 8
+        ruler_h = self.ruler_height()
+        bands = self._day_bands(width) if ruler_h > _RULER_H else []
+        for tick in ticks:
+            if ruler_h > _RULER_H:
+                try:
+                    text = datetime.datetime.fromtimestamp(tick / 1000).strftime(
+                        "%H:%M:%S" if step < 60_000 else "%H:%M"
+                    )
+                except (ValueError, OverflowError, OSError):
+                    text = _ms_to_hms(tick)
+            else:
+                text = tick_label(tick, step)
+            label_w = metrics.horizontalAdvance(text) + 4
+            if label_w > track_w:
+                continue
+            x = int(left + (tick - self._view_start_ms) / duration * track_w)
+            if bands:
+                day_end = next(
+                    (end for start, end, _box, _name in bands if start <= tick < end), tick
+                )
+                limit = min(right, int(left + (day_end - self._view_start_ms) / duration * track_w))
+                label_x = max(left, x + 2)
+                if label_x + label_w > limit:
+                    continue  # never move a midnight label back under the previous day's header
+            else:
+                label_x = max(left, min(x + 2, right - label_w))
+            if label_x < previous_right + 8:
+                continue
+            rect = QRect(label_x, ruler_h - _RULER_H + 2, label_w, _RULER_H - 2)
+            labels.append((tick, rect, text))
+            previous_right = rect.right()
+        return labels
+
+    def _day_bands(self, width: int | None = None) -> list[tuple[int, int, QRect, str]]:
+        """Visible local calendar days, with labels contained in their own span."""
+        if self.ruler_height() == _RULER_H:
+            return []
+        try:
+            day = datetime.datetime.fromtimestamp(self._view_start_ms / 1000).date()
+            start_year = datetime.datetime.fromtimestamp(self._range_start_ms / 1000).year
+            end_year = datetime.datetime.fromtimestamp(self._range_end_ms / 1000).year
+        except (ValueError, OverflowError, OSError):
+            return []
+        left, right, track_w = self._track_bounds(width)
+        duration = max(1, self._view_end_ms - self._view_start_ms)
+        metrics = QFontMetrics(ui_font(8, QFont.Weight.DemiBold))
+        bands: list[tuple[int, int, QRect, str]] = []
+        while True:
+            try:
+                following = day + datetime.timedelta(days=1)
+                start = int(datetime.datetime.combine(day, datetime.time()).timestamp() * 1000)
+                end = int(datetime.datetime.combine(following, datetime.time()).timestamp() * 1000)
+            except (ValueError, OverflowError, OSError):
+                break
+            if start >= self._view_end_ms:
+                break
+            x = max(left, int(left + (start - self._view_start_ms) / duration * track_w))
+            ex = min(right, int(left + (end - self._view_start_ms) / duration * track_w))
+            box = QRect(x + 3, 0, max(0, ex - x - 6), _DATE_BAND_H)
+            year = " %Y" if start_year != end_year else ""
+            text = day.strftime("%a, %b %d" + year)
+            if metrics.horizontalAdvance(text) > box.width():
+                text = day.strftime("%b %d" + year)
+            if metrics.horizontalAdvance(text) > box.width():
+                text = ""  # a tiny partial day has no room for an unambiguous label
+            bands.append((start, end, box, text))
+            day = following
+        return bands
+
+    def _draw_day_boundaries(self, painter: QPainter, track_h: int) -> None:
+        painter.save()
+        painter.setPen(QPen(QColor(100, 116, 139, 130), 1, Qt.PenStyle.DashLine))
+        left, _, track_w = self._track_bounds()
+        duration = max(1, self._view_end_ms - self._view_start_ms)
+        for start, _end, _box, _text in self._day_bands():
+            if self._view_start_ms < start < self._view_end_ms:
+                x = int(left + (start - self._view_start_ms) / duration * track_w)
+                painter.drawLine(x, 0, x, track_h)
+        painter.restore()
 
     def _draw_segments(self, painter: QPainter, w: int, track_h: int) -> None:
         if not self._segment_rows:
@@ -457,27 +772,19 @@ class PlaybackTimeline(QWidget):
 
         view_dur = max(1, self._view_end_ms - self._view_start_ms)
         track_left, _, track_w = self._track_bounds(w)
-        rows = self._segment_rows
-        row_count = max(1, len(rows))
-        usable_h = max(1, track_h - _RULER_H - 8)
-        row_gap = _ROW_GAP
-        if row_count > 1:
-            max_gap_total = max(0, usable_h - row_count)
-            row_gap = min(row_gap, max_gap_total // (row_count - 1))
-        row_h = max(1, int((usable_h - (row_count - 1) * row_gap) / row_count))
-        row_y = _RULER_H + 4
+        ruler_h = self.ruler_height()
 
         # Label gutter background + separator.
         if track_left > _MARGIN:
             painter.fillRect(
-                QRect(_MARGIN, _RULER_H, track_left - _MARGIN - 2, track_h - _RULER_H),
+                QRect(_MARGIN, ruler_h, track_left - _MARGIN - 2, track_h - ruler_h),
                 _ROW_LABEL_BG,
             )
             painter.setPen(_GRID_LINE)
-            painter.drawLine(track_left - 2, _RULER_H, track_left - 2, track_h)
+            painter.drawLine(track_left - 2, ruler_h, track_left - 2, track_h)
 
         painter.setFont(ui_font(8))
-        for row in rows:
+        for row, row_y, row_h in self._row_geometry(track_h):
             label = str(row.get("label", "Camera"))
             segments = row.get("segments") or []
             if track_left > _MARGIN:
@@ -506,9 +813,50 @@ class PlaybackTimeline(QWidget):
                 if rw > 2 and seg_h > 2:
                     painter.drawRect(QRect(sx, seg_y, rw - 1, seg_h - 1))
 
+            for event in self._motion_events.get(str(row.get("camera_id") or ""), []):
+                marker = self._motion_rect(event, row_y, row_h)
+                if not marker.isNull():
+                    painter.fillRect(marker, _EVENT_FILLS.get(event.kind, _MOTION_FILL))
+
             painter.setPen(_GRID_LINE)
             painter.drawLine(track_left, row_y + row_h + 1, w - _MARGIN, row_y + row_h + 1)
-            row_y += row_h + row_gap
+
+    def _row_geometry(self, track_h: int) -> list[tuple[dict, int, int]]:
+        count = max(1, len(self._segment_rows))
+        ruler_h = self.ruler_height()
+        usable = max(1, track_h - ruler_h - 8)
+        gap = min(_ROW_GAP, max(0, usable - count) // (count - 1)) if count > 1 else 0
+        height = max(1, (usable - (count - 1) * gap) // count)
+        return [
+            (row, ruler_h + 4 + i * (height + gap), height)
+            for i, row in enumerate(self._segment_rows)
+        ]
+
+    def _motion_rect(self, event: Event, row_y: int, row_h: int) -> QRect:
+        end = event.end_ms
+        if end is None:
+            end = min(int(datetime.datetime.now().timestamp() * 1000), self._range_end_ms)
+        # Instant events remain visible at a minimum width even in long ranges.
+        if event.start_ms > self._view_end_ms or end < self._view_start_ms:
+            return QRect()
+        start = max(event.start_ms, self._view_start_ms)
+        end = min(max(start, end), self._view_end_ms)
+        left, right, width = self._track_bounds()
+        duration = max(1, self._view_end_ms - self._view_start_ms)
+        x = min(right - 3, int(left + (start - self._view_start_ms) / duration * width))
+        end_x = int(left + (end - self._view_start_ms) / duration * width)
+        height = min(6, row_h)
+        return QRect(x, row_y + row_h - height, min(right - x, max(3, end_x - x)), height)
+
+    def _motion_at(self, point: QPoint) -> tuple[dict, Event] | None:
+        track_h = self.height() - self._ctrl.height() - _SCROLLBAR_H - 2
+        for row, y, height in self._row_geometry(track_h):
+            if not y <= point.y() < y + height:
+                continue
+            for event in reversed(self._motion_events.get(str(row.get("camera_id") or ""), [])):
+                if self._motion_rect(event, y, height).contains(point):
+                    return row, event
+        return None
 
     def _draw_playhead(self, painter: QPainter, w: int, track_h: int) -> None:
         if self._range_end_ms <= self._range_start_ms:
@@ -555,6 +903,11 @@ class PlaybackTimeline(QWidget):
             self._on_play_pause()
 
     def _on_play_pause(self) -> None:
+        if not self._is_playing and self._event_review:
+            if self._review_plan().next_at(self._playhead_ms) is None:
+                self._stop_at_end()
+                return
+            self._advance_event_review(self._playhead_ms)
         self._is_playing = not self._is_playing
         if self._is_playing:
             self._play_btn.setText("⏸ Pause")
@@ -580,6 +933,8 @@ class PlaybackTimeline(QWidget):
             return
         step_ms = int(250 * self._speed)
         new_ts = self._playhead_ms + step_ms
+        if self._event_review and self._advance_event_review(new_ts):
+            return
 
         if new_ts >= self._range_end_ms:
             new_ts = self._range_end_ms
@@ -663,6 +1018,7 @@ class PlaybackTimeline(QWidget):
             except (OverflowError, OSError, ValueError):
                 pass
         self._time_label.setText(text)
+        self._layout_controls()
 
     def _spans_days(self) -> bool:
         try:
@@ -673,22 +1029,42 @@ class PlaybackTimeline(QWidget):
         return first != last
 
     def _layout_controls(self) -> None:
+        self._ctrl.ensurePolished()
+        margins = self._ctrl_layout.contentsMargins()
+        needed = self._buttons.minimumSizeHint().width() + self._details.minimumSizeHint().width()
+        needed += margins.left() + margins.right() + self._ctrl_layout.horizontalSpacing()
+        wrapped = needed > self.width()
+        if wrapped != self._controls_wrapped:
+            self._controls_wrapped = wrapped
+            self._ctrl_layout.removeWidget(self._details)
+            if wrapped:
+                self._ctrl_layout.addWidget(self._details, 1, 0, 1, 2)
+            else:
+                self._ctrl_layout.addWidget(self._details, 0, 1)
         ctrl_h = self._ctrl.sizeHint().height()
         self._ctrl.setGeometry(0, self.height() - ctrl_h, self.width(), ctrl_h)
         left, _, track_w = self._track_bounds()
         self._scrollbar.setGeometry(
             left, self.height() - ctrl_h - _SCROLLBAR_H - 1, track_w, _SCROLLBAR_H
         )
-        base_min = _RULER_H + 20 + _SCROLLBAR_H + ctrl_h
-        if self.minimumHeight() < base_min:
-            self.setMinimumHeight(base_min)
+        ruler_h = self.ruler_height()
+        base_min = ruler_h + 20 + _SCROLLBAR_H + ctrl_h
+        if self.minimumHeight() != self._last_controls_minimum:
+            # Export's trim timeline sets its own 140 px floor. Preserve that
+            # while allowing our automatic toolbar minimum to shrink again.
+            self._requested_minimum_height = self.minimumHeight()
+        minimum = max(self._requested_minimum_height, base_min)
+        self._last_controls_minimum = minimum
+        if self.minimumHeight() != minimum:
+            self.setMinimumHeight(minimum)
+        row_count = max(1, len(self._segment_rows))
+        track_h = ruler_h + 8 + row_count * _ROW_H + max(0, row_count - 1) * _ROW_GAP + 8
+        preferred = track_h + _SCROLLBAR_H + 2 + ctrl_h
+        if preferred != self._preferred_height:
+            self._preferred_height = preferred
+            self.updateGeometry()
 
     def _update_height(self) -> None:
-        ctrl_h = self._ctrl.sizeHint().height()
-        row_count = max(1, len(self._segment_rows))
-        track_h = _RULER_H + 8 + row_count * _ROW_H + max(0, row_count - 1) * _ROW_GAP + 8
-        self._preferred_height = track_h + _SCROLLBAR_H + 2 + ctrl_h
-        self.updateGeometry()
         self._layout_controls()
 
     def _track_bounds(self, width: int | None = None) -> tuple[int, int, int]:

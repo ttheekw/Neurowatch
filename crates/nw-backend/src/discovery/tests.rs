@@ -246,6 +246,11 @@ async fn a_search_finds_the_camera_then_its_streams_with_its_own_password() {
             source: Some("Profile_101".into())
         })
     );
+    // Where it answered ONVIF, for its events and PTZ later.
+    assert!(camera
+        .onvif
+        .as_ref()
+        .is_some_and(|onvif| onvif.device_url.starts_with("http://127.0.0.1")));
 
     // Once added, the next look at the same search says so.
     let cameras = vec![camera];
@@ -325,4 +330,24 @@ async fn a_search_can_be_cancelled_and_expired_ids_are_refused() {
             .is_err(),
         "bounded"
     );
+}
+
+#[tokio::test]
+async fn a_refusal_with_the_right_password_is_not_reported_as_a_wrong_password() {
+    let device = fake_device(true).await;
+    let url = format!("http://127.0.0.1:{}/onvif/device_service", device.http_port);
+    let client = SoapClient::new().expect("client");
+    // The bare attempt is "not authorized"; the signed one reaches the
+    // service, which does not know the action: that is the answer.
+    let unknown = client
+        .call(&url, "<tds:SomethingUnknown/>", creds("secret").as_ref())
+        .await;
+    assert!(
+        matches!(unknown, Err(OnvifError::Invalid(_))),
+        "{unknown:?}"
+    );
+    let wrong = client
+        .call(&url, "<tds:SomethingUnknown/>", creds("nope").as_ref())
+        .await;
+    assert_eq!(wrong, Err(OnvifError::Unauthorized));
 }

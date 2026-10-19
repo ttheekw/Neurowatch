@@ -179,12 +179,16 @@ def test_check_login_signs_in_without_adding(qtbot, dialog, backend) -> None:
 def test_the_main_window_takes_the_cameras_the_dialog_added(monkeypatch) -> None:
     from types import SimpleNamespace
 
+    from PySide6.QtCore import QObject, Signal
+
     import neurowatch.main as main_mod
 
-    class Dialog:
+    class Dialog(QObject):
         DialogCode = camera_dialog.AddEditCameraDialog.DialogCode
+        finished = Signal(int)  # the window deletes its dialogs after use
 
         def __init__(self, **kwargs) -> None:
+            super().__init__()
             assert kwargs["existing_names"] == ["Gate"]
 
         def exec(self):

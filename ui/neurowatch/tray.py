@@ -26,13 +26,15 @@ from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
-from neurowatch import extensions
+from neurowatch.cloud.tray import tray_status as cloud_tray_status
+from neurowatch.ipc.alert_feed import AlertFeedWorker
 from neurowatch.models.camera import connection_status
 from neurowatch.service import probe
 from neurowatch.service.lock import InstanceLock
 from neurowatch.service.manager import ServiceController
 from neurowatch.service.paths import IS_WINDOWS, lock_path, log_path, service_endpoint, ui_command
 from neurowatch.theme import app_icon, apply_app_theme, icon_path, menu_stylesheet
+from neurowatch.utils.threads import Worker
 from neurowatch.widgets.centered_prompt import CenteredPrompt
 
 logger = logging.getLogger(__name__)
@@ -86,7 +88,7 @@ class ServiceStatus:
     cameras: int = 0
     online: int = 0
     recording: int = 0
-    # Extension details (see ``neurowatch.extensions``), e.g. "Name: state".
+    # Further details, e.g. "Cloud: connected".
     details: tuple[str, ...] = ()
     decoder: str = ""
     version: str = ""
@@ -206,13 +208,9 @@ def read_status(
     decoder = acceleration.get("label", "") if isinstance(acceleration, Mapping) else ""
     cameras = int(system.get("cameras") or len(states))
     online = sum(1 for state in states.values() if connection_status(str(state)) == "streaming")
-    details: list[str] = []
-    extra_problems: list[Problem] = []
-    for extra in extensions.call_each("tray_status", request, target):
-        if isinstance(extra, extensions.ExtensionStatus):
-            if extra.detail:
-                details.append(extra.detail)
-            extra_problems += [Problem(label, explanation) for label, explanation in extra.problems]
+    cloud = cloud_tray_status(request, target)
+    details = [cloud.detail] if cloud.detail else []
+    extra_problems = [Problem(label, explanation) for label, explanation in cloud.problems]
     return ServiceStatus(
         running=True,
         site=str(system.get("site_name") or ""),
@@ -259,7 +257,7 @@ def tray_icon(state: str, alert: bool = False, size: int = 64) -> QIcon:
     return QIcon(pixmap)
 
 
-class _StatusWorker(QThread):
+class _StatusWorker(Worker):
     """Reads the service's status every few seconds, off the GUI thread."""
 
     status_read = Signal(object)  # ServiceStatus
@@ -285,7 +283,7 @@ class _StatusWorker(QThread):
             self._wake = False
 
 
-class _ServiceAction(QThread):
+class _ServiceAction(Worker):
     """Starts, stops or restarts the service off the GUI thread."""
 
     finished_with = Signal(str, bool)  # action, ok
@@ -318,6 +316,7 @@ class TrayApp(QObject):
         read: Callable[[], ServiceStatus] | None = None,
         launch_ui: Callable[[], None] | None = None,
         ensure_service: bool = True,
+        alerts: AlertFeedWorker | None = None,
     ) -> None:
         super().__init__()
         self._controller = controller or ServiceController(sleep=_qt_sleep)
@@ -353,6 +352,10 @@ class TrayApp(QObject):
 
         self._worker = _StatusWorker(read or read_status, self)
         self._worker.status_read.connect(self.show_status)
+        # Alerts for "This computer": shown as system notifications.
+        self._alerts = alerts or AlertFeedWorker()
+        self._alerts.alert.connect(self.show_alert)
+        self.icon.messageClicked.connect(self._launch_ui)
         self.show_status(self._status, checking=True)
         if ensure_service:
             self.run_action("start")
@@ -360,13 +363,25 @@ class TrayApp(QObject):
     def start(self) -> None:
         self.icon.show()
         self._worker.start()
+        self._alerts.start()
 
     def shutdown(self) -> None:
         self._worker.requestInterruption()
+        self._alerts.requestInterruption()
         self._worker.wait(3000)
+        self._alerts.wait(3000)
         if self._action is not None:
             self._action.wait(5000)
         self.icon.hide()
+
+    def show_alert(self, alert: dict) -> None:
+        """A desktop alert from the recorder, as a system notification."""
+        self.icon.showMessage(
+            str(alert.get("title") or "NeuroWatch alert"),
+            str(alert.get("message") or ""),
+            QSystemTrayIcon.MessageIcon.Information,
+            10_000,
+        )
 
     # -- status --------------------------------------------------------
 

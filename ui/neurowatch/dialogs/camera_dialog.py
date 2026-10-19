@@ -10,9 +10,10 @@ import base64
 import logging
 from collections.abc import Iterable
 from urllib.parse import quote as url_quote
+from urllib.parse import unquote as url_unquote
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter, QPaintEvent, QPen, QPixmap, QShowEvent
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPaintEvent, QPen, QPixmap, QShowEvent
 from PySide6.QtWidgets import (
     QBoxLayout,
     QButtonGroup,
@@ -20,10 +21,11 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
-    QGroupBox,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -31,19 +33,20 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
+    QSlider,
     QSpinBox,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from neurowatch.dialogs.message import show_message
 from neurowatch.ipc.sync_client import BackendOfflineError, IpcError, SyncIpcClient
 from neurowatch.models import bulk_add
 from neurowatch.models.camera import (
@@ -54,6 +57,15 @@ from neurowatch.models.camera import (
     LocalRecordingDest,
 )
 from neurowatch.models.discovery import Candidate, StreamChoice, check_range, discovered_streams
+from neurowatch.models.motion import (
+    camera_event_topics,
+    camera_events_status,
+    source_of,
+    uses_camera_events,
+    valid_motion_zones,
+    with_camera_events,
+)
+from neurowatch.models.recording_policy import policy_problem
 from neurowatch.theme import (
     active_colors,
     apply_dialog_theme,
@@ -62,7 +74,8 @@ from neurowatch.theme import (
     set_status_tone,
     style_button_box,
 )
-from neurowatch.utils.threads import retire
+from neurowatch.utils.threads import Worker, retire
+from neurowatch.widgets.recording_policy import RecordingPolicyEditor
 from neurowatch.widgets.window_chrome import (
     card_overlay,
     chrome_size_hint,
@@ -118,6 +131,48 @@ def _manual_streams(
     return streams
 
 
+def _split_credentials(url: str) -> tuple[str, str, str]:
+    """(url without ``user:password@``, user, password)."""
+    if "://" not in url:
+        return url, "", ""
+    scheme, rest = url.split("://", 1)
+    authority, slash, path = rest.partition("/")
+    if "@" not in authority:
+        return url, "", ""
+    userinfo, host = authority.rsplit("@", 1)
+    user, _, password = userinfo.partition(":")
+    return f"{scheme}://{host}{slash}{path}", url_unquote(user), url_unquote(password)
+
+
+def _url_host_port(url: str) -> tuple[str, int | None]:
+    """The host of a URL (no credentials) and its port, if it names one."""
+    if "://" not in url:
+        return "", None
+    authority = url.split("://", 1)[1].split("/", 1)[0].rsplit("@", 1)[-1]
+    if authority.startswith("["):
+        host, _, rest = authority[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else ""
+    else:
+        host, _, port = authority.partition(":")
+    return host, int(port) if port.isdigit() else None
+
+
+def _saved_stream_choices(cam: CameraConfig) -> list[StreamChoice]:
+    """A camera's saved streams, to choose from again without asking the camera."""
+    streams = cam.streams or [s for s in cam.stream_options() if s.url]
+    return [
+        StreamChoice(
+            stream_id=s.id,
+            name=s.name,
+            width=s.width,
+            height=s.height,
+            url=_split_credentials(s.url)[0],
+        )
+        for s in streams
+        if s.url
+    ]
+
+
 def _password_b64(password: str) -> str:
     return base64.b64encode(password.encode()).decode() if password else ""
 
@@ -128,7 +183,7 @@ def _password_b64(password: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-class _RpcWorker(QThread):
+class _RpcWorker(Worker):
     """Runs one backend call."""
 
     done = Signal(object)  # result, or Exception
@@ -146,7 +201,7 @@ class _RpcWorker(QThread):
             self.done.emit(e)
 
 
-class _StreamsWorker(QThread):
+class _StreamsWorker(Worker):
     """Finds a device by address (unless it came from a search), then reads
     its streams with the credentials given for it."""
 
@@ -187,7 +242,7 @@ class _StreamsWorker(QThread):
             self.done.emit(e)
 
 
-class _BatchWorker(QThread):
+class _BatchWorker(Worker):
     """Signs in to the ticked cameras with one login and, when ``add``, adds
     each with the streams the backend picks; a few at a time."""
 
@@ -259,7 +314,7 @@ class _BatchWorker(QThread):
         self.row.emit(candidate_id, bulk_add.ADDED, detail, camera)
 
 
-class _ScanWorker(QThread):
+class _ScanWorker(Worker):
     """Starts a network search and polls it until it ends or is stopped."""
 
     progress = Signal(object)  # camera.discovery.results dict
@@ -298,7 +353,7 @@ class _ScanWorker(QThread):
             self.done.emit(e)
 
 
-class _TestWorker(QThread):
+class _TestWorker(Worker):
     """Runs camera.test IPC call off the main thread."""
 
     result = Signal(object)
@@ -406,10 +461,16 @@ class _EmptyResults(QFrame):
 class AddEditCameraDialog(QDialog):
     """Modal dialog for creating or editing a CameraConfig.
 
-    Search tab   — search the recorder's network for ONVIF cameras (adding only).
-    ONVIF tab    — a camera's address + credentials; streams read over ONVIF.
-    Advanced tab — manually enter full RTSP URL(s) with optional credentials.
+    Search tab  — search the recorder's network for ONVIF cameras (adding only).
+    Camera tab  — name and credentials, then the streams: found over ONVIF
+                  (address → Load Streams → main and grid stream) or entered
+                  as URLs. The chosen method is what Save uses, whichever tab
+                  is showing; an edited camera keeps its saved streams and
+                  password unless they are changed.
+    Recording, Motion tabs — the camera's other settings.
     """
+
+    recording_policy_copied = Signal(object, object)
 
     def __init__(
         self,
@@ -426,7 +487,8 @@ class AddEditCameraDialog(QDialog):
         self._is_edit = camera is not None
         self._is_recording = is_recording
         self.setWindowTitle("Edit Camera" if self._is_edit else "Add Camera")
-        self.setMinimumWidth(540)
+        # One width for every tab: the motion and schedule editors need room.
+        self.setMinimumWidth(840)
         self.setModal(True)
         apply_dialog_theme(self)
 
@@ -448,10 +510,35 @@ class AddEditCameraDialog(QDialog):
         # an edit in the Advanced tab.
         self._original_streams: list[CameraStream] = list(camera.streams) if camera else []
         self._camera_id: str | None = camera.id if camera else None
+        # Kept unless a new password is typed (never shown).
+        self._saved_password_b64: str = camera.password_b64 if camera else ""
+        self._original_discovery: DiscoveryIdentity | None = camera.discovery if camera else None
+        # Main and grid stream URLs to keep selected when streams load again.
+        self._keep_choice: tuple[str | None, str | None] = (None, None)
+        # Settings this dialog does not show, kept as they were.
+        self._motion: dict = dict(camera.motion) if camera else {}
+        self._onvif: dict | None = camera.onvif if camera else None
+        self._motion_worker: _RpcWorker | None = None
+        self._policy_worker: _RpcWorker | None = None
+        self._record_action_worker: _RpcWorker | None = None
+        self._record_action = ""
+        self._snapshot_worker: _RpcWorker | None = None
+        self._recording_policy = {
+            key: getattr(camera.recording, key) if camera else None
+            for key in (
+                "mode",
+                "weekly_rules",
+                "event_pre_sec",
+                "event_post_sec",
+                "non_event_keep_hours",
+            )
+        }
 
         layout = install_dialog_chrome(self, "Edit camera" if self._is_edit else "Add camera")
         subtitle = QLabel(
-            "Search the network for cameras, look one up over ONVIF, or enter stream URLs."
+            "Change how NeuroWatch connects to this camera, how it records, and its motion events."
+            if self._is_edit
+            else "Search the network for cameras, look one up over ONVIF, or enter stream URLs."
         )
         subtitle.setObjectName("dialogSubtitle")
         layout.addWidget(subtitle)
@@ -462,11 +549,10 @@ class AddEditCameraDialog(QDialog):
         if not self._is_edit:
             self._search_tab = self._build_search_tab()
             self._tabs.addTab(self._search_tab, "Search Network")
-        self._simple_tab = self._build_simple_tab()
-        self._tabs.addTab(self._simple_tab, "ONVIF")
-        self._advanced_tab = self._build_advanced_tab()
-        self._tabs.addTab(self._advanced_tab, "Advanced")
+        self._camera_tab = self._build_camera_tab()
+        self._tabs.addTab(self._camera_tab, "Camera")
         self._tabs.addTab(self._build_recording_tab(), "Recording")
+        self._tabs.addTab(self._build_motion_tab(), "Motion")
 
         # ── Connection test: below the tabs, or beside them on a short screen ──
         self._test_panel = QWidget()
@@ -507,12 +593,16 @@ class AddEditCameraDialog(QDialog):
         layout.addWidget(buttons)
 
         self._tabs.currentChanged.connect(lambda _index: self._on_tab_changed())
+        self._motion_timer = QTimer(self)
+        self._motion_timer.setInterval(2000)
+        self._motion_timer.timeout.connect(self._poll_motion_if_visible)
+        self._motion_timer.start()
         self._on_tab_changed()
 
-        # Pre-fill if editing; open Advanced tab for edits (URL is already known)
+        # Pre-fill if editing; edits open on the Camera tab.
         if camera:
             self._fill(camera)
-            self._tabs.setCurrentWidget(self._advanced_tab)
+            self._tabs.setCurrentWidget(self._camera_tab)
         self._interfaces_loaded = False
 
     #: Share of the screen's height the stacked layout may use before the
@@ -565,6 +655,7 @@ class AddEditCameraDialog(QDialog):
         if self._search_tab is not None and not self._interfaces_loaded:
             self._interfaces_loaded = True
             self._load_interfaces()
+        self._load_motion_status()
 
     # ------------------------------------------------------------------
     # Search tab
@@ -628,12 +719,8 @@ class AddEditCameraDialog(QDialog):
         # failed) instead of an empty table.
         self._results_empty = _EmptyResults()
         self._results_empty.search_again.clicked.connect(self._on_search)
-        self._results_empty.lookup.clicked.connect(
-            lambda: self._tabs.setCurrentWidget(self._simple_tab)
-        )
-        self._results_empty.manual.clicked.connect(
-            lambda: self._tabs.setCurrentWidget(self._advanced_tab)
-        )
+        self._results_empty.lookup.clicked.connect(lambda: self._show_camera_tab("onvif"))
+        self._results_empty.manual.clicked.connect(lambda: self._show_camera_tab("urls"))
         self._results_stack = QStackedWidget()
         self._results_stack.setMinimumHeight(170)
         self._results_stack.addWidget(self._results_empty)
@@ -873,11 +960,22 @@ class AddEditCameraDialog(QDialog):
             self._sync_add_button()
 
     def _on_tab_changed(self) -> None:
-        # The connection test belongs to one camera's streams (ONVIF,
-        # Advanced): the Search tab tests each camera as it adds it.
+        # The connection test belongs to one camera's streams (Camera tab):
+        # the Search tab tests each camera as it adds it.
         on_search = self._search_tab is not None and self._tabs.currentWidget() is self._search_tab
-        self._test_panel.setVisible(not on_search)
+        self._test_panel.setVisible(
+            not on_search
+            and self._tabs.tabText(self._tabs.currentIndex()) not in ("Motion", "Recording")
+        )
+        tall = min(640, max(200, self._available_height() - 220))
+        for page in (self._recording_scroll, self._motion_scroll):
+            page.setMinimumHeight(tall if self._tabs.currentWidget() is page else 0)
         self._sync_add_button()
+        on_motion = self._tabs.tabText(self._tabs.currentIndex()) == "Motion"
+        if on_motion and self.isVisible():
+            if self._camera_id and not self._zone_canvas.has_snapshot():
+                self._load_zone_snapshot()
+            self._load_motion_status()
         if self.isVisible():
             # Its size changes with the panel: fit the screen again, centred.
             self.fit_to_screen()
@@ -1065,14 +1163,11 @@ class AddEditCameraDialog(QDialog):
         if candidate is None or not candidate.can_add:
             return
         self._candidate = candidate
-        self._discovered = []
-        self._profile_list.clear()
-        self._s_main_combo.clear()
-        self._s_sub_combo.clear()
+        self._show_stream_choices([], None, None)
         self._s_host.setText(candidate.address)
         if candidate.title != "ONVIF device":
-            self._s_name.setText(candidate.title)
-        self._tabs.setCurrentWidget(self._simple_tab)
+            self._name.setText(candidate.title)
+        self._show_camera_tab("onvif")
         tone = "warning" if candidate.state == "possible_match" else "info"
         set_status_tone(self._discover_status, tone)
         prefix = (
@@ -1081,112 +1176,221 @@ class AddEditCameraDialog(QDialog):
             else ""
         )
         self._discover_status.setText(
-            f"{prefix}Enter the username and password of {candidate.title}, then Discover Streams."
+            f"{prefix}Enter the username and password of {candidate.title}, then Load Streams."
         )
-        self._s_pass.setFocus()
+        self._pass.setFocus()
+
+    def _show_camera_tab(self, mode: str) -> None:
+        self._set_mode(mode)
+        self._tabs.setCurrentWidget(self._camera_tab)
 
     # ------------------------------------------------------------------
-    # Simple tab
+    # Camera tab: name, credentials, and where the streams come from
     # ------------------------------------------------------------------
+
+    def _build_camera_tab(self) -> QWidget:
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setSpacing(8)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self._name = QLineEdit()
+        self._name.setPlaceholderText("Front Door")
+        form.addRow("Name:", self._name)
+        self._user = QLineEdit()
+        self._user.setPlaceholderText("admin")
+        form.addRow("Username:", self._user)
+        self._pass = QLineEdit()
+        self._pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pass.setPlaceholderText("••••••••")
+        form.addRow("Password:", self._pass)
+
+        mode_row = QWidget()
+        mode_layout = QHBoxLayout(mode_row)
+        mode_layout.setContentsMargins(0, 0, 0, 0)
+        self._mode_onvif = QRadioButton("Automatic (ONVIF)")
+        self._mode_onvif.setToolTip(
+            "Ask the camera for its streams with its address, username and password"
+        )
+        self._mode_urls = QRadioButton("Stream URLs")
+        self._mode_urls.setToolTip("Type the camera's RTSP (or other) addresses yourself")
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.addButton(self._mode_onvif)
+        self._mode_group.addButton(self._mode_urls)
+        mode_layout.addWidget(self._mode_onvif)
+        mode_layout.addWidget(self._mode_urls)
+        mode_layout.addStretch()
+        form.addRow("Streams:", mode_row)
+        vl.addLayout(form)
+
+        self._simple_tab = self._build_simple_tab()
+        self._advanced_tab = self._build_advanced_tab()
+        self._source_stack = QStackedWidget()
+        self._source_stack.addWidget(self._simple_tab)
+        self._source_stack.addWidget(self._advanced_tab)
+        vl.addWidget(self._source_stack)
+
+        notes_form = QFormLayout()
+        notes_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self._notes = QLineEdit()
+        self._notes.setPlaceholderText("Optional")
+        notes_form.addRow("Notes:", self._notes)
+        vl.addLayout(notes_form)
+        vl.addStretch(1)
+
+        self._mode_onvif.setChecked(True)
+        self._mode_onvif.toggled.connect(self._on_mode_toggled)
+        return w
+
+    def _mode(self) -> str:
+        """``"onvif"`` or ``"urls"``: how this camera's streams are chosen."""
+        return "onvif" if self._mode_onvif.isChecked() else "urls"
+
+    def _set_mode(self, mode: str) -> None:
+        (self._mode_onvif if mode == "onvif" else self._mode_urls).setChecked(True)
+        self._on_mode_toggled()
+
+    def _on_mode_toggled(self, _checked: bool = False) -> None:
+        onvif = self._mode() == "onvif"
+        self._source_stack.setCurrentWidget(self._simple_tab if onvif else self._advanced_tab)
+        if onvif:
+            # Start from the address typed as a URL.
+            if not self._s_host.text().strip():
+                host, _port = _url_host_port(self._a_url.text())
+                if host:
+                    self._s_host.setText(host)
+        elif not self._a_url.text().strip():
+            # Start from the streams the camera offered, to adjust them.
+            main, sub = self._chosen_streams()
+            if main is not None:
+                self._a_url.setText(main.url or "")
+                self._a_sub_url.setText(sub.url or "" if sub else "")
+                rest = [c.url for c in self._discovered if c.url and c not in (main, sub)]
+                self._a_more_streams.setPlainText("\n".join(u for u in rest if u))
+        self._update_credential_fields()
+
+    def _chosen_streams(self) -> tuple[StreamChoice | None, StreamChoice | None]:
+        """The ONVIF main and grid streams chosen, if any."""
+        main_idx = self._s_main_combo.currentData()
+        sub_idx = self._s_sub_combo.currentData()
+        main = self._discovered[main_idx] if isinstance(main_idx, int) else None
+        sub = self._discovered[sub_idx] if isinstance(sub_idx, int) else None
+        return main, sub
+
+    def _password(self) -> str:
+        """The password typed, else the one saved with the camera being edited."""
+        typed = self._pass.text()
+        if typed:
+            return typed
+        if self._saved_password_b64 and self._user.text().strip():
+            try:
+                return base64.b64decode(self._saved_password_b64).decode()
+            except (ValueError, UnicodeDecodeError):
+                return ""
+        return ""
+
+    def _credentials(self) -> tuple[str, str]:
+        """(username, password); none for devices that take no credentials."""
+        if self._mode() == "urls" and _is_local_device(self._a_url.text()):
+            return "", ""
+        user = self._user.text().strip()
+        return (user, self._password()) if user else ("", "")
 
     def _build_simple_tab(self) -> QWidget:
         w = QWidget()
         vl = QVBoxLayout(w)
+        vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
+        address_row = QWidget()
+        address_layout = QHBoxLayout(address_row)
+        address_layout.setContentsMargins(0, 0, 0, 0)
+        address_layout.setSpacing(6)
         self._s_host = QLineEdit()
         self._s_host.setPlaceholderText("192.168.1.100")
-        form.addRow("IP / Host:", self._s_host)
-
+        self._s_host.setMinimumWidth(140)
+        address_layout.addWidget(self._s_host, stretch=1)
+        address_layout.addWidget(QLabel("Port:"))
         self._s_port = QSpinBox()
         self._s_port.setRange(1, 65535)
         self._s_port.setValue(80)
         self._s_port.setToolTip("ONVIF HTTP port — usually 80 or 8080")
-        form.addRow("ONVIF Port:", self._s_port)
-
-        self._s_user = QLineEdit()
-        self._s_user.setPlaceholderText("admin")
-        form.addRow("Username:", self._s_user)
-
-        self._s_pass = QLineEdit()
-        self._s_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self._s_pass.setPlaceholderText("••••••••")
-        form.addRow("Password:", self._s_pass)
-
-        vl.addLayout(form)
-
-        # Discover row
-        disc_row = QHBoxLayout()
-        self._discover_btn = QPushButton("Discover Streams")
+        self._s_port.setMaximumWidth(90)
+        address_layout.addWidget(self._s_port)
+        self._discover_btn = QPushButton("Load Streams")
         set_button_variant(self._discover_btn, "secondary")
-        self._discover_btn.setToolTip("Connect via ONVIF and list available stream profiles")
+        self._discover_btn.setToolTip("Ask the camera over ONVIF for the streams it offers")
         self._discover_btn.clicked.connect(self._on_discover)
-        disc_row.addWidget(self._discover_btn)
+        address_layout.addWidget(self._discover_btn)
+        form.addRow("Address:", address_row)
+
         self._discover_status = QLabel()
         self._discover_status.setWordWrap(True)
-        disc_row.addWidget(self._discover_status, stretch=1)
-        vl.addLayout(disc_row)
-
-        # Profile list
-        profiles_lbl = QLabel("Available Streams:")
-        set_label_role(profiles_lbl, "sectionLabel")
-        vl.addWidget(profiles_lbl)
-
-        self._profile_list = QListWidget()
-        self._profile_list.setMaximumHeight(110)
-        self._profile_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
-        vl.addWidget(self._profile_list)
-
-        # Stream selection
-        sel_form = QFormLayout()
-        sel_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-
-        self._s_name = QLineEdit()
-        self._s_name.setPlaceholderText("Camera name (auto-filled from host)")
-        sel_form.addRow("Camera Name:", self._s_name)
+        form.addRow("", self._discover_status)
 
         self._s_main_combo = QComboBox()
         self._s_main_combo.setToolTip(
-            "Recorded, and shown in full screen. Defaults to the highest resolution."
+            "Recorded, and shown in single view. Usually the highest resolution."
         )
-        sel_form.addRow("Main Stream:", self._s_main_combo)
+        form.addRow("Main stream:", self._s_main_combo)
 
         self._s_sub_combo = QComboBox()
         self._s_sub_combo.setToolTip(
-            "Shown in multi-camera grids. Defaults to the lowest resolution. "
+            "Shown in multi-camera grids. Usually the lowest resolution. "
             "Any stream can also be picked per view from a tile's right-click menu."
         )
-        sel_form.addRow("Grid Stream:", self._s_sub_combo)
+        form.addRow("Grid stream:", self._s_sub_combo)
 
-        vl.addLayout(sel_form)
+        vl.addLayout(form)
+        self._show_stream_choices([], None, None)
         return w
 
-    # ------------------------------------------------------------------
-    # Advanced tab
-    # ------------------------------------------------------------------
+    def _show_stream_choices(
+        self, choices: list[StreamChoice], main_url: str | None, sub_url: str | None
+    ) -> None:
+        """Fill the stream lists; preselect the streams with these URLs."""
+        self._discovered = list(choices)
+        self._s_main_combo.clear()
+        self._s_sub_combo.clear()
+        if not choices:
+            self._s_main_combo.addItem("Load the camera's streams first", None)
+            self._s_sub_combo.addItem("Load the camera's streams first", None)
+            self._s_main_combo.setEnabled(False)
+            self._s_sub_combo.setEnabled(False)
+            return
+        self._s_main_combo.setEnabled(True)
+        self._s_sub_combo.setEnabled(True)
+        self._s_sub_combo.addItem("Same as main stream", None)
+        for i, choice in enumerate(choices):
+            self._s_main_combo.addItem(choice.label or f"Stream {i + 1}", i)
+            self._s_sub_combo.addItem(choice.label or f"Stream {i + 1}", i)
+        urls = [c.url for c in choices]
+        if main_url in urls:
+            self._s_main_combo.setCurrentIndex(urls.index(main_url))
+        if sub_url and sub_url in urls:
+            self._s_sub_combo.setCurrentIndex(urls.index(sub_url) + 1)  # 0: same as main
 
     def _build_advanced_tab(self) -> QWidget:
         w = QWidget()
         vl = QVBoxLayout(w)
+        vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        self._a_name = QLineEdit()
-        self._a_name.setPlaceholderText("Front Door")
-        form.addRow("Name:", self._a_name)
-
         self._a_url = QLineEdit()
         self._a_url.setPlaceholderText("rtsp://192.168.1.100:554/stream1")
+        self._a_url.setToolTip("Recorded, and shown in single view. Leave the password out.")
         form.addRow("Main URL:", self._a_url)
 
         self._a_sub_url = QLineEdit()
-        self._a_sub_url.setPlaceholderText("rtsp://… (optional low-res sub stream)")
-        form.addRow("Sub URL:", self._a_sub_url)
+        self._a_sub_url.setPlaceholderText("rtsp://…  (optional: a smaller stream for grids)")
+        form.addRow("Grid URL:", self._a_sub_url)
 
         self._a_more_streams = QPlainTextEdit()
         self._a_more_streams.setFixedHeight(52)
@@ -1195,16 +1399,7 @@ class AddEditCameraDialog(QDialog):
             "Further streams (e.g. a third stream), selectable per view from a "
             "tile's right-click menu."
         )
-        form.addRow("More Streams:", self._a_more_streams)
-
-        self._a_user = QLineEdit()
-        self._a_user.setPlaceholderText("admin  (optional if embedded in URL)")
-        form.addRow("Username:", self._a_user)
-
-        self._a_pass = QLineEdit()
-        self._a_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self._a_pass.setPlaceholderText("••••••••  (optional if embedded in URL)")
-        form.addRow("Password:", self._a_pass)
+        form.addRow("More streams:", self._a_more_streams)
         self._a_url.textChanged.connect(self._update_credential_fields)
 
         self._a_protocol = QComboBox()
@@ -1212,115 +1407,569 @@ class AddEditCameraDialog(QDialog):
             self._a_protocol.addItem(p)
         form.addRow("Protocol:", self._a_protocol)
 
-        vl.addLayout(form)
-
-        # Transport
-        tg = QGroupBox("Transport")
-        tl = QHBoxLayout(tg)
+        options = QWidget()
+        options_layout = QHBoxLayout(options)
+        options_layout.setContentsMargins(0, 0, 0, 0)
         self._a_tcp = QRadioButton("TCP (recommended)")
         self._a_udp = QRadioButton("UDP")
         self._a_tcp.setChecked(True)
-        bg = QButtonGroup(self)
-        bg.addButton(self._a_tcp)
-        bg.addButton(self._a_udp)
-        tl.addWidget(self._a_tcp)
-        tl.addWidget(self._a_udp)
-        tl.addStretch()
-        vl.addWidget(tg)
+        transport = QButtonGroup(self)
+        transport.addButton(self._a_tcp)
+        transport.addButton(self._a_udp)
+        options_layout.addWidget(self._a_tcp)
+        options_layout.addWidget(self._a_udp)
+        options_layout.addStretch()
+        form.addRow("Transport:", options)
 
-        # Notes
-        self._a_notes = QTextEdit()
-        self._a_notes.setFixedHeight(52)
-        self._a_notes.setPlaceholderText("Optional notes…")
-        vl.addWidget(QLabel("Notes:"))
-        vl.addWidget(self._a_notes)
-
+        vl.addLayout(form)
         return w
 
     def _update_credential_fields(self) -> None:
-        enabled = not _is_local_device(self._a_url.text())
-        self._a_user.setEnabled(enabled)
-        self._a_pass.setEnabled(enabled)
-
-    def _advanced_creds(self) -> tuple[str, str]:
-        """Return (username, raw_password), empty for credential-less devices."""
-        if not self._a_user.isEnabled():
-            return "", ""
-        return self._a_user.text().strip(), self._a_pass.text()
+        enabled = not (self._mode() == "urls" and _is_local_device(self._a_url.text()))
+        self._user.setEnabled(enabled)
+        self._pass.setEnabled(enabled)
 
     # ------------------------------------------------------------------
     # Recording tab
     # ------------------------------------------------------------------
 
     def _build_recording_tab(self) -> QWidget:
+        from neurowatch.widgets.form_parts import settings_card
+
         w = QWidget()
+        w.setObjectName("cameraRecordingPage")
         vl = QVBoxLayout(w)
-        vl.setSpacing(10)
+        vl.setContentsMargins(4, 4, 8, 4)
+        vl.setSpacing(14)
 
-        # Shared schedule row
-        sched_form = QFormLayout()
-        sched_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        # ── Recording on or off, what it does now, and the default mode ──
+        card, body, heading = settings_card("Recording")
+        self._rec_start_btn = QPushButton("Start Now")
+        self._rec_start_btn.setToolTip("Record now, whatever the schedule says")
+        set_button_variant(self._rec_start_btn, "secondary")
+        self._rec_start_btn.setEnabled(self._is_edit)
+        self._rec_start_btn.clicked.connect(self._on_rec_start)
+        heading.addWidget(self._rec_start_btn)
+        self._rec_stop_btn = QPushButton("Stop Now")
+        self._rec_stop_btn.setToolTip("Stop recording now, whatever the schedule says")
+        set_button_variant(self._rec_stop_btn, "danger")
+        self._rec_stop_btn.setEnabled(self._is_edit)
+        self._rec_stop_btn.clicked.connect(self._on_rec_stop)
+        heading.addWidget(self._rec_stop_btn)
+        self._local_enabled = QCheckBox("Record this camera")
+        self._local_enabled.setToolTip("Save this camera's video on this computer")
+        body.addWidget(self._local_enabled)
+        self._policy_status_lbl = QLabel()
+        self._policy_status_lbl.setWordWrap(True)
+        set_label_role(self._policy_status_lbl, "hint")
+        body.addWidget(self._policy_status_lbl)
+        self._rec_status_lbl = QLabel()
+        set_label_role(self._rec_status_lbl, "hint")
+        self._rec_status_lbl.setWordWrap(True)
+        body.addWidget(self._rec_status_lbl)
+        self._rec_status_lbl.hide()
+        vl.addWidget(card)
+
+        # Preserve the unused legacy string without advertising cron as an
+        # enforced schedule. All new schedules use explicit weekly windows.
         self._rec_schedule = QLineEdit()
-        self._rec_schedule.setPlaceholderText("Always  (or cron: 0 8 * * 1-5)")
-        self._rec_schedule.setToolTip("Leave blank for always-on; applies to both destinations")
-        sched_form.addRow("Schedule:", self._rec_schedule)
-        vl.addLayout(sched_form)
+        self._rec_schedule.hide()
+        self._policy_editor = RecordingPolicyEditor(self._recording_policy, mode_host=body)
+        self._policy_editor.copy_button.setEnabled(self._is_edit)
+        self._policy_editor.copy_requested.connect(self._copy_recording_policy)
+        vl.addWidget(self._policy_editor)
 
-        # ── Local Storage group ─────────────────────────────────────────
-        local_grp = QGroupBox("Local Storage")
-        local_form = QFormLayout(local_grp)
-        local_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-
-        self._local_enabled = QCheckBox("Enable local recording")
-        local_form.addRow("", self._local_enabled)
-
-        local_storage_row = QWidget()
-        local_storage_hl = QHBoxLayout(local_storage_row)
-        local_storage_hl.setContentsMargins(0, 0, 0, 0)
-        local_storage_hl.setSpacing(6)
+        # ── Where recordings go ────────────────────────────────────────
+        card, body, _ = settings_card(
+            "Storage", "Where this camera's recordings go, and how much space they may use."
+        )
+        storage = QGridLayout()
+        storage.setHorizontalSpacing(14)
+        storage.setVerticalSpacing(8)
+        storage.setColumnStretch(1, 1)
+        local_storage_row = QHBoxLayout()
+        local_storage_row.setSpacing(6)
         self._local_storage = QLineEdit()
-        self._local_storage.setPlaceholderText("Default (global setting)")
-        local_storage_hl.addWidget(self._local_storage)
+        self._local_storage.setPlaceholderText("Default folder (Settings)")
+        local_storage_row.addWidget(self._local_storage, 1)
         local_browse_btn = QPushButton("Browse…")
         local_browse_btn.setAccessibleName("Browse local storage path")
         set_button_variant(local_browse_btn, "secondary")
         local_browse_btn.clicked.connect(self._browse_local_storage)
-        local_storage_hl.addWidget(local_browse_btn)
-        local_form.addRow("Storage Path:", local_storage_row)
-
+        local_storage_row.addWidget(local_browse_btn)
+        storage.addWidget(QLabel("Folder"), 0, 0)
+        storage.addLayout(local_storage_row, 0, 1)
         self._local_quota = QSpinBox()
         self._local_quota.setRange(0, 100000)
         self._local_quota.setSuffix(" GB")
         self._local_quota.setSpecialValueText("No limit")
         self._local_quota.setValue(0)
+        self._local_quota.setMinimumWidth(140)
         self._local_quota.setToolTip(
-            "Auto-delete oldest segments when this limit is reached (0 = no limit)"
+            "When this camera's recordings reach this size, the oldest are deleted"
         )
-        local_form.addRow("Storage Quota:", self._local_quota)
-
-        vl.addWidget(local_grp)
-
-        # Start / Stop Now buttons (only useful in edit mode with backend connected)
-        ctrl_row = QHBoxLayout()
-        self._rec_start_btn = QPushButton("▶ Start Recording Now")
-        set_button_variant(self._rec_start_btn, "secondary")
-        self._rec_start_btn.setEnabled(self._is_edit)
-        self._rec_start_btn.clicked.connect(self._on_rec_start)
-        ctrl_row.addWidget(self._rec_start_btn)
-
-        self._rec_stop_btn = QPushButton("■ Stop Recording Now")
-        set_button_variant(self._rec_stop_btn, "danger")
-        self._rec_stop_btn.setEnabled(self._is_edit)
-        self._rec_stop_btn.clicked.connect(self._on_rec_stop)
-        ctrl_row.addWidget(self._rec_stop_btn)
-        vl.addLayout(ctrl_row)
-
-        self._rec_status_lbl = QLabel()
-        set_label_role(self._rec_status_lbl, "hint")
-        self._rec_status_lbl.setWordWrap(True)
-        vl.addWidget(self._rec_status_lbl)
+        storage.addWidget(QLabel("Space limit"), 1, 0)
+        storage.addWidget(self._local_quota, 1, 1, Qt.AlignmentFlag.AlignLeft)
+        body.addLayout(storage)
+        vl.addWidget(card)
         vl.addStretch()
-        return w
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(w)
+        self._recording_scroll = scroll
+        return scroll
+
+    def _show_rec_status(self, text: str) -> None:
+        self._rec_status_lbl.setText(text)
+        self._rec_status_lbl.setVisible(bool(text))
+
+    def _copy_recording_policy(self) -> None:
+        from neurowatch.dialogs.copy_recording_policy_dialog import CopyRecordingPolicyDialog
+
+        if not self._camera_id:
+            return
+        policy = self._policy_editor.policy()
+        problem = policy_problem(policy)
+        if problem:
+            self._show_rec_status(problem)
+            return
+        self._copy_policy_dialog = CopyRecordingPolicyDialog(
+            self._endpoint, self._camera_id, policy, self
+        )
+        self._copy_policy_dialog.copied.connect(self.recording_policy_copied)
+        self._copy_policy_dialog.open()
+
+    def _build_motion_tab(self) -> QWidget:
+        from neurowatch.widgets.form_parts import OptionCard, settings_card
+        from neurowatch.widgets.motion_zones import ZoneCanvas
+
+        w = QWidget()
+        w.setObjectName("cameraMotionPage")
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(4, 4, 8, 4)
+        vl.setSpacing(14)
+
+        # ── Who detects motion ──────────────────────────────────────────
+        card, body, _ = settings_card(
+            "Motion detection", "Choose who detects motion. Both can run together."
+        )
+        sources = QHBoxLayout()
+        sources.setSpacing(10)
+        camera_card = OptionCard(
+            "Camera's own detection",
+            "The camera reports motion over ONVIF, at no cost to this computer. Cameras "
+            "with analytics also report intrusion, line crossing, tampering and alarm "
+            "inputs. Set its areas and sensitivity in the camera's web settings.",
+        )
+        self._camera_events = camera_card.checkbox
+        self._camera_events.setChecked(uses_camera_events(self._motion))
+        self._motion_status_lbl = camera_card.status
+        sources.addWidget(camera_card, 1)
+        builtin_card = OptionCard(
+            "NeuroWatch detection",
+            "This computer analyses a small video stream (the grid stream when there is "
+            "one) at 5 pictures a second, using the zones below. Recording is never "
+            "affected.",
+        )
+        self._builtin_events = builtin_card.checkbox
+        self._builtin_events.setChecked(source_of(self._motion) in ("builtin", "both"))
+        self._builtin_status_lbl = builtin_card.status
+        sources.addWidget(builtin_card, 1)
+        body.addLayout(sources)
+        vl.addWidget(card)
+
+        # ── Detection settings ──────────────────────────────────────────
+        self._builtin_controls = QWidget()
+        controls = QVBoxLayout(self._builtin_controls)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(14)
+        card, body, _ = settings_card(
+            "Detection settings", "How NeuroWatch detection decides that something moved."
+        )
+        form = QGridLayout()
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(10)
+        form.setColumnStretch(1, 1)
+        self._motion_sensitivity = QSlider(Qt.Orientation.Horizontal)
+        self._motion_sensitivity.setRange(1, 10)
+        self._motion_sensitivity.setPageStep(1)
+        self._motion_sensitivity.setAccessibleName("Motion sensitivity")
+        self._motion_sensitivity.setValue(int(self._motion.get("sensitivity", 5)))
+        sensitivity_value = QLabel()
+        sensitivity_value.setMinimumWidth(96)
+
+        def show_sensitivity(value: int) -> None:
+            word = "Low" if value <= 3 else "Medium" if value <= 7 else "High"
+            sensitivity_value.setText(f"{value} · {word}")
+
+        self._motion_sensitivity.valueChanged.connect(show_sensitivity)
+        show_sensitivity(self._motion_sensitivity.value())
+        form.addWidget(QLabel("Sensitivity"), 0, 0)
+        form.addWidget(self._motion_sensitivity, 0, 1)
+        form.addWidget(sensitivity_value, 0, 2)
+        self._motion_min_duration = QDoubleSpinBox()
+        self._motion_min_duration.setRange(0, 60)
+        self._motion_min_duration.setDecimals(1)
+        self._motion_min_duration.setSingleStep(0.5)
+        self._motion_min_duration.setSuffix(" s")
+        self._motion_min_duration.setValue(float(self._motion.get("min_duration_sec", 0.5)))
+        self._motion_min_duration.setToolTip(
+            "Movement shorter than this (a flicker, a passing shadow) starts no event"
+        )
+        form.addWidget(QLabel("Ignore movement shorter than"), 1, 0)
+        form.addWidget(self._motion_min_duration, 1, 1, 1, 2, Qt.AlignmentFlag.AlignLeft)
+        self._motion_cooldown = QDoubleSpinBox()
+        self._motion_cooldown.setRange(0, 600)
+        self._motion_cooldown.setDecimals(1)
+        self._motion_cooldown.setSingleStep(1)
+        self._motion_cooldown.setSuffix(" s")
+        self._motion_cooldown.setValue(float(self._motion.get("cooldown_sec", 10)))
+        self._motion_cooldown.setToolTip(
+            "An event ends once the picture has been still this long; movement before "
+            "then continues the same event"
+        )
+        form.addWidget(QLabel("End the event after stillness of"), 2, 0)
+        form.addWidget(self._motion_cooldown, 2, 1, 1, 2, Qt.AlignmentFlag.AlignLeft)
+        for spin in (self._motion_min_duration, self._motion_cooldown):
+            spin.setMinimumWidth(110)
+        body.addLayout(form)
+        self._motion_low_cpu = QCheckBox("Low CPU mode (keyframes only)")
+        self._motion_low_cpu.setChecked(bool(self._motion.get("low_cpu", False)))
+        self._motion_low_cpu.setToolTip(
+            "Decodes keyframes only. Pictures may be seconds apart, so short movements "
+            "can be missed. Uses software decoding; normal detection remains the default."
+        )
+        body.addWidget(self._motion_low_cpu)
+        low_cpu_hint = QLabel(
+            "Analyses only the stream's keyframes, often seconds apart: much less work, "
+            "but short movements can be missed."
+        )
+        low_cpu_hint.setWordWrap(True)
+        set_label_role(low_cpu_hint, "hint")
+        body.addWidget(low_cpu_hint)
+        controls.addWidget(card)
+
+        # ── Zones and live view ─────────────────────────────────────────
+        card, body, heading = settings_card(
+            "Zones and live view",
+            "Draw where movement counts. Without zones the whole picture is watched; "
+            "ignored areas always win. Blue blocks show what moves right now.",
+        )
+        self._zone_snapshot_btn = QPushButton("Refresh Picture")
+        self._zone_snapshot_btn.setToolTip("Take a new picture from the camera to draw on")
+        set_button_variant(self._zone_snapshot_btn, "secondary")
+        self._zone_snapshot_btn.clicked.connect(self._load_zone_snapshot)
+        self._zone_snapshot_btn.setEnabled(bool(self._camera_id))
+        heading.addWidget(self._zone_snapshot_btn, 0, Qt.AlignmentFlag.AlignTop)
+        editor = QHBoxLayout()
+        editor.setSpacing(12)
+        picture_column = QVBoxLayout()
+        picture_column.setSpacing(8)
+        self._zone_canvas = ZoneCanvas()
+        self._zone_canvas.set_zones(self._motion.get("zones", []))
+        self._zone_canvas.changed.connect(self._refresh_zone_picker)
+        self._analysis_preview = self._zone_canvas
+        picture_column.addWidget(self._zone_canvas)
+        meter = QHBoxLayout()
+        meter.setSpacing(8)
+        meter_label = QLabel("Movement now")
+        set_label_role(meter_label, "hint")
+        meter.addWidget(meter_label)
+        self._motion_score = QProgressBar()
+        self._motion_score.setObjectName("motionMeter")
+        self._motion_score.setRange(0, 100)
+        self._motion_score.setValue(0)
+        self._motion_score.setTextVisible(False)
+        self._motion_score.setFixedHeight(6)
+        self._motion_score.setAccessibleName("Live motion score")
+        meter.addWidget(self._motion_score, 1)
+        self._motion_score_text = QLabel("—")
+        self._motion_score_text.setMinimumWidth(36)
+        self._motion_score_text.setAlignment(Qt.AlignmentFlag.AlignRight)
+        set_label_role(self._motion_score_text, "hint")
+        meter.addWidget(self._motion_score_text)
+        picture_column.addLayout(meter)
+        self._zone_status = QLabel(
+            "" if self._camera_id else "Save the camera first to see its picture here."
+        )
+        self._zone_status.setWordWrap(True)
+        set_label_role(self._zone_status, "hint")
+        picture_column.addWidget(self._zone_status)
+        editor.addLayout(picture_column, 3)
+
+        zone_column = QVBoxLayout()
+        zone_column.setSpacing(8)
+        zones_label = QLabel("Zones")
+        set_label_role(zones_label, "sectionLabel")
+        zone_column.addWidget(zones_label)
+        self._zone_picker = QListWidget()
+        self._zone_picker.setObjectName("zoneList")
+        self._zone_picker.setAccessibleName("Motion zones")
+        self._zone_picker.setMinimumWidth(180)
+        self._zone_picker.currentRowChanged.connect(self._select_zone)
+        zone_column.addWidget(self._zone_picker, 1)
+        self._zone_name = QLineEdit()
+        self._zone_name.setMaxLength(64)
+        self._zone_name.setPlaceholderText("Zone name")
+        self._zone_name.setAccessibleName("Zone name")
+        self._zone_name.textEdited.connect(self._rename_zone)
+        zone_column.addWidget(self._zone_name)
+        add_row = QHBoxLayout()
+        add_row.setSpacing(6)
+        for label, kind, tip in (
+            ("+ Watch", "include", "Add an area where movement counts"),
+            ("+ Ignore", "exclude", "Add an area where movement never counts"),
+        ):
+            button = QPushButton(label)
+            button.setToolTip(tip)
+            set_button_variant(button, "secondary")
+            button.clicked.connect(lambda _checked=False, kind=kind: self._add_zone(kind))
+            add_row.addWidget(button)
+        zone_column.addLayout(add_row)
+        self._zone_remove = QPushButton("Remove Zone")
+        set_button_variant(self._zone_remove, "ghost")
+        self._zone_remove.clicked.connect(self._remove_zone)
+        zone_column.addWidget(self._zone_remove)
+        editor.addLayout(zone_column, 1)
+        body.addLayout(editor)
+        zone_hint = QLabel(
+            "Click the picture to add points (three or more make a zone), drag a point to "
+            "move it, right-click a point to remove it. Check the zones again after the "
+            "camera is moved or re-aimed."
+        )
+        zone_hint.setWordWrap(True)
+        set_label_role(zone_hint, "hint")
+        body.addWidget(zone_hint)
+        controls.addWidget(card)
+        self._refresh_zone_picker()
+        self._builtin_controls.setEnabled(self._builtin_events.isChecked())
+        self._builtin_events.toggled.connect(self._builtin_controls.setEnabled)
+        vl.addWidget(self._builtin_controls)
+        vl.addStretch()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(w)
+        self._motion_scroll = scroll
+        return scroll
+
+    def _refresh_zone_picker(self) -> None:
+        from neurowatch.widgets.motion_zones import zone_color
+
+        zones = self._zone_canvas.zones()
+        selected = self._zone_canvas.selected
+        self._zone_picker.blockSignals(True)
+        self._zone_picker.clear()
+        for zone in zones:
+            points = len(zone.get("points", []))
+            kind = "Ignore" if zone.get("kind") == "exclude" else "Watch"
+            text = str(zone.get("name") or zone["id"])
+            item = QListWidgetItem(f"{text}\n{kind}" + ("" if points >= 3 else " · add points"))
+            swatch = QPixmap(12, 12)
+            swatch.fill(zone_color(zone))
+            item.setIcon(QIcon(swatch))
+            self._zone_picker.addItem(item)
+        if not zones:
+            item = QListWidgetItem("Whole picture\nNo zones yet")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._zone_picker.addItem(item)
+        else:
+            self._zone_picker.setCurrentRow(selected)
+        self._zone_picker.blockSignals(False)
+        self._select_zone(selected)
+
+    def _select_zone(self, index: int) -> None:
+        zones = self._zone_canvas.zones()
+        if not 0 <= index < len(zones):
+            index = 0
+        self._zone_canvas.selected = index
+        name = str(zones[index].get("name", "")) if zones else ""
+        if self._zone_name.text() != name:
+            self._zone_name.setText(name)
+        self._zone_name.setEnabled(bool(zones))
+        self._zone_remove.setEnabled(bool(zones))
+        self._zone_canvas.update()
+
+    def _rename_zone(self, name: str) -> None:
+        zones = self._zone_canvas.zones()
+        if zones:
+            zones[self._zone_canvas.selected]["name"] = name
+            self._zone_canvas.set_zones(zones)
+            self._refresh_zone_picker()
+
+    def _add_zone(self, kind: str) -> None:
+        if self._zone_canvas.add_zone(kind):
+            self._zone_name.setFocus()
+            self._zone_name.selectAll()
+
+    def _remove_zone(self) -> None:
+        zones = self._zone_canvas.zones()
+        if zones:
+            zones.pop(self._zone_canvas.selected)
+            self._zone_canvas.set_zones(zones)
+            self._refresh_zone_picker()
+
+    def _load_zone_snapshot(self) -> None:
+        if not self._camera_id or self._snapshot_worker is not None:
+            return
+        self._zone_snapshot_btn.setEnabled(False)
+        self._zone_status.setText("Taking a picture from the camera…")
+        worker = _RpcWorker(self._endpoint, "snapshot.capture", {"camera_id": self._camera_id})
+        worker.done.connect(self._on_zone_snapshot)
+        worker.finished.connect(worker.deleteLater)
+        self._snapshot_worker = worker
+        worker.start()
+
+    def _on_zone_snapshot(self, result: object) -> None:
+        self._snapshot_worker = None
+        self._zone_snapshot_btn.setEnabled(True)
+        set_status_tone(self._zone_status, "muted")
+        if not isinstance(result, dict):
+            self._zone_status.setText(
+                "The camera's picture is unavailable; zones can still be drawn. "
+                "Check the camera connection, then Refresh Picture."
+            )
+            return
+        picture = QPixmap()
+        try:
+            data = base64.b64decode(result.get("jpeg_b64", ""), validate=True)
+        except (ValueError, TypeError):
+            data = b""
+        if picture.loadFromData(data):
+            self._zone_canvas.set_snapshot(picture)
+            self._zone_status.setText("")
+        else:
+            self._zone_status.setText("The camera did not return a usable picture.")
+
+    def _load_motion_status(self) -> None:
+        """Show the camera's event subscription (edit mode, off the UI thread)."""
+        if not self._camera_id or self._motion_worker is not None:
+            return
+        preview = self.isVisible() and self._tabs.tabText(self._tabs.currentIndex()) == "Motion"
+        worker = _RpcWorker(
+            self._endpoint,
+            "motion.status",
+            {
+                "camera_id": self._camera_id,
+                "include_preview": preview,
+            },
+        )
+        worker.done.connect(self._on_motion_status)
+        worker.finished.connect(worker.deleteLater)
+        self._motion_worker = worker
+        worker.start()
+
+    def _poll_motion_if_visible(self) -> None:
+        if self.isVisible() and self._tabs.tabText(self._tabs.currentIndex()) == "Motion":
+            self._load_motion_status()
+        elif self.isVisible() and self._tabs.tabText(self._tabs.currentIndex()) == "Recording":
+            self._load_policy_status()
+
+    def _load_policy_status(self) -> None:
+        if (
+            not self._camera_id
+            or self._policy_worker is not None
+            or self._record_action_worker is not None
+        ):
+            return
+        worker = _RpcWorker(self._endpoint, "recording.policy_status")
+        worker.done.connect(self._on_policy_status)
+        worker.finished.connect(worker.deleteLater)
+        self._policy_worker = worker
+        worker.start()
+
+    def _on_policy_status(self, result: object) -> None:
+        self._policy_worker = None
+        if not isinstance(result, dict) or not self._camera_id:
+            return
+        status = result.get(self._camera_id)
+        if not isinstance(status, dict):
+            return
+        if not self._local_enabled.isChecked():
+            self._policy_status_lbl.setText("Not recording: turn on Record this camera.")
+            return
+        names = {"continuous": "continuously", "events": "events only", "off": "nothing"}
+        mode = str(status.get("active_mode"))
+        text = f"Recording {names[mode]} now" if mode in names else "Recording policy"
+        if status.get("manual_override"):
+            text += " (started or stopped by hand)"
+        detail = str(status.get("detail") or "").strip()
+        if detail:
+            text += f" · {detail}"
+        change = status.get("next_change_wall_minutes")
+        if type(change) is int and change > 0:
+            hours, minutes = divmod(change, 60)
+            when = f"{hours} h {minutes} min" if hours else f"{minutes} min"
+            text += f" Next scheduled change in {when}."
+        self._policy_status_lbl.setText(text)
+
+    def _on_motion_status(self, result: object) -> None:
+        self._motion_worker = None
+        if not isinstance(result, dict) or not self._camera_id:
+            return
+        camera_status = result.get("cameras", {}).get(self._camera_id, {})
+        if not isinstance(camera_status, dict):
+            camera_status = {}
+        if self._camera_events.isChecked() and uses_camera_events(self._motion):
+            text, tone = camera_events_status(result, self._camera_id)
+            self._camera_card_status(text, tone)
+        elif self._camera_events.isChecked():
+            self._camera_card_status("Starts when you save.", "info")
+        else:
+            self._camera_card_status("", "muted")
+        topics = camera_event_topics(result, self._camera_id)
+        self._motion_status_lbl.setToolTip(
+            "The camera's names for them:\n" + "\n".join(topics) if topics else ""
+        )
+        builtin = camera_status.get("builtin")
+        running = isinstance(builtin, dict) and builtin.get("state") == "running"
+        self._analysis_preview.set_analysis(
+            camera_status.get("preview") if running else None,
+            builtin.get("blocks") if isinstance(builtin, dict) else None,
+        )
+        score = (
+            round(float(builtin.get("score", 0)) * 100)
+            if running and isinstance(builtin, dict)
+            else 0
+        )
+        self._motion_score.setValue(score)
+        self._motion_score_text.setText(f"{score}%" if running else "—")
+        if not self._builtin_events.isChecked():
+            self._builtin_card_status("", "muted")
+        elif not isinstance(builtin, dict):
+            self._builtin_card_status("Starts when you save.", "info")
+        elif running:
+            text = f"Running · {float(builtin.get('analysis_fps', 0)):.1f} pictures a second"
+            if builtin.get("low_cpu"):
+                text += " · keyframes only"
+            if not builtin.get("using_substream"):
+                text += " · main stream (a grid stream would use less CPU)"
+            self._builtin_card_status(text, "success")
+        else:
+            state = str(builtin.get("state", "connecting"))
+            detail = str(builtin.get("detail") or "").strip()
+            tone = "error" if state in ("unsupported", "error", "failed") else "info"
+            self._builtin_card_status(
+                detail or {"backoff": "Reconnecting…"}.get(state, state.capitalize() + "…"),
+                tone,
+            )
+
+    def _camera_card_status(self, text: str, tone: str) -> None:
+        from neurowatch.widgets.form_parts import OptionCard
+
+        card = self._camera_events.parentWidget()
+        if isinstance(card, OptionCard):
+            card.set_status(text, tone)
+
+    def _builtin_card_status(self, text: str, tone: str) -> None:
+        from neurowatch.widgets.form_parts import OptionCard
+
+        card = self._builtin_events.parentWidget()
+        if isinstance(card, OptionCard):
+            card.set_status(text, tone)
 
     def _browse_local_storage(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select Local Storage Directory")
@@ -1328,60 +1977,86 @@ class AddEditCameraDialog(QDialog):
             self._local_storage.setText(path)
 
     def _on_rec_start(self) -> None:
-        cam_id = self._camera_id
-        if not cam_id:
-            return
-        try:
-            client = SyncIpcClient(endpoint=self._endpoint)
-            client.call("recording.start", {"id": cam_id})
-            set_status_tone(self._rec_status_lbl, "success")
-            self._rec_status_lbl.setText("Recording started.")
-        except Exception as e:
-            set_status_tone(self._rec_status_lbl, "error")
-            self._rec_status_lbl.setText(f"Error: {e}")
+        self._request_recording_action("start")
 
     def _on_rec_stop(self) -> None:
-        cam_id = self._camera_id
-        if not cam_id:
+        self._request_recording_action("stop")
+
+    def _request_recording_action(self, action: str) -> None:
+        if not self._camera_id or self._record_action_worker is not None:
             return
-        try:
-            client = SyncIpcClient(endpoint=self._endpoint)
-            client.call("recording.stop", {"id": cam_id})
-            set_status_tone(self._rec_status_lbl, "warning")
-            self._rec_status_lbl.setText("Recording stopped.")
-        except Exception as e:
+        self._record_action = action
+        self._rec_start_btn.setEnabled(False)
+        self._rec_stop_btn.setEnabled(False)
+        self._show_rec_status("Requesting manual recording change…")
+        worker = _RpcWorker(self._endpoint, f"recording.{action}", {"id": self._camera_id})
+        worker.done.connect(self._on_recording_action)
+        worker.finished.connect(worker.deleteLater)
+        self._record_action_worker = worker
+        worker.start()
+
+    def _on_recording_action(self, result: object) -> None:
+        self._record_action_worker = None
+        self._rec_start_btn.setEnabled(self._is_edit)
+        self._rec_stop_btn.setEnabled(self._is_edit)
+        if not isinstance(result, dict) or result.get("ok") is False:
             set_status_tone(self._rec_status_lbl, "error")
-            self._rec_status_lbl.setText(f"Error: {e}")
+            self._show_rec_status("Recording change failed. Check the recorder and try again.")
+        else:
+            set_status_tone(self._rec_status_lbl, "success")
+            self._show_rec_status(
+                "Manual recording requested."
+                if self._record_action == "start"
+                else "Manual recording stopped."
+            )
+            self._load_policy_status()
 
     # ------------------------------------------------------------------
     # Pre-fill for edit mode
     # ------------------------------------------------------------------
 
     def _fill(self, cam: CameraConfig) -> None:
-        self._a_name.setText(cam.name)
-        self._a_url.setText(cam.url)
-        self._a_sub_url.setText(cam.sub_url or "")
-        extra = [s.url for s in cam.streams if s.url not in {cam.url, cam.sub_url}]
+        self._name.setText(cam.name)
+        url, url_user, url_password = _split_credentials(cam.url)
+        self._user.setText(cam.username or url_user)
+        if cam.password_b64:
+            self._pass.setPlaceholderText("Saved — type a new one to change it")
+        elif url_password and not cam.username:
+            # An older camera with the password in its URL: shown as a field.
+            self._pass.setText(url_password)
+        self._notes.setText(cam.notes)
+        self._a_url.setText(url)
+        self._a_sub_url.setText(_split_credentials(cam.sub_url or "")[0])
+        extra = [
+            _split_credentials(s.url)[0] for s in cam.streams if s.url not in {cam.url, cam.sub_url}
+        ]
         self._a_more_streams.setPlainText("\n".join(extra))
-        self._a_user.setText(cam.username or "")
         self._a_tcp.setChecked(cam.transport != "udp")
         self._a_udp.setChecked(cam.transport == "udp")
-        self._a_notes.setPlainText(cam.notes)
         proto = (cam.protocol or "auto").capitalize()
         if proto.lower() == "auto":
             proto = "Auto"
         idx = self._a_protocol.findText(proto, Qt.MatchFlag.MatchFixedString)
         if idx >= 0:
             self._a_protocol.setCurrentIndex(idx)
-        # Pre-fill Simple tab host from the stored URL
-        url = cam.url
-        if "://" in url:
-            rest = url.split("://", 1)[1]
-            if "@" in rest:
-                rest = rest.split("@", 1)[1]
-            host = rest.split("/")[0].split(":")[0]
-            self._s_host.setText(host)
-        self._s_user.setText(cam.username or "")
+        host, _port = _url_host_port(url)
+        self._s_host.setText(host)
+        onvif_url = (cam.onvif or {}).get("device_url")
+        onvif_port = _url_host_port(onvif_url)[1] if isinstance(onvif_url, str) else None
+        if onvif_port:
+            self._s_port.setValue(onvif_port)
+        # A camera whose streams came from ONVIF opens with them to choose from.
+        from_onvif = cam.discovery is not None or cam.onvif is not None
+        choices = _saved_stream_choices(cam) if from_onvif else []
+        if choices:
+            self._show_stream_choices(choices, url, _split_credentials(cam.sub_url or "")[0])
+            set_status_tone(self._discover_status, "info")
+            self._discover_status.setText(
+                "These are the streams saved with this camera. Load Streams asks the camera again."
+            )
+            self._set_mode("onvif")
+        else:
+            self._set_mode("urls")
         # Recording tab
         rec = cam.recording
         self._rec_schedule.setText(rec.schedule or "")
@@ -1405,11 +2080,13 @@ class AddEditCameraDialog(QDialog):
         self._stop_streams_worker()
         self._discover_btn.setEnabled(False)
         set_status_tone(self._discover_status, "info")
-        self._discover_status.setText("Connecting via ONVIF…")
-        self._profile_list.clear()
-        self._s_main_combo.clear()
-        self._s_sub_combo.clear()
-        self._discovered = []
+        self._discover_status.setText("Asking the camera for its streams…")
+        main_before, sub_before = self._chosen_streams()
+        self._keep_choice = (
+            main_before.url if main_before else None,
+            sub_before.url if sub_before else None,
+        )
+        self._show_stream_choices([], None, None)
 
         port = self._s_port.value()
         # A device from a search is asked by its result id; a typed address
@@ -1425,13 +2102,16 @@ class AddEditCameraDialog(QDialog):
             candidate_id,
             host,
             port,
-            self._s_user.text().strip(),
-            self._s_pass.text(),
+            *self._onvif_credentials(),
         )
         worker.done.connect(self._on_discover_done)
         worker.finished.connect(worker.deleteLater)
         worker.start()
         self._streams_worker = worker
+
+    def _onvif_credentials(self) -> tuple[str, str]:
+        user = self._user.text().strip()
+        return (user, self._password()) if user else ("", "")
 
     def _on_discover_done(self, result: object) -> None:
         self._discover_btn.setEnabled(True)
@@ -1446,8 +2126,10 @@ class AddEditCameraDialog(QDialog):
             logger.warning("ONVIF discovery failed: %s", message)
             set_status_tone(self._discover_status, "error")
             self._discover_status.setText(
-                f"ONVIF failed: {message}\nTry Advanced mode and enter the RTSP URL manually."
+                f"The camera's streams could not be read: {message}. "
+                "Check the address and password, or choose Enter stream URLs."
             )
+            self._restore_saved_choices()
             return
 
         candidate_raw = result.get("candidate")
@@ -1460,7 +2142,10 @@ class AddEditCameraDialog(QDialog):
         if not choices:
             logger.warning("ONVIF discovery returned no streams")
             set_status_tone(self._discover_status, "warning")
-            self._discover_status.setText("No streams found. Try Advanced mode.")
+            self._discover_status.setText(
+                "The camera offered no streams. Choose Enter stream URLs instead."
+            )
+            self._restore_saved_choices()
             return
 
         logger.info("ONVIF discovery found %d stream(s)", len(choices))
@@ -1476,29 +2161,39 @@ class AddEditCameraDialog(QDialog):
             set_status_tone(self._discover_status, "success")
             self._discover_status.setText(f"Found {len(choices)} stream(s).")
 
-        self._profile_list.clear()
-        self._s_main_combo.clear()
-        self._s_sub_combo.clear()
-        self._s_sub_combo.addItem("None (no sub stream)", None)
-        for i, choice in enumerate(self._discovered):
-            self._profile_list.addItem(QListWidgetItem(choice.label))
-            self._s_main_combo.addItem(choice.label, i)
-            self._s_sub_combo.addItem(choice.label, i)
-
-        if not self._s_name.text():
+        if not self._name.text():
             title = candidate.title if candidate else ""
-            self._s_name.setText(
-                title if title and title != "ONVIF device" else self._s_host.text()
-            )
-        # The backend suggests main (largest) and grid (smallest) streams.
-        ids = [c.stream_id for c in self._discovered]
-        main_id, sub_id = result.get("main_stream_id"), result.get("sub_stream_id")
-        if main_id in ids:
-            self._s_main_combo.setCurrentIndex(ids.index(main_id))
-        if sub_id in ids:
-            self._s_sub_combo.setCurrentIndex(ids.index(sub_id) + 1)  # 0 = None
-        elif len(ids) >= 2:
-            self._s_sub_combo.setCurrentIndex(len(ids))
+            self._name.setText(title if title and title != "ONVIF device" else self._s_host.text())
+        # Keep the streams chosen before, else take the backend's suggestion:
+        # main the largest, grid the smallest.
+        by_id = {c.stream_id: c.url for c in self._discovered}
+        kept_main, kept_sub = self._keep_choice
+        urls = [c.url for c in self._discovered]
+        main_url = kept_main if kept_main in urls else by_id.get(str(result.get("main_stream_id")))
+        if kept_main in urls:
+            sub_url = kept_sub if kept_sub in urls else None
+        else:
+            sub_url = by_id.get(str(result.get("sub_stream_id")))
+            if sub_url is None and len(urls) >= 2:
+                sub_url = urls[-1]
+        self._show_stream_choices(self._discovered, main_url, sub_url)
+
+    def _restore_saved_choices(self) -> None:
+        """A failed reload of an edited camera leaves its saved streams to choose from."""
+        if self._is_edit and self._original_streams:
+            kept_main, kept_sub = self._keep_choice
+            choices = [
+                StreamChoice(
+                    stream_id=s.id,
+                    name=s.name,
+                    width=s.width,
+                    height=s.height,
+                    url=_split_credentials(s.url)[0],
+                )
+                for s in self._original_streams
+                if s.url
+            ]
+            self._show_stream_choices(choices, kept_main, kept_sub)
 
     def _stop_streams_worker(self) -> None:
         w = self._streams_worker
@@ -1514,6 +2209,27 @@ class AddEditCameraDialog(QDialog):
         self._streams_worker = None
 
     def _stop_background_work(self) -> None:
+        self._motion_timer.stop()
+        for attribute, callback in (
+            ("_policy_worker", self._on_policy_status),
+            ("_record_action_worker", self._on_recording_action),
+        ):
+            worker = getattr(self, attribute)
+            if worker is not None:
+                try:
+                    worker.done.disconnect(callback)
+                except Exception:
+                    pass
+                retire(worker)
+                setattr(self, attribute, None)
+        snapshot = self._snapshot_worker
+        if snapshot is not None:
+            try:
+                snapshot.done.disconnect(self._on_zone_snapshot)
+            except Exception:
+                pass
+            retire(snapshot)
+            self._snapshot_worker = None
         self._stop_streams_worker()
         batch = self._batch_worker
         if batch is not None:
@@ -1549,6 +2265,14 @@ class AddEditCameraDialog(QDialog):
                 interfaces.wait(2000)
             retire(interfaces)
             self._interfaces_worker = None
+        motion = self._motion_worker
+        if motion is not None:
+            try:
+                motion.done.disconnect(self._on_motion_status)
+            except Exception:
+                pass
+            retire(motion)
+            self._motion_worker = None
 
     # ------------------------------------------------------------------
     # Test connection
@@ -1559,7 +2283,7 @@ class AddEditCameraDialog(QDialog):
         if not url:
             set_status_tone(self._status_label, "warning")
             self._status_label.setText(
-                "No URL to test. Discover streams (Simple) or enter a URL (Advanced)."
+                "Nothing to test yet: load the camera's streams, or enter its stream URL."
             )
             return
         self._stop_test_worker()
@@ -1652,106 +2376,139 @@ class AddEditCameraDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _on_accept(self) -> None:
+        problem = policy_problem(
+            {key: value for key, value in self._policy_editor.policy().items() if value is not None}
+        )
+        if problem:
+            set_status_tone(self._rec_status_lbl, "warning")
+            self._show_rec_status(problem)
+            for index in range(self._tabs.count()):
+                if self._tabs.tabText(index) == "Recording":
+                    self._tabs.setCurrentIndex(index)
+                    break
+            return
+        if not valid_motion_zones(self._zone_canvas.zones()):
+            set_status_tone(self._zone_status, "warning")
+            self._zone_status.setText(
+                "Complete each zone with 3–64 points, or remove it before saving."
+            )
+            for index in range(self._tabs.count()):
+                if self._tabs.tabText(index) == "Motion":
+                    self._tabs.setCurrentIndex(index)
+                    break
+            return
         if self._search_tab is not None and self._tabs.currentWidget() is self._search_tab:
             self._run_batch(add=True)
             return
-        is_simple = self._tabs.currentWidget() is self._simple_tab
-        if is_simple:
-            if not self._discovered:
-                show_message(
-                    self,
-                    "No Streams Discovered",
-                    "Run ONVIF discovery first, or switch to the Advanced tab "
-                    "and enter the RTSP URL manually.",
-                    kind="warning",
-                )
-                return
-            if self._s_main_combo.currentData() is None:
-                show_message(self, "Select Stream", "Select a main stream.", kind="warning")
-                return
-        else:
-            if not self._a_url.text().strip():
-                show_message(self, "Validation", "Stream URL is required.", kind="warning")
-                return
+        # What is checked is how the camera connects, whichever tab is showing.
+        problem = self._connection_problem()
+        if problem is not None:
+            self._show_camera_tab(self._mode())
+            label = self._discover_status if self._mode() == "onvif" else self._status_label
+            set_status_tone(label, "warning")
+            label.setText(problem)
+            (self._discover_btn if self._mode() == "onvif" else self._a_url).setFocus()
+            return
         self.accept()
 
+    def _connection_problem(self) -> str | None:
+        """Why the camera cannot be saved as it is, or None."""
+        if self._mode() == "onvif":
+            if self._chosen_streams()[0] is None:
+                return (
+                    "Load the camera's streams first (enter its address, username and "
+                    "password, then Load Streams), or choose Enter stream URLs."
+                )
+            return None
+        if not self._a_url.text().strip():
+            return "Enter the camera's main stream URL."
+        return None
+
+    def _main_url(self) -> str:
+        """The main stream's URL without credentials, for the chosen method."""
+        if self._mode() == "onvif":
+            main, _ = self._chosen_streams()
+            return main.url or "" if main else ""
+        return _split_credentials(self._a_url.text().strip())[0]
+
+    def _onvif_endpoint(self, main_url: str) -> dict | None:
+        """Where the camera answers ONVIF, for its events: the address and port
+        typed for Load Streams, else what was saved (unless the camera moved)."""
+        host, port = self._s_host.text().strip(), self._s_port.value()
+        saved = self._onvif
+        saved_url = saved.get("device_url") if isinstance(saved, dict) else None
+        saved_host, saved_port = (
+            _url_host_port(saved_url) if isinstance(saved_url, str) else ("", None)
+        )
+        if self._mode() == "onvif" and host:
+            if saved is not None and saved_host == host and (saved_port or 80) == port:
+                return saved
+            authority = host if port == 80 else f"{host}:{port}"
+            return {"device_url": f"http://{authority}/onvif/device_service"}
+        if saved is not None and saved_host == _url_host_port(main_url)[0]:
+            return saved
+        return None
+
     def _effective_url_and_creds(self) -> tuple[str, str, str]:
-        """Return (url_with_creds, username, password_b64) for the active tab."""
-        is_simple = self._tabs.currentWidget() is self._simple_tab
-        if is_simple:
-            idx = self._s_main_combo.currentData()
-            if idx is None or not self._discovered:
-                return "", "", ""
-            # Discovered URLs carry no credentials; camera.test adds them.
-            url = self._discovered[idx].url or ""
-            user = self._s_user.text().strip()
-            return url, user, _password_b64(self._s_pass.text())
-        else:
-            url = self._a_url.text().strip()
-            user, raw_pass = self._advanced_creds()
-            pb64 = base64.b64encode(raw_pass.encode()).decode() if raw_pass else ""
-            # Embed credentials into URL for testing if user supplied them separately
-            effective = _inject_creds(url, user, raw_pass) if user else url
-            return effective, user, pb64
+        """(url, username, password_b64) to test; the backend adds the credentials."""
+        url = self._main_url()
+        if not url:
+            return "", "", ""
+        user, password = self._credentials()
+        typed_user, typed_password = _split_credentials(self._a_url.text().strip())[1:]
+        if self._mode() == "urls" and not user and typed_user:
+            user, password = typed_user, typed_password
+        return url, user, _password_b64(password)
 
     def get_config(self) -> CameraConfig:
-        """Return a CameraConfig built from the active tab's fields."""
+        """The camera as configured: streams from the chosen method (ONVIF or
+        URLs), whichever tab is showing. URLs are kept without credentials:
+        the backend adds the username and password when it connects."""
         cam = CameraConfig()
         if self._camera_id:
             cam.id = self._camera_id
+        user, password = self._credentials()
 
-        is_simple = self._tabs.currentWidget() is self._simple_tab
-
-        if is_simple:
-            main_idx = self._s_main_combo.currentData()
-            sub_idx = self._s_sub_combo.currentData()
-            main = self._discovered[main_idx] if main_idx is not None else None
-            cam.name = self._s_name.text().strip() or self._s_host.text().strip() or "Camera"
-            cam.url = (main.url or "") if main else ""
-            cam.sub_url = (self._discovered[sub_idx].url or "") if sub_idx is not None else ""
+        if self._mode() == "onvif":
+            main, sub = self._chosen_streams()
+            cam.url = main.url or "" if main else ""
+            cam.sub_url = sub.url or "" if sub and sub is not main else ""
             cam.streams = discovered_streams(self._discovered)
             # Remembered so later searches show this camera as already added.
             epr = self._candidate.endpoint_reference if self._candidate else None
             if epr and main:
                 cam.discovery = DiscoveryIdentity(endpoint_reference=epr, source=main.source)
-            cam.username = self._s_user.text().strip()
-            raw_pass = self._s_pass.text()
-            if raw_pass:
-                cam.password_b64 = base64.b64encode(raw_pass.encode()).decode()
-            cam.transport = "tcp"
+            else:
+                cam.discovery = self._original_discovery
+            cam.name = self._name.text().strip() or self._s_host.text().strip() or "Camera"
             cam.protocol = "auto"
         else:
-            user, raw_pass = self._advanced_creds()
-            url = self._a_url.text().strip()
-            sub_url = self._a_sub_url.text().strip()
-
+            url, url_user, url_password = _split_credentials(self._a_url.text().strip())
+            if not user and url_user:
+                # Credentials typed into the URL: kept as fields instead.
+                user, password = url_user, url_password
+            sub_url = _split_credentials(self._a_sub_url.text().strip())[0]
             extra = [
-                line.strip()
+                _split_credentials(line.strip())[0]
                 for line in self._a_more_streams.toPlainText().splitlines()
                 if line.strip()
             ]
-
-            # Embed credentials into every URL if not already present
-            if user:
-                url = _inject_creds(url, user, raw_pass)
-                if sub_url:
-                    sub_url = _inject_creds(sub_url, user, raw_pass)
-                extra = [_inject_creds(u, user, raw_pass) for u in extra]
             cam.streams = _manual_streams(url, sub_url, extra, self._original_streams)
-
-            cam.name = self._a_name.text().strip() or url.split("/")[-1] or "Camera"
             cam.url = url
             cam.sub_url = sub_url
-            cam.username = user
-            if raw_pass:
-                cam.password_b64 = base64.b64encode(raw_pass.encode()).decode()
-            cam.transport = "udp" if self._a_udp.isChecked() else "tcp"
+            cam.discovery = self._original_discovery if self._is_edit else None
+            cam.name = self._name.text().strip() or url.split("/")[-1] or "Camera"
             cam.protocol = self._a_protocol.currentText().lower()
-            cam.notes = self._a_notes.toPlainText().strip()
+        cam.transport = "udp" if self._a_udp.isChecked() else "tcp"
+        cam.username = user
+        cam.password_b64 = _password_b64(password) if user else ""
+        cam.notes = self._notes.text().strip()
+        cam.onvif = self._onvif_endpoint(cam.url)
 
         # Recording settings (from dedicated tab — applies regardless of which stream tab is active)
         local_quota = self._local_quota.value()
         cam.recording = CameraRecordingConfig(
+            **self._policy_editor.policy(),
             schedule=self._rec_schedule.text().strip() or None,
             local=LocalRecordingDest(
                 enabled=self._local_enabled.isChecked(),
@@ -1759,6 +2516,37 @@ class AddEditCameraDialog(QDialog):
                 quota_gb=local_quota if local_quota > 0 else None,
             ),
         )
+
+        # Motion: only send it when it changes, so the backend keeps the rest.
+        if self._camera_events.isChecked() != uses_camera_events(self._motion):
+            cam.motion = with_camera_events(self._motion, self._camera_events.isChecked())
+        else:
+            cam.motion = dict(self._motion)
+
+        builtin = self._builtin_events.isChecked()
+        if builtin != (source_of(cam.motion) in ("builtin", "both")):
+            onvif = uses_camera_events(cam.motion)
+            cam.motion["source"] = (
+                "both"
+                if builtin and onvif
+                else "builtin"
+                if builtin
+                else "onvif"
+                if onvif
+                else "off"
+            )
+            cam.motion["enabled"] = False
+        for key, value, default in (
+            ("sensitivity", self._motion_sensitivity.value(), 5),
+            ("cooldown_sec", self._motion_cooldown.value(), 10.0),
+            ("min_duration_sec", self._motion_min_duration.value(), 0.5),
+            ("low_cpu", self._motion_low_cpu.isChecked(), False),
+        ):
+            if value != self._motion.get(key, default):
+                cam.motion[key] = value
+        zones = self._zone_canvas.zones()
+        if zones != self._motion.get("zones", []):
+            cam.motion["zones"] = zones
 
         logger.info(
             "Camera config built: name='%s', protocol=%s, has_sub=%s, streams=%d, local_rec=%s",

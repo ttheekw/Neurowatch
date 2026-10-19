@@ -289,23 +289,25 @@ QComboBox::down-arrow {{
     width: 10px;
     height: 10px;
 }}
-QSpinBox::up-button, QSpinBox::down-button {{
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {{
     subcontrol-origin: border;
     width: 16px;
     border: none;
     background: transparent;
 }}
-QSpinBox::up-button {{ subcontrol-position: top right; }}
-QSpinBox::down-button {{ subcontrol-position: bottom right; }}
-QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+QSpinBox::up-button, QDoubleSpinBox::up-button {{ subcontrol-position: top right; }}
+QSpinBox::down-button, QDoubleSpinBox::down-button {{ subcontrol-position: bottom right; }}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
     background: rgba(255, 255, 255, 0.08);
 }}
-QSpinBox::up-arrow {{
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
     image: url("{_icon("chevron-up.svg")}");
     width: 8px;
     height: 8px;
 }}
-QSpinBox::down-arrow {{
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
     image: url("{_icon("chevron-down.svg")}");
     width: 8px;
     height: 8px;
@@ -388,7 +390,9 @@ QCalendarWidget QAbstractItemView:disabled {{
 
 
 def _input_rules(c: ColorTokens = COLORS, m: Metrics = METRICS) -> str:
-    fields = "QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDateTimeEdit"
+    fields = (
+        "QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateTimeEdit"
+    )
     return f"""{_COMBO_LIST_RULE}
 QProgressBar {{
     min-height: 6px;
@@ -444,16 +448,16 @@ QSlider::handle:horizontal:disabled {{
     selection-color: {c.on_accent};
 }}
 QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QComboBox:hover,
-QSpinBox:hover, QDateTimeEdit:hover {{
+QSpinBox:hover, QDoubleSpinBox:hover, QDateTimeEdit:hover {{
     border-color: {c.text_muted};
 }}
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus,
-QSpinBox:focus, QDateTimeEdit:focus {{
+QSpinBox:focus, QDoubleSpinBox:focus, QDateTimeEdit:focus {{
     border: 2px solid {c.focus_ring};
     padding: 3px 7px;
 }}
 QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled,
-QSpinBox:disabled, QDateTimeEdit:disabled {{
+QSpinBox:disabled, QDoubleSpinBox:disabled, QDateTimeEdit:disabled {{
     color: {c.text_disabled};
     background-color: {c.surface};
     border-color: {c.border};
@@ -478,29 +482,30 @@ QComboBox QAbstractItemView {{
     outline: 0;
     padding: 4px;
 }}
-QSpinBox::up-button, QSpinBox::down-button,
+QSpinBox::up-button, QDoubleSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::down-button,
 QDateTimeEdit::up-button, QDateTimeEdit::down-button {{
     subcontrol-origin: border;
     width: 18px;
     border: none;
     background: transparent;
 }}
-QSpinBox::up-button, QDateTimeEdit::up-button {{
+QSpinBox::up-button, QDoubleSpinBox::up-button, QDateTimeEdit::up-button {{
     subcontrol-position: top right;
 }}
-QSpinBox::down-button, QDateTimeEdit::down-button {{
+QSpinBox::down-button, QDoubleSpinBox::down-button, QDateTimeEdit::down-button {{
     subcontrol-position: bottom right;
 }}
-QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover,
 QDateTimeEdit::up-button:hover, QDateTimeEdit::down-button:hover {{
     background-color: {c.hover};
 }}
-QSpinBox::up-arrow, QDateTimeEdit::up-arrow {{
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow, QDateTimeEdit::up-arrow {{
     image: url("{_icon("chevron-up.svg")}");
     width: 10px;
     height: 10px;
 }}
-QSpinBox::down-arrow, QDateTimeEdit::down-arrow {{
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow, QDateTimeEdit::down-arrow {{
     image: url("{_icon("chevron-down.svg")}");
     width: 10px;
     height: 10px;
@@ -594,6 +599,20 @@ QPushButton[variant]:disabled {{
     color: {c.text_disabled};
     background-color: {c.surface};
     border: 1px solid {c.border};
+}}
+QPushButton[variant="ghost"]:disabled {{
+    background-color: transparent;
+    border-color: transparent;
+}}
+QPushButton:checked, QPushButton[variant="secondary"]:checked,
+QPushButton[variant="ghost"]:checked {{
+    background-color: {c.accent_subtle};
+    color: {c.text};
+    border: 1px solid {c.accent};
+}}
+QPushButton:checked:hover, QPushButton[variant="secondary"]:checked:hover {{
+    background-color: {c.accent_subtle};
+    border-color: {c.focus_ring};
 }}
 """
 
@@ -886,6 +905,16 @@ QLabel#dialogTitle {{
     font-weight: 700;
     color: {c.text};
 }}
+QLabel#aboutName {{
+    font-size: 22px;
+    font-weight: 700;
+    color: {c.text};
+}}
+QFrame#aboutRule {{
+    border: none;
+    background: {c.border};
+    max-height: 1px;
+}}
 QLabel#dialogSubtitle, QLabel[role="hint"] {{
     color: {c.text_muted};
     font-size: {m.font_size_small + 1}px;
@@ -926,6 +955,55 @@ QGroupBox::title {{
     color: {c.text_muted};
     font-weight: 600;
 }}
+QFrame#settingsCard {{
+    background-color: {c.surface_raised};
+    border: 1px solid {c.border};
+    border-radius: 10px;
+}}
+QFrame#settingsCard QLabel {{ background: transparent; }}
+QLabel#cardTitle {{
+    color: {c.text}; font-size: 14px; font-weight: 600; background: transparent;
+}}
+QFrame#optionCard {{
+    background-color: {c.surface};
+    border: 1px solid {c.border_strong};
+    border-radius: 10px;
+}}
+QFrame#optionCard:hover {{ border-color: {c.border_control}; }}
+QFrame#optionCard[checked="true"] {{
+    background-color: {c.accent_subtle};
+    border: 1px solid {c.accent};
+}}
+QFrame#optionCard QCheckBox {{ font-weight: 600; background: transparent; }}
+QFrame#optionCard QLabel {{ background: transparent; }}
+QWidget#segmented {{ background: transparent; }}
+QWidget#segmented QPushButton {{
+    background-color: {c.surface};
+    color: {c.text_muted};
+    border: 1px solid {c.border_strong};
+    border-radius: 0;
+    padding: 5px 14px;
+    margin: 0;
+    font-weight: 500;
+}}
+QWidget#segmented QPushButton:hover {{ color: {c.text}; background-color: {c.hover}; }}
+QWidget#segmented QPushButton:checked {{
+    background-color: {c.accent_subtle};
+    color: {c.text};
+    border-color: {c.accent};
+}}
+QWidget#segmented QPushButton:focus {{ border: 1px solid {c.focus_ring}; padding: 5px 14px; }}
+QWidget#segmented QPushButton[segment="first"] {{
+    border-top-left-radius: {m.radius}px; border-bottom-left-radius: {m.radius}px;
+}}
+QWidget#segmented QPushButton[segment="last"] {{
+    border-top-right-radius: {m.radius}px; border-bottom-right-radius: {m.radius}px;
+}}
+QWidget#segmented QPushButton[segment="only"] {{ border-radius: {m.radius}px; }}
+QProgressBar#motionMeter {{
+    background: {c.surface_sunken}; border: none; border-radius: 3px; max-height: 6px;
+}}
+QProgressBar#motionMeter::chunk {{ background: #38bdf8; border-radius: 3px; }}
 QTabWidget::pane {{
     border: 1px solid {c.border};
     border-radius: {m.radius}px;
@@ -978,23 +1056,31 @@ QScrollArea {{
     background: transparent;
     border: none;
 }}
-QScrollBar:vertical {{
+QListWidget#settingsNav {{
     background: transparent;
-    width: 10px;
-    margin: 2px;
+    border: none;
+    border-right: 1px solid {c.border};
+    border-radius: 0;
+    padding: 0 10px 0 0;
 }}
-QScrollBar::handle:vertical {{
-    background: {c.border_strong};
-    border-radius: 3px;
-    min-height: 24px;
+QListWidget#settingsNav::item {{
+    color: {c.text_muted};
+    padding: 0 12px;
+    border-radius: {m.radius}px;
 }}
-QScrollBar::handle:vertical:hover {{
-    background: {c.text_disabled};
+QListWidget#settingsNav::item:hover {{ background-color: {c.hover}; color: {c.text}; }}
+QListWidget#settingsNav::item:selected {{
+    background-color: {c.accent_subtle};
+    color: {c.text};
 }}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-    height: 0;
+QWidget#settingsPage {{ background: transparent; }}
+QLabel#settingsPageTitle {{
+    color: {c.text}; font-size: 18px; font-weight: 600; background: transparent;
 }}
-"""
+QWidget#cameraRecordingPage {{
+    background-color: {c.surface};
+}}
+""" + _scrollbar_rules(c)
 
 
 def dialog_stylesheet(theme_name: str | None = None) -> str:
@@ -1030,11 +1116,226 @@ def datetime_input_stylesheet(theme_name: str | None = None) -> str:
     return _input_rules(c) + _calendar_rules(c) + _menu_rules(c)
 
 
-def app_stylesheet(theme_name: str | None = None) -> str:
-    """Application-wide rules limited to popup classes (menus, tooltips, message boxes)."""
+def _event_review_rules(c: ColorTokens) -> str:
+    """The event list and detail pane on the Events and Playback pages.
+    Explicit surfaces prevent white Qt scroll viewports in dark pages."""
+    return f"""
+QWidget#eventPreview {{
+    background: {c.surface}; color: {c.text};
+    border: 1px solid {c.border}; border-radius: 12px;
+}}
+QWidget#playbackEvents {{
+    background: {c.surface}; color: {c.text};
+    border: 1px solid {c.border}; border-radius: 12px;
+}}
+QWidget#playbackEvents QWidget#eventPreview {{
+    border: none; border-radius: 0; background: transparent;
+}}
+QWidget#eventPreview QLabel, QWidget#playbackEvents QLabel {{
+    background: transparent; color: {c.text}; border: none;
+}}
+QWidget#eventPreview QLabel[role="muted"], QWidget#playbackEvents QLabel[role="muted"] {{
+    color: {c.text_muted};
+}}
+QWidget#eventPreview QLabel#eventPreviewTitle {{
+    font-size: 15px; font-weight: 600;
+}}
+QWidget#eventPreview QLabel#eventPreviewEmptyTitle {{
+    color: {c.text}; font-size: 15px; font-weight: 600;
+}}
+QWidget#eventPreview QLabel#eventPreviewState {{
+    border-radius: 10px; padding: 2px 9px; font-size: 11px; font-weight: 700;
+}}
+QWidget#eventPreview QLabel#eventPreviewState[tone="warning"] {{
+    color: {c.warning}; background: {_tint(c.warning, c.surface, 0.16)};
+}}
+QWidget#eventPreview QLabel#eventPreviewState[tone="info"] {{
+    color: {c.info}; background: {_tint(c.info, c.surface, 0.16)};
+}}
+QListView#eventList, QWidget#eventsHistory QListView#eventList,
+QWidget#playbackEvents QListView#eventList {{
+    background: transparent; border: none; outline: none; color: {c.text};
+}}
+QWidget#eventPreview QStackedWidget, QWidget#eventPreview QWidget#eventPreviewPage,
+QWidget#eventsHistory QStackedWidget, QWidget#eventsHistory QWidget#eventsEmpty,
+QWidget#playbackEvents QSplitter, QWidget#playbackEvents QWidget#eventListBox,
+QWidget#playbackEvents QCheckBox {{
+    background: transparent;
+}}
+QScrollArea#playbackEventsScroll, QWidget#playbackEventsViewport {{
+    background: {c.window}; border: none;
+}}
+"""
+
+
+def _tint(color: str, background: str, amount: float) -> str:
+    """``amount`` of ``color`` over ``background``, as an opaque colour."""
+    fg, bg = QColor(color), QColor(background)
+    mixed = QColor(
+        round(fg.red() * amount + bg.red() * (1 - amount)),
+        round(fg.green() * amount + bg.green() * (1 - amount)),
+        round(fg.blue() * amount + bg.blue() * (1 - amount)),
+    )
+    return str(mixed.name())
+
+
+def events_stylesheet(theme_name: str | None = None) -> str:
+    """Events page: heading, filter row, event list and details."""
     c = active_colors(theme_name)
     return (
-        _tooltip_rules(c)
+        scope_stylesheet(
+            _input_rules(c) + _button_rules(c) + _container_rules(c) + _calendar_rules(c),
+            "QWidget#eventsPage",
+        )
+        + f"""
+QWidget#eventsPage {{ background: {c.window}; }}
+QWidget#eventsHistory {{
+    background: {c.surface}; border: 1px solid {c.border}; border-radius: 12px;
+}}
+QWidget#eventsFooter {{
+    background: transparent; border: none; border-top: 1px solid {c.border};
+    border-radius: 0;
+}}
+QWidget#eventsPage QLabel[role="pageTitle"] {{
+    color: {c.text}; font-size: 23px; font-weight: 700;
+}}
+QWidget#eventsPage QLabel[role="sectionTitle"] {{
+    color: {c.text}; font-size: 14px; font-weight: 600;
+}}
+QWidget#eventsPage QLabel[role="muted"] {{ color: {c.text_muted}; font-size: 12px; }}
+QWidget#eventsPage QLabel#eventsCount {{
+    color: {c.text_muted}; font-size: 12px; padding: 0 8px 6px 0;
+}}
+QWidget#eventsPage QLineEdit#eventsSearch {{ padding-left: 10px; }}
+QWidget#eventsPage QLabel#eventsEmptyTitle {{
+    color: {c.text}; font-size: 18px; font-weight: 600;
+}}
+QWidget#eventsPage QSplitter::handle {{ background: transparent; }}
+"""
+        + _event_review_rules(c)
+    )
+
+
+def playback_stylesheet(theme_name: str | None = None) -> str:
+    """Playback page chrome; selectors leave video tiles and other pages alone."""
+    c = active_colors(theme_name)
+    base = scope_stylesheet(
+        _input_rules(c) + _button_rules(c) + _choice_rules(c) + _container_rules(c),
+        "QWidget#playbackPage",
+    )
+    return (
+        base
+        + _event_review_rules(c)
+        + f"""
+QWidget#playbackPage {{ background: {c.window}; }}
+QWidget#playbackSidebar, QWidget#playbackTimelineCard {{
+    background: {c.surface}; border: 1px solid {c.border}; border-radius: 10px;
+}}
+QWidget#playbackPage QLabel[role="pageTitle"] {{
+    color: {c.text}; font-size: 23px; font-weight: 700;
+}}
+QWidget#playbackPage QLabel[role="sectionTitle"] {{
+    color: {c.text}; font-size: 13px; font-weight: 600;
+}}
+QWidget#playbackPage QLabel[role="muted"] {{ color: {c.text_muted}; font-size: 12px; }}
+QWidget#playbackPage QLabel#playbackSelectionCount {{
+    color: {c.info}; background: {c.accent_subtle}; border-radius: 5px;
+    padding: 3px 7px; font-size: 11px;
+}}
+QWidget#playbackPage QListWidget#playbackCameras {{
+    background: {c.surface_sunken}; color: {c.text};
+    border: 1px solid {c.border}; border-radius: 7px; outline: none;
+}}
+QWidget#playbackPage QListWidget#playbackCameras::item {{
+    padding: 9px 8px; border-radius: 4px; font-size: 13px;
+}}
+QWidget#playbackPage QListWidget#playbackCameras::item:hover {{ background: {c.hover}; }}
+QWidget#playbackPage QListWidget#playbackCameras::item:selected {{
+    background: {c.accent_subtle}; color: {c.text};
+}}
+QWidget#playbackPage QListWidget#playbackCameras::indicator {{
+    width: 16px; height: 16px; border: 1px solid {c.border_control};
+    border-radius: 4px; background: {c.surface};
+}}
+QWidget#playbackPage QListWidget#playbackCameras::indicator:checked {{
+    background: {c.accent}; border-color: {c.accent}; image: url("{icon_path("check.svg")}");
+}}
+QWidget#playbackPage QGroupBox#playbackRange {{
+    border: none; margin-top: 18px; padding-top: 6px; color: {c.text}; font-weight: 600;
+}}
+QWidget#playbackPage QGroupBox#playbackRange::title {{
+    subcontrol-origin: margin; subcontrol-position: top left; padding: 0;
+}}
+QWidget#playbackPage QLabel#playbackPlaceholder {{
+    color: {COLORS.text_muted}; font-size: 14px; padding: 32px;
+}}
+QWidget#playbackPage QSplitter::handle {{ background: {c.window}; }}
+QWidget#playbackPage QSplitter::handle:hover {{ background: {c.border_strong}; }}
+"""
+    )
+
+
+def playback_transport_stylesheet(theme_name: str | None = None) -> str:
+    """Compact playback controls, shared with the clip trim timeline."""
+    c = active_colors(theme_name)
+    return f"""
+QWidget#playbackTransport {{ background: {c.surface}; border-top: 1px solid {c.border}; }}
+QWidget#playbackTransport QPushButton {{
+    background: {c.surface_raised}; color: {c.text_muted}; border: 1px solid {c.border};
+    border-radius: 6px; padding: 0; font-size: 11px; font-weight: 500;
+}}
+QWidget#playbackTransport QPushButton:hover {{ background: {c.hover}; color: {c.text}; }}
+QWidget#playbackTransport QPushButton:pressed {{ background: {c.pressed}; }}
+QWidget#playbackTransport QPushButton:checked {{
+    background: {c.accent_subtle}; color: {c.info}; border-color: {c.accent};
+}}
+QWidget#playbackTransport QPushButton:focus {{ border: 1px solid {c.focus_ring}; }}
+QWidget#playbackTransport QPushButton#playbackPlay {{
+    background: {c.accent}; color: {c.on_accent}; border-color: {c.accent}; font-weight: 600;
+}}
+QWidget#playbackTransport QPushButton#playbackPlay:hover {{ background: {c.accent_hover}; }}
+QWidget#playbackTransport QPushButton:disabled,
+QWidget#playbackTransport QPushButton#playbackPlay:disabled {{
+    background: {c.surface}; color: {c.text_disabled}; border-color: {c.border};
+}}
+QWidget#playbackTransport QLabel {{ background: transparent; color: {c.text_muted}; }}
+QWidget#playbackTransport QLabel#playbackMotionLegend {{ color: #f97316; font-size: 11px; }}
+QWidget#playbackTransport QLabel#playbackClock {{
+    color: {c.text}; background: {c.surface_sunken}; border-radius: 5px; padding: 5px 8px;
+}}
+"""
+
+
+def _scrollbar_rules(c: ColorTokens = COLORS) -> str:
+    """Slim rounded scroll bars without arrow buttons, in both directions."""
+    return f"""
+QScrollBar:vertical {{
+    background: transparent; width: 10px; margin: 2px; border: none;
+}}
+QScrollBar:horizontal {{
+    background: transparent; height: 10px; margin: 2px; border: none;
+}}
+QScrollBar::handle:vertical {{
+    background: {c.border_strong}; border-radius: 3px; min-height: 24px;
+}}
+QScrollBar::handle:horizontal {{
+    background: {c.border_strong}; border-radius: 3px; min-width: 24px;
+}}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{
+    background: {c.text_disabled};
+}}
+QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; border: none; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+"""
+
+
+def app_stylesheet(theme_name: str | None = None) -> str:
+    """Application-wide rules: popup classes (menus, tooltips, message
+    boxes) and scroll bars."""
+    c = active_colors(theme_name)
+    return (
+        _scrollbar_rules(c)
+        + _tooltip_rules(c)
         + _menu_rules(c)
         + _message_box_container_rules(c)
         + scope_stylesheet(_button_rules(c) + _choice_rules(c), "QMessageBox")
@@ -1153,7 +1454,16 @@ def apply_app_theme(app: QApplication, theme_name: str = "dark") -> None:
     global _active_theme
     _active_theme = normalize_theme(theme_name)
     colors = active_colors()
+    sheet = app_stylesheet(_active_theme)
+    current = app.styleSheet()
+    previous = app.property("nwThemeStylesheet") or ""
+    if previous == sheet and sheet in current and app.property("nwFusionStyle"):
+        # Already applied. Setting the style, palette or style sheet again
+        # restyles every widget of the app (1.8 s with a full wall): a settings
+        # reload after each camera save froze the window.
+        return
     app.setStyle("Fusion")
+    app.setProperty("nwFusionStyle", True)
     if sys.platform == "win32":
         # Crisp text like native Windows apps: Qt's DirectWrite engine hints
         # only lightly by default, which looks soft at 125% / 150% scaling.
@@ -1176,9 +1486,6 @@ def apply_app_theme(app: QApplication, theme_name: str = "dark") -> None:
     palette.setColor(QPalette.ColorRole.ToolTipText, QColor(colors.text))
     app.setPalette(palette)
 
-    sheet = app_stylesheet(_active_theme)
-    current = app.styleSheet()
-    previous = app.property("nwThemeStylesheet") or ""
     if previous and previous in current:
         current = current.replace(previous, "")
     app.setStyleSheet(current + sheet)

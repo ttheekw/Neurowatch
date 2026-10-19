@@ -42,6 +42,9 @@ pub struct ViewerManager {
     /// The desktop UI client that attached each session, so its sessions
     /// end with its view lease (a UI that crashed leaves no decoder behind).
     owners: Mutex<HashMap<ViewerSessionId, String>>,
+    /// Shared camera connections: an RTSP/RTMP session decodes its stream's
+    /// hub instead of connecting itself.
+    hubs: Option<std::sync::Arc<crate::streams::StreamHubs>>,
 }
 
 impl ViewerManager {
@@ -51,7 +54,14 @@ impl ViewerManager {
             capabilities,
             sessions: Mutex::new(HashMap::new()),
             owners: Mutex::new(HashMap::new()),
+            hubs: None,
         }
+    }
+
+    /// Decode RTSP/RTMP cameras from their shared connection (`hubs`).
+    pub fn with_stream_hubs(mut self, hubs: std::sync::Arc<crate::streams::StreamHubs>) -> Self {
+        self.hubs = Some(hubs);
+        self
     }
 
     pub fn capabilities(&self) -> &ViewerCapabilities {
@@ -88,6 +98,7 @@ impl ViewerManager {
             self.hwaccel,
             sink_factory,
             handle,
+            self.hubs.as_ref(),
         )?;
         self.sessions
             .lock()

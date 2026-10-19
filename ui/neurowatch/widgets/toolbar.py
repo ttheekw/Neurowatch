@@ -18,6 +18,7 @@ from neurowatch.models.wall_layout import GRID_PRESETS
 from neurowatch.theme import arrow_rules
 
 _HEIGHT = 36
+_CONTROL_HEIGHT = 26
 _BG = "#14141e"
 _TEXT = "#c0c0d4"
 _BTN = "#1e1e32"
@@ -73,6 +74,7 @@ class ToolBar(QWidget):
     grid_changed = Signal(int, int)  # rows, cols
     add_camera = Signal()
     edit_camera = Signal()
+    ptz_requested = Signal()
     remove_camera = Signal()
     prev_page = Signal()
     next_page = Signal()
@@ -155,6 +157,13 @@ class ToolBar(QWidget):
         self._edit_btn.clicked.connect(self.edit_camera)
         layout.addWidget(self._edit_btn)
 
+        self._ptz_btn = QPushButton("PTZ")
+        self._ptz_btn.setStyleSheet(_BTN_STYLE)
+        self._ptz_btn.setToolTip("Pan, tilt, zoom and presets for the selected camera")
+        self._ptz_btn.setEnabled(False)
+        self._ptz_btn.clicked.connect(self.ptz_requested)
+        layout.addWidget(self._ptz_btn)
+
         self._remove_btn = QPushButton("✕ Remove")
         self._remove_btn.setStyleSheet(_BTN_STYLE)
         self._remove_btn.setToolTip("Remove selected camera")
@@ -200,6 +209,12 @@ class ToolBar(QWidget):
         sp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         layout.addWidget(sp)
 
+        # One even height for every control: centred in the row, odd heights
+        # landed half a pixel off and their text sat 1 px above the labels.
+        for kind in (QPushButton, QComboBox, QSpinBox):
+            for control in self.findChildren(kind):
+                control.setFixedHeight(_CONTROL_HEIGHT)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -222,7 +237,16 @@ class ToolBar(QWidget):
     def set_camera_selected(self, selected: bool) -> None:
         """Enable/disable Edit and Remove buttons based on selection."""
         self._edit_btn.setEnabled(selected)
+        self._ptz_btn.setEnabled(selected)
         self._remove_btn.setEnabled(selected)
+
+    def apply_role(self) -> None:
+        """Show only what the signed-in account may do (all without sign-in)."""
+        from neurowatch.ipc.auth import may
+
+        for button in (self._add_btn, self._edit_btn, self._remove_btn):
+            button.setVisible(may("admin"))
+        self._ptz_btn.setVisible(may("operator"))
 
     def set_grid(self, rows: int, cols: int) -> None:
         """Update combo to reflect the active grid without emitting signal."""

@@ -46,6 +46,12 @@ jobs:
             gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-ugly \
             gstreamer1.0-libav
+      # The cloud's LiveKit publisher links libwebrtc, built with clang >= 21.
+      - name: Install clang 21
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm.sh -o llvm.sh
+          sudo bash llvm.sh 21
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy

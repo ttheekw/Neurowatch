@@ -1,9 +1,9 @@
 //! Optional consumers of camera media inside the backend.
 //!
-//! The backend works without any of them. An extension (see
-//! [`crate::extension`]) can install them on [`crate::app_state::AppState`]
-//! before the cameras start, for example to make snapshots from pictures the
-//! backend already has instead of opening another camera connection.
+//! The backend works without any of them. NeuroWatch Cloud ([`crate::cloud`])
+//! installs them on [`crate::app_state::AppState`] before the cameras start,
+//! to make thumbnails from pictures the backend already has instead of opening
+//! another camera connection.
 //!
 //! Both are called on GStreamer streaming threads: return at once (see the
 //! appsink rule in the coding standards).

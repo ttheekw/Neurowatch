@@ -511,6 +511,16 @@ impl DiscoveryService {
                 endpoint_reference: epr,
                 source: Some(main.profile.token.clone()),
             });
+        // The device service that answered is tried first (see `promote`).
+        camera.onvif =
+            candidate
+                .device_urls
+                .first()
+                .map(|device_url| nw_core::camera::OnvifEndpoint {
+                    device_url: device_url.clone(),
+                    events_url: None,
+                    ptz_url: None,
+                });
         Ok(camera)
     }
 

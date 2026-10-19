@@ -45,6 +45,32 @@ impl ExportHandler {
         }
     }
 
+    /// A job's stored camera is authoritative; caller-supplied camera ids
+    /// cannot authorize another camera's status or cancellation.
+    pub(crate) async fn authorize_job(
+        &self,
+        session: &crate::accounts::Session,
+        method: &str,
+        params: &Value,
+    ) -> Result<(), RpcError> {
+        if session.cameras.is_empty() || !matches!(method, "export.status" | "export.cancel") {
+            return Ok(());
+        }
+        let id = job_id(params)?;
+        let exports = Arc::clone(&self.state.read().await.exports);
+        if exports
+            .status(id)
+            .is_some_and(|job| !session.sees(&job.camera_id))
+        {
+            return Err(RpcError {
+                code: super::handler::NOT_ALLOWED as i32,
+                message: "You may not access this camera's exports".into(),
+                data: None,
+            });
+        }
+        Ok(())
+    }
+
     async fn start(&self, params: &Value) -> Result<Value, RpcError> {
         let camera_id = params["camera_id"]
             .as_str()
@@ -62,7 +88,16 @@ impl ExportHandler {
             _ => return Err(RpcError::invalid_params("'path' must be a string")),
         };
         let overwrite = params["overwrite"].as_bool().unwrap_or(false);
-        export::validate_range(start_ms, end_ms).map_err(rpc_error)?;
+        let timelapse: Option<export::TimelapseOptions> = params
+            .get("timelapse")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|e| RpcError::invalid_params(format!("Invalid timelapse options: {e}")))?;
+        if let Some(options) = timelapse {
+            options.validate(start_ms, end_ms).map_err(rpc_error)?;
+        } else {
+            export::validate_range(start_ms, end_ms).map_err(rpc_error)?;
+        }
 
         let (camera_name, exports) = {
             let st = self.state.read().await;
@@ -88,10 +123,13 @@ impl ExportHandler {
             overwrite,
         };
         // Checking the destination touches the disk.
-        let status = tokio::task::spawn_blocking(move || exports.start(&request, segments))
-            .await
-            .map_err(|e| RpcError::internal(e.to_string()))?
-            .map_err(rpc_error)?;
+        let status = tokio::task::spawn_blocking(move || match timelapse {
+            Some(options) => exports.start_timelapse(&request, segments, options),
+            None => exports.start(&request, segments),
+        })
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?
+        .map_err(rpc_error)?;
         serde_json::to_value(status).map_err(|e| RpcError::internal(e.to_string()))
     }
 
@@ -186,6 +224,18 @@ mod tests {
                 "export.start",
                 json!({"camera_id": "cam", "start_ms": 0, "end_ms": 5}),
                 "No recordings",
+            ),
+            (
+                "export.start",
+                json!({"camera_id":"cam", "start_ms":0, "end_ms":1000,
+                "timelapse":{"interval_sec":0,"fps":25}}),
+                "Timelapse interval",
+            ),
+            (
+                "export.start",
+                json!({"camera_id":"nope", "start_ms":0, "end_ms":172800000,
+                "timelapse":{"interval_sec":10,"fps":25}}),
+                "Unknown camera",
             ),
             ("export.status", json!({}), "Missing 'job_id'"),
             ("export.status", json!({"job_id": "x"}), "Unknown export"),

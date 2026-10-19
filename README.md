@@ -7,24 +7,24 @@
 <p align="center">
   <b>Turn the computer you already have into a security camera recorder.</b><br>
   Watch every camera live, record around the clock to your own drive, and find any moment in seconds.<br>
-  Free and open source. No camera limit. No account. No subscription.
+  Free for up to 16 cameras; NeuroWatch Unlimited is USD 50 once. Open source. No account needed for local use.
 </p>
 
 <p align="center">
-  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-windows-x86_64-setup.exe"><img src="https://img.shields.io/badge/Download_for_Windows-10_%26_11,_64--bit-2563eb?style=for-the-badge" alt="Download NeuroWatch for Windows 10 and 11"></a>
+  <a href="https://neurowatch.app/downloads?version=latest&platform=windows&arch=x86_64&kind=installer"><img src="https://img.shields.io/badge/Download_for_Windows-10_%26_11,_64--bit-2563eb?style=for-the-badge" alt="Download NeuroWatch for Windows 10 and 11"></a>
   &nbsp;
-  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch_amd64.deb"><img src="https://img.shields.io/badge/Download_for_Ubuntu_%2F_Debian-.deb,_64--bit-E95420?style=for-the-badge" alt="Download NeuroWatch for Ubuntu and Debian"></a>
+  <a href="https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=deb"><img src="https://img.shields.io/badge/Download_for_Ubuntu_%2F_Debian-.deb,_64--bit-E95420?style=for-the-badge" alt="Download NeuroWatch for Ubuntu and Debian"></a>
 </p>
 
 <p align="center">
   Also for
-  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch.x86_64.rpm">Fedora (.rpm)</a> ·
-  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-x86_64.pkg.tar.zst">Arch Linux</a> ·
-  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch_arm64.deb">Raspberry Pi &amp; ARM (.deb)</a> ·
-  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch.aarch64.rpm">Fedora ARM</a> ·
-  portable <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-windows-x86_64.zip">Windows .zip</a>,
-  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-linux-x86_64.tar.gz">Linux .tar.gz</a>,
-  <a href="https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-linux-arm64.tar.gz">ARM .tar.gz</a><br>
+  <a href="https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=rpm">Fedora (.rpm)</a> ·
+  <a href="https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=arch">Arch Linux</a> ·
+  <a href="https://neurowatch.app/downloads?version=latest&platform=linux&arch=arm64&kind=deb">Raspberry Pi &amp; ARM (.deb)</a> ·
+  <a href="https://neurowatch.app/downloads?version=latest&platform=linux&arch=arm64&kind=rpm">Fedora ARM</a> ·
+  portable <a href="https://neurowatch.app/downloads?version=latest&platform=windows&arch=x86_64&kind=portable">Windows .zip</a>,
+  <a href="https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=portable">Linux .tar.gz</a>,
+  <a href="https://neurowatch.app/downloads?version=latest&platform=linux&arch=arm64&kind=portable">ARM .tar.gz</a><br>
   <a href="https://github.com/ttheekw/Neurowatch/releases/latest">Release notes and checksums</a> ·
   <a href="#installing">Installation help</a> ·
   <a href="docs/system-requirements.md">System requirements</a>
@@ -34,7 +34,7 @@
   <a href="https://github.com/ttheekw/Neurowatch/releases/latest"><img src="https://img.shields.io/github/v/release/ttheekw/Neurowatch?include_prereleases&label=latest" alt="Latest version"></a>
   <a href="https://github.com/ttheekw/Neurowatch/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/ttheekw/Neurowatch/actions/workflows/ci.yml/badge.svg?branch=main" alt="Tests"></a>
   <a href="#installing"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-informational" alt="Linux and Windows"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue" alt="License: AGPL-3.0-or-later"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0"></a>
 </p>
 
 ### Why NeuroWatch
@@ -47,7 +47,7 @@
 
 > **Beta:** every release is install-tested on Windows, Ubuntu 22.04 and 24.04, Debian 12 and 13, Fedora 43 and Arch Linux before it is published. Found a problem? [Tell us](https://github.com/ttheekw/Neurowatch/issues), it makes the next release better.
 
-NeuroWatch is **free and open source** ([AGPL-3.0-or-later](LICENSE)). The optional NeuroWatch Cloud, for watching from a browser, is a separate service in the official downloads (see [Licensing](#licensing)).
+NeuroWatch is **free and open source** ([Apache-2.0](LICENSE)), including its NeuroWatch Cloud client. The optional NeuroWatch Cloud, for watching from a browser, is an online service (see [Licensing](#licensing)).
 
 ## Contents
 
@@ -77,17 +77,35 @@ NeuroWatch is **free and open source** ([AGPL-3.0-or-later](LICENSE)). The optio
 
 ### Cameras
 - **Search Network** finds ONVIF cameras on your network, shows their model and whether they're ready, need a password, or are already added. Then add them in a few clicks.
-- Or add any camera by its address: RTSP/RTSPS, RTMP, MJPEG over HTTP(S), USB cameras, or a video file.
+- Or add one by its address on the **Camera** tab, two ways: **Automatic (ONVIF)** asks the camera for its streams (enter its address, username and password, then **Load Streams**, and pick the main and grid stream from the lists), or **Stream URLs** for any camera by its stream address: RTSP/RTSPS, RTMP, MJPEG over HTTP(S), USB cameras, or a video file.
+- **Edit Camera** opens on the same tab with the camera's saved streams to choose from. Its password is kept unless you type a new one.
 - **Several streams per camera:** NeuroWatch records the best-quality stream and shows a lighter one in the grid. You can pick another stream for any tile from its right-click menu.
 - Test a camera before saving it, and see each camera's live status, codec and resolution on its tile.
 - **Audio:** cameras that send sound (AAC, G.711 or Opus) are recorded with it. Tiles of cameras with audio show a speaker at the top right: click it, or right-click → **Listen**, to hear that camera live. One camera at a time; the sound stops when the camera leaves the screen.
 - NeuroWatch won't add the same camera twice, and reconnects by itself when a camera drops out.
 
+### Events
+
+- **Computer motion detection:** enable **Detect motion on this computer** in Edit Camera → Motion to analyze a separate stream, preferably the lower-resolution substream. Set sensitivity, minimum duration, cooldown, and watched/ignored zones using a camera snapshot. Watch the live analysis picture, highlighted changed blocks and score in the Motion tab while checking saved settings. **Low CPU · keyframes only** decodes fewer pictures but can miss short movements; it uses software decoding and is off by default. Main-stream fallback is explained when no grid stream is available. Detection also works without the desktop window, adds decoding work, and does not share the recording pipeline. Diagnostics reports motion decoders, analysis FPS, detector time and queue drops.
+- **Camera motion events:** most ONVIF cameras detect motion themselves. Turn on **Use the camera's own motion detection** in a camera's **Motion** tab (Edit Camera), and NeuroWatch records each time the camera sees motion without continuously decoding video for detection. Event pictures use a short, one-frame snapshot. Cameras with analytics also report intrusion, line crossing, tampering and alarm inputs. The Motion tab shows whether the camera is sending its events. Set where and how sensitively the camera looks for motion in the camera's own web settings.
+- Cameras send their events straight to NeuroWatch when they can reach your computer (TCP port 7681; allow it in your firewall if one blocks cameras). Otherwise NeuroWatch asks each camera for its events every few seconds, automatically; the Motion tab says which.
+- **See events in the app:** the **Events** tab lists activity and alerts as they happen. Search your event history by camera, event or details; filter by camera, event type, ongoing/finished status and date range. Click a column heading to sort the loaded rows, and **Show Older** to go further back. Double-click an event to watch that moment in Playback. The tab counts new events while you're elsewhere; a camera's tile shows an orange **MOTION** badge while the camera sees motion.
+- **Motion alerts on tiles:** an orange bell icon at the top right stays after motion ends, including when you change pages or reopen the app. Click the icon to clear the events seen so far; new motion brings it back. Clearing the alert keeps the event history. In **Playback**, orange marks on each camera's timeline show motion, intrusion and line crossing: hover for the event's time and duration, or click there to seek through the recordings.
+- **Problems are events too:** a camera going offline (and coming back), a recording that keeps failing, and a recording drive that is almost full are noted with their times, also when NeuroWatch runs without a screen.
+- See them from a terminal with `neurowatch events` (the latest 20), `neurowatch events --follow` (and new ones as they happen) or `--camera "Front Door"`. Events are kept for 30 days.
+
 ### Recording and playback
 - Record all cameras or only the ones you choose, around the clock, to your computer's drive.
+- **Weekly recording schedules:** right-click a camera tile, choose **Edit Camera → Recording**, then choose Continuous, Event retention or Off, then drag across the weekly grid to paint hours or 15-minute intervals. Use **Edit exact time windows** for minute precision, including overnight. Faint cells use the default; erase restores it and **Undo paint** reverses edits. Schedules follow the recorder’s local clock through daylight-saving changes. Manual Start/Stop overrides the schedule until the recorder restarts. The hosted portal offers the same policy controls.
+- **Copy recording policies:** in **Edit Camera → Recording → Copy to cameras…**, select cameras and confirm. This saves the shown modes, schedule, padding and retention settings to those cameras immediately. Each camera keeps its recording enable switch, storage path, quota and motion settings. The source camera still needs **Save**.
+- **Event retention** records continuously, then trims footage without events; it saves space, not disk writes. Choose footage before/after events and how long to keep non-event footage. Cleanup waits through a safety grace and pauses if recording or detection is unhealthy; older continuous footage is not enrolled. Quota and drive limits still apply to event footage.
 - **Choose Drive…** lists your drives with their free space and records to the one you pick. The new location takes effect immediately.
 - **Disk cleanup:** when the recording drive gets fuller than a limit you choose (90% by default), the oldest recordings are deleted to make room, so recording never stops for lack of space. Set it in **Settings → Recording → Disk Cleanup**. Only NeuroWatch's own recordings are deleted, never your other files. Each camera can also have its own **Storage Quota**.
-- **Playback:** a timeline with several cameras side by side, with play/pause, seek and speed controls.
+- **Network drives and USB disks are safe to record to:** if the drive is not connected or a network share is not mounted, NeuroWatch records nothing there instead of quietly filling your computer's own disk. The cameras show recording **failed**, a **Recording storage missing** event (and alert, if you set one up) says which folder, and recording carries on by itself once the drive is back. NeuroWatch recognises its folders by a small `.neurowatch-storage` file; please leave it there.
+- **Archive to a NAS:** **Settings → Archive** moves recordings older than a few days (7 by default) to another folder, such as a network share, and Playback and Export still find them there. Each recording is checked against the original before it is removed from the recording drive. You can limit the archive's size, the hours it runs (for example only at night) and its speed. Recording to the computer's own drive and archiving to the NAS is the most reliable way to use one.
+- **Playback:** a timeline with several cameras side by side, with play/pause, seek and speed controls. Turn on **Events only** to skip quiet time and pause at the last recorded event; turn it off for normal review. The **Events** sidebar offers searchable lists or paged **Thumbnails** of saved images, with zone names, peak score and changed-area details when available.
+- **Review events while playing recordings:** open **Events** on the desktop timeline or **Review events** in the portal. Filter the loaded range by event type, acknowledgement or text (and camera on desktop), see a saved event picture, and review its recording with a short lead-in. Coloured timeline marks distinguish motion, bookmarks and camera alerts; hover shows the type and full time.
+- **Export an event:** choose **Export event…** on desktop to prepare a clip with that camera's pre/post padding. In portal recording review, select an event and choose **Prepare event clip** with the padding you want (where export is available). Review the yellow handles, then export; missing footage and clip limits are explained.
 - **Export Video:** **File → Export Video…** saves a clip as an MP4 file you can share. Load a camera's recordings, drag the yellow handles on the timeline to the part you want (a preview plays it), press **Export…** and choose where to save. The video is copied as recorded, so it is quick and keeps the camera's quality. A clip may start a moment before the time you chose, and gaps where nothing was recorded are left out.
 - **Export from the web portal:** a camera's **Export** tab in NeuroWatch Cloud lets you play its recordings and drag the start and end of a clip on the timeline; the recorder makes the MP4 and the portal offers it for download for 7 days.
 - **Playback with sound:** recordings with audio play it back. The first camera with audio is heard; click another tile's speaker to switch, or the same one to mute. Sound keeps its normal pitch from 0.5× to 2× speed and is muted at faster or slower speeds.
@@ -101,10 +119,10 @@ NeuroWatch is **free and open source** ([AGPL-3.0-or-later](LICENSE)). The optio
 - **Headless mode** for a computer without a screen: NeuroWatch runs as a background service that starts when the computer boots, even if nobody logs in. See [Running without a screen](#running-without-a-screen).
 
 ### NeuroWatch Cloud (optional, official downloads)
-NeuroWatch Cloud is an online service, free for up to 16 cameras, with paid plans for more. It is included in the official downloads from the Releases page, not in builds made from this source code.
-- Link NeuroWatch to your NeuroWatch Cloud account with a one-time code (**≡ menu → Cloud Link…**).
+NeuroWatch Cloud is an online service, free for up to 16 cameras, with paid plans for more. The official downloads from the Releases page link to it.
+- Link NeuroWatch to your NeuroWatch Cloud account with a one-time code (**Settings → Cloud**, or click **Cloud** in the status bar).
 - Then watch live video and recordings from a web browser, with camera thumbnails.
-- On a computer without a screen, manage everything from the web portal: add and edit cameras, turn recording on or off, and choose the recording drive. You can also see the same diagnostics as in the desktop app.
+- Manage it from the web portal, with or without a screen: add and edit cameras, turn recording on or off, and choose the recording drive. The desktop app shows changes made there at once. You can also see the same diagnostics as in the desktop app.
 - Camera addresses and passwords you enter in the portal are encrypted between your browser and your recorder, so the cloud only passes them along and can't read them.
 - Without linking, nothing leaves your computer.
 
@@ -114,28 +132,37 @@ NeuroWatch Cloud is an online service, free for up to 16 cameras, with paid plan
 - Light and dark themes.
 
 ### Coming later
-Motion detection and events, recording schedules, AI object detection, multi-site management, user accounts and permissions, PTZ camera control and a mobile app are planned. They are not part of NeuroWatch yet.
+Alerts (push, email, Telegram, webhooks), Home Assistant and MQTT, a local web interface, AI object detection, multi-site management, user accounts and permissions, PTZ camera control and a mobile app are planned. They are not part of NeuroWatch yet.
 
 ---
 
 ## Installing
 
-Each link below downloads the newest version. Older versions, release notes and checksums are on the [Releases page](https://github.com/ttheekw/Neurowatch/releases). NeuroWatch is in beta: it works, but hasn't been tested on many computers yet, so please [report problems](https://github.com/ttheekw/Neurowatch/issues).
+Each link below opens the [downloads page](https://neurowatch.app/downloads) at the newest version. It offers two editions of every download:
+
+- **NeuroWatch** (free): everything described here, for up to 16 cameras.
+- **NeuroWatch Unlimited** (USD 50, once): the same app with **no software camera limit**; capacity depends on your hardware. Includes a **support response within 24 hours** at [hello@neurowatch.app](mailto:hello@neurowatch.app). Buy it on the downloads page while signed in to your NeuroWatch account; its downloads (this version and later ones) then appear there for you. Install it over the free version: your cameras and recordings stay.
+
+The desktop purchase and optional NeuroWatch Cloud plans are separate.
+
+With more than 16 cameras in the free version, the first 16 (in wall order) run; the others are kept as they are and run again when you remove cameras or install Unlimited. Older versions, release notes and checksums are on the [Releases page](https://github.com/ttheekw/Neurowatch/releases). NeuroWatch is in beta: it works, but hasn't been tested on many computers yet, so please [report problems](https://github.com/ttheekw/Neurowatch/issues).
 
 On Ubuntu, Debian, Linux Mint and Fedora you can **double-click** the downloaded package and choose **Install**; the terminal command next to it does the same, run in the folder you downloaded it to (usually `~/Downloads`):
 
 | System | Download | Install |
 |---|---|---|
-| Windows 10/11 (64-bit) | [Installer (.exe)](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-windows-x86_64-setup.exe) | Run the installer, then open NeuroWatch from Start. Windows may warn that the installer is unrecognised: choose **More info → Run anyway**. |
-| Windows 10/11 (portable) | [.zip](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-windows-x86_64.zip) | Extract it, then run `neurowatch.cmd` |
-| Ubuntu, Debian, Linux Mint (64-bit PC) | [.deb](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch_amd64.deb) | Double-click → **Install**, or `sudo apt install ./neurowatch*_amd64.deb` |
-| Ubuntu, Debian, Raspberry Pi OS 64-bit (ARM) | [.deb](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch_arm64.deb) | Double-click → **Install**, or `sudo apt install ./neurowatch*_arm64.deb` |
-| Fedora (64-bit PC) | [.rpm](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch.x86_64.rpm) | Double-click → **Install**, or `sudo dnf install ./neurowatch*.x86_64.rpm` |
-| Fedora (ARM) | [.rpm](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch.aarch64.rpm) | Double-click → **Install**, or `sudo dnf install ./neurowatch*.aarch64.rpm` |
-| Arch Linux (64-bit PC) | [.pkg.tar.zst](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-x86_64.pkg.tar.zst) | `sudo pacman -U ./neurowatch*-x86_64.pkg.tar.zst` |
-| Other Linux (portable) | [x86_64](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-linux-x86_64.tar.gz) or [ARM](https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch-linux-arm64.tar.gz) .tar.gz | `tar xzf neurowatch*-linux-*.tar.gz && ./neurowatch/neurowatch` (needs the system's desktop and audio libraries) |
+| Windows 10/11 (64-bit) | [Installer (.exe)](https://neurowatch.app/downloads?version=latest&platform=windows&arch=x86_64&kind=installer) | Run the installer, then open NeuroWatch from Start. Windows may warn that the installer is unrecognised: choose **More info → Run anyway**. |
+| Windows 10/11 (portable) | [.zip](https://neurowatch.app/downloads?version=latest&platform=windows&arch=x86_64&kind=portable) | Extract it, then run `neurowatch.cmd` |
+| Ubuntu, Debian, Linux Mint (64-bit PC) | [.deb](https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=deb) | Double-click → **Install**, or `sudo apt install ./neurowatch*_amd64.deb` |
+| Ubuntu, Debian, Raspberry Pi OS 64-bit (ARM) | [.deb](https://neurowatch.app/downloads?version=latest&platform=linux&arch=arm64&kind=deb) | Double-click → **Install**, or `sudo apt install ./neurowatch*_arm64.deb` |
+| Fedora (64-bit PC) | [.rpm](https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=rpm) | Double-click → **Install**, or `sudo dnf install ./neurowatch*.x86_64.rpm` |
+| Fedora (ARM) | [.rpm](https://neurowatch.app/downloads?version=latest&platform=linux&arch=arm64&kind=rpm) | Double-click → **Install**, or `sudo dnf install ./neurowatch*.aarch64.rpm` |
+| Arch Linux (64-bit PC) | [.pkg.tar.zst](https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=arch) | `sudo pacman -U ./neurowatch*-x86_64.pkg.tar.zst` |
+| Other Linux (portable) | [x86_64](https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=portable) or [ARM](https://neurowatch.app/downloads?version=latest&platform=linux&arch=arm64&kind=portable) .tar.gz | `tar xzf neurowatch*-linux-*.tar.gz && ./neurowatch/neurowatch` (needs the system's desktop and audio libraries) |
 
 Double-clicking opens the package in your software centre (App Center on Ubuntu 24.04 and later, Software on Fedora), which asks for your password and installs the system libraries NeuroWatch needs as well; then open **NeuroWatch** from your applications. If double-clicking opens another program (for example on Ubuntu 22.04), use the terminal command instead, with the `./` so the required libraries are installed too. Downloads include the video components NeuroWatch needs; you don't have to install any yourself.
+
+On Linux the packages also add the computer's user accounts to the `render` and `video` groups, so recording can use the graphics card (or, on ARM boards such as the Raspberry Pi, the video decoder) and USB cameras from the moment the computer starts, before anyone signs in (after the next restart). With the portable download, run `sudo usermod -aG render,video $USER` once for the same. Windows needs nothing: NeuroWatch starts there when you sign in.
 
 The Windows installer installs for your account and adds a Start Menu shortcut. Uninstalling stops the service and removes its startup entry; your configuration and recordings are preserved. Before removing a Linux package, run `neurowatch service stop` and `neurowatch service uninstall` from your own account.
 
@@ -162,7 +189,7 @@ The Windows installer installs for your account and adds a Start Menu shortcut. 
    - Or, under **Advanced**, enter a name and the camera's stream address, for example `rtsp://admin:password@192.168.1.100:554/stream1`. **Test** checks it before you save.
 3. **Turn on recording:** on the camera's **Recording** tab, or for every camera at once in **Settings → Recording**. That page is also where you choose the drive to record to.
 4. **Watch recordings** in the **Playback** tab.
-5. **Optional:** link to NeuroWatch Cloud from **≡ menu → Cloud Link…** to watch from a browser.
+5. **Optional:** link to NeuroWatch Cloud from **Settings → Cloud** to watch from a browser.
 
 ---
 
@@ -186,7 +213,7 @@ The Windows installer installs for your account and adds a Start Menu shortcut. 
 
 ### The background service
 
-NeuroWatch's recorder keeps running when the window is closed. Use the tray icon to stop or restart it, or these commands (Linux; on Windows, use the tray icon):
+NeuroWatch's recorder keeps running when the window is closed. **Settings → Startup** chooses what happens when you sign in: start NeuroWatch or not, stay in the background (tray icon) or open the window, record from boot before anyone signs in (Linux), and open the window in fullscreen. Use the tray icon to stop or restart it, or these commands (Linux; on Windows, use the tray icon):
 
 | Command | What it does |
 |---|---|
@@ -208,7 +235,7 @@ On a server or a small computer with no display:
 neurowatch --headless
 ```
 
-NeuroWatch starts as a background service that also starts when the computer boots, without anyone logging in. The terminal shows what it's doing: cameras coming online, recording starting, and the cloud connection in official downloads. Press **Ctrl+C** to stop watching; NeuroWatch keeps recording.
+NeuroWatch starts as a background service that also starts when the computer boots, without anyone logging in. The terminal shows what it's doing: cameras coming online, recording starting, events such as motion or a camera going offline, and the cloud connection in official downloads. Press **Ctrl+C** to stop watching; NeuroWatch keeps recording. `neurowatch events` lists what happened while you weren't watching.
 
 With NeuroWatch Cloud (official downloads):
 - Link it to NeuroWatch Cloud straight away with `neurowatch --headless --link CODE --name "Head Office"`, using an enrollment code from the web portal (**Nodes → Create enrollment**, valid five minutes).
@@ -244,7 +271,7 @@ With NeuroWatch Cloud (official downloads):
 
 ## Disclaimer
 
-NeuroWatch is free, open-source software provided **as is, without any warranty**, and used at your own risk. To the extent the law allows, its authors and contributors are **not liable** for any loss or damage from using it, including missed, lost or corrupted recordings. It is not a guaranteed security, safety or alarm system: test that it works for you and keep backups of footage you need. The full disclaimer is in [`NOTICE`](NOTICE); the [licence](LICENSE) (sections 15 and 16) governs.
+NeuroWatch is free, open-source software provided **as is, without any warranty**, and used at your own risk. To the extent the law allows, its authors and contributors are **not liable** for any loss or damage from using it, including missed, lost or corrupted recordings. It is not a guaranteed security, safety or alarm system: test that it works for you and keep backups of footage you need. The full disclaimer is in [`NOTICE`](NOTICE); the [licence](LICENSE) (sections 7 and 8) governs.
 
 ---
 
@@ -252,10 +279,10 @@ NeuroWatch is free, open-source software provided **as is, without any warranty*
 
 This is a summary, not legal advice; the licence texts govern.
 
-- **The NeuroWatch app is open source** under the [GNU Affero General Public License v3.0 or later](LICENSE): live view, recording, playback, export and headless mode, with no camera limit, free for any use, including business use.
-- **If you change NeuroWatch and share it**, or let others use your changed version over a network, you must publish your changes under the same licence. Using it unchanged, or changing it only for yourself, needs nothing.
-- **NeuroWatch Cloud is a separate, proprietary service.** Its code is not in this repository and not covered by the AGPL. It is free for up to 16 cameras; more cameras need a paid plan. The official downloads include its client.
-- **Trademark:** "NeuroWatch" and its logo are not licensed under the AGPL (see [`NOTICE`](NOTICE)). A modified version must use another name and must not be presented as the official NeuroWatch.
+- **The NeuroWatch app is open source** under the [Apache License 2.0](LICENSE): live view, recording, playback, export and headless mode, free for any use, including business use. The free downloads run up to 16 cameras; NeuroWatch Unlimited, sold on the [downloads page](https://neurowatch.app/downloads), has no software camera limit. Capacity depends on your hardware.
+- **You may use, change and share it**, also in your own products, open or closed. When you share it, keep the [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) files and mark the files you changed. The licence includes a patent grant from contributors.
+- **NeuroWatch Cloud is an online service with its own terms.** Its client in NeuroWatch is open source like the rest of this repository; the hosted service is not part of it. It is free for up to 16 cameras; more cameras need a paid plan.
+- **Trademark:** "NeuroWatch" and its logo are not licensed under the Apache License (see [`NOTICE`](NOTICE)). A modified version must use another name and must not be presented as the official NeuroWatch.
 
 NeuroWatch builds on third-party software under its own licences, including GStreamer, Qt/PySide6 and many Rust and Python libraries. You are responsible for any codec or patent licensing that applies where you use it (for example H.264/H.265).
 
@@ -263,7 +290,7 @@ NeuroWatch builds on third-party software under its own licences, including GStr
 
 ## For developers
 
-**Overview.** NeuroWatch has two parts that run as separate programs on the same computer: a background recorder, written in Rust on GStreamer, that connects to the cameras, records and serves video; and the desktop app, written in Python with Qt (PySide6), that shows it. Both can be extended: official builds add NeuroWatch Cloud that way, and this repository builds the app without it.
+**Overview.** NeuroWatch has two parts that run as separate programs on the same computer: a background recorder, written in Rust on GStreamer, that connects to the cameras, records and serves video; and the desktop app, written in Python with Qt (PySide6), that shows it. Both can be extended; the NeuroWatch Cloud client is built in that way.
 
 Build and run from source on Ubuntu/Debian:
 
@@ -280,4 +307,4 @@ More detail:
 
 **Tests.** Every merge to `main`, and every pull request, runs the full test suite on GitHub: Rust formatting, lints and tests (with at least 80% line coverage), and Python lint, type checks and tests. The **Tests** badge at the top shows the result for `main`; open a [run](https://github.com/ttheekw/Neurowatch/actions/workflows/ci.yml) to see its summary, a table of passed, failed and skipped tests per suite with the names of any failures, and the coverage report. To run the same checks locally, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-**Contributing.** Bug reports, ideas and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Contributors sign the [Contributor License Agreement](CLA.md) once, on their first pull request.
+**Contributing.** Bug reports, ideas and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Contributions are licensed under the Apache License 2.0, like the rest of NeuroWatch.

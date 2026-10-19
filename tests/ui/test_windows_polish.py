@@ -32,7 +32,7 @@ def test_add_camera_goes_side_by_side_when_stacking_would_not_fit(
     )
     dialog = camera_dialog.AddEditCameraDialog(parent=parent, ipc_endpoint=None)
     qtbot.addWidget(dialog)
-    dialog._tabs.setCurrentWidget(dialog._simple_tab)  # where the connection test shows
+    dialog._show_camera_tab("onvif")  # where the connection test shows
     dialog.fit_to_screen()
     assert dialog.property("columns") == columns
     if columns == 2:
@@ -152,5 +152,5 @@ def test_the_search_tab_has_no_connection_test_and_stays_one_column(
     assert dialog._test_panel.isHidden(), "each camera is tested as it is added"
     dialog.fit_to_screen()
     assert dialog.property("columns") == 1
-    dialog._tabs.setCurrentWidget(dialog._advanced_tab)
+    dialog._show_camera_tab("urls")
     assert not dialog._test_panel.isHidden()

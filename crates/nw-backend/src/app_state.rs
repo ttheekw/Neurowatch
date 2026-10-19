@@ -37,6 +37,7 @@ pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     /// Recording state machine — tracks which cameras are actively recording.
     pub recording: RecordingSupervisor,
+    recording_intervals: crate::recording::event_retention::EligibilityClock,
     /// Active playback sessions keyed by session_id.
     pub playback_sessions: HashMap<String, PlaybackSession>,
     event_bus: Arc<dyn EventBus>,
@@ -65,9 +66,17 @@ pub struct AppState {
     live_audio: Option<(CameraId, watch::Sender<bool>)>,
     /// Cameras asked to record whose source has no compressed video to keep.
     recording_unsupported: HashSet<CameraId>,
+    /// Recording locations' readiness (`crate::storage_guard`).
+    pub storage: Arc<crate::storage_guard::StorageGuard>,
+    /// Cameras asked to record whose location is missing, with why.
+    storage_blocked: HashMap<CameraId, String>,
+    /// The archive tier's mover (`recording::archive`).
+    pub archive: Arc<crate::recording::archive::Archive>,
     /// Registry of per-camera renderer/decoder health counters, shared with
     /// active supervisors and read by the stats aggregator.
     pub stream_health: Arc<StreamHealthRegistry>,
+    /// Shared camera connections, one per stream (`crate::streams`).
+    pub streams: Arc<crate::streams::StreamHubs>,
     /// No desktop UI: camera pipelines skip the SHM ring and convert frames
     /// only when a [`FrameTap`] wants them.
     headless: bool,
@@ -80,6 +89,20 @@ pub struct AppState {
     reachability: HashMap<CameraId, Arc<Reachability>>,
     /// Clip export jobs, shared by every client (desktop IPC, web portal).
     pub exports: Arc<crate::export::ExportService>,
+    /// Motion, camera analytics, health and bookmarks ([`crate::events`]).
+    pub events: Arc<crate::events::EventHub>,
+    /// The cameras' own events over ONVIF ([`crate::onvif_events`]).
+    pub onvif_events: Arc<crate::onvif_events::OnvifEvents>,
+    /// Opt-in analysis decoders, independent of desktop views and recording.
+    pub ptz: Arc<crate::ptz::PtzService>,
+    /// Alert notifications (`crate::alerts`).
+    pub alerts: Arc<crate::alerts::AlertService>,
+    /// Signed-in local accounts (`crate::accounts`).
+    pub sessions: Arc<crate::accounts::Sessions>,
+    /// Two-way audio: who talks through which camera (`crate::talk`).
+    pub talk: Arc<crate::talk::TalkService>,
+    pub builtin_motion: Arc<crate::motion::runtime::BuiltinMotion>,
+    pub snapshots: Arc<crate::snapshot::SnapshotService>,
 }
 
 impl AppState {
@@ -106,12 +129,16 @@ impl AppState {
         db: rusqlite::Connection,
     ) -> Self {
         let db = Arc::new(Mutex::new(db));
+        let events = Arc::new(crate::events::EventHub::new(Arc::clone(&db)));
+        let streams = Arc::new(crate::streams::StreamHubs::default());
+        let snapshots = Arc::new(crate::snapshot::SnapshotService::new(Arc::clone(&streams)));
         Self {
             config,
             config_path,
             hwaccel,
             db,
             recording: RecordingSupervisor::new(),
+            recording_intervals: crate::recording::event_retention::EligibilityClock::default(),
             playback_sessions: HashMap::new(),
             event_bus: Arc::new(LogEventBus),
             assignment_registry: Arc::new(LocalAssignmentRegistry::new()),
@@ -127,12 +154,24 @@ impl AppState {
             audio_demand: HashMap::new(),
             live_audio: None,
             recording_unsupported: HashSet::new(),
+            storage: Arc::default(),
+            storage_blocked: HashMap::new(),
+            archive: Arc::default(),
             stream_health: Arc::new(StreamHealthRegistry::new()),
+            streams,
             headless: false,
             frame_tap: None,
             keyframe_sink: None,
             reachability: HashMap::new(),
             exports: Arc::new(crate::export::ExportService::new()),
+            events,
+            onvif_events: Arc::new(crate::onvif_events::OnvifEvents::new()),
+            ptz: Arc::new(crate::ptz::PtzService::default()),
+            alerts: Arc::new(crate::alerts::AlertService::default()),
+            sessions: Arc::new(crate::accounts::Sessions::default()),
+            talk: Arc::new(crate::talk::TalkService::default()),
+            builtin_motion: Arc::new(crate::motion::runtime::BuiltinMotion::default()),
+            snapshots,
         }
     }
 
@@ -167,28 +206,34 @@ impl AppState {
     /// (Re)start the camera's encoded ingest, picking up recording changes.
     /// Desktop views and browser live view are not touched.
     pub fn restart_ingest(&mut self, cam: &CameraConfig) {
+        self.recording_intervals.observe(&cam.id, "", false, 0);
         if let Some(old) = self.ingest.remove(&cam.id) {
             let _ = old.stop_tx.send(true);
         }
         if let Some(sink) = &self.keyframe_sink {
             sink.forget(&cam.id);
         }
+        self.snapshots.forget(&cam.id);
+        self.storage_blocked.remove(&cam.id);
         // Global setting: automatically enable local recording for every camera.
         // Manual recording sessions take precedence and are preserved.
         if self.config.recording.local_all_cameras && !self.recording.wants_recording(&cam.id) {
             let storage_dir = self.global_recording_output_dir(cam);
-            match std::fs::create_dir_all(&storage_dir) {
-                Ok(_) => self
+            let root = self.global_storage_root();
+            match self.prepare_recording_dir(&root, &storage_dir) {
+                Ok(()) => self
                     .recording
                     .start_global_all_local(cam.id.clone(), storage_dir),
-                Err(e) => tracing::warn!(
-                    cam_id = %cam.id,
-                    error = %e,
-                    "Cannot create global recording directory; camera will stream without recording"
-                ),
+                Err(reason) => {
+                    tracing::warn!(cam_id = %cam.id, reason = %reason, "Camera streams without recording: its recording location is unavailable");
+                    self.storage_blocked.insert(cam.id.clone(), reason);
+                }
             }
         }
         self.reconcile_configured_local_recording(cam);
+        if crate::recording::policy::current_mode(cam) == nw_core::camera::RecordingMode::Off {
+            self.recording.pause_automatic(&cam.id);
+        }
 
         let (stop_tx, stop_rx) = watch::channel(false);
         let (state_tx, state_rx) = watch::channel("connecting".to_owned());
@@ -200,13 +245,36 @@ impl AppState {
             state_tx,
             stream_info_tx,
         )
-        .with_health_counters(self.stream_health.counters_for(&cam.id));
+        .with_health_counters(self.stream_health.counters_for(&cam.id))
+        .with_stream_hubs(Arc::clone(&self.streams));
         ingest = ingest.with_reachability(self.reachability_of(&cam.id));
-        if let Some(sink) = &self.keyframe_sink {
-            ingest = ingest.with_keyframes(Arc::clone(sink));
-        }
+        ingest = ingest.with_keyframes(Arc::new(crate::snapshot::KeyframeFanout {
+            local: Arc::clone(&self.snapshots),
+            cloud: self.keyframe_sink.clone(),
+        }));
         self.recording_unsupported.remove(&cam.id);
-        if let Some(storage_path) = self.recording.recording_storage_path(&cam.id).cloned() {
+        // Last check before the ingest is given a folder (manual recordings
+        // included): the location's cached readiness, kept current by
+        // `run_storage_checks`.
+        let recording_path = self
+            .recording
+            .recording_storage_path(&cam.id)
+            .cloned()
+            .filter(|path| {
+                let root = self.storage_root_of(cam, path);
+                match self
+                    .storage
+                    .status(&root)
+                    .and_then(|status| status.reason().map(str::to_owned))
+                {
+                    Some(reason) => {
+                        self.storage_blocked.insert(cam.id.clone(), reason);
+                        false
+                    }
+                    None => true,
+                }
+            });
+        if let Some(storage_path) = recording_path {
             if crate::pipeline::builder::recording_supported(&cam.url) {
                 ingest = ingest.with_recording(
                     storage_path.to_string_lossy().to_string(),
@@ -257,7 +325,8 @@ impl AppState {
         )
         .with_assignment(assignment.clone(), Arc::clone(&self.assignment_registry))
         .with_health_counters(Arc::clone(&health_counters))
-        .with_headless(self.headless);
+        .with_headless(self.headless)
+        .with_stream_hubs(Arc::clone(&self.streams));
         if let Some(tap) = self.frame_tap.clone() {
             supervisor = supervisor.with_frame_tap(tap);
         }
@@ -307,11 +376,39 @@ impl AppState {
 
     /// Stop everything for a camera: its desktop view and its ingest.
     /// The camera's shared "it answered" signal (see [`Reachability`]).
+    /// Subscribe to a camera's stream through its shared connection (opened
+    /// if none is open; see [`crate::streams`]). `stream` is `main`, `sub`
+    /// (the main stream when no sub stream is configured, sharing its
+    /// connection) or a listed stream id. Dropping the subscription
+    /// unsubscribes.
+    pub fn subscribe_stream(
+        &self,
+        camera_id: &str,
+        stream: &str,
+        policy: crate::streams::SubscriberPolicy,
+    ) -> Result<crate::streams::Subscription, String> {
+        let camera = self
+            .config
+            .cameras
+            .iter()
+            .find(|camera| camera.id == camera_id)
+            .ok_or_else(|| "Camera not found".to_owned())?;
+        let url = camera
+            .stream_url(stream)
+            .filter(|url| !url.trim().is_empty())
+            .ok_or_else(|| format!("camera has no stream '{stream}'"))?;
+        let mut source = camera.clone();
+        source.url = url;
+        self.streams
+            .subscribe(&source, policy, self.reachability.get(camera_id).cloned())
+    }
+
     fn reachability_of(&mut self, cam_id: &CameraId) -> Arc<Reachability> {
         Arc::clone(self.reachability.entry(cam_id.clone()).or_default())
     }
 
     pub fn stop_supervisor(&mut self, cam_id: &CameraId) {
+        self.ptz.forget(cam_id, Arc::clone(&self.events));
         self.stop_view(cam_id);
         if let Some(ingest) = self.ingest.remove(cam_id) {
             let _ = ingest.stop_tx.send(true);
@@ -319,12 +416,14 @@ impl AppState {
         if let Some(sink) = &self.keyframe_sink {
             sink.forget(cam_id);
         }
+        self.snapshots.forget(cam_id);
         self.recording_unsupported.remove(cam_id);
         self.reachability.remove(cam_id);
     }
 
     /// Stop all running supervisors and playback sessions.
     pub fn stop_all(&mut self) {
+        self.ptz.shutdown(Arc::clone(&self.events));
         for (cam_id, tx) in self.stop_txs.drain() {
             let _ = tx.send(true);
             tracing::info!(cam_id = %cam_id, "Desktop view stop requested (shutdown)");
@@ -484,7 +583,8 @@ impl AppState {
         if let Some(camera) = desired {
             let (stop_tx, stop_rx) = watch::channel(false);
             let cam_id = camera.id.clone();
-            let listener = crate::pipeline::audio::LiveAudio::new(camera, stop_rx);
+            let listener = crate::pipeline::audio::LiveAudio::new(camera, stop_rx)
+                .with_stream_hubs(Arc::clone(&self.streams));
             if tokio::runtime::Handle::try_current().is_ok() {
                 tokio::task::spawn_blocking(move || listener.run());
             } else {
@@ -611,6 +711,30 @@ impl AppState {
             .filter(|v| v.is_object())
             .map(crate::config::DesktopConfig::from_value)
             .transpose()?;
+        let events = value
+            .get("events")
+            .filter(|v| v.is_object())
+            .map(|events| crate::config::EventsConfig::changed(&self.config.events, events))
+            .transpose()?;
+        let archive = value
+            .get("recording")
+            .and_then(|rec| rec.get("archive"))
+            .filter(|v| v.is_object())
+            .map(|archive| {
+                crate::config::ArchiveConfig::changed(&self.config.recording.archive, archive)
+            })
+            .transpose()?;
+        if let Some(archive) = archive.as_ref().filter(|a| a.enabled) {
+            let mut roots = crate::recording::archive::recording_roots(self);
+            if let Some(path) = value["recording"]["storage_path"].as_str() {
+                roots.push(expand_user_path(path));
+            }
+            if let Some(reason) =
+                crate::recording::archive::overlap(&expand_user_path(&archive.path), &roots)
+            {
+                anyhow::bail!("{reason}");
+            }
+        }
         let local_all_before = self.config.recording.local_all_cameras;
         let storage_before = self.config.recording.storage_path.clone();
         if let Some(s) = value["site_name"].as_str() {
@@ -643,6 +767,9 @@ impl AppState {
             if let Some(v) = ui["fullscreen_status_opacity"].as_u64() {
                 self.config.ui.fullscreen_status_opacity = v.min(100) as u8;
             }
+            if let Some(fps) = ui.get("preview_fps").filter(|v| v.is_object()) {
+                self.config.ui.preview_fps = self.config.ui.preview_fps.updated(fps);
+            }
         }
         if let Some(desktop) = desktop {
             self.config.desktop = desktop;
@@ -671,6 +798,18 @@ impl AppState {
             {
                 self.config.recording.disk_threshold_percent = v as u8;
             }
+        }
+
+        if let Some(archive) = archive {
+            if archive != self.config.recording.archive {
+                self.config.recording.archive = archive;
+                self.archive.reconfigured();
+            }
+        }
+        if let Some(events) = events {
+            // Retention applies on the next cleanup pass; a new push port
+            // when the camera-event listener next starts (recorder restart).
+            self.config.events = events;
         }
 
         let local_all_after = self.config.recording.local_all_cameras;
@@ -709,11 +848,12 @@ impl AppState {
                 continue;
             }
             let to = self.global_recording_output_dir(&cam);
-            if let Err(e) = std::fs::create_dir_all(&to) {
+            let root = self.global_storage_root();
+            if let Err(reason) = self.prepare_recording_dir(&root, &to) {
                 tracing::warn!(
                     cam_id = %cam.id,
-                    error = %e,
-                    "Cannot create the new recording directory; recording stays in the old location"
+                    reason = %reason,
+                    "Cannot record in the new location; recording stays in the old location"
                 );
                 continue;
             }
@@ -736,10 +876,185 @@ impl AppState {
         base.join(&cam.id).join(date_stamp)
     }
 
+    /// The global recording location.
+    pub fn global_storage_root(&self) -> PathBuf {
+        expand_user_path(&self.config.recording.storage_path)
+    }
+
+    /// Where `cam` records on its own (`recording.local`, manual Start): its
+    /// own folder when it has one, else the global location.
+    pub fn camera_storage_root(&self, cam: &CameraConfig) -> PathBuf {
+        cam.recording
+            .local
+            .storage_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .map_or_else(|| self.global_storage_root(), expand_user_path)
+    }
+
+    /// Where `cam` records automatically: its own location when it records
+    /// by itself, else the global one ("record all cameras").
+    fn automatic_storage_root(&self, cam: &CameraConfig) -> PathBuf {
+        if cam.recording.local.enabled {
+            self.camera_storage_root(cam)
+        } else {
+            self.global_storage_root()
+        }
+    }
+
+    /// The recording location a recording folder of `cam` lies in.
+    fn storage_root_of(&self, cam: &CameraConfig, path: &Path) -> PathBuf {
+        let own = self.camera_storage_root(cam);
+        if path.starts_with(&own) {
+            own
+        } else {
+            self.global_storage_root()
+        }
+    }
+
+    /// Why `cam` is not recording although asked to: its recording location
+    /// is missing.
+    pub fn storage_blocked(&self, cam_id: &str) -> Option<&str> {
+        self.storage_blocked.get(cam_id).map(String::as_str)
+    }
+
+    /// Whether `root` can be recorded to now. Its first use gives it its
+    /// marker and remembers the id (`recording.storage_ids`). A location
+    /// already known to be missing is not checked again here: the periodic
+    /// check (`run_storage_checks`) notices when it is back.
+    pub fn ensure_storage(&mut self, root: &Path) -> Result<(), String> {
+        use crate::storage_guard::{bounded, Readiness};
+        if let Some(Readiness::Missing(reason)) = self.storage.status(root) {
+            return Err(reason);
+        }
+        let key = root.to_string_lossy().into_owned();
+        let expected = self.config.recording.storage_ids.get(&key).cloned();
+        let result = bounded(root, expected.as_deref(), &self.storage);
+        if let (Ok(id), None) = (&result, &expected) {
+            self.config.recording.storage_ids.insert(key, id.clone());
+            if let Err(error) = self.save_config() {
+                tracing::warn!(storage = %root.display(), %error, "Cannot save the recording location's id");
+            }
+            tracing::info!(storage = %root.display(), "Recording location marked");
+        }
+        let readiness = match &result {
+            Ok(_) => Readiness::Ready,
+            Err(reason) => Readiness::Missing(reason.clone()),
+        };
+        if self.storage.set(root, readiness) {
+            if let Err(reason) = &result {
+                tracing::warn!(storage = %root.display(), reason = %reason, "Recording location missing; nothing is recorded there");
+            }
+        }
+        result.map(|_| ())
+    }
+
+    /// Create a recording folder `dir` under the location `root`, only while
+    /// `root` is really there (never on an empty mount point).
+    pub fn prepare_recording_dir(&mut self, root: &Path, dir: &Path) -> Result<(), String> {
+        self.ensure_storage(root)?;
+        std::fs::create_dir_all(dir)
+            .map_err(|error| format!("cannot create {}: {error}", dir.display()))
+    }
+
     pub fn global_recording_output_dir(&self, cam: &CameraConfig) -> PathBuf {
         let base = expand_user_path(&self.config.recording.storage_path);
         let date_stamp = current_local_date_stamp();
         base.join(&cam.id).join(date_stamp)
+    }
+
+    /// Reevaluate automatic schedules without restarting the encoded pipeline
+    /// for Continuous↔Events transitions. Explicit Start/Stop always wins.
+    pub fn reconcile_recording_policies(&mut self) {
+        let now = (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        self.recording_intervals
+            .retain_cameras(&self.config.cameras);
+        for cam in self.config.cameras.clone() {
+            let mode = crate::recording::policy::current_mode(&cam);
+            if self.recording.has_manual_override(&cam.id) {
+                self.recording_intervals.observe(&cam.id, "", false, now);
+                continue;
+            }
+            let enabled = cam.recording.local.enabled || self.config.recording.local_all_cameras;
+            // A missing location (cached; no file-system access here) is not
+            // recorded to: no restart loop while it stays missing.
+            let wanted = enabled
+                && mode != nw_core::camera::RecordingMode::Off
+                && self.storage.is_ready(&self.automatic_storage_root(&cam));
+            if wanted != self.recording.wants_recording(&cam.id) {
+                if !wanted {
+                    self.recording.pause_automatic(&cam.id);
+                }
+                self.restart_ingest(&cam);
+            }
+            let source = cam.motion.effective_source();
+            let healthy = (source.uses_builtin()
+                && self
+                    .builtin_motion
+                    .status(&cam.id)
+                    .is_some_and(|status| status.state == "running"))
+                || (source.uses_onvif()
+                    && self.onvif_events.status(&cam.id).is_some_and(|status| {
+                        status.state == crate::onvif_events::SubscriptionState::Subscribed
+                    }));
+            let fingerprint = serde_json::to_string(&(
+                &cam.recording,
+                &cam.motion,
+                &cam.url,
+                &cam.sub_url,
+                self.events.activity_generation(&cam.id),
+            ))
+            .unwrap_or_default();
+            self.recording_intervals.observe(
+                &cam.id,
+                &fingerprint,
+                wanted
+                    && !self.events.activity_paused(&cam.id)
+                    && healthy
+                    && self.recording_pipeline_ready(&cam.id)
+                    && mode == nw_core::camera::RecordingMode::Events,
+                now,
+            );
+        }
+    }
+
+    pub fn event_retention_since(&self, camera_id: &str) -> Option<i64> {
+        let camera = self
+            .config
+            .cameras
+            .iter()
+            .find(|camera| camera.id == camera_id)?;
+        if self.recording.has_manual_override(&camera.id)
+            || !self.recording.wants_recording(&camera.id)
+            || !self.recording_pipeline_ready(camera_id)
+            || crate::recording::policy::current_mode(camera)
+                != nw_core::camera::RecordingMode::Events
+        {
+            return None;
+        }
+        let source = camera.motion.effective_source();
+        let healthy = (source.uses_builtin()
+            && self
+                .builtin_motion
+                .status(camera_id)
+                .is_some_and(|status| status.state == "running"))
+            || (source.uses_onvif()
+                && self.onvif_events.status(camera_id).is_some_and(|status| {
+                    status.state == crate::onvif_events::SubscriptionState::Subscribed
+                }));
+        if !healthy {
+            return None;
+        }
+        if self.events.activity_paused(camera_id) {
+            return None;
+        }
+        self.recording_intervals.since(camera_id)
+    }
+
+    fn recording_pipeline_ready(&self, camera_id: &str) -> bool {
+        self.ingest
+            .get(camera_id)
+            .is_some_and(|ingest| ingest.state_rx.borrow().as_str() == "recording_ready")
     }
 
     fn reconcile_configured_local_recording(&mut self, cam: &CameraConfig) {
@@ -747,30 +1062,33 @@ impl AppState {
             self.recording.stop_configured_local(&cam.id);
             if self.config.recording.local_all_cameras && !self.recording.wants_recording(&cam.id) {
                 let storage_dir = self.global_recording_output_dir(cam);
-                match std::fs::create_dir_all(&storage_dir) {
-                    Ok(_) => self
+                let root = self.global_storage_root();
+                match self.prepare_recording_dir(&root, &storage_dir) {
+                    Ok(()) => self
                         .recording
                         .start_global_all_local(cam.id.clone(), storage_dir),
-                    Err(e) => tracing::warn!(
-                        cam_id = %cam.id,
-                        error = %e,
-                        "Cannot create global recording directory; camera will stream without recording"
-                    ),
+                    Err(reason) => {
+                        tracing::warn!(cam_id = %cam.id, reason = %reason, "Camera streams without recording: its recording location is unavailable");
+                        self.storage_blocked.insert(cam.id.clone(), reason);
+                    }
                 }
             }
             return;
         }
 
         let storage_dir = self.local_recording_output_dir(cam);
-        match std::fs::create_dir_all(&storage_dir) {
-            Ok(_) => self
+        let root = self.camera_storage_root(cam);
+        match self.prepare_recording_dir(&root, &storage_dir) {
+            Ok(()) => self
                 .recording
                 .start_configured_local(cam.id.clone(), storage_dir),
-            Err(e) => tracing::warn!(
-                cam_id = %cam.id,
-                error = %e,
-                "Cannot create configured local recording directory; camera will stream without recording"
-            ),
+            Err(reason) => {
+                tracing::warn!(cam_id = %cam.id, reason = %reason, "Camera streams without recording: its recording location is unavailable");
+                // An automatic recording already running there stops too
+                // (a manual one is kept, and resumes when the location is back).
+                self.recording.pause_automatic(&cam.id);
+                self.storage_blocked.insert(cam.id.clone(), reason);
+            }
         }
     }
 
@@ -908,6 +1226,85 @@ mod tests {
         let _ = gstreamer::init();
     }
 
+    /// Mount protection: a location recorded to before, whose marker is
+    /// gone (an unmounted share leaves an empty mount point), gets no new
+    /// folders and no recording; the camera reports `failed`; recording
+    /// resumes when the marker is back.
+    #[tokio::test]
+    async fn a_missing_recording_location_is_never_recorded_to_and_resumes_when_back() {
+        use crate::storage_guard::{Readiness, MARKER_FILE};
+        init_gstreamer();
+        let root = test_config_path("mount").with_extension("");
+        let mut cam = camera("on-the-nas");
+        cam.recording.local.enabled = true;
+        let mut cfg = AppConfig::default();
+        cfg.recording.storage_path = root.to_string_lossy().into_owned();
+        cfg.cameras.push(cam.clone());
+        let mut st = app_state(cfg);
+
+        st.restart_ingest(&cam);
+        assert!(
+            st.recording.wants_recording(&cam.id),
+            "first use claims the location"
+        );
+        assert!(root.join(MARKER_FILE).is_file());
+        let id = st.config.recording.storage_ids[&root.to_string_lossy().into_owned()].clone();
+        let saved = crate::config::AppConfig::load_or_default(&st.config_path).unwrap();
+        assert_eq!(
+            saved.recording.storage_ids.values().next(),
+            Some(&id),
+            "the id is saved"
+        );
+
+        // The share is unmounted: an empty folder, no marker.
+        st.stop_supervisor(&cam.id);
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        st.storage.set(&root, Readiness::Missing("gone".into()));
+        st.reconcile_recording_policies();
+        st.restart_ingest(&cam);
+        assert!(!st.recording.wants_recording(&cam.id));
+        assert!(st.storage_blocked(&cam.id).is_some());
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "nothing was created on the empty mount point"
+        );
+        // Asking again re-checks nothing (the periodic check does) and still refuses.
+        assert!(st.ensure_storage(&root).is_err());
+
+        // Mounted again: the marker is there; the next check sees it.
+        std::fs::write(root.join(MARKER_FILE), format!("x\nid={id}\n")).unwrap();
+        st.storage.set(&root, Readiness::Ready);
+        st.reconcile_recording_policies();
+        assert!(st.recording.wants_recording(&cam.id), "recording resumes");
+        assert!(st.storage_blocked(&cam.id).is_none());
+        st.stop_supervisor(&cam.id);
+        std::fs::remove_dir_all(root).unwrap();
+        let _ = std::fs::remove_file(&st.config_path);
+    }
+
+    #[tokio::test]
+    async fn off_policy_pauses_automatic_ingest_recording_but_not_manual_start() {
+        init_gstreamer();
+        let root = test_config_path("off-policy").with_extension("");
+        let mut cam = camera("policy-off");
+        cam.recording.local.enabled = true;
+        cam.recording.mode = nw_core::camera::RecordingMode::Off;
+        let mut cfg = AppConfig::default();
+        cfg.recording.storage_path = root.to_string_lossy().into_owned();
+        let mut st = app_state(cfg);
+        st.restart_ingest(&cam);
+        assert!(!st.recording.wants_recording(&cam.id));
+        st.recording.start(cam.id.clone(), root.clone());
+        st.restart_ingest(&cam);
+        assert!(st.recording.wants_recording(&cam.id));
+        st.stop_supervisor(&cam.id);
+        if root.exists() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     fn camera(id: &str) -> CameraConfig {
         let mut cam = CameraConfig::new("Camera", "rtsp://example.invalid/stream");
         cam.id = id.to_owned();
@@ -961,6 +1358,39 @@ mod tests {
         }
         assert!(moved.is_some_and(|path| path.starts_with(&new_base)));
         assert!(kept.is_some_and(|path| path.starts_with(&own)));
+    }
+
+    #[tokio::test]
+    async fn preview_frame_rates_default_to_the_old_limits_and_are_clamped() {
+        use crate::config::PreviewFpsConfig;
+        let older: crate::config::UiConfig =
+            serde_json::from_value(serde_json::json!({"theme": "dark", "fullscreen": true}))
+                .expect("a config without the setting still loads");
+        assert_eq!(older.preview_fps, PreviewFpsConfig::default());
+        let partial: PreviewFpsConfig = serde_json::from_value(serde_json::json!({"single": 30}))
+            .expect("missing fields take their defaults");
+        assert_eq!((partial.single, partial.wall), (30, 15));
+
+        let mut st = app_state(AppConfig::default());
+        let defaults = st.config.ui.preview_fps;
+        assert_eq!(
+            (
+                defaults.single,
+                defaults.wall,
+                defaults.dense,
+                defaults.hidden
+            ),
+            (25, 15, 4, 2)
+        );
+        st.update_config_settings(&serde_json::json!({"ui": {"preview_fps": {
+            "single": 30, "wall": 30, "dense": 0, "hidden": 500,
+        }}}))
+        .expect("settings should save");
+        let _ = std::fs::remove_file(&st.config_path);
+        let fps = st.config.ui.preview_fps;
+        assert_eq!((fps.single, fps.wall), (30, 30));
+        assert_eq!(fps.dense, 1, "at least 1 fps");
+        assert_eq!(fps.hidden, 30, "hidden pages at most 30 fps");
     }
 
     #[tokio::test]
@@ -1261,6 +1691,7 @@ mod tests {
         // 2. splitmuxsink-fragment-opened element message received by supervisor →
         //    supervisor publishes `recording_ready` (the definitive sink-open event).
         state_tx.send("recording_ready".to_owned()).unwrap();
+        assert!(st.recording_pipeline_ready(&cam_id));
         let statuses = st
             .recording
             .status_all_with_pipeline_states(&st.supervisor_states());
@@ -1272,6 +1703,7 @@ mod tests {
 
         // 3. Pipeline failure maps to failed status.
         state_tx.send("error".to_owned()).unwrap();
+        assert!(!st.recording_pipeline_ready(&cam_id));
         let statuses = st
             .recording
             .status_all_with_pipeline_states(&st.supervisor_states());
@@ -1478,3 +1910,7 @@ mod tests {
         st.stop_all();
     }
 }
+
+#[cfg(test)]
+#[path = "recording/qualification.rs"]
+mod recording_qualification;

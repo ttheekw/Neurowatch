@@ -194,6 +194,32 @@ fn maybe_promote(current: Bottleneck, candidate: Bottleneck) -> Bottleneck {
     }
 }
 
+/// Name analysis pressure from observed recent queue loss. Intentional
+/// keyframe/rate sampling and historical drops never create a warning.
+pub fn with_motion(
+    mut current: Bottleneck,
+    motion: &[nw_core::stats::MotionMetrics],
+) -> Bottleneck {
+    for camera in motion {
+        if camera.state != "running" || camera.input_fps <= 0.0 {
+            continue;
+        }
+        let ratio = camera.dropped_fps / camera.input_fps;
+        let severity = if ratio >= 0.15 {
+            Severity::Critical
+        } else if ratio >= 0.05 {
+            Severity::Warning
+        } else {
+            continue;
+        };
+        current = maybe_promote(current, Bottleneck {
+            kind: BottleneckKind::Motion, severity,
+            explanation: format!("Motion analysis cannot keep up ({:.0}% of analysis pictures dropped); use a smaller substream or keyframe-only mode", ratio * 100.0),
+        });
+    }
+    current
+}
+
 fn severity_rank(s: Severity) -> u8 {
     match s {
         Severity::Ok => 0,

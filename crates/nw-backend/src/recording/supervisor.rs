@@ -140,6 +140,22 @@ impl RecordingSupervisor {
             .is_some_and(|r| r.state == RecordingState::Starting)
     }
 
+    /// A schedule pause is not a user's explicit Stop. Keep its automatic
+    /// origin so the next active window can resume normally.
+    pub fn pause_automatic(&mut self, cam_id: &CameraId) {
+        if let Some(rec) = self.cameras.get_mut(cam_id) {
+            if rec.source != RecordingSource::Manual {
+                rec.state = RecordingState::Idle;
+            }
+        }
+    }
+
+    pub fn has_manual_override(&self, cam_id: &CameraId) -> bool {
+        self.cameras
+            .get(cam_id)
+            .is_some_and(|rec| rec.source == RecordingSource::Manual)
+    }
+
     /// Point an active recording that writes under `from` at `to` (the
     /// recording location changed). Returns whether it moved.
     pub fn relocate(&mut self, cam_id: &CameraId, from: &Path, to: PathBuf) -> bool {
@@ -201,6 +217,25 @@ mod tests {
     use super::RecordingSupervisor;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn schedule_pause_resumes_automatic_recording_without_overriding_manual_choices() {
+        let id = "scheduled".to_owned();
+        let mut s = RecordingSupervisor::new();
+        s.start_configured_local(id.clone(), PathBuf::from("/unused"));
+        s.pause_automatic(&id);
+        assert!(!s.wants_recording(&id));
+        assert!(!s.has_manual_override(&id));
+        s.start_configured_local(id.clone(), PathBuf::from("/unused"));
+        assert!(s.wants_recording(&id));
+        s.start(id.clone(), PathBuf::from("/manual"));
+        s.pause_automatic(&id);
+        assert!(s.wants_recording(&id));
+        s.stop(&id);
+        s.start_configured_local(id.clone(), PathBuf::from("/unused"));
+        assert!(!s.wants_recording(&id));
+        assert!(s.has_manual_override(&id));
+    }
 
     #[test]
     fn only_recordings_in_the_old_location_move() {

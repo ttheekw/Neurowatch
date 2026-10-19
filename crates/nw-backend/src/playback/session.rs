@@ -61,6 +61,9 @@ const JOIN_TOLERANCE_MS: i64 = 100;
 const MAX_JOINED: usize = 30;
 /// A file modified this recently may still be being written: played alone.
 const OPEN_FILE_MS: u128 = 10_000;
+/// A file followed by its run's next one is finished once it has not changed
+/// for this long (the recorder finalizes files asynchronously, in moments).
+const FINALIZED_MS: u128 = 2_000;
 
 /// `{camera}_{run_epoch_ms}_{sequence}` of a recording segment's file name
 /// (`{camera}_{run_epoch_ms}_{sequence}_{fragment}.mkv`), with its folder;
@@ -83,21 +86,33 @@ fn run_of(path: &str) -> Option<(std::path::PathBuf, String)> {
     ))
 }
 
-fn recently_modified(path: &str) -> bool {
+/// Whether `path` changed in the last `ms` (a missing file counts as changed).
+fn modified_within(path: &str, ms: u128) -> bool {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .map_or(true, |age| age.as_millis() < OPEN_FILE_MS)
+        .map_or(true, |age| age.as_millis() < ms)
 }
 
 /// The playlist as pipelines: each run's consecutive, finished segments
 /// together (up to `MAX_JOINED`), everything else on its own.
+///
+/// Only a run's newest file can still be being written: one followed by the
+/// run's next file is finished as soon as it settled (`FINALIZED_MS`), not
+/// after `OPEN_FILE_MS`. Played alone, a just-finished file cost a rebuilt
+/// pipeline at its boundary: two missing frames and a sound glitch, the
+/// first time only (played again later, it was old enough to be joined).
 pub fn play_units(segments: &[PlaybackSegment]) -> Vec<PlayUnit> {
+    let runs: Vec<_> = segments.iter().map(|s| run_of(&s.path)).collect();
     let mut units: Vec<PlayUnit> = Vec::new();
     let mut last_run: Option<(std::path::PathBuf, String)> = None;
-    for segment in segments {
-        let run = run_of(&segment.path).filter(|_| !recently_modified(&segment.path));
+    for (index, segment) in segments.iter().enumerate() {
+        let followed = runs[index].is_some() && runs[index + 1..].contains(&runs[index]);
+        let open_for = if followed { FINALIZED_MS } else { OPEN_FILE_MS };
+        let run = runs[index]
+            .clone()
+            .filter(|_| !modified_within(&segment.path, open_for));
         let joins = match (units.last(), &run, &last_run) {
             (Some(unit), Some(run), Some(previous)) => {
                 run == previous
@@ -356,6 +371,8 @@ fn run_pipeline(
     };
 
     let units = play_units(&segments);
+    // The next unit, prepared while the one before it played.
+    let mut ready: Option<PreparedUnit> = None;
     for (index, unit) in units.iter().enumerate() {
         if *stop_rx.borrow() {
             break;
@@ -364,19 +381,30 @@ fn run_pipeline(
             *range = (unit.start_ts, unit.end_ts);
         }
         let seek_ms = if index == 0 { initial_seek_ms } else { 0 };
-        let has_next = index + 1 < units.len();
-        match run_segment(
-            &shm_key,
-            unit,
-            seek_ms,
-            has_next,
-            &writer,
-            &stop_rx,
-            &mut seek_rx,
-            &mut speed_rx,
-            &mut playing_rx,
-            &audio,
-        ) {
+        let next = units.get(index + 1);
+        let has_next = next.is_some();
+        let prepared = ready
+            .take()
+            .or_else(|| prepare_unit(&shm_key, unit, seek_ms, true, &writer, &audio));
+        let exit = match prepared {
+            Some(prepared) => {
+                let (exit, prepared_next) = play_unit(
+                    &shm_key,
+                    prepared,
+                    next,
+                    &writer,
+                    &stop_rx,
+                    &mut seek_rx,
+                    &mut speed_rx,
+                    &mut playing_rx,
+                    &audio,
+                );
+                ready = prepared_next;
+                exit
+            }
+            None => SegmentExit::Error,
+        };
+        match exit {
             SegmentExit::Eos if has_next => continue,
             // An unreadable file (e.g. cut short when recording stopped
             // abruptly) is skipped rather than ending the whole playback.
@@ -386,6 +414,9 @@ fn run_pipeline(
             }
             SegmentExit::Eos | SegmentExit::Stop | SegmentExit::Error => break,
         }
+    }
+    if let Some(unit) = ready.take() {
+        unit.discard();
     }
 
     tracing::info!(shm_key = %shm_key, "Playback session stopped");
@@ -398,77 +429,137 @@ enum SegmentExit {
     Error,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_segment(
+/// A unit's pipeline, built and prerolled paused at the moment it starts.
+struct PreparedUnit {
+    pipeline: gstreamer::Pipeline,
+    /// Whether its paused frame reaches the view (see `wire_appsink`).
+    show_preroll: Arc<AtomicBool>,
+}
+
+impl PreparedUnit {
+    fn discard(self) {
+        let _ = self.pipeline.set_state(gstreamer::State::Null);
+        // Wait for NULL so in-flight appsink callbacks complete before SHM drops.
+        let _ = self
+            .pipeline
+            .state(Some(gstreamer::ClockTime::from_seconds(5)));
+    }
+}
+
+/// Before its unit ends, the next unit's pipeline is built and prerolled
+/// (paused, hidden), so the boundary costs a state change instead of a
+/// pipeline build (about 70 ms with VA-API: two frames at 30 fps, and a new
+/// audio output starting).
+const PREPARE_AHEAD_MS: i64 = 5_000;
+
+/// Build `unit`'s pipeline and preroll it paused at `seek_ms`. `visible`:
+/// its paused frame is shown (the unit about to play); a unit prepared ahead
+/// stays hidden until it plays.
+fn prepare_unit(
     shm_key: &str,
     unit: &PlayUnit,
-    initial_seek_ms: i64,
-    advance_on_eos: bool,
+    seek_ms: i64,
+    visible: bool,
+    writer: &SegmentSink,
+    audio: &Arc<AudioState>,
+) -> Option<PreparedUnit> {
+    tracing::debug!(
+        shm_key,
+        paths = ?unit.paths,
+        start_ts = unit.start_ts,
+        end_ts = unit.end_ts,
+        visible,
+        "Opening playback segment"
+    );
+    let pipeline_str = match unit.paths.as_slice() {
+        [single] => build_pipeline_str(single),
+        _ => build_run_pipeline_str(),
+    };
+    let Some(pipeline) = gstreamer::parse::launch(&pipeline_str)
+        .ok()
+        .and_then(|e| e.downcast::<gstreamer::Pipeline>().ok())
+    else {
+        tracing::error!(shm_key = %shm_key, "Failed to build playback pipeline");
+        return None;
+    };
+    attach_audio(&pipeline, shm_key, audio);
+    if unit.paths.len() > 1 && !wire_run_source(&pipeline, shm_key, &unit.paths, audio) {
+        let _ = pipeline.set_state(gstreamer::State::Null);
+        return None;
+    }
+    // The frame held when first paused is the file's start; with a seek to
+    // come it is not shown, so the view never flashes the wrong moment.
+    let show_preroll = Arc::new(AtomicBool::new(visible && seek_ms <= 0));
+    if !wire_appsink(&pipeline, shm_key, writer, &show_preroll) {
+        let _ = pipeline.set_state(gstreamer::State::Null);
+        return None;
+    }
+    // Preroll paused and seek before playing, so the first frame shown is
+    // the one asked for rather than the start of the file.
+    if pipeline.set_state(gstreamer::State::Paused).is_err() {
+        tracing::error!(shm_key = %shm_key, "Failed to preroll playback pipeline");
+        let _ = pipeline.set_state(gstreamer::State::Null);
+        return None;
+    }
+    let _ = pipeline.state(gstreamer::ClockTime::from_seconds(5));
+    if seek_ms > 0 {
+        show_preroll.store(visible, AtomicOrdering::Relaxed);
+        apply_seek(&pipeline, seek_ms);
+        let _ = pipeline.state(gstreamer::ClockTime::from_seconds(5));
+    }
+    Some(PreparedUnit {
+        pipeline,
+        show_preroll,
+    })
+}
+
+/// Whether the unit playing in `pipeline` ends within `PREPARE_AHEAD_MS` of
+/// playing time (or its length is unknown).
+fn ending_soon(pipeline: &gstreamer::Pipeline, rate: f64) -> bool {
+    let (Some(position), Some(duration)) = (
+        pipeline.query_position::<gstreamer::ClockTime>(),
+        pipeline.query_duration::<gstreamer::ClockTime>(),
+    ) else {
+        return true;
+    };
+    let left_ms = duration.mseconds().saturating_sub(position.mseconds()) as f64;
+    left_ms / rate.abs().max(0.1) <= PREPARE_AHEAD_MS as f64
+}
+
+/// Play a prepared unit until it ends, the session stops or it fails,
+/// following the session's controls; `next` (the unit after it) is prepared
+/// ahead and returned, ready to play.
+#[allow(clippy::too_many_arguments)]
+fn play_unit(
+    shm_key: &str,
+    prepared: PreparedUnit,
+    next: Option<&PlayUnit>,
     writer: &SegmentSink,
     stop_rx: &watch::Receiver<bool>,
     seek_rx: &mut watch::Receiver<Option<i64>>,
     speed_rx: &mut watch::Receiver<f64>,
     playing_rx: &mut watch::Receiver<bool>,
     audio: &Arc<AudioState>,
-) -> SegmentExit {
-    tracing::debug!(
-        shm_key,
-        paths = ?unit.paths,
-        start_ts = unit.start_ts,
-        end_ts = unit.end_ts,
-        "Opening playback segment"
-    );
-
-    let pipeline_str = match unit.paths.as_slice() {
-        [single] => build_pipeline_str(single),
-        _ => build_run_pipeline_str(),
+) -> (SegmentExit, Option<PreparedUnit>) {
+    let PreparedUnit {
+        pipeline,
+        show_preroll,
+    } = prepared;
+    // From now on a paused frame (a seek while paused) is shown.
+    show_preroll.store(true, AtomicOrdering::Relaxed);
+    let mut ready: Option<PreparedUnit> = None;
+    let mut want_next = next.is_some();
+    let fail = |ready: Option<PreparedUnit>| {
+        let _ = pipeline.set_state(gstreamer::State::Null);
+        (SegmentExit::Error, ready)
     };
-    let pipeline = match gstreamer::parse::launch(&pipeline_str)
-        .ok()
-        .and_then(|e| e.downcast::<gstreamer::Pipeline>().ok())
-    {
-        Some(p) => p,
-        None => {
-            tracing::error!(shm_key = %shm_key, "Failed to build playback pipeline");
-            return SegmentExit::Error;
-        }
-    };
-
-    attach_audio(&pipeline, shm_key, audio);
-    if unit.paths.len() > 1 && !wire_run_source(&pipeline, shm_key, &unit.paths, audio) {
-        let _ = pipeline.set_state(gstreamer::State::Null);
-        return SegmentExit::Error;
-    }
-
-    // The frame held when first paused is the file's start; with a seek to
-    // come it is not shown, so the view never flashes the wrong moment.
-    let show_preroll = Arc::new(AtomicBool::new(initial_seek_ms <= 0));
-    if !wire_appsink(&pipeline, shm_key, writer, &show_preroll) {
-        let _ = pipeline.set_state(gstreamer::State::Null);
-        return SegmentExit::Error;
-    }
-
-    // Preroll paused and seek before playing, so the first frame shown is
-    // the one asked for rather than the start of the file.
-    if pipeline.set_state(gstreamer::State::Paused).is_err() {
-        tracing::error!(shm_key = %shm_key, "Failed to preroll playback pipeline");
-        let _ = pipeline.set_state(gstreamer::State::Null);
-        return SegmentExit::Error;
-    }
-    let _ = pipeline.state(gstreamer::ClockTime::from_seconds(5));
-    if initial_seek_ms > 0 {
-        show_preroll.store(true, AtomicOrdering::Relaxed);
-        apply_seek(&pipeline, initial_seek_ms);
-        let _ = pipeline.state(gstreamer::ClockTime::from_seconds(5));
-    }
 
     // A paused session stays paused: its first frame is already on screen
     // (the appsinks deliver the preroll frame).
     let playing = *playing_rx.borrow_and_update();
     if playing && pipeline.set_state(gstreamer::State::Playing).is_err() {
         tracing::error!(shm_key = %shm_key, "Failed to set pipeline to PLAYING");
-        let _ = pipeline.set_state(gstreamer::State::Null);
-        return SegmentExit::Error;
+        return fail(None);
     }
 
     let speed = *speed_rx.borrow_and_update();
@@ -480,13 +571,9 @@ fn run_segment(
     }
     apply_audio_mute(&pipeline, audio);
 
-    let bus = match pipeline.bus() {
-        Some(b) => b,
-        None => {
-            tracing::error!(shm_key = %shm_key, "Cannot get pipeline bus");
-            let _ = pipeline.set_state(gstreamer::State::Null);
-            return SegmentExit::Error;
-        }
+    let Some(bus) = pipeline.bus() else {
+        tracing::error!(shm_key = %shm_key, "Cannot get pipeline bus");
+        return fail(None);
     };
 
     let exit = loop {
@@ -544,7 +631,7 @@ fn run_segment(
                     break SegmentExit::Error;
                 }
                 MessageView::Eos(_) => {
-                    if advance_on_eos {
+                    if next.is_some() {
                         tracing::debug!(shm_key, "Playback segment ended; advancing");
                         break SegmentExit::Eos;
                     }
@@ -556,12 +643,26 @@ fn run_segment(
                 _ => {}
             }
         }
+
+        // Near the end, get the next unit ready while this one plays.
+        if want_next
+            && pipeline.current_state() == gstreamer::State::Playing
+            && ending_soon(&pipeline, audio.rate())
+        {
+            want_next = false;
+            ready = next.and_then(|unit| prepare_unit(shm_key, unit, 0, false, writer, audio));
+        }
     };
 
     let _ = pipeline.set_state(gstreamer::State::Null);
     // Wait for NULL so in-flight appsink callbacks complete before SHM drops.
     let _ = pipeline.state(Some(gstreamer::ClockTime::from_seconds(5)));
-    exit
+    if exit == SegmentExit::Stop {
+        if let Some(unit) = ready.take() {
+            unit.discard();
+        }
+    }
+    (exit, ready)
 }
 
 fn build_pipeline_str(path: &str) -> String {
@@ -1358,5 +1459,94 @@ mod tests {
         worker.join().expect("join playback worker");
         let _ = std::fs::remove_file(first_path);
         let _ = std::fs::remove_file(second_path);
+    }
+
+    #[test]
+    fn a_just_finished_file_joins_its_run_and_only_the_newest_plays_alone() {
+        use super::play_units;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nw-fresh-run-{nonce}"));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = |n: u32, age_s: u64| {
+            let path = dir.join(format!("cam_1789659000000_0_{n:05}.mkv"));
+            std::fs::write(&path, b"x").expect("write");
+            let modified = SystemTime::now() - Duration::from_secs(age_s);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_modified(modified))
+                .expect("age");
+            PlaybackSegment {
+                path: path.to_string_lossy().into_owned(),
+                start_ts: i64::from(n) * 60_000,
+                end_ts: i64::from(n + 1) * 60_000,
+            }
+        };
+        // Finished 5 s and 4 s ago (each followed by the run's next file),
+        // and the file still being written.
+        let segments = [file(0, 5), file(1, 4), file(2, 0)];
+        let units = play_units(&segments);
+        assert_eq!(units.len(), 2, "{units:?}");
+        assert_eq!(units[0].paths.len(), 2, "both finished files, one stream");
+        assert_eq!(units[1].paths, vec![segments[2].path.clone()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_next_unit_is_ready_before_this_one_ends() {
+        use super::{play_unit, prepare_unit, PlayUnit, SegmentExit, SegmentSink};
+        gstreamer::init().expect("initialize GStreamer");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let first = std::env::temp_dir().join(format!("nw-ahead-{nonce}-a.mkv"));
+        let second = std::env::temp_dir().join(format!("nw-ahead-{nonce}-b.mkv"));
+        create_segment_at(&first, 0, 0, 15); // 1 s
+        create_segment(&second, 1);
+        let unit = |path: &std::path::Path| PlayUnit {
+            paths: vec![path.to_string_lossy().into_owned()],
+            start_ts: 0,
+            end_ts: 1_000,
+        };
+        let (first_unit, second_unit) = (unit(&first), unit(&second));
+        let key = format!("pb_ahead_{nonce}");
+        let writer = SegmentSink::Shm(Arc::new(Mutex::new(
+            crate::shm::ring_buffer::ShmRingBufferWriter::create(&key).expect("shm"),
+        )));
+        let audio = Arc::new(AudioState::default());
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let (_seek_tx, mut seek_rx) = watch::channel(None);
+        let (_speed_tx, mut speed_rx) = watch::channel(1.0);
+        let (_playing_tx, mut playing_rx) = watch::channel(true);
+
+        let prepared =
+            prepare_unit(&key, &first_unit, 0, true, &writer, &audio).expect("first prepared");
+        let (exit, ready) = play_unit(
+            &key,
+            prepared,
+            Some(&second_unit),
+            &writer,
+            &stop_rx,
+            &mut seek_rx,
+            &mut speed_rx,
+            &mut playing_rx,
+            &audio,
+        );
+        assert_eq!(exit, SegmentExit::Eos);
+        let ready = ready.expect("the next unit was prepared while this one played");
+        assert_eq!(ready.pipeline.current_state(), gstreamer::State::Paused);
+        assert!(
+            !ready
+                .show_preroll
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "its paused frame stays hidden until it plays"
+        );
+        ready.discard();
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
     }
 }

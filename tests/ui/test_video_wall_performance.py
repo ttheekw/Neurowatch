@@ -372,9 +372,7 @@ def test_page_navigation_throttles_and_reuses_warm_readers(fake_reader, qtbot):
         assert reader.max_emit_fps == expected, cam_id
 
 
-def test_hidden_readers_stay_at_exact_two_fps_across_grid_and_solo_changes(
-    fake_reader, qtbot
-):
+def test_hidden_readers_stay_at_exact_two_fps_across_grid_and_solo_changes(fake_reader, qtbot):
     cameras = _cams(8, sub=True)
     wall = _make_wall(qtbot, 2, 2, cameras)
     readers = dict(wall._readers)
@@ -476,3 +474,31 @@ def test_solo_quality_changes_are_exact_and_idempotent(fake_reader, qtbot):
     wall.set_page(0)
     wall.set_grid(2, 2)
     assert requests == []
+
+
+def test_preview_limits_from_settings_retune_running_readers(fake_reader, qtbot):
+    from neurowatch.models.preview_fps import PreviewFps
+
+    cameras = _cams(16)
+    wall = _make_wall(qtbot, 2, 2, cameras)
+    page0 = {f"cam-{i:02d}" for i in range(4)}
+    readers = dict(wall._readers)
+
+    wall.set_preview_fps(PreviewFps(single=30, wall=30, dense=10, hidden=5))
+
+    assert len(fake_reader.instances) == 16, "new limits never create readers"
+    for cam_id, reader in wall._readers.items():
+        assert reader is readers[cam_id] and reader.stop_calls == 0
+        assert reader.max_emit_fps == (30.0 if cam_id in page0 else 5.0), cam_id
+    assert wall._render_timer.interval() == round(500.0 / 30.0)
+
+    wall.set_page(1)  # later page changes use the new limits too
+    page1 = {f"cam-{i:02d}" for i in range(4, 8)}
+    for cam_id, reader in wall._readers.items():
+        assert reader.max_emit_fps == (30.0 if cam_id in page1 else 5.0), cam_id
+
+    updates = sum(len(r.max_emit_fps_updates) for r in wall._readers.values())
+    wall.set_preview_fps(PreviewFps(single=30, wall=30, dense=10, hidden=5))
+    assert sum(len(r.max_emit_fps_updates) for r in wall._readers.values()) == updates, (
+        "unchanged limits do nothing"
+    )

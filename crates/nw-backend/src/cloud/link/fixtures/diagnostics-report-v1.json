@@ -1,0 +1,27 @@
+{
+  "idle": {
+    "audience": "neurowatch-cloud-node",
+    "auth_epoch": 3,
+    "challenge": "challenge-2",
+    "expires_at": "2026-09-21T14:14:20Z",
+    "issued_at": "2026-09-21T14:13:20Z",
+    "node_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "protocol_version": 1,
+    "signature": "Lr8SsuE2Wf7o6GbS8mWaI4TyxR97Az4dDsvbc4G1QlWnPp2vyShwHSBly7gY7sd5xXH97j37JZbgHr7Sd6adBg",
+    "snapshot_json": null,
+    "tenant_id": "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+  },
+  "public_key": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+  "watched": {
+    "audience": "neurowatch-cloud-node",
+    "auth_epoch": 3,
+    "challenge": "challenge-1",
+    "expires_at": "2026-09-21T14:14:20Z",
+    "issued_at": "2026-09-21T14:13:20Z",
+    "node_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "protocol_version": 1,
+    "signature": "V5vSgN-u5vaHINTMlaglmTzQf7a4q_kPZw9_F1MNjz94PP21oOZFNWRFbOabwVp4IQ-kdhHzjvB2jzYhz3zwBw",
+    "snapshot_json": "{\"app_version\":\"1.0.0\",\"bottleneck\":{\"explanation\":\"No resource is under pressure.\",\"kind\":\"none\",\"severity\":\"ok\"},\"cameras\":[{\"camera_id\":\"cam-1\",\"decoder_drops\":2,\"decoder_fps\":14.9,\"end_to_end_latency_ms\":null,\"renderer_drops\":0,\"renderer_fps\":null,\"state\":\"streaming\"}],\"captured_at_utc\":\"2026-09-21T13:46:40Z\",\"drives\":[{\"available_bytes\":200000000000,\"filesystem\":\"ext4\",\"mount_point\":\"/media/Données\",\"recording\":true,\"total_bytes\":500000000000}],\"gpu\":{\"reason\":\"Intel GPU — no counters (\\\"VA-API\\\")\",\"status\":\"unavailable\"},\"ipc\":{\"avg_latency_ms\":1.5,\"backpressure_events_total\":0,\"bytes_in_total\":900,\"bytes_out_total\":4000,\"drops_total\":0,\"inflight\":0,\"messages_total\":10,\"p95_latency_ms\":3.0,\"requests_total\":10},\"process\":{\"cpu_percent\":12.5,\"memory_percent\":2.6,\"rss_bytes\":210000000,\"siblings\":[{\"cpu_percent\":12.5,\"label\":\"nw-backend\",\"pid\":4242,\"rss_bytes\":210000000}],\"system_cpu_percent\":31.0,\"system_memory_percent\":null},\"system\":{\"cpu_cores\":8,\"load_average\":[1.2,0.9,0.7],\"memory_available_bytes\":8300000000,\"memory_total_bytes\":16000000000,\"uptime_seconds\":86400},\"video_acceleration\":{\"hardware\":true,\"kind\":\"vaapi\",\"label\":\"VA-API\"}}",
+    "tenant_id": "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+  }
+}

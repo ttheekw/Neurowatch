@@ -180,7 +180,7 @@ def test_onvif_discovery_keeps_every_profile_highest_resolution_first(qtbot):
 
     dlg = AddEditCameraDialog()
     qtbot.addWidget(dlg)
-    dlg._tabs.setCurrentWidget(dlg._simple_tab)
+    dlg._show_camera_tab("onvif")
     dlg._s_host.setText("10.0.0.9")
     # The backend's camera.discovery.profiles answer, without suggested streams.
     dlg._on_discover_done(
@@ -227,7 +227,7 @@ def test_manual_streams_add_extra_urls_and_keep_known_details(qtbot):
 
     dlg = AddEditCameraDialog(camera=_three_stream_cam(4))
     qtbot.addWidget(dlg)
-    dlg._tabs.setCurrentIndex(1)
+    dlg._show_camera_tab("urls")
     assert dlg._a_more_streams.toPlainText() == "rtsp://host/4/s3"
 
     dlg._a_more_streams.setPlainText("rtsp://host/4/s3\nrtsp://host/4/s4\n")

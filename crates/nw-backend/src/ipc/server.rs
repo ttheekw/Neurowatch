@@ -213,11 +213,13 @@ where
             Some(token) if token::presented(&request, token) => IpcTransport::Protected,
             _ => transport,
         };
-        let response = handler.dispatch_from(&request, transport).await;
+        let (response, idle) =
+            crate::stats::ipc_metrics::measure_handler(handler.dispatch_gated(request, transport))
+                .await;
         let mut out = serde_json::to_string(&response).context("Failed to serialize response")?;
         out.push('\n');
         writer.write_all(out.as_bytes()).await?;
-        span.complete(out.len());
+        span.complete_with_idle(out.len(), idle);
     }
     Ok(())
 }

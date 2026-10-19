@@ -97,6 +97,22 @@ def check_clip(start_ms: int, end_ms: int) -> str | None:
     return None
 
 
+MAX_TIMELAPSE_MS = 31 * MAX_CLIP_MS
+MAX_TIMELAPSE_FRAMES = 500_000
+
+
+def check_timelapse(start_ms: int, end_ms: int, interval_sec: int, fps: int) -> str | None:
+    if not 1 <= interval_sec <= 3600 or not 1 <= fps <= 60:
+        return "Use a sampling interval of 1–3600 seconds and a frame rate of 1–60 fps."
+    if start_ms < 0 or end_ms <= start_ms or end_ms - start_ms > MAX_TIMELAPSE_MS:
+        return "Choose a forward timelapse range of at most 31 days."
+    if (end_ms - start_ms + interval_sec * 1000 - 1) // (
+        interval_sec * 1000
+    ) > MAX_TIMELAPSE_FRAMES:
+        return "Use a longer sampling interval for this time range."
+    return None
+
+
 def default_clip_name(camera_name: str, start_ms: int) -> str:
     """``<camera>_<YYYY-MM-DD_HH-MM-SS>.mp4`` (local time), as the backend names it."""
     name = re.sub(r"[^\w-]", "_", camera_name).strip("_") or "camera"

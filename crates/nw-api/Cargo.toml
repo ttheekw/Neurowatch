@@ -1,0 +1,77 @@
+[package]
+name        = "nw-api"
+description = "Neurowatch hosted control plane — tenant, node enrollment and camera inventory API"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace   = true
+publish.workspace      = true
+rust-version.workspace = true
+
+[lib]
+name = "nw_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nw-api"
+path = "src/main.rs"
+
+[dependencies]
+nw-core            = { workspace = true }
+nw-cloud-protocol  = { workspace = true }
+axum               = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid               = { workspace = true }
+rusqlite           = { workspace = true }
+time               = { workspace = true, features = ["formatting"] }
+base64             = "0.22"
+sha2               = "0.10"
+hmac               = "0.12"
+subtle             = "2"
+getrandom          = "0.2"
+# Verify-only node signatures. Pinned to 2.1.x for the workspace Rust 1.75 MSRV.
+ed25519-dalek      = { version = "=2.1.1", default-features = false, features = ["std"] }
+livekit-api        = { version = "0.8.0", default-features = false, features = ["access-token"] }
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["test-util"] }
+reqwest  = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
+[[test]]
+name = "test_api_enrollment"
+path = "../../tests/rust/test_api_enrollment.rs"
+
+[[test]]
+name = "test_api_tenant_isolation"
+path = "../../tests/rust/test_api_tenant_isolation.rs"
+
+[[test]]
+name = "test_api_node_auth"
+path = "../../tests/rust/test_api_node_auth.rs"
+
+[[test]]
+name = "test_api_inventory"
+path = "../../tests/rust/test_api_inventory.rs"
+
+[[test]]
+name = "test_api_health_persistence"
+path = "../../tests/rust/test_api_health_persistence.rs"
+
+[[test]]
+name = "test_api_node_protocol_vectors"
+path = "../../tests/rust/test_api_node_protocol_vectors.rs"
+
+[[test]]
+name = "test_media_grant_lifecycle"
+path = "../../tests/rust/test_media_grant_lifecycle.rs"
+
+[[test]]
+name = "test_api_publish_directives"
+path = "../../tests/rust/test_api_publish_directives.rs"

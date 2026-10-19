@@ -259,13 +259,13 @@ pub struct Credentials {
     pub password: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SoapVersion {
     V12,
     V11,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Auth {
     None,
     Digest,
@@ -314,12 +314,11 @@ fn security_header(creds: &Credentials, auth: Auth, clock_offset: time::Duration
     };
     format!(
         concat!(
-            "<s:Header>",
             r#"<Security xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd""#,
             r#" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" s:mustUnderstand="1">"#,
             "<UsernameToken><Username>{user}</Username>{password}",
             r#"<Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{nonce}</Nonce>"#,
-            "<wsu:Created>{created}</wsu:Created></UsernameToken></Security></s:Header>"
+            "<wsu:Created>{created}</wsu:Created></UsernameToken></Security>"
         ),
         user = xml_escape(&creds.username),
         password = password,
@@ -328,18 +327,50 @@ fn security_header(creds: &Credentials, auth: Auth, clock_offset: time::Duration
     )
 }
 
+/// WS-Addressing for a call to a subscription: where it goes and the
+/// reference parameters the device handed out with the subscription.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Addressing {
+    pub to: String,
+    /// Already serialised elements, each declaring its own namespace.
+    pub reference_parameters: String,
+}
+
+fn addressing_header(addressing: &Addressing, action: Option<&str>) -> String {
+    let mut id = [0u8; 16];
+    let _ = getrandom::getrandom(&mut id);
+    let message_id: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    let action = action
+        .map(|a| format!("<wsa:Action>{}</wsa:Action>", xml_escape(a)))
+        .unwrap_or_default();
+    format!(
+        "{action}<wsa:MessageID>urn:uuid:{message_id}</wsa:MessageID><wsa:To>{to}</wsa:To>{params}",
+        to = xml_escape(&addressing.to),
+        params = addressing.reference_parameters,
+    )
+}
+
 fn envelope(version: SoapVersion, header: &str, body: &str) -> String {
     let ns = match version {
         SoapVersion::V12 => "http://www.w3.org/2003/05/soap-envelope",
         SoapVersion::V11 => "http://schemas.xmlsoap.org/soap/envelope/",
+    };
+    let header = if header.is_empty() {
+        String::new()
+    } else {
+        format!("<s:Header>{header}</s:Header>")
     };
     format!(
         concat!(
             r#"<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="{ns}""#,
             r#" xmlns:tt="http://www.onvif.org/ver10/schema""#,
             r#" xmlns:tds="http://www.onvif.org/ver10/device/wsdl""#,
+            r#" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl""#,
             r#" xmlns:trt="http://www.onvif.org/ver10/media/wsdl""#,
-            r#" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl">{header}<s:Body>{body}</s:Body></s:Envelope>"#
+            r#" xmlns:tr2="http://www.onvif.org/ver20/media/wsdl""#,
+            r#" xmlns:tev="http://www.onvif.org/ver10/events/wsdl""#,
+            r#" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2""#,
+            r#" xmlns:wsa="http://www.w3.org/2005/08/addressing">{header}<s:Body>{body}</s:Body></s:Envelope>"#
         ),
         ns = ns,
         header = header,
@@ -349,6 +380,17 @@ fn envelope(version: SoapVersion, header: &str, body: &str) -> String {
 
 fn soap_action(body: &str) -> Option<&'static str> {
     [
+        ("tptz:GetConfigurationOptions", "http://www.onvif.org/ver20/ptz/wsdl/GetConfigurationOptions"),
+        ("tptz:GetNode", "http://www.onvif.org/ver20/ptz/wsdl/GetNode"),
+        ("tptz:ContinuousMove", "http://www.onvif.org/ver20/ptz/wsdl/ContinuousMove"),
+        ("tptz:RelativeMove", "http://www.onvif.org/ver20/ptz/wsdl/RelativeMove"),
+        ("tptz:Stop", "http://www.onvif.org/ver20/ptz/wsdl/Stop"),
+        ("tptz:GetPresets", "http://www.onvif.org/ver20/ptz/wsdl/GetPresets"),
+        ("tptz:GotoPreset", "http://www.onvif.org/ver20/ptz/wsdl/GotoPreset"),
+        ("tptz:SetPreset", "http://www.onvif.org/ver20/ptz/wsdl/SetPreset"),
+        ("tptz:RemovePreset", "http://www.onvif.org/ver20/ptz/wsdl/RemovePreset"),
+        ("tptz:GotoHomePosition", "http://www.onvif.org/ver20/ptz/wsdl/GotoHomePosition"),
+        ("tptz:GetStatus", "http://www.onvif.org/ver20/ptz/wsdl/GetStatus"),
         (
             "GetSystemDateAndTime",
             "http://www.onvif.org/ver10/device/wsdl/GetSystemDateAndTime",
@@ -373,6 +415,30 @@ fn soap_action(body: &str) -> Option<&'static str> {
             "GetSnapshotUri",
             "http://www.onvif.org/ver10/media/wsdl/GetSnapshotUri",
         ),
+        (
+            "CreatePullPointSubscription",
+            "http://www.onvif.org/ver10/events/wsdl/EventPortType/CreatePullPointSubscriptionRequest",
+        ),
+        (
+            "PullMessages",
+            "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest",
+        ),
+        (
+            "GetEventProperties",
+            "http://www.onvif.org/ver10/events/wsdl/EventPortType/GetEventPropertiesRequest",
+        ),
+        (
+            "wsnt:Subscribe",
+            "http://docs.oasis-open.org/wsn/bw-2/NotificationProducer/SubscribeRequest",
+        ),
+        (
+            "wsnt:Renew",
+            "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/RenewRequest",
+        ),
+        (
+            "wsnt:Unsubscribe",
+            "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/UnsubscribeRequest",
+        ),
     ]
     .into_iter()
     .find(|(tag, _)| body.contains(tag))
@@ -396,6 +462,17 @@ fn is_auth_failure(status: u16, body: &str) -> bool {
 pub struct SoapClient {
     http: reqwest::Client,
     clock_offset: time::Duration,
+    /// The SOAP version and authentication the device accepted last, tried
+    /// first from then on (a subscription polls every few seconds).
+    accepted: std::sync::Mutex<Option<(SoapVersion, Auth)>>,
+}
+
+/// Extras for one call: WS-Addressing and a longer wait for the answer
+/// (a pull that the device holds open until events arrive).
+#[derive(Debug, Clone, Default)]
+pub struct CallOptions {
+    pub addressing: Option<Addressing>,
+    pub timeout: Option<Duration>,
 }
 
 impl SoapClient {
@@ -410,6 +487,7 @@ impl SoapClient {
         Ok(Self {
             http,
             clock_offset: time::Duration::ZERO,
+            accepted: std::sync::Mutex::new(None),
         })
     }
 
@@ -419,6 +497,7 @@ impl SoapClient {
         version: SoapVersion,
         xml: String,
         action: Option<&str>,
+        timeout: Option<Duration>,
     ) -> Result<(u16, String), OnvifError> {
         let content_type = match (version, action) {
             (SoapVersion::V12, Some(action)) => {
@@ -432,6 +511,9 @@ impl SoapClient {
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, content_type)
             .body(xml);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
         if version == SoapVersion::V11 {
             if let Some(action) = action {
                 request = request.header("SOAPAction", format!("\"{action}\""));
@@ -465,46 +547,118 @@ impl SoapClient {
         body: &str,
         creds: Option<&Credentials>,
     ) -> Result<String, OnvifError> {
+        self.call_with(url, body, creds, &CallOptions::default())
+            .await
+    }
+
+    /// [`Self::call`] with WS-Addressing or a longer timeout.
+    pub async fn call_with(
+        &self,
+        url: &str,
+        body: &str,
+        creds: Option<&Credentials>,
+        options: &CallOptions,
+    ) -> Result<String, OnvifError> {
+        self.call_strategy(url, body, creds, options, true).await
+    }
+
+    /// Mutating camera actions may be repeated only after an explicit auth or
+    /// SOAP-version refusal. Never replay an ambiguously failed move/preset.
+    pub async fn call_command(
+        &self,
+        url: &str,
+        body: &str,
+        creds: Option<&Credentials>,
+    ) -> Result<String, OnvifError> {
+        self.call_strategy(url, body, creds, &CallOptions::default(), false)
+            .await
+    }
+
+    async fn call_strategy(
+        &self,
+        url: &str,
+        body: &str,
+        creds: Option<&Credentials>,
+        options: &CallOptions,
+        retry_refusals: bool,
+    ) -> Result<String, OnvifError> {
         let auths: &[Auth] = match creds {
             Some(c) if !c.username.is_empty() => &[Auth::None, Auth::Digest, Auth::Text],
             _ => &[Auth::None],
         };
+        let mut attempts: Vec<(SoapVersion, Auth)> = [SoapVersion::V12, SoapVersion::V11]
+            .into_iter()
+            .flat_map(|version| auths.iter().map(move |auth| (version, *auth)))
+            .collect();
+        let accepted = self.accepted.lock().ok().and_then(|accepted| *accepted);
+        if let Some(index) = accepted.and_then(|a| attempts.iter().position(|b| *b == a)) {
+            let first = attempts.remove(index);
+            attempts.insert(0, first);
+        }
+        let action = soap_action(body);
         let mut last = OnvifError::Unreachable("no answer".into());
         let mut unauthorized = false;
-        for version in [SoapVersion::V12, SoapVersion::V11] {
-            for auth in auths {
-                let header = match (creds, auth) {
-                    (Some(creds), Auth::Digest | Auth::Text) => {
-                        security_header(creds, *auth, self.clock_offset)
+        // A refusal the device gave a request carrying the credentials (or to
+        // any request, without credentials): the real answer, which an
+        // earlier "not authorized" to a bare request must not hide.
+        let mut refusal: Option<OnvifError> = None;
+        for (version, auth) in attempts {
+            let mut header = match (creds, auth) {
+                (Some(creds), Auth::Digest | Auth::Text) => {
+                    security_header(creds, auth, self.clock_offset)
+                }
+                _ => String::new(),
+            };
+            if let Some(addressing) = &options.addressing {
+                header.push_str(&addressing_header(addressing, action));
+            }
+            let xml = envelope(version, &header, body);
+            match self.post(url, version, xml, action, options.timeout).await {
+                Ok((status, reply))
+                    if (200..300).contains(&status) && !reply.contains(":Fault>") =>
+                {
+                    if let Ok(mut remembered) = self.accepted.lock() {
+                        *remembered = Some((version, auth));
                     }
-                    _ => String::new(),
-                };
-                let xml = envelope(version, &header, body);
-                match self.post(url, version, xml, soap_action(body)).await {
-                    Ok((status, reply))
-                        if (200..300).contains(&status) && !reply.contains(":Fault>") =>
-                    {
-                        return Ok(reply);
+                    return Ok(reply);
+                }
+                Ok((_, reply)) if reply.contains("ONVIF integrate function is disabled") => {
+                    return Err(OnvifError::Disabled);
+                }
+                Ok((status, reply)) if is_auth_failure(status, &reply) => {
+                    unauthorized = true;
+                    last = OnvifError::Unauthorized;
+                }
+                Ok((status, ref reply))
+                    if !retry_refusals && (status == 415 || reply.contains("VersionMismatch")) =>
+                {
+                    last = OnvifError::Invalid(format!("HTTP {status}"));
+                }
+                Ok((status, _)) => {
+                    let error = OnvifError::Invalid(format!("HTTP {status}"));
+                    if !retry_refusals {
+                        return Err(error);
                     }
-                    Ok((_, reply)) if reply.contains("ONVIF integrate function is disabled") => {
-                        return Err(OnvifError::Disabled);
+                    if auth != Auth::None || auths.len() == 1 {
+                        refusal = Some(error.clone());
                     }
-                    Ok((status, reply)) if is_auth_failure(status, &reply) => {
-                        unauthorized = true;
-                        last = OnvifError::Unauthorized;
+                    last = error;
+                }
+                // Unreachable is the same for every variant.
+                Err(error @ OnvifError::Unreachable(_)) => return Err(error),
+                Err(error) => {
+                    if !retry_refusals {
+                        return Err(error);
                     }
-                    Ok((status, _)) => last = OnvifError::Invalid(format!("HTTP {status}")),
-                    // Unreachable is the same for every variant.
-                    Err(error @ OnvifError::Unreachable(_)) => return Err(error),
-                    Err(error) => last = error,
+                    last = error;
                 }
             }
         }
-        Err(if unauthorized {
+        Err(refusal.unwrap_or(if unauthorized {
             OnvifError::Unauthorized
         } else {
             last
-        })
+        }))
     }
 
     /// Learn the device clock, so digests carry a time the device accepts
