@@ -38,6 +38,7 @@ def test_every_merge_to_main_runs_the_tests_and_summarises_them() -> None:
         in commands
     )
     assert any("--junitxml=reports/app.xml" in cmd for cmd in commands)
+    assert any("tests/test_release_smoke.py" in cmd for cmd in commands)
     summaries = [cmd for cmd in commands if "scripts/ci_test_summary.py" in cmd]
     assert len(summaries) == 2 and all('>> "$GITHUB_STEP_SUMMARY"' in cmd for cmd in summaries)
     # Summaries and report uploads run even when tests failed.

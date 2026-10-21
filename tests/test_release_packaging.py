@@ -244,6 +244,76 @@ def test_linux_script_declares_distro_runtime_dependencies() -> None:
     assert 'echo "depend = $dep"' in text
 
 
+def test_linux_release_builder_installs_the_qt_xcb_dependencies(workflow: str) -> None:
+    linux = _jobs(workflow)["package-linux"]
+    install = linux.split("- name: Install build dependencies", 1)[1].split("- name:", 1)[0]
+    for package in (
+        "libxkbcommon-x11-0",
+        "libxcb-cursor0",
+        "libxcb-image0",
+        "libxcb-icccm4",
+        "libxcb-keysyms1",
+        "libxcb-shape0",
+        "libxcb-util1",
+        "libxcb-render-util0",
+        "libxcb-xkb1",
+    ):
+        assert package in install, f"Qt X11 dependency missing from the release builder: {package}"
+
+
+@pytest.mark.parametrize(
+    ("array", "dependencies"),
+    [
+        (
+            "DEB_DEPENDS",
+            {
+                "libxkbcommon-x11-0",
+                "libxcb-cursor0",
+                "libxcb-image0",
+                "libxcb-icccm4",
+                "libxcb-keysyms1",
+                "libxcb-shape0",
+                "libxcb-util1",
+                "libxcb-render-util0",
+                "libxcb-xkb1",
+            },
+        ),
+        (
+            "RPM_REQUIRES",
+            {
+                "libxkbcommon-x11",
+                "xcb-util-cursor",
+                "xcb-util-image",
+                "xcb-util-wm",
+                "xcb-util-keysyms",
+                "xcb-util-renderutil",
+                "xcb-util",
+                "libxcb",
+            },
+        ),
+        (
+            "ARCH_DEPENDS",
+            {
+                "libxkbcommon-x11",
+                "xcb-util-cursor",
+                "xcb-util-image",
+                "xcb-util-wm",
+                "xcb-util-keysyms",
+                "xcb-util-renderutil",
+                "xcb-util",
+                "libxcb",
+            },
+        ),
+    ],
+)
+def test_native_packages_declare_qt_xcb_runtime_libraries(
+    array: str, dependencies: set[str]
+) -> None:
+    match = re.search(rf"^{array}=\((.*?)^\)", LINUX_SCRIPT.read_text(), re.MULTILINE | re.DOTALL)
+    assert match is not None
+    assert dependencies <= set(match[1].split())
+
+
 def test_linux_script_builds_from_root_pyproject_with_pyinstaller() -> None:
     text = LINUX_SCRIPT.read_text()
     assert "--locked --no-dev --no-emit-project" in text
