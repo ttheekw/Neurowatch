@@ -2217,7 +2217,7 @@ dependencies = [
 
 [[package]]
 name = "nw-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2244,7 +2244,7 @@ dependencies = [
 
 [[package]]
 name = "nw-backend"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2292,7 +2292,7 @@ dependencies = [
 
 [[package]]
 name = "nw-cloud-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2302,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "nw-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
