@@ -22,6 +22,9 @@ use super::{detect, parse, Delivery, OnvifEvents, SubscriptionState};
 use crate::discovery::onvif::{CallOptions, Credentials, OnvifError, SoapClient};
 use crate::events::{now_ms, EventHub, NewEvent};
 
+#[cfg(test)]
+mod tests;
+
 const CREATE: &str = "<tev:CreatePullPointSubscription>\
     <tev:InitialTerminationTime>PT120S</tev:InitialTerminationTime>\
     </tev:CreatePullPointSubscription>";

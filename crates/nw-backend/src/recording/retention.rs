@@ -13,6 +13,9 @@ use crate::app_state::{expand_user_path, AppState};
 use crate::recording::quota;
 use crate::storage_drives;
 
+#[cfg(test)]
+mod tests;
+
 /// A segment file modified this recently may still be being written and is
 /// never deleted by a periodic pass.
 const ACTIVE_SEGMENT_GRACE: Duration = Duration::from_secs(60);

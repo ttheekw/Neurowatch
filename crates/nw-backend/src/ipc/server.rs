@@ -11,6 +11,9 @@ use super::handler::RpcHandler;
 use super::token;
 use crate::stats::IpcMetricsRecorder;
 
+#[cfg(test)]
+mod tests;
+
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
