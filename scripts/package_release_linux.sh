@@ -44,6 +44,13 @@ DEB_DEPENDS=(
     libfontconfig1
     libxkbcommon-x11-0
     libxcb-cursor0
+    libxcb-image0
+    libxcb-icccm4
+    libxcb-keysyms1
+    libxcb-shape0
+    libxcb-util1
+    libxcb-render-util0
+    libxcb-xkb1
     libdbus-1-3
 )
 DEB_RECOMMENDS=(mesa-va-drivers)
@@ -55,6 +62,7 @@ RPM_REQUIRES=(
     fontconfig
     libxkbcommon-x11
     xcb-util-cursor
+    xcb-util-image xcb-util-wm xcb-util-keysyms xcb-util-renderutil xcb-util libxcb
     dbus-libs
 )
 RPM_RECOMMENDS=(mesa-va-drivers)
@@ -65,6 +73,7 @@ ARCH_DEPENDS=(
     fontconfig
     libxkbcommon-x11
     xcb-util-cursor
+    xcb-util-image xcb-util-wm xcb-util-keysyms xcb-util-renderutil xcb-util libxcb
     dbus
 )
 ARCH_OPTDEPENDS=("mesa: AMD VA-API drivers" "intel-media-driver: Intel VA-API drivers")

@@ -69,6 +69,38 @@ def _system_has(soname: str) -> bool:
     return True
 
 
+def check_qt_x11_dependencies(ui_dir: Path, env: dict[str, str]) -> None:
+    """Check the packaged X11 plugins even when the UI runs offscreen.
+
+    Use the frozen app's library directories so ldd resolves the bundled Qt
+    libraries and their host dependencies without requiring a display server.
+    """
+    platforms = sorted(ui_dir.rglob("libqxcb.so"))
+    if not platforms:
+        raise RuntimeError(f"Packaged Qt X11 platform plugin is missing from {ui_dir}")
+    plugins = set(platforms)
+    for platform in platforms:
+        plugins.update((platform.parent.parent / "xcbglintegrations").glob("libqxcb-*.so"))
+    check_env = env.copy()
+    check_env["LC_ALL"] = "C"
+    check_env["LD_LIBRARY_PATH"] = os.pathsep.join(
+        str(path) for path in (ui_dir / "_internal", ui_dir / "_internal/PySide6/Qt/lib")
+    )
+    for plugin in sorted(plugins):
+        result = subprocess.run(
+            ["ldd", str(plugin)],
+            env=check_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        output = result.stdout + result.stderr
+        if result.returncode or "not found" in output:
+            raise RuntimeError(f"Packaged Qt X11 dependencies unresolved for {plugin}:\n{output}")
+    print(f"Qt X11 dependencies resolved for {len(plugins)} packaged plugins", flush=True)
+
+
 def smoke(bundle: Path) -> None:
     # Rust's Windows directory provider uses Known Folders rather than the
     # overridden APPDATA variables. Never run against a developer's user data.
@@ -77,6 +109,8 @@ def smoke(bundle: Path) -> None:
     suffix = ".exe" if os.name == "nt" else ""
     ui = bundle / "app" / "neurowatch-ui" / f"neurowatch-ui{suffix}"
     gst = bundle / "gstreamer"
+    if os.name != "nt":
+        check_qt_x11_dependencies(ui.parent, os.environ.copy())
     with tempfile.TemporaryDirectory(prefix="neurowatch-release-check-") as temp:
         state = Path(temp)
         env = {

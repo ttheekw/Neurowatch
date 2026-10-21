@@ -38,12 +38,19 @@ keep working.
 | Repository secret | Value |
 |---|---|
 | `DOWNLOADS_S3_BUCKET` | Private bucket the downloads page reads (the portal's `NEUROWATCH_DOWNLOADS_S3_BUCKET`) |
-| `DOWNLOADS_S3_ENDPOINT` | S3-compatible endpoint, e.g. Cloudflare R2's `https://<account>.r2.cloudflarestorage.com`; empty for AWS |
-| `DOWNLOADS_S3_REGION` | Region (`auto` for R2, the default) |
+| `DOWNLOADS_S3_ENDPOINT` | S3-compatible endpoint, e.g. Cloudflare R2's `https://<account>.r2.cloudflarestorage.com` or Wasabi's `https://s3.<region>.wasabisys.com` (host only, no bucket in the path); empty for AWS |
+| `DOWNLOADS_S3_REGION` | Region (`auto` for R2, the default; anything else needs its real region, e.g. `ap-southeast-1`) |
 | `DOWNLOADS_S3_ACCESS_KEY_ID`, `DOWNLOADS_S3_SECRET_ACCESS_KEY` | A key that may write to the bucket |
 
 The official repository fails an Unlimited build if the bucket or key pair is
 missing. Forks warn and retain no Unlimited artifacts without private storage.
+
+Check the values before setting the secrets: `scripts/check_downloads_bucket.sh`
+asks for any that are not in the environment, flags stray spaces, `s3://`
+prefixes and a region that does not match the endpoint, checks that the bucket
+exists, and lists, writes, reads back and deletes a test object under
+`staging/` with the key (`--read-only` for the portal's key). It prints the
+values to copy into the secrets. It needs only bash and curl.
 
 Before accepting purchases, deploy the webapp's downloads page and configure
 its read-only bucket credentials, live payments.lk key and signing secret
