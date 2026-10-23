@@ -269,9 +269,71 @@ jobs:
           docker run --rm -v "$PWD:/work:ro" "$IMAGE" \
             bash /work/scripts/smoke_linux_package.sh "$FORMAT"
 
+  # Container images from the free .deb: headless (the backend alone) and gui
+  # (backend + desktop UI on the host's display), each for x86_64 and arm64 on
+  # native runners. Every image is smoke-tested (the gui one on Xvfb); tag
+  # builds push them per architecture to GHCR, and publish-docker joins them
+  # into multi-architecture tags once the GitHub Release is out.
+  docker:
+    name: Docker ${{ matrix.variant }} (${{ matrix.arch }})
+    needs: [version, package-linux]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        variant: [headless, gui]
+        arch: [x86_64, arm64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            platform: amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-linux-${{ matrix.arch }}-free
+          path: dist/release
+      - name: Build the image
+        run: |
+          scripts/docker.sh build "${{ matrix.variant }}" \
+            --deb dist/release/neurowatch_*_${{ matrix.platform }}.deb \
+            --tag "neurowatch-ci:${{ matrix.variant }}"
+      - name: Start a virtual display
+        if: matrix.variant == 'gui'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils
+          Xvfb :99 -screen 0 1600x900x24 >/tmp/xvfb.log 2>&1 &
+          for _ in $(seq 1 30); do xdpyinfo -display :99 >/dev/null 2>&1 && break; sleep 1; done
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+      - name: Smoke check the image
+        env:
+          NW_EXPECT_EDITION: free
+        run: |
+          scripts/docker_smoke.sh "neurowatch-ci:${{ matrix.variant }}" "${{ matrix.variant }}"
+      - name: Push the image for this architecture
+        if: (github.event_name == 'push' || github.event_name == 'release') && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/neurowatch"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          target="$image:${RELEASE_TAG#v}-${{ matrix.variant }}-${{ matrix.platform }}"
+          docker tag "neurowatch-ci:${{ matrix.variant }}" "$target"
+          docker push "$target"
+
   publish:
     name: Publish GitHub Release
-    needs: [version, package-linux, package-windows, install-linux]
+    needs: [version, package-linux, package-windows, install-linux, docker]
     if: (github.event_name == 'push' || github.event_name == 'release') && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -335,6 +397,38 @@ jobs:
             --generate-notes \
             --latest \
             dist/release/*
+
+  # One multi-architecture tag per image from the per-architecture pushes:
+  # ghcr.io/<owner>/neurowatch:<version> and :latest are the headless image
+  # (also :<version>-headless, :headless); :<version>-gui and :gui the gui one.
+  # Like the GitHub Release, every release (betas included) moves latest.
+  publish-docker:
+    name: Publish Docker images
+    needs: [version, publish]
+    if: (github.event_name == 'push' || github.event_name == 'release') && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Tag the multi-architecture images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/neurowatch"
+          version="${RELEASE_TAG#v}"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools create \
+            --tag "$image:$version" --tag "$image:latest" \
+            --tag "$image:$version-headless" --tag "$image:headless" \
+            "$image:$version-headless-amd64" "$image:$version-headless-arm64"
+          docker buildx imagetools create \
+            --tag "$image:$version-gui" --tag "$image:gui" \
+            "$image:$version-gui-amd64" "$image:$version-gui-arm64"
+          docker buildx imagetools inspect "$image:$version"
+          docker buildx imagetools inspect "$image:$version-gui"
 
   # The downloads page (https://neurowatch.app/downloads) reads the private
   # bucket: per version a manifest of both editions (free files link to this

@@ -25,6 +25,7 @@
   portable <a href="https://neurowatch.app/downloads?version=latest&platform=windows&arch=x86_64&kind=portable">Windows .zip</a>,
   <a href="https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=portable">Linux .tar.gz</a>,
   <a href="https://neurowatch.app/downloads?version=latest&platform=linux&arch=arm64&kind=portable">ARM .tar.gz</a><br>
+  <a href="https://neurowatch.app">Website: neurowatch.app</a> ·
   <a href="https://github.com/ttheekw/Neurowatch/releases/latest">Release notes and checksums</a> ·
   <a href="#installing">Installation help</a> ·
   <a href="docs/system-requirements.md">System requirements</a>
@@ -35,6 +36,7 @@
   <a href="https://github.com/ttheekw/Neurowatch/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/ttheekw/Neurowatch/actions/workflows/ci.yml/badge.svg?branch=main" alt="Tests"></a>
   <a href="#installing"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-informational" alt="Linux and Windows"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0"></a>
+  <a href="https://neurowatch.app"><img src="https://img.shields.io/badge/website-neurowatch.app-2563eb" alt="Website: neurowatch.app"></a>
 </p>
 
 ### Why NeuroWatch
@@ -56,6 +58,7 @@ NeuroWatch is **free and open source** ([Apache-2.0](LICENSE)), including its Ne
 - [Getting started](#getting-started)
 - [Everyday use](#everyday-use)
 - [Running without a screen](#running-without-a-screen)
+- [Running in Docker](#running-in-docker)
 - [Troubleshooting](#troubleshooting)
 - [Privacy and responsible use](#privacy-and-responsible-use)
 - [Disclaimer](#disclaimer)
@@ -259,6 +262,65 @@ With NeuroWatch Cloud:
 - Once linked, manage its cameras, recording and drive from the web portal (open the recorder, then **Settings**).
 - From another terminal: `neurowatch cloud status`, `neurowatch cloud link CODE --name NAME`, `neurowatch cloud unlink --yes`.
 - Opening the desktop app on the same computer switches NeuroWatch back to desktop mode.
+
+---
+
+## Running in Docker
+
+NeuroWatch is also published as two container images for Linux (64-bit PC and ARM64):
+
+- `ghcr.io/ttheekw/neurowatch:latest`: the **headless** recorder, without a window. Use it on a server and watch through NeuroWatch Cloud.
+- `ghcr.io/ttheekw/neurowatch:gui`: the full app, with its **window** on your screen.
+
+Both keep their settings and recordings in two folders you create first:
+
+```bash
+mkdir -p ~/neurowatch/data ~/neurowatch/recordings
+```
+
+**Headless recorder** (starts again with Docker until you stop it):
+
+```bash
+docker run -d --name neurowatch --restart unless-stopped --network host \
+  --user "$(id -u):$(id -g)" --stop-timeout 30 \
+  -v ~/neurowatch/data:/data -v ~/neurowatch/recordings:/recordings \
+  ghcr.io/ttheekw/neurowatch:latest
+```
+
+Link it to NeuroWatch Cloud with an enrollment code from the web portal:
+
+```bash
+docker exec --user "$(id -u):$(id -g)" neurowatch neurowatch-docker cloud link CODE --name "Head Office"
+```
+
+**With the window** (run from your desktop session; on Wayland desktops this uses XWayland):
+
+```bash
+xhost +SI:localuser:$(id -un)
+docker run -d --name neurowatch-gui --network host \
+  --user "$(id -u):$(id -g)" --stop-timeout 30 --shm-size 1g \
+  -e DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
+  -v ~/neurowatch/data:/data -v ~/neurowatch/recordings:/recordings \
+  ghcr.io/ttheekw/neurowatch:gui
+```
+
+Closing the window stops the container and recording, so use the headless image to record around the clock.
+
+**Graphics card and sound.** Add these options to either command, before the image name:
+
+| For | Add | Needs on the computer |
+|---|---|---|
+| Intel or AMD graphics (VA-API) | `--device /dev/dri --group-add "$(stat -c %g /dev/dri/renderD128)"` | The graphics driver (included with Linux) |
+| NVIDIA graphics (NVDEC) | `--gpus all` | The NVIDIA driver and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) |
+| Camera sound through your speakers (window only) | `-v "$XDG_RUNTIME_DIR/pulse/native:/run/host/pulse" -e PULSE_SERVER=unix:/run/host/pulse` | PulseAudio or PipeWire (most desktops); check that `$XDG_RUNTIME_DIR/pulse/native` exists first |
+
+With a graphics card option, the status bar shows **VA-API** or **NVIDIA NVDEC** instead of **CPU Decode** (or check with `docker logs neurowatch 2>&1 | grep "Hardware acceleration"`). Without one, video is decoded on the processor. After changing options, remove the container and run it again (`docker stop neurowatch && docker rm neurowatch`); your settings and recordings stay. Step-by-step setup for each card, the NVIDIA Container Toolkit, and what to do if it still says CPU Decode: [Decoding on the graphics card](docs/docker.md#decoding-on-the-graphics-card-va-api-nvidia).
+
+**Day-to-day:** `docker logs -f neurowatch` shows what it's doing, `docker stop neurowatch` stops it (it finishes its recordings first), `docker start neurowatch` starts it again. Run only one of the two at a time: they share the data folder.
+
+**Updating:** `docker pull ghcr.io/ttheekw/neurowatch:latest` (or `:gui`), then `docker stop neurowatch && docker rm neurowatch` (or `neurowatch-gui`) and run the same command again. Your cameras and recordings stay in the folders.
+
+From a copy of this repository, `scripts/docker.sh headless` or `scripts/docker.sh gui` does all of the above, including the graphics card and sound, and `scripts/docker.sh status | logs | stop` controls it. The images are the free edition; with NeuroWatch Unlimited, build your own from its `.deb`: `scripts/docker.sh build --deb FILE`. Details: [NeuroWatch in Docker](docs/docker.md).
 
 ---
 

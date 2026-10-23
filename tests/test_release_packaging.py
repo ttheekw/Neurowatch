@@ -105,7 +105,7 @@ def test_release_workflow_default_token_is_read_only(workflow: str) -> None:
 def test_publish_job_is_guarded_to_tag_refs(workflow: str) -> None:
     publish = _jobs(workflow)["publish"]
     assert re.search(r"^    if: .*startsWith\(github\.ref, 'refs/tags/v'\)", publish, re.MULTILINE)
-    assert "needs: [version, package-linux, package-windows, install-linux]" in publish
+    assert "needs: [version, package-linux, package-windows, install-linux, docker]" in publish
     assert "github.event_name == 'push' || github.event_name == 'release'" in publish
 
 
@@ -128,7 +128,7 @@ def test_no_workflow_publishes_releases_on_branch_pushes() -> None:
 
 def test_workflow_direct_shell_scripts_are_executable_in_git_index(workflow: str) -> None:
     scripts = _directly_invoked_shell_scripts(workflow)
-    assert scripts == {"scripts/package_release_linux.sh"}
+    assert scripts == {"scripts/package_release_linux.sh", "scripts/docker.sh", "scripts/docker_smoke.sh"}
     assert _git_index_modes(scripts) == dict.fromkeys(scripts, "100755")
 
 

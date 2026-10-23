@@ -1,0 +1,57 @@
+# NeuroWatch with Docker Compose (docs/docker.md). Linux hosts.
+#
+#   headless (recorder without a window, restarts with Docker):
+#     NW_UID=$(id -u) NW_GID=$(id -g) docker compose -f docker/compose.yml up -d
+#   gui (desktop window on this computer's X11 display; run from your desktop session):
+#     xhost +SI:localuser:$(id -un)    # once per session, lets the container's user use the display
+#     NW_UID=$(id -u) NW_GID=$(id -g) docker compose -f docker/compose.yml --profile gui up -d gui
+#
+# Settings and recordings go to NW_DATA / NW_RECORDINGS (default: ./neurowatch-data
+# and ./neurowatch-recordings next to this file); create them as yourself first.
+# Run one service at a time: both use the same data. scripts/docker.sh does
+# the same with less setup (GPU groups, sound, Wayland).
+
+x-neurowatch: &neurowatch
+  user: "${NW_UID:-1000}:${NW_GID:-1000}"
+  network_mode: host  # camera discovery (multicast) and the camera event port 7681
+  stop_grace_period: 30s
+  volumes:
+    - ${NW_DATA:-./neurowatch-data}:/data
+    - ${NW_RECORDINGS:-./neurowatch-recordings}:/recordings
+  # GPU decoding (docs/docker.md, "Decoding on the graphics card").
+  # Intel or AMD (VA-API): uncomment, and set NW_RENDER_GID=$(stat -c %g /dev/dri/renderD128).
+  # devices:
+  #   - /dev/dri:/dev/dri
+  # group_add:
+  #   - "${NW_RENDER_GID:-video}"
+  # NVIDIA (NVDEC; needs the NVIDIA Container Toolkit): uncomment.
+  # deploy:
+  #   resources:
+  #     reservations:
+  #       devices:
+  #         - driver: nvidia
+  #           count: all
+  #           capabilities: [gpu]
+
+services:
+  headless:
+    <<: *neurowatch
+    image: ${NW_IMAGE:-ghcr.io/ttheekw/neurowatch:latest}
+    container_name: neurowatch
+    command: ["headless"]
+    restart: unless-stopped
+
+  gui:
+    <<: *neurowatch
+    image: ${NW_GUI_IMAGE:-ghcr.io/ttheekw/neurowatch:gui}
+    container_name: neurowatch-gui
+    command: ["gui"]
+    profiles: [gui]
+    shm_size: 1g  # live video frames for the window
+    environment:
+      DISPLAY: ${DISPLAY:-:0}
+      QT_QPA_PLATFORM: xcb
+    volumes:
+      - ${NW_DATA:-./neurowatch-data}:/data
+      - ${NW_RECORDINGS:-./neurowatch-recordings}:/recordings
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
