@@ -29,6 +29,7 @@ Usage: ./neurowatch.sh [--no-autostart]
        ./neurowatch.sh service (status | start | stop | restart | install | uninstall)
        ./neurowatch.sh events [--follow] [--camera NAME] [--limit N]
        ./neurowatch.sh cloud (status | link CODE --name NAME | unlink --yes)
+       ./neurowatch.sh docker (headless | gui | stop | logs | status | exec ... | build ...)
        ./neurowatch.sh [--check | --bootstrap [--system --yes]]
 
   (no arguments)  synchronize Python dependencies, build the backend, then
@@ -60,6 +61,9 @@ Usage: ./neurowatch.sh [--no-autostart]
                    with --headless: link to NeuroWatch Cloud first (an
                    enrollment code from the web portal)
   cloud            NeuroWatch Cloud: status, link CODE --name NAME, unlink --yes
+  docker           run the container images instead (scripts/docker.sh: headless
+                   recorder or desktop window, built from a release package;
+                   ./neurowatch.sh docker --help)
   --check          validate the local tools and GStreamer development files;
                   does not synchronize dependencies or start a service
   --bootstrap      synchronize locked Python project dependencies only
@@ -388,6 +392,7 @@ while (( $# )); do
             mode="service"; ((MODE_FLAGS += 1)); shift
             SERVICE_ARGS=("$@")
             break ;;
+        docker) shift; exec "$ROOT/scripts/docker.sh" "$@" ;;
         --help|-h) usage; exit 0 ;;
         -*) EXTRA_ARGS+=("$1") ;;  # a further --headless option (--link, --name)
         *)

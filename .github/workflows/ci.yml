@@ -131,7 +131,7 @@ jobs:
       # Also when the app tests failed, so every result is reported.
       - name: pytest (release packaging and CI contracts)
         if: ${{ !cancelled() }}
-        run: uv run pytest tests/test_release_packaging.py tests/test_release_smoke.py tests/test_ci_workflow.py --tb=short -q --junitxml=reports/contracts.xml
+        run: uv run pytest tests/test_release_packaging.py tests/test_release_smoke.py tests/test_ci_workflow.py tests/test_docker.py --tb=short -q --junitxml=reports/contracts.xml
       - name: Test summary
         if: ${{ !cancelled() }}
         run: uv run python scripts/ci_test_summary.py --title Python reports/app.xml reports/contracts.xml >> "$GITHUB_STEP_SUMMARY"

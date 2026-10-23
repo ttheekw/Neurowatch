@@ -8,6 +8,7 @@ The [release workflow](../.github/workflows/release.yml) produces these download
 | Linux arm64 | `.deb`, `.rpm`, portable `.tar.gz` (no Arch package: Arch Linux is x86_64 only) |
 | Windows x86_64 | Inno Setup `-setup.exe`, portable `.zip` |
 | All | `SHA256SUMS` |
+| Docker (x86_64, arm64) | `ghcr.io/<owner>/neurowatch`: headless (`:latest`, `:<version>`) and gui (`:gui`, `:<version>-gui`) images from the free `.deb` ([NeuroWatch in Docker](docker.md)) |
 
 Every package is built twice: **free** (runs up to 16 cameras) and
 **unlimited** (the backend's `unlimited` Cargo feature; `--edition` /
@@ -147,6 +148,11 @@ manually publishing while its run is in progress.
   Debian 12/13, Fedora 43 and Arch (x86_64); Ubuntu 24.04, Debian 13 and
   Fedora 43 (arm64). Every generated Linux package therefore has a native
   install, packaged-service/media, removal and residue check.
+- Both Docker images (headless, gui) are built from the free `.deb` on both
+  architectures and run with `scripts/docker_smoke.sh`: healthy backend as a
+  non-root user on mounted volumes, the expected mode and edition, the gui
+  window on Xvfb, and a clean `docker stop`. The release waits for them;
+  `publish-docker` tags the multi-architecture images after it.
 - Windows silently installs into a path with spaces, exercises the installed
   service and media runtime with the build SDK removed from `PATH` and temporarily
   renamed on the disposable runner, and uninstalls.
