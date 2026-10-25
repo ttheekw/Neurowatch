@@ -181,6 +181,7 @@ pub fn unmounted_mount_point(path: &Path) -> Option<PathBuf> {
 }
 
 /// [`unmounted_mount_point`] for the given `/etc/fstab` and mount table.
+#[cfg(any(target_os = "linux", test))]
 fn unmounted_in(path: &Path, fstab: &str, mounted: &str) -> Option<PathBuf> {
     let table: Vec<String> = crate::storage_drives::parse_mounts(mounted)
         .into_iter()
