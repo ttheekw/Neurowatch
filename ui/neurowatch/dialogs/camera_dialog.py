@@ -7,6 +7,7 @@ same service the web portal uses; this dialog only shows its answers.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import logging
 from collections.abc import Iterable
 from urllib.parse import quote as url_quote
@@ -56,7 +57,16 @@ from neurowatch.models.camera import (
     DiscoveryIdentity,
     LocalRecordingDest,
 )
-from neurowatch.models.discovery import Candidate, StreamChoice, check_range, discovered_streams
+from neurowatch.models.discovery import (
+    Candidate,
+    RangeSuggestion,
+    StreamChoice,
+    check_range,
+    discovered_streams,
+    parse_range,
+    range_suggestions,
+    widen_to_network,
+)
 from neurowatch.models.motion import (
     camera_event_topics,
     camera_events_status,
@@ -171,6 +181,14 @@ def _saved_stream_choices(cam: CameraConfig) -> list[StreamChoice]:
         for s in streams
         if s.url
     ]
+
+
+def _address_key(address: str) -> tuple[int, int | str]:
+    """Sorts IPv4 addresses by number (192.168.1.9 before 192.168.1.10)."""
+    try:
+        return (0, int(ipaddress.IPv4Address(address)))
+    except ValueError:
+        return (1, address)
 
 
 def _password_b64(password: str) -> str:
@@ -667,8 +685,9 @@ class AddEditCameraDialog(QDialog):
         vl.setSpacing(8)
 
         hint = QLabel(
-            "Find the ONVIF cameras on the recorder's network, tick the ones to add, "
-            "and add them all with one login. Nothing is sent until you click Search."
+            "Find the cameras on the recorder's network (ONVIF, Hikvision, and any device "
+            "with its RTSP port open), tick the ones to add, and add them all with one "
+            "login. Nothing is sent until you click Search."
         )
         hint.setWordWrap(True)
         set_label_role(hint, "hint")
@@ -682,16 +701,22 @@ class AddEditCameraDialog(QDialog):
         self._net_combo.currentIndexChanged.connect(self._on_network_changed)
         row.addWidget(self._net_combo, stretch=1)
         self._range_edit = QLineEdit()
-        self._range_edit.setPlaceholderText("10.0.10.0/24")
+        self._range_edit.setPlaceholderText("192.168.1.x, 192.168.1.10-50 or 192.168.1.64")
+        self._range_edit.setToolTip(
+            "A network (192.168.1.x or 192.168.1.0/24), a range (192.168.1.10-50) or "
+            "one address; separate several with commas. At most 1024 addresses."
+        )
         self._range_edit.setAccessibleName("Range to search")
         self._range_edit.setVisible(False)
         self._range_edit.returnPressed.connect(self._on_search)
+        self._range_edit.textChanged.connect(self._on_range_edited)
         row.addWidget(self._range_edit, stretch=1)
         self._search_btn = QPushButton("Search")
         set_button_variant(self._search_btn, "primary")
         self._search_btn.clicked.connect(self._on_search)
         row.addWidget(self._search_btn)
         vl.addLayout(row)
+        vl.addWidget(self._build_range_help())
 
         self._search_status = QLabel()
         self._search_status.setWordWrap(True)
@@ -774,6 +799,122 @@ class AddEditCameraDialog(QDialog):
         self._set_results_state("idle")
         return w
 
+    def _build_range_help(self) -> QWidget:
+        """Under the range box: what the typed text searches (or what is wrong
+        with it, before Search is pressed), and networks to search with one
+        click: the recorder's own and the cameras' factory networks."""
+        box = QWidget()
+        box.setStyleSheet('QPushButton[chip="true"] { padding: 2px 10px; border-radius: 11px; }')
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        preview_row = QHBoxLayout()
+        preview_row.setSpacing(6)
+        self._range_preview = QLabel()
+        self._range_preview.setWordWrap(True)
+        self._range_preview.setAccessibleName("What the range searches")
+        preview_row.addWidget(self._range_preview, stretch=1)
+        self._widen_btn = QPushButton()
+        set_button_variant(self._widen_btn, "ghost")
+        self._widen_btn.setToolTip("Search every address of this camera's network instead")
+        self._widen_btn.clicked.connect(self._widen_range)
+        self._widen_btn.hide()
+        preview_row.addWidget(self._widen_btn)
+        layout.addLayout(preview_row)
+
+        self._chip_row = QHBoxLayout()
+        self._chip_row.setSpacing(6)
+        chips_label = QLabel("Try:")
+        set_label_role(chips_label, "hint")
+        self._chip_row.addWidget(chips_label)
+        self._chip_row.addStretch(1)
+        layout.addLayout(self._chip_row)
+        self._chips: list[QPushButton] = []
+        self._set_range_chips(range_suggestions([]))
+
+        self._range_help = box
+        box.setVisible(False)
+        self._on_range_edited()
+        return box
+
+    def _set_range_chips(self, suggestions: list[RangeSuggestion]) -> None:
+        for chip in self._chips:
+            self._chip_row.removeWidget(chip)
+            chip.setParent(None)
+            chip.deleteLater()
+        self._chips = []
+        for suggestion in suggestions:
+            chip = QPushButton(suggestion.label)
+            chip.setProperty("chip", True)
+            chip.setProperty("range", suggestion.text)
+            chip.setCheckable(True)
+            chip.setToolTip(suggestion.tooltip)
+            chip.setAccessibleName(f"Search {suggestion.text}")
+            set_button_variant(chip, "secondary")
+            chip.clicked.connect(lambda _checked=False, text=suggestion.text: self._use_range(text))
+            # Before the stretch that keeps the chips left-aligned.
+            self._chip_row.insertWidget(self._chip_row.count() - 1, chip)
+            self._chips.append(chip)
+        self._sync_chips()
+
+    def _sync_chips(self) -> None:
+        typed = self._range_edit.text().strip()
+        for chip in self._chips:
+            chip.setChecked(chip.property("range") == typed)
+
+    def _range_mode(self) -> bool:
+        return (self._net_combo.currentData() or {}).get("scope") == "cidr"
+
+    def _use_range(self, text: str) -> None:
+        """Search ``text``: switch to a typed range, ready to search."""
+        if not self._range_mode():
+            for index in range(self._net_combo.count()):
+                if (self._net_combo.itemData(index) or {}).get("scope") == "cidr":
+                    self._net_combo.setCurrentIndex(index)
+                    break
+        self._range_edit.setText(text)
+        self._range_edit.setFocus()
+
+    def _widen_range(self) -> None:
+        try:
+            single = parse_range(self._range_edit.text()).single
+        except ValueError:
+            return
+        if single:
+            self._use_range(widen_to_network(single))
+
+    def _on_range_edited(self, _text: str = "") -> None:
+        """Say what the typed text searches, or what is wrong with it."""
+        text = self._range_edit.text()
+        self._widen_btn.hide()
+        if not text.strip():
+            set_status_tone(self._range_preview, "muted")
+            self._range_preview.setText(
+                "Type a network (192.168.1.x), a range (192.168.1.10-50) or one address; "
+                "separate several with commas."
+            )
+        else:
+            try:
+                found = parse_range(text)
+            except ValueError as e:
+                set_status_tone(self._range_preview, "warning")
+                self._range_preview.setText(str(e))
+            else:
+                set_status_tone(self._range_preview, "muted")
+                self._range_preview.setText(found.summary)
+                if found.single:
+                    self._widen_btn.setText(f"Search all of {widen_to_network(found.single)}")
+                    self._widen_btn.show()
+        self._sync_chips()
+        self._sync_search_button()
+
+    def _sync_search_button(self) -> None:
+        """Search needs a valid range when one is typed; Stop is always on."""
+        if self._scan_worker is not None:
+            return
+        typed_ok = check_range(self._range_edit.text()) is None
+        self._search_btn.setEnabled(not self._range_mode() or typed_ok)
+
     def _set_results_state(self, state: str, detail: str = "") -> None:
         """Show the result table when it has rows, else the panel for
         ``state``: "idle", "searching", "none" or "failed"."""
@@ -791,7 +932,7 @@ class AddEditCameraDialog(QDialog):
             elif state == "none":
                 self._results_empty.show_state(
                     "No cameras found",
-                    detail or "No ONVIF camera answered the search.",
+                    detail or "No camera answered the search.",
                     actions=True,
                 )
             elif state == "failed":
@@ -799,9 +940,9 @@ class AddEditCameraDialog(QDialog):
             else:
                 self._results_empty.show_state(
                     "Search for cameras",
-                    f"Click Search to list the ONVIF cameras on {network}."
+                    f"Click Search to list the cameras on {network}."
                     if self._range_edit.isHidden()
-                    else "Enter a range, then click Search.",
+                    else "Type what to search, or pick a network under the box, then click Search.",
                 )
             self._results_stack.setCurrentWidget(self._results_empty)
         self._sync_search_status()
@@ -839,12 +980,17 @@ class AddEditCameraDialog(QDialog):
                     label,
                     {"scope": "interface", "interface": iface.get("id", "")},
                 )
+        self._set_range_chips(range_suggestions(interfaces))
         if self._results_state == "idle":
             self._set_results_state("idle")  # names the network found
 
     def _on_network_changed(self) -> None:
-        scope = self._net_combo.currentData() or {}
-        self._range_edit.setVisible(scope.get("scope") == "cidr")
+        typed = self._range_mode()
+        self._range_edit.setVisible(typed)
+        self._range_help.setVisible(typed)
+        if typed:
+            self._range_edit.setFocus()
+        self._on_range_edited()
         if self._results_state == "idle":
             self._set_results_state("idle")
 
@@ -858,7 +1004,7 @@ class AddEditCameraDialog(QDialog):
         scope = dict(self._net_combo.currentData() or {"scope": "current"})
         if scope.get("scope") == "cidr":
             text = self._range_edit.text().strip()
-            problem = check_range(text) if text else "Enter a range such as 192.168.1.0/24."
+            problem = check_range(text)
             if problem:
                 set_status_tone(self._search_status, "warning")
                 self._search_status.setText(problem)
@@ -882,7 +1028,9 @@ class AddEditCameraDialog(QDialog):
         candidates = [
             Candidate.from_dict(c) for c in results.get("candidates", []) if isinstance(c, dict)
         ]
-        candidates.sort(key=lambda c: (not c.can_add, c.state == "possible_match", c.address))
+        candidates.sort(
+            key=lambda c: (not c.can_add, c.state == "possible_match", _address_key(c.address))
+        )
         selected = self._selected_candidate()
         self._results_table.blockSignals(True)
         self._results_table.setRowCount(len(candidates))
@@ -896,7 +1044,7 @@ class AddEditCameraDialog(QDialog):
             ticked = self._ticked.setdefault(cid, addable and candidate.state != "possible_match")
             title = QTableWidgetItem(candidate.title)
             title.setData(Qt.ItemDataRole.UserRole, candidate)
-            title.setToolTip(" ".join(p for p in (candidate.manufacturer, candidate.model) if p))
+            title.setToolTip(candidate.details)
             flags = title.flags() & ~Qt.ItemFlag.ItemIsEditable
             if addable:
                 title.setFlags(flags | Qt.ItemFlag.ItemIsUserCheckable)
@@ -909,6 +1057,7 @@ class AddEditCameraDialog(QDialog):
             self._results_table.setItem(row, 1, QTableWidgetItem(candidate.address))
             status = QTableWidgetItem()
             self._paint_status(status, candidate)
+            status.setToolTip(candidate.note or "")
             self._results_table.setItem(row, 2, status)
             if selected and selected.candidate_id == cid:
                 self._results_table.selectRow(row)
@@ -1103,6 +1252,7 @@ class AddEditCameraDialog(QDialog):
         self._scan_worker = None
         self._search_btn.setText("Search")
         self._search_btn.setEnabled(True)
+        self._sync_search_button()
         if isinstance(result, BackendOfflineError):
             self._search_failed("The recorder's backend is offline, so nothing was searched.")
             return
@@ -1122,23 +1272,28 @@ class AddEditCameraDialog(QDialog):
             self._set_results_state("idle")
         elif found:
             set_status_tone(self._search_status, "success")
+            addable = sum(1 for c in found if c.can_add)
             self._search_status.setText(
-                f"Found {len(found)} device(s) on {scope}. "
-                "Select one and click Use Selected Camera."
+                f"Found {len(found)} device{'s' if len(found) != 1 else ''} on {scope}. "
+                + (
+                    "Tick the cameras to add, enter their login, then click Add."
+                    if addable
+                    else "Hover over a device to see why it cannot be added yet."
+                )
             )
             self._set_results_state("found")
         else:
             message = (
-                f"No ONVIF cameras answered on {scope}. Discovery may be off on the cameras "
-                "or filtered by the network."
+                f"No cameras answered on {scope}. Their discovery may be off, or the network "
+                "may filter it."
             )
             set_status_tone(self._search_status, "warning")
             self._search_status.setText(message)
             self._set_results_state(
                 "none",
-                f"Nothing on {scope} answered. ONVIF discovery may be turned off on the "
-                "cameras, or the network may block it. Look a camera up by its address, "
-                "or enter its stream URL.",
+                f"Nothing on {scope} answered ONVIF, Hikvision SADP or the RTSP port check. "
+                "Check that the recorder is on the cameras' network, look a camera up by "
+                "its address, or enter its stream URL.",
             )
 
     def _search_failed(self, message: str) -> None:
@@ -1156,11 +1311,14 @@ class AddEditCameraDialog(QDialog):
 
     def _on_result_selected(self) -> None:
         candidate = self._selected_candidate()
-        self._use_btn.setEnabled(bool(candidate and candidate.can_add))
+        self._use_btn.setEnabled(bool(candidate and candidate.can_set_up))
 
     def _use_selected(self) -> None:
         candidate = self._selected_candidate()
-        if candidate is None or not candidate.can_add:
+        if candidate is None or not candidate.can_set_up:
+            return
+        if not candidate.can_add:
+            self._set_up_by_url(candidate)
             return
         self._candidate = candidate
         self._show_stream_choices([], None, None)
@@ -1179,6 +1337,23 @@ class AddEditCameraDialog(QDialog):
             f"{prefix}Enter the username and password of {candidate.title}, then Load Streams."
         )
         self._pass.setFocus()
+
+    def _set_up_by_url(self, candidate: Candidate) -> None:
+        """A device that answers RTSP only: its stream URL is typed by hand,
+        starting from its address."""
+        self._candidate = None
+        if not self._name.text().strip():
+            self._name.setText(f"Camera {candidate.address}")
+        self._show_camera_tab("urls")
+        if not self._a_url.text().strip() or self._a_url.text().startswith("rtsp://"):
+            self._a_url.setText(f"rtsp://{candidate.address}:554/")
+        set_status_tone(self._status_label, "info")
+        self._status_label.setText(
+            f"{candidate.address} answers RTSP but not ONVIF. Complete its stream path "
+            "(from the camera's manual or web page), enter its login, then Test Connection."
+        )
+        self._a_url.setFocus()
+        self._a_url.end(False)
 
     def _show_camera_tab(self, mode: str) -> None:
         self._set_mode(mode)

@@ -51,6 +51,11 @@ from neurowatch.models.preview_fps import (
     MAX_VISIBLE_FPS,
     PreviewFps,
 )
+from neurowatch.models.video_decoder import (
+    DecoderStatus,
+    decoder_choices,
+    decoder_from_config,
+)
 from neurowatch.service.startup import StartupPrefs
 from neurowatch.theme import (
     apply_dialog_theme,
@@ -101,6 +106,24 @@ class _UseLocationWorker(Worker):
                 "recording.use_location", {"path": self._path}
             )
             self.done.emit(None)
+        except Exception as exc:
+            self.done.emit(exc)
+
+
+class _DecoderStatusWorker(Worker):
+    """Reads ``system.status`` (the decoders found, the one in use) off the
+    UI thread."""
+
+    done = Signal(object)  # DecoderStatus, or Exception
+
+    def __init__(self, endpoint: str) -> None:
+        super().__init__()
+        self._endpoint = endpoint
+
+    def run(self) -> None:
+        try:
+            result = SyncIpcClient(endpoint=self._endpoint).call("system.status", {})
+            self.done.emit(DecoderStatus.from_status(result))
         except Exception as exc:
             self.done.emit(exc)
 
@@ -174,6 +197,7 @@ class SettingsDialog(QDialog):
         self._scan_worker: DriveScanWorker | None = None
         self._archive_worker: _ArchiveStatusWorker | None = None
         self._use_worker: _UseLocationWorker | None = None
+        self._decoder_worker: _DecoderStatusWorker | None = None
         self._chosen_drive: Drive | None = None
         apply_dialog_theme(self)
 
@@ -351,6 +375,7 @@ class SettingsDialog(QDialog):
         set_label_role(preview_hint, "hint")
         preview_form.addRow(preview_hint)
         self._pages["wall"].addWidget(preview_box)
+        self._pages["wall"].addWidget(self._build_decoder())
 
         # ------------------------------------------------------------------
         # Recording
@@ -519,6 +544,7 @@ class SettingsDialog(QDialog):
         resize_window(self, self._opening_size.expandedTo(self.minimumSizeHint()))
         self._scan_drives()
         self._read_archive_status()
+        self._read_decoder_status()
 
     @staticmethod
     def _card(title: str, subtitle: str = "") -> tuple[QFrame, QFormLayout]:
@@ -530,6 +556,89 @@ class SettingsDialog(QDialog):
         form.setVerticalSpacing(10)
         body.addLayout(form)
         return card, form
+
+    # ------------------------------------------------------------------
+    # Video decoding
+    # ------------------------------------------------------------------
+
+    def _build_decoder(self) -> QFrame:
+        """Which decoder shows live video: automatic, a graphics card's
+        decoder, or the CPU. The recorder applies it when it starts, so saving
+        a change restarts it."""
+        box, form = self._card(
+            "Video decoding",
+            "What decodes the cameras' video for live view and playback.",
+        )
+        self._decoder_initial = decoder_from_config(self._config)
+        self._decoder = QComboBox()
+        self._decoder.setAccessibleName("Video decoder")
+        self._decoder.setToolTip(
+            "Automatic uses the graphics card when it can. Pick a decoder to use only"
+            " that one, or CPU only to never use the graphics card."
+        )
+        self._fill_decoders(DecoderStatus())
+        form.addRow("Decoder:", self._decoder)
+        self._decoder_now = QLabel("Checking which decoder is in use…")
+        self._decoder_now.setWordWrap(True)
+        set_label_role(self._decoder_now, "hint")
+        form.addRow("", self._decoder_now)
+        self._decoder_now.setVisible(self._endpoint is not None)
+        self._decoder_warning = QLabel("")
+        self._decoder_warning.setWordWrap(True)
+        set_status_tone(self._decoder_warning, "warning")
+        form.addRow("", self._decoder_warning)
+        self._decoder_warning.setVisible(False)
+        note = QLabel(
+            "NeuroWatch restarts its background service to apply this (recording pauses"
+            " for a few seconds)."
+        )
+        note.setWordWrap(True)
+        set_label_role(note, "hint")
+        form.addRow("", note)
+        return box
+
+    def _fill_decoders(self, status: DecoderStatus) -> None:
+        """List Automatic, the decoders the recorder found and CPU only,
+        keeping the selection."""
+        current = self._decoder.currentData() if self._decoder.count() else None
+        if not isinstance(current, str):
+            current = self._decoder_initial
+        self._decoder.blockSignals(True)
+        self._decoder.clear()
+        for value, text in decoder_choices(self._decoder_initial, status.available):
+            self._decoder.addItem(text, value)
+        index = self._decoder.findData(current)
+        self._decoder.setCurrentIndex(max(0, index))
+        self._decoder.blockSignals(False)
+
+    def _read_decoder_status(self) -> None:
+        if self._endpoint is None:
+            return
+        worker = _DecoderStatusWorker(self._endpoint)
+        worker.done.connect(self._on_decoder_status)
+        worker.finished.connect(worker.deleteLater)
+        self._decoder_worker = worker
+        worker.start()
+
+    def _on_decoder_status(self, result: object) -> None:
+        self._decoder_worker = None
+        if not isinstance(result, DecoderStatus):
+            self._decoder_now.setText("The decoder in use could not be read.")
+            return
+        self._fill_decoders(result)
+        self._decoder_now.setText(f"Now decoding with: {result.active}" if result.active else "")
+        self._decoder_now.setVisible(bool(result.active))
+        self._decoder_warning.setText(result.warning)
+        self._decoder_warning.setVisible(bool(result.warning))
+
+    def video_decoder(self) -> str:
+        """The decoder choice as edited (``video.decoder``)."""
+        value = self._decoder.currentData()
+        return value if isinstance(value, str) else self._decoder_initial
+
+    def decoder_changed(self) -> bool:
+        """Whether saving changes the decoder (and so restarts the recorder)."""
+        return self.video_decoder() != self._decoder_initial
 
     # ------------------------------------------------------------------
     # Startup
@@ -926,11 +1035,20 @@ class SettingsDialog(QDialog):
 
     def _stop_scan(self) -> None:
         workers: tuple[
-            tuple[DriveScanWorker | _ArchiveStatusWorker | _UseLocationWorker | None, object], ...
+            tuple[
+                DriveScanWorker
+                | _ArchiveStatusWorker
+                | _UseLocationWorker
+                | _DecoderStatusWorker
+                | None,
+                object,
+            ],
+            ...,
         ] = (
             (self._scan_worker, self._on_drives),
             (self._archive_worker, self._on_archive_status),
             (self._use_worker, self._on_location_used),
+            (self._decoder_worker, self._on_decoder_status),
         )
         for worker, slot in workers:
             if worker is None:
@@ -945,6 +1063,7 @@ class SettingsDialog(QDialog):
         self._scan_worker = None
         self._archive_worker = None
         self._use_worker = None
+        self._decoder_worker = None
 
     def done(self, result: int) -> None:
         self._stop_scan()
@@ -995,4 +1114,6 @@ class SettingsDialog(QDialog):
         cfg["recording"]["archive"] = self.archive_settings().to_json()
         cfg.setdefault("debug", {})
         cfg["debug"]["gst_log"] = self._gst_log.currentText()
+        cfg.setdefault("video", {})
+        cfg["video"]["decoder"] = self.video_decoder()
         return cfg

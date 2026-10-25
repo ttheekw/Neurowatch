@@ -14,10 +14,12 @@ pub const RECOMMENDED_MIN_BYTES: u64 = 128_000_000_000;
 /// Folder created at the top of the chosen drive for recordings.
 pub const STORAGE_FOLDER: &str = "nw-storage";
 
+#[cfg(any(not(windows), test))]
 const DISK_FILESYSTEMS: &[&str] = &[
     "ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "jfs", "vfat", "exfat", "ntfs", "ntfs3",
     "fuseblk",
 ];
+#[cfg(any(not(windows), test))]
 const SYSTEM_MOUNTS: &[&str] = &[
     "/boot",
     "/efi",
@@ -50,6 +52,7 @@ pub(crate) struct Mount {
 }
 
 /// `/proc/mounts` escapes spaces, tabs, newlines and backslashes as octal.
+#[cfg(any(not(windows), test))]
 fn unescape(field: &str) -> String {
     let mut out = String::with_capacity(field.len());
     let mut rest = field;
@@ -71,6 +74,7 @@ fn unescape(field: &str) -> String {
     out
 }
 
+#[cfg(any(not(windows), test))]
 pub(crate) fn parse_mounts(text: &str) -> Vec<Mount> {
     text.lines()
         .filter_map(|line| {
@@ -89,6 +93,7 @@ pub(crate) fn parse_mounts(text: &str) -> Vec<Mount> {
         .collect()
 }
 
+#[cfg(any(not(windows), test))]
 fn is_system_mount(mount_point: &str) -> bool {
     SYSTEM_MOUNTS
         .iter()
@@ -97,6 +102,7 @@ fn is_system_mount(mount_point: &str) -> bool {
 
 /// Writable disk partitions, one per device (a device mounted twice, e.g. by
 /// a bind mount, is listed at its shortest mount point).
+#[cfg(any(not(windows), test))]
 pub(crate) fn disk_mounts(mounts: Vec<Mount>) -> Vec<Mount> {
     let mut kept: Vec<Mount> = Vec::new();
     for mount in mounts {
@@ -145,6 +151,7 @@ pub(crate) fn space(path: &str) -> Option<(u64, u64)> {
 pub(crate) fn space(path: &str) -> Option<(u64, u64)> {
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
+    let _error_mode = VolumeErrorMode::new()?;
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     let mut available = 0_u64;
     let mut total = 0_u64;
@@ -166,25 +173,187 @@ pub(crate) fn space(_path: &str) -> Option<(u64, u64)> {
     None
 }
 
-fn mount_table() -> Result<String, String> {
+#[cfg(not(windows))]
+fn mounted_disks() -> Result<Vec<Mount>, String> {
     std::fs::read_to_string("/proc/mounts")
+        .map(|text| disk_mounts(parse_mounts(&text)))
         .map_err(|_| "listing drives is only supported on Linux".to_owned())
+}
+
+/// Win32 drive-type values are part of the API ABI; kept here so filtering is
+/// also testable on Linux without linking Windows APIs.
+#[cfg(any(windows, test))]
+fn windows_disks(volumes: Vec<(u32, Mount)>) -> Vec<Mount> {
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32 = 3;
+    let mut mounts: Vec<_> = volumes
+        .into_iter()
+        .filter(|(kind, mount)| matches!(*kind, DRIVE_FIXED | DRIVE_REMOVABLE) && !mount.read_only)
+        .map(|(_, mount)| mount)
+        .collect();
+    mounts.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+    mounts
+}
+
+/// Empty removable media must fail without opening a Windows dialog in the
+/// background service. The error mode belongs to this thread, not the process.
+#[cfg(windows)]
+struct VolumeErrorMode(u32);
+
+#[cfg(windows)]
+impl VolumeErrorMode {
+    fn new() -> Option<Self> {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            GetThreadErrorMode, SetThreadErrorMode, SEM_FAILCRITICALERRORS, SEM_NOOPENFILEERRORBOX,
+        };
+
+        let mut previous = 0;
+        // SAFETY: these calls affect only the current thread; previous is a
+        // writable output. Preserve existing flags and restore them on Drop.
+        let ok = unsafe {
+            SetThreadErrorMode(
+                GetThreadErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX,
+                &mut previous,
+            )
+        };
+        (ok != 0).then(|| Self(previous))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for VolumeErrorMode {
+    fn drop(&mut self) {
+        // SAFETY: restoring the saved error mode on the same thread. The
+        // optional previous-mode output is unused.
+        unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::SetThreadErrorMode(
+                self.0,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+fn mounted_disks() -> Result<Vec<Mount>, String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDriveTypeW, GetLogicalDriveStringsW, GetVolumeInformationW,
+    };
+
+    let _error_mode = VolumeErrorMode::new()
+        .ok_or_else(|| "cannot safely check removable drives without Windows dialogs".to_owned())?;
+    // FILE_READ_ONLY_VOLUME from GetVolumeInformationW's filesystem flags.
+    const FILE_READ_ONLY_VOLUME: u32 = 0x0008_0000;
+    // SAFETY: a null buffer with length zero queries the required buffer size.
+    let required = unsafe { GetLogicalDriveStringsW(0, std::ptr::null_mut()) };
+    if required == 0 {
+        return Err(format!(
+            "cannot list drives: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut buffer = vec![0_u16; required as usize + 1];
+    // SAFETY: buffer is writable for the advertised number of UTF-16 units.
+    let written = unsafe { GetLogicalDriveStringsW(buffer.len() as u32, buffer.as_mut_ptr()) };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err("cannot list drives: the drive list changed; try again".to_owned());
+    }
+    let mut volumes = Vec::new();
+    for root in buffer[..written as usize].split(|unit| *unit == 0) {
+        if root.is_empty() {
+            continue;
+        }
+        let wide: Vec<u16> = root.iter().copied().chain(std::iter::once(0)).collect();
+        // SAFETY: wide holds a NUL-terminated drive root.
+        let kind = unsafe { GetDriveTypeW(wide.as_ptr()) };
+        if !matches!(kind, 2 | 3) {
+            continue; // Never probe CD-ROMs, network shares or RAM disks.
+        }
+        let mut filesystem = [0_u16; 261];
+        let mut flags = 0_u32;
+        // SAFETY: input is NUL-terminated; output buffers and their sizes are
+        // valid. Unneeded volume label, serial and component length are null.
+        let ok = unsafe {
+            GetVolumeInformationW(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut flags,
+                filesystem.as_mut_ptr(),
+                filesystem.len() as u32,
+            )
+        };
+        if ok == 0 {
+            continue; // Includes removable drives with no media inserted.
+        }
+        let end = filesystem
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(filesystem.len());
+        let mount_point = String::from_utf16_lossy(root);
+        volumes.push((
+            kind,
+            Mount {
+                device: mount_point.trim_end_matches('\\').to_owned(),
+                mount_point,
+                filesystem: String::from_utf16_lossy(&filesystem[..end]),
+                read_only: flags & FILE_READ_ONLY_VOLUME != 0,
+            },
+        ));
+    }
+    Ok(windows_disks(volumes))
+}
+
+/// Compare Windows paths without the host's std::path semantics. Require a
+/// component boundary so C:\\recordings never matches C:\\recordings-old.
+#[cfg(any(windows, test))]
+fn windows_path_under(path: &str, mount: &str) -> bool {
+    let path = path.replace('\\', "/").to_lowercase();
+    let mount = mount.replace('\\', "/").to_lowercase();
+    let mount = mount.trim_end_matches('/');
+    (path == mount && !mount.ends_with(':')) || path.starts_with(&format!("{mount}/"))
+}
+
+#[cfg(any(windows, test))]
+fn windows_drive_of<'a>(drives: &'a [Drive], path: &str) -> Option<&'a Drive> {
+    drives
+        .iter()
+        .filter(|drive| windows_path_under(path, &drive.mount_point))
+        .max_by_key(|drive| drive.mount_point.len())
 }
 
 /// The drive that holds `path`: the longest mount point it lies under.
 fn drive_of<'a>(drives: &'a [Drive], path: &Path) -> Option<&'a Drive> {
-    drives
-        .iter()
-        .filter(|drive| path.starts_with(&drive.mount_point))
-        .max_by_key(|drive| drive.mount_point.len())
+    #[cfg(windows)]
+    {
+        windows_drive_of(drives, &path.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        drives
+            .iter()
+            .filter(|drive| path.starts_with(&drive.mount_point))
+            .max_by_key(|drive| drive.mount_point.len())
+    }
 }
 
+#[cfg(test)]
 pub(crate) fn drives_from(
     mounts: Vec<Mount>,
     space: impl Fn(&str) -> Option<(u64, u64)>,
     current_storage: &Path,
 ) -> Vec<Drive> {
-    let mut drives: Vec<Drive> = disk_mounts(mounts)
+    drives_on(disk_mounts(mounts), space, current_storage)
+}
+
+fn drives_on(
+    mounts: Vec<Mount>,
+    space: impl Fn(&str) -> Option<(u64, u64)>,
+    current_storage: &Path,
+) -> Vec<Drive> {
+    let mut drives: Vec<Drive> = mounts
         .into_iter()
         .filter_map(|mount| {
             let (total_bytes, available_bytes) = space(&mount.mount_point)?;
@@ -210,7 +379,7 @@ pub(crate) fn drives_from(
 /// Mounted drives a recording location can be put on. Unless `all`, only
 /// drives of at least [`RECOMMENDED_MIN_BYTES`] (and the current one).
 pub fn list(all: bool, current_storage: &Path) -> Result<Vec<Drive>, String> {
-    let drives = drives_from(parse_mounts(&mount_table()?), space, current_storage);
+    let drives = drives_on(mounted_disks()?, space, current_storage);
     Ok(drives
         .into_iter()
         .filter(|drive| all || drive.recommended || drive.selected)
@@ -220,7 +389,7 @@ pub fn list(all: bool, current_storage: &Path) -> Result<Vec<Drive>, String> {
 /// Create `<mount_point>/nw-storage` on a drive the scan reports and check it
 /// can be written. Any other path is refused.
 pub fn prepare(mount_point: &str) -> Result<PathBuf, String> {
-    let drives = drives_from(parse_mounts(&mount_table()?), space, Path::new(""));
+    let drives = drives_on(mounted_disks()?, space, Path::new(""));
     prepare_on(&drives, mount_point)
 }
 
@@ -324,5 +493,74 @@ server:/share /mnt/nas nfs4 rw 0 0
         assert!(folder.is_dir());
         assert!(!folder.join(".nw-write-test").exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn windows_lists_only_writable_fixed_and_removable_volumes() {
+        let volume = |letter: &str, filesystem: &str, read_only| Mount {
+            device: format!("{letter}:"),
+            mount_point: format!("{letter}:\\"),
+            filesystem: filesystem.to_owned(),
+            read_only,
+        };
+        let mounts = windows_disks(vec![
+            (2, volume("E", "exFAT", false)),
+            (3, volume("C", "NTFS", false)),
+            (3, volume("D", "ReFS", true)),
+            (4, volume("N", "NTFS", false)), // network
+            (5, volume("F", "UDF", false)),  // optical
+            (6, volume("R", "NTFS", false)), // RAM disk
+            (1, volume("X", "", false)),     // no media/root
+        ]);
+        let drives = drives_on(
+            mounts,
+            |path| match path {
+                "C:\\" => Some((500_000_000_000, 120_000_000_000)),
+                "E:\\" => Some((64_000_000_000, 40_000_000_000)),
+                _ => None,
+            },
+            Path::new(""),
+        );
+        assert_eq!(
+            drives
+                .iter()
+                .map(|d| d.mount_point.as_str())
+                .collect::<Vec<_>>(),
+            ["C:\\", "E:\\"]
+        );
+        assert_eq!(drives[0].device, "C:");
+        assert_eq!(drives[0].filesystem, "NTFS");
+        assert_eq!(drives[0].available_bytes, 120_000_000_000);
+        assert!(drives[0].recommended);
+        assert!(!drives[1].recommended);
+        assert!(drives_on(
+            windows_disks(vec![(3, volume("C", "NTFS", false))]),
+            |_| None,
+            Path::new("")
+        )
+        .is_empty());
+
+        assert_eq!(
+            windows_drive_of(&drives, "c:/Users/x/Videos"),
+            Some(&drives[0])
+        );
+        assert_eq!(
+            windows_drive_of(&drives, "e:\\nw-storage"),
+            Some(&drives[1])
+        );
+        assert!(windows_drive_of(&drives, "Z:\\Videos").is_none());
+    }
+
+    #[test]
+    fn windows_path_matching_accepts_either_slash_and_checks_component_boundaries() {
+        assert!(windows_path_under("c:/Users/x/Videos", "C:\\"));
+        assert!(windows_path_under("C:\\", "c:/"));
+        assert!(windows_path_under(
+            "d:\\Recordings\\Camera",
+            "D:/recordings"
+        ));
+        assert!(!windows_path_under("D:/Recordings-old", "d:\\Recordings"));
+        assert!(!windows_path_under("C:/Videos", "D:\\"));
+        assert!(!windows_path_under("C:Videos", "C:\\"));
     }
 }

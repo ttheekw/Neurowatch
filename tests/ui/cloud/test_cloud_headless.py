@@ -284,3 +284,32 @@ def test_cloud_is_a_launch_command():
     launch = parse_launch_args(["neurowatch-ui", "cloud", "link", "CODE", "--name", "Lab"])
     assert launch.mode == "command"
     assert launch.rest == ("cloud", "link", "CODE", "--name", "Lab")
+
+
+WARNING = "This computer's clock is 5 h 30 min ahead of NeuroWatch Cloud."
+
+
+def test_the_cloud_line_carries_the_clock_warning():
+    assert cloud.cloud_line({**LINKED, "clock_warning": WARNING}) == f"Cloud: connected. {WARNING}"
+
+
+def test_a_failed_link_prints_the_clock_warning_the_attempt_revealed():
+    backend = FakeBackend(
+        {
+            "cloud.status": {
+                "phase": "unlinked",
+                "cloud_configured": True,
+                "clock_warning": WARNING,
+            },
+            "cloud.begin": RuntimeError(
+                "invalid params: unsafe or invalid cloud configuration: the enrollment code "
+                "has expired (codes last five minutes)"
+            ),
+        }
+    )
+    said: list[str] = []
+
+    assert link(backend, CODE, "Lab", said.append) == 1
+    assert said[-2].startswith("Cloud link failed: The enrollment code has expired")
+    assert "time zone" in said[-2]
+    assert said[-1] == f"Cloud link: {WARNING}"

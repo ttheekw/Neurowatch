@@ -833,6 +833,26 @@ pub fn hikvision_profiles(device: Ipv4Addr) -> Vec<(MediaProfile, String)> {
         .collect()
 }
 
+/// Dahua stream paths (also many OEM brands built on Dahua), for a Dahua
+/// camera whose ONVIF is turned off.
+pub fn dahua_profiles(device: Ipv4Addr) -> Vec<(MediaProfile, String)> {
+    [("0", "Main stream"), ("1", "Sub stream")]
+        .into_iter()
+        .map(|(subtype, name)| {
+            (
+                MediaProfile {
+                    token: format!("dahua-{subtype}"),
+                    name: name.to_owned(),
+                    width: None,
+                    height: None,
+                    encoding: None,
+                },
+                format!("rtsp://{device}:554/cam/realmonitor?channel=1&subtype={subtype}"),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

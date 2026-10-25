@@ -285,3 +285,165 @@ def test_add_camera_dialog_has_no_desktop_border(qtbot: object) -> None:
     bar = dlg.findChild(ChromeTitleBar)
     assert bar is not None and bar._title.text() == "Add camera"
     assert dlg.windowTitle() == "Add Camera"  # still named for the taskbar
+
+
+def test_the_add_button_survives_the_network_list_arriving_after_the_dialog_opens(
+    qtbot: object,
+) -> None:
+    """Opening a chrome dialog picks its first focus; the networks then
+    rebuild the range buttons. That once left the OK button's wrapper deleted
+    ("Internal C++ object already deleted" on every search update)."""
+    dlg = camera_dialog.AddEditCameraDialog(ipc_endpoint=ENDPOINT)
+    qtbot.addWidget(dlg)  # type: ignore[attr-defined]
+    dlg.show()
+    qtbot.waitUntil(lambda: dlg.focusWidget() is dlg._net_combo)  # type: ignore[attr-defined]
+    dlg._on_interfaces(
+        {"interfaces": [{"id": "wlan0", "name": "wlan0", "cidr": "10.0.10.0/24", "primary": True}]}
+    )
+    qtbot.wait(20)  # type: ignore[attr-defined]  # the old buttons' deferred deletion
+
+    dlg._on_scan_progress({"status": "running", "candidates": [CANDIDATE]})
+    assert dlg._ok_btn.text() == "Add 1 Camera"
+    dlg._tabs.setCurrentWidget(dlg._camera_tab)
+    assert dlg._ok_btn.text() == "Add Camera"
+
+
+def test_a_typed_range_is_previewed_and_checked_while_typing(qtbot: object) -> None:
+    dlg = camera_dialog.AddEditCameraDialog(ipc_endpoint=ENDPOINT)
+    qtbot.addWidget(dlg)  # type: ignore[attr-defined]
+    dlg._on_interfaces(
+        {
+            "interfaces": [
+                {
+                    "id": "wlan0",
+                    "name": "wlan0",
+                    "address": "10.0.10.5",
+                    "prefix": 24,
+                    "cidr": "10.0.10.0/24",
+                    "primary": True,
+                }
+            ]
+        }
+    )
+    assert not dlg._range_help.isVisibleTo(dlg)
+    chips = {c.property("range"): c for c in dlg._chips}
+    assert list(chips) == ["10.0.10.x", "192.168.1.x", "192.168.0.x"]
+
+    # A chip switches to a typed range, ready to search.
+    chips["192.168.1.x"].click()
+    assert dlg._net_combo.currentData() == {"scope": "cidr"}
+    assert dlg._range_help.isVisibleTo(dlg)
+    assert dlg._range_edit.text() == "192.168.1.x"
+    assert dlg._range_preview.text() == "Searches 192.168.1.1 – 192.168.1.254 · 254 addresses"
+    assert chips["192.168.1.x"].isChecked() and not chips["10.0.10.x"].isChecked()
+    assert dlg._search_btn.isEnabled()
+
+    # Mistakes are said before Search, which waits for a valid range.
+    dlg._range_edit.setText("192.168.1.50-10")
+    assert "ends before it starts" in dlg._range_preview.text()
+    assert dlg._range_preview.property("tone") == "warning"
+    assert not dlg._search_btn.isEnabled()
+
+    # One camera's address: offered its whole network too.
+    dlg._range_edit.setText("192.168.1.64")
+    assert dlg._range_preview.text() == "Searches 192.168.1.64 only"
+    assert dlg._widen_btn.isVisibleTo(dlg)
+    assert dlg._widen_btn.text() == "Search all of 192.168.1.x"
+    dlg._widen_btn.click()
+    assert dlg._range_edit.text() == "192.168.1.x"
+    assert not dlg._widen_btn.isVisibleTo(dlg)
+
+    # This recorder's network needs no range.
+    dlg._net_combo.setCurrentIndex(0)
+    assert dlg._search_btn.isEnabled()
+    assert not dlg._range_help.isVisibleTo(dlg)
+
+
+def test_a_typed_range_is_sent_as_typed(qtbot: object, backend: FakeBackend) -> None:
+    dlg = camera_dialog.AddEditCameraDialog(ipc_endpoint=ENDPOINT)
+    qtbot.addWidget(dlg)  # type: ignore[attr-defined]
+    backend.answers = {
+        "camera.discovery.start": [
+            {"scan_id": "s", "status": "complete", "scope": "192.168.1.10-50", "candidates": []}
+        ],
+    }
+    dlg._use_range("192.168.1.10 - 50")
+    dlg._on_search()
+    worker = dlg._scan_worker
+    assert worker is not None
+    _run(worker)
+    assert backend.calls[0][:2] == (
+        "camera.discovery.start",
+        {"scope": "cidr", "cidr": "192.168.1.10 - 50"},
+    )
+
+
+def test_devices_found_without_onvif_are_listed_with_what_they_need(qtbot: object) -> None:
+    dlg = camera_dialog.AddEditCameraDialog(ipc_endpoint=ENDPOINT)
+    qtbot.addWidget(dlg)  # type: ignore[attr-defined]
+    hikvision = {
+        "candidate_id": "h",
+        "address": "192.168.1.65",
+        "state": "credentials_needed",
+        "manufacturer": "Hikvision",
+        "model": "DS-2CD1043G0-I",
+        "found_by": ["sadp"],
+        "serial": "DS-2CD1043G0-I20210101AAWRE1",
+        "note": "Its ONVIF service did not answer, so Hikvision stream addresses are used.",
+    }
+    inactive = {
+        **hikvision,
+        "candidate_id": "n",
+        "address": "192.168.1.66",
+        "state": "unavailable",
+        "activated": False,
+        "note": "Not activated yet: set its admin password.",
+    }
+    rtsp = {
+        "candidate_id": "r",
+        "address": "192.168.1.70",
+        "state": "unavailable",
+        "found_by": ["rtsp"],
+        "stream_url_needed": True,
+        "note": "Answers RTSP but not ONVIF, so its stream address is unknown.",
+    }
+    dlg._on_scan_done(
+        {
+            "scan_id": "s",
+            "status": "complete",
+            "scope": "192.168.1.0/24",
+            "candidates": [rtsp, inactive, hikvision, CANDIDATE],
+        }
+    )
+    rows = {c.address: (row, c) for row, c in dlg._rows()}
+    # Addable first, by address; the Hikvision found by SADP is ticked like any camera.
+    assert [c.address for _, c in dlg._rows()] == [
+        "192.168.1.64",
+        "192.168.1.65",
+        "192.168.1.66",
+        "192.168.1.70",
+    ]
+    assert {c.candidate_id for c in dlg._ticked_candidates()} == {"c1", "h"}
+    row, _ = rows["192.168.1.66"]
+    assert dlg._results_table.item(row, 2).text() == "Not activated"
+    assert dlg._results_table.item(row, 2).toolTip().startswith("Not activated yet")
+    row, _ = rows["192.168.1.65"]
+    assert "Serial number" in dlg._results_table.item(row, 0).toolTip()
+
+    # An RTSP-only device is set up with its stream URL, starting from its address.
+    row, _ = rows["192.168.1.70"]
+    assert dlg._results_table.item(row, 0).text() == "RTSP device"
+    assert dlg._results_table.item(row, 2).text() == "Needs stream URL"
+    dlg._results_table.selectRow(row)
+    assert dlg._use_btn.isEnabled()
+    dlg._use_selected()
+    assert (dlg._tabs.currentWidget(), dlg._mode()) == (dlg._camera_tab, "urls")
+    assert dlg._a_url.text() == "rtsp://192.168.1.70:554/"
+    assert dlg._name.text() == "Camera 192.168.1.70"
+    assert "answers RTSP but not ONVIF" in dlg._status_label.text()
+
+    # A device that is not activated cannot be set up.
+    dlg._tabs.setCurrentWidget(dlg._search_tab)
+    row, _ = rows["192.168.1.66"]
+    dlg._results_table.selectRow(row)
+    assert not dlg._use_btn.isEnabled()

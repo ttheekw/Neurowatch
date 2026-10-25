@@ -20,6 +20,9 @@ pub struct AppConfig {
     pub ui: UiConfig,
     #[serde(default)]
     pub debug: DebugConfig,
+    /// How video is decoded (`crate::pipeline::hwaccel`).
+    #[serde(default)]
+    pub video: VideoConfig,
     #[serde(default)]
     pub recording: RecordingGlobalConfig,
     #[serde(default)]
@@ -69,6 +72,50 @@ mod recording_policy_tests {
         );
         assert!(loaded.cameras[0].recording.weekly_rules.is_empty());
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod video_config_tests {
+    use super::*;
+
+    #[test]
+    fn decoder_choice_defaults_to_auto_round_trips_and_is_validated() {
+        // A config written before the setting existed reads as automatic.
+        let mut old = serde_json::to_value(AppConfig::default()).unwrap();
+        old.as_object_mut().unwrap().remove("video");
+        let config: AppConfig = serde_json::from_value(old).unwrap();
+        assert_eq!(config.video.decoder, VideoDecoder::Auto);
+
+        for decoder in VideoDecoder::ALL {
+            let mut config = AppConfig::default();
+            config.video.decoder = decoder;
+            let text = serde_json::to_string(&config).unwrap();
+            assert!(text.contains(&format!("\"decoder\":\"{}\"", decoder.id())));
+            let back: AppConfig = serde_json::from_str(&text).unwrap();
+            assert_eq!(back.video.decoder, decoder);
+            assert_eq!(VideoDecoder::from_id(decoder.id()), Some(decoder));
+        }
+
+        let current = VideoConfig::default();
+        let next =
+            VideoConfig::changed(&current, &serde_json::json!({"decoder": "nvdec"})).unwrap();
+        assert_eq!(next.decoder, VideoDecoder::Nvdec);
+        assert_eq!(
+            VideoConfig::changed(&next, &serde_json::json!({})).unwrap(),
+            next,
+            "nothing asked, nothing changed"
+        );
+        for bad in [
+            serde_json::json!("cuda"),
+            serde_json::json!(3),
+            serde_json::json!("NVDEC"),
+        ] {
+            let error = VideoConfig::changed(&current, &serde_json::json!({"decoder": bad}))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("software"), "{error}");
+        }
     }
 }
 
@@ -159,6 +206,83 @@ impl Default for DebugConfig {
         Self {
             gst_log: "warn".into(),
         }
+    }
+}
+
+/// Video decoding settings. Applied when the backend starts: the decoder
+/// choice changes GStreamer's process-wide registry, so a change restarts the
+/// backend (`config.set`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoConfig {
+    #[serde(default)]
+    pub decoder: VideoDecoder,
+}
+
+impl VideoConfig {
+    /// `current` with the fields of `changes` applied (a `config.set`
+    /// `video` object), or why they cannot be. Nothing changes on error.
+    pub fn changed(current: &Self, changes: &serde_json::Value) -> anyhow::Result<Self> {
+        let mut next = *current;
+        if let Some(value) = changes.get("decoder") {
+            next.decoder = value
+                .as_str()
+                .and_then(VideoDecoder::from_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "video decoder must be one of: {}",
+                        VideoDecoder::ALL.map(VideoDecoder::id).join(", ")
+                    )
+                })?;
+        }
+        Ok(next)
+    }
+}
+
+/// Which decoder family decodes video: `Auto` picks the best one found,
+/// a hardware family is used whenever this computer has it (the others are
+/// left out), `Software` decodes on the CPU only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoDecoder {
+    #[default]
+    Auto,
+    Nvdec,
+    D3d11,
+    D3d12,
+    Qsv,
+    Vaapi,
+    V4l2,
+    Software,
+}
+
+impl VideoDecoder {
+    pub const ALL: [Self; 8] = [
+        Self::Auto,
+        Self::Nvdec,
+        Self::D3d11,
+        Self::D3d12,
+        Self::Qsv,
+        Self::Vaapi,
+        Self::V4l2,
+        Self::Software,
+    ];
+
+    /// The value in the config file and over IPC.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Nvdec => "nvdec",
+            Self::D3d11 => "d3d11",
+            Self::D3d12 => "d3d12",
+            Self::Qsv => "qsv",
+            Self::Vaapi => "vaapi",
+            Self::V4l2 => "v4l2",
+            Self::Software => "software",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|decoder| decoder.id() == id)
     }
 }
 
@@ -601,6 +725,7 @@ impl Default for AppConfig {
                 preview_fps: PreviewFpsConfig::default(),
             },
             debug: DebugConfig::default(),
+            video: VideoConfig::default(),
             recording: RecordingGlobalConfig::default(),
             motion: MotionGlobalConfig::default(),
             events: EventsConfig::default(),

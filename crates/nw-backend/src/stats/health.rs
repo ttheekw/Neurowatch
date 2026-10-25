@@ -72,7 +72,7 @@ impl HealthCounters {
         }
     }
 
-    fn state_snapshot(&self) -> String {
+    pub(crate) fn state_snapshot(&self) -> String {
         self.state
             .lock()
             .map(|s| s.clone())

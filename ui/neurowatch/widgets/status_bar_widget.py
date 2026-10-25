@@ -13,8 +13,13 @@ bottom.
 
 from __future__ import annotations
 
+import logging
 import shutil
+import time
 from collections.abc import Mapping
+from pathlib import Path
+from queue import Empty, SimpleQueue
+from threading import Thread
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QPaintEvent, QPen, QPolygonF
@@ -30,6 +35,30 @@ BAR_RGB = (0x0A, 0x0A, 0x14)
 _TEXT = "#7878a0"
 _TEXT_BRIGHT = "#a0a0c0"
 _SEP_COLOR = "#1a1a30"
+logger = logging.getLogger(__name__)
+_DISK_TIMEOUT_SECONDS = 2.0
+_MAX_DISK_READERS = 2
+
+
+def recording_disk_path(path: str) -> Path:
+    """Nearest existing ancestor, before a new recording folder is created.
+
+    Filesystem checks belong on the disk reader thread: a disconnected network
+    mount can stall even an exists() call.
+    """
+    folder = Path(path).expanduser().absolute()
+    while not folder.exists() and folder.parent != folder:
+        folder = folder.parent
+    return folder
+
+
+def _read_disk(path: str, results: SimpleQueue[tuple[str, int | None]]) -> None:
+    try:
+        free = shutil.disk_usage(recording_disk_path(path)).free
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.debug("Could not read recording disk space for %s: %s", path, exc)
+        free = None
+    results.put((path, free))
 
 
 #: Every reading (extensions' indicators too): one size, centred, without
@@ -216,6 +245,14 @@ class StatusBarWidget(QWidget):
         layout.addWidget(self._version_lbl)
 
         # Free disk space is read here; the other readings come from the backend.
+        self._storage_path = ""
+        self._disk_pending = False
+        self._disk_started = 0.0
+        self._disk_reads: dict[str, float] = {}
+        self._disk_results: SimpleQueue[tuple[str, int | None]] = SimpleQueue()
+        self._disk_poll = QTimer(self)
+        self._disk_poll.setInterval(100)
+        self._disk_poll.timeout.connect(self._poll_disk_result)
         self._timer = QTimer(self)
         self._timer.setInterval(2000)
         self._timer.timeout.connect(self._update_disk)
@@ -277,6 +314,8 @@ class StatusBarWidget(QWidget):
             "vaapi": ("square", "VA-API", "#67e8f9", "Intel/AMD VA-API hardware decode"),
             "nvdec": ("diamond", "NVIDIA NVDEC", "#a3e635", "NVIDIA hardware decode"),
             "d3d11": ("square", "Direct3D 11", "#67e8f9", "Direct3D 11 hardware decode"),
+            "d3d12": ("square", "Direct3D 12", "#67e8f9", "Direct3D 12 hardware decode"),
+            "qsv": ("square", "Quick Sync", "#67e8f9", "Intel Quick Sync hardware decode"),
             "v4l2_m2m": ("square", "V4L2 M2M", "#c4b5fd", "V4L2 hardware decode"),
             "software": (
                 "ring",
@@ -303,13 +342,60 @@ class StatusBarWidget(QWidget):
         self._accel_lbl.setToolTip(tooltip)
         self._accel_lbl.setStyleSheet(f"color: {color}; font-weight: 600;")
 
+    def set_storage_path(self, path: str) -> None:
+        """Refresh the recording drive at load, Settings save and config reload."""
+        if path == self._storage_path:
+            return
+        self._storage_path = path
+        self._disk_pending = False
+        self._disk_lbl.setText("Disk: --")
+        self._disk_lbl.setToolTip(f"Free space where recordings are saved: {path}")
+        self._update_disk()
+
     def _update_disk(self) -> None:
+        if not self._storage_path or self._disk_pending:
+            return
+        if self._storage_path in self._disk_reads:
+            self._disk_pending = True
+            self._disk_started = self._disk_reads[self._storage_path]
+            return
+        if len(self._disk_reads) >= _MAX_DISK_READERS:
+            return
+        self._disk_pending = True
+        self._disk_started = time.monotonic()
+        self._disk_reads[self._storage_path] = self._disk_started
+        # One read per path, with a spare slot so switching away from a hung
+        # drive can recover. The total stays bounded even if several mounts
+        # hang; daemon readers hold no widgets and cannot block app exit.
+        Thread(
+            target=_read_disk,
+            args=(self._storage_path, self._disk_results),
+            daemon=True,
+            name="recording-disk-space",
+        ).start()
+        self._disk_poll.start()
+
+    def _poll_disk_result(self) -> None:
         try:
-            usage = shutil.disk_usage("/")
-            gb_free = usage.free / (1024**3)
-            self._disk_lbl.setText(f"Disk: {gb_free:.0f} GB Free")
-        except OSError:
-            self._disk_lbl.setText("Disk: --")
+            path, free = self._disk_results.get_nowait()
+        except Empty:
+            if (
+                self._disk_pending
+                and time.monotonic() - self._disk_started >= _DISK_TIMEOUT_SECONDS
+            ):
+                self._disk_lbl.setText("Disk: --")
+            return
+        self._disk_reads.pop(path, None)
+        if not self._disk_reads:
+            self._disk_poll.stop()
+        if path != self._storage_path:
+            self._update_disk()  # A Settings change superseded this read.
+        else:
+            self._disk_pending = False
+            if free is None:
+                self._disk_lbl.setText("Disk: --")
+            else:
+                self._disk_lbl.setText(f"Disk: {free / (1024**3):.0f} GB Free")
 
     def set_performance(self, snapshot: object) -> None:
         """Show the backend's CPU, memory and network readings (the

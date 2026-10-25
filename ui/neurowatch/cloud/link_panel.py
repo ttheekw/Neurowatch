@@ -117,6 +117,12 @@ class CloudLinkPanel(QWidget):
         self.cloud_label.setWordWrap(True)
         set_label_role(self.cloud_label, "hint")
         status_layout.addWidget(self.cloud_label)
+        # This computer's clock is off NeuroWatch Cloud's (shown only then).
+        self.clock_label = QLabel("")
+        self.clock_label.setWordWrap(True)
+        set_status_tone(self.clock_label, "warning")
+        self.clock_label.setVisible(False)
+        status_layout.addWidget(self.clock_label)
         layout.addWidget(status_card)
 
         # The code and the recorder's name.
@@ -202,7 +208,8 @@ class CloudLinkPanel(QWidget):
         if self._busy:
             return
         self._busy = True
-        self.error_label.setText("")
+        if method != "cloud.status":
+            self.error_label.setText("")  # a refresh keeps the last failure shown
         self._update_controls()
         worker = _CloudRpcWorker(self._rpc, method, params, timeout)
         worker.result.connect(self._on_result)
@@ -218,6 +225,10 @@ class CloudLinkPanel(QWidget):
             self.error_label.setText(operator_error(f"{method} failed: {result}"))
             self.status_label.setText(self._status.summary)
             self._update_controls()
+            if method in ("cloud.begin", "cloud.confirm"):
+                # The attempt may have taught the backend that this computer's
+                # clock is off; show that next to the failure.
+                self._run("cloud.status", {}, _STATUS_TIMEOUT_S)
             return
         if method == "cloud.unlink":
             self._run("cloud.status", {}, _STATUS_TIMEOUT_S)
@@ -229,6 +240,9 @@ class CloudLinkPanel(QWidget):
         linked_now = method in ("cloud.begin", "cloud.confirm") and self._status.phase == "linked"
         self.status_label.setText(_SUCCESS if linked_now else self._status.summary)
         self.cloud_label.setText(self._status.cloud_description)
+        warning = self._status.clock_warning or ""
+        self.clock_label.setText(warning)
+        self.clock_label.setVisible(bool(warning))
         self._update_controls()
 
     def _update_controls(self) -> None:

@@ -51,6 +51,9 @@ pub(super) const OFFLINE_AFTER_FAILURES: u32 = 3;
 /// or mid-stream) is treated as failed, so a source that accepts the
 /// connection but sends no video does not sit in `connecting` forever.
 pub(crate) const NO_FRAME_TIMEOUT: Duration = Duration::from_secs(20);
+/// A decoder teardown taking longer is logged: a replacement view (a stream
+/// switch restarts the view in place) waits for it.
+const SLOW_TEARDOWN: Duration = Duration::from_secs(1);
 /// Upper bound for the cheap reachability probe before a pipeline build.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Cap on elements visited while walking upstream from the live sink.
@@ -860,6 +863,7 @@ impl PipelineSupervisor {
     /// Return true only after GStreamer reports that the pipeline is NULL.
     fn destroy_pipeline(&mut self) -> bool {
         if let Some(pipeline) = self.pipeline.take() {
+            let started = Instant::now();
             if let Err(error) = pipeline.set_state(gstreamer::State::Null) {
                 tracing::error!(cam_id = %self.cam_id, %error, "Failed to set pipeline to NULL");
                 self.pipeline = Some(pipeline);
@@ -875,7 +879,13 @@ impl PipelineSupervisor {
                 self.pipeline = Some(pipeline);
                 return false;
             }
-            tracing::debug!(cam_id = %self.cam_id, "Pipeline destroyed");
+            let elapsed = started.elapsed();
+            if elapsed >= SLOW_TEARDOWN {
+                // A replacement view (stream switch) waits for this.
+                tracing::warn!(cam_id = %self.cam_id, teardown_ms = elapsed.as_millis() as u64, "Decoder teardown was slow");
+            } else {
+                tracing::debug!(cam_id = %self.cam_id, teardown_ms = elapsed.as_millis() as u64, "Pipeline destroyed");
+            }
         }
         // Drop after pipeline so callback is unregistered first.
         self.feed = None;

@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -58,6 +59,8 @@ pub struct AppState {
     ingest: HashMap<CameraId, IngestHandle>,
     /// Cameras whose desktop view (decoder) is running.
     views: HashSet<CameraId>,
+    /// Set when a camera's latest desktop view supervisor has exited.
+    view_ended: HashMap<CameraId, Arc<AtomicBool>>,
     /// Desktop UIs' view leases: which cameras each shows, until when.
     view_demand: HashMap<String, (HashSet<CameraId>, Instant)>,
     /// Which camera each desktop UI listens to live, until when (its lease).
@@ -150,6 +153,7 @@ impl AppState {
             live_stream: HashMap::new(),
             ingest: HashMap::new(),
             views: HashSet::new(),
+            view_ended: HashMap::new(),
             view_demand: HashMap::new(),
             audio_demand: HashMap::new(),
             live_audio: None,
@@ -335,11 +339,36 @@ impl AppState {
         // Installing a replacement can wait for the old pipeline's verified
         // teardown. Keep that wait off the Tokio worker and outside AppState's
         // write lock so status/diagnostics and other cameras remain responsive.
+        //
+        // A replacement (a stream switch restarts the view in place) waits
+        // for that teardown for as long as the view is wanted: giving up left
+        // a camera the wall shows with no decoder until the view was stopped
+        // and started again (bug: frozen until the window was minimized). A
+        // slow teardown (many hardware decoders closing at once) is reported
+        // as `teardown_failed` meanwhile, and the view starts once it ends.
         let registry = Arc::clone(&self.assignment_registry);
+        let ended = Arc::new(AtomicBool::new(false));
+        let task_ended = Arc::clone(&ended);
         self.supervisor_tasks.retain(|task| !task.is_finished());
         let task = tokio::task::spawn_blocking(move || {
-            match install_local_assignment(&*registry, &assignment, &startup_stop_rx) {
-                Ok(true) => supervisor.run(),
+            let mut status_before = None;
+            let installed =
+                install_local_assignment(&*registry, &assignment, &startup_stop_rx, || {
+                    status_before = Some(health_counters.state_snapshot());
+                    health_counters.set_state("teardown_failed");
+                    let _ = startup_state_tx.send("teardown_failed".to_owned());
+                });
+            match installed {
+                Ok(true) => {
+                    if let Some(before) = status_before {
+                        tracing::info!(cam_id = %assignment.camera_id, "Prior desktop view stopped; the replacement starts now");
+                        // The camera's own status again, unless it moved on.
+                        if health_counters.state_snapshot() == "teardown_failed" {
+                            health_counters.set_state(before);
+                        }
+                    }
+                    supervisor.run();
+                }
                 Ok(false) => {
                     let _ = startup_state_tx.send("offline".to_owned());
                 }
@@ -349,8 +378,10 @@ impl AppState {
                     tracing::error!(cam_id = %assignment.camera_id, %error, "Supervisor spawn skipped; assignment fence was not available");
                 }
             }
+            task_ended.store(true, AtomicOrdering::SeqCst);
         });
         self.supervisor_tasks.push(task);
+        self.view_ended.insert(cam.id.clone(), ended);
         self.stop_txs.insert(cam.id.clone(), stop_tx);
         self.supervisor_state_rx.insert(cam.id.clone(), state_rx);
         self.supervisor_stream_info_rx
@@ -368,6 +399,7 @@ impl AppState {
     /// unquiesced teardown.
     fn stop_view(&mut self, cam_id: &CameraId) {
         self.views.remove(cam_id);
+        self.view_ended.remove(cam_id);
         if let Some(tx) = self.stop_txs.get(cam_id) {
             let _ = tx.send(true);
             tracing::info!(cam_id = %cam_id, "Desktop view stop requested");
@@ -433,6 +465,7 @@ impl AppState {
             tracing::info!(cam_id = %cam_id, "Ingest stop requested (shutdown)");
         }
         self.views.clear();
+        self.view_ended.clear();
         self.view_demand.clear();
         self.audio_demand.clear();
         if let Some((cam_id, stop)) = self.live_audio.take() {
@@ -540,10 +573,16 @@ impl AppState {
         let desired = self.desired_views();
         let cameras = self.config.cameras.clone();
         for cam in &cameras {
-            let running = self.views.contains(&cam.id);
-            if desired.contains(&cam.id) && !running {
+            let started = self.views.contains(&cam.id);
+            if desired.contains(&cam.id) && !started {
                 self.spawn_view(cam);
-            } else if !desired.contains(&cam.id) && running {
+            } else if desired.contains(&cam.id) && self.view_ended(&cam.id) {
+                // Its supervisor exited although the view is still shown (it
+                // could not take over the camera): a shown camera always has
+                // a decoder, so start it again.
+                tracing::warn!(cam_id = %cam.id, "Desktop view ended while still shown; starting it again");
+                self.spawn_view(cam);
+            } else if !desired.contains(&cam.id) && started {
                 self.stop_view(&cam.id);
             }
         }
@@ -592,6 +631,13 @@ impl AppState {
             }
             self.live_audio = Some((cam_id, stop_tx));
         }
+    }
+
+    /// Whether the camera's latest desktop view supervisor has exited.
+    fn view_ended(&self, cam_id: &str) -> bool {
+        self.view_ended
+            .get(cam_id)
+            .is_some_and(|ended| ended.load(AtomicOrdering::SeqCst))
     }
 
     /// Cameras being decoded for a desktop view right now.
@@ -702,7 +748,7 @@ impl AppState {
         self.live_stream.remove(cam_id);
     }
 
-    /// Merge top-level config keys (site_name, wall, ui, debug, recording)
+    /// Merge top-level config keys (site_name, wall, ui, debug, video, recording)
     /// from a JSON value. Does NOT touch cameras. Saves to disk after updating.
     pub fn update_config_settings(&mut self, value: &serde_json::Value) -> anyhow::Result<()> {
         // Checked before anything changes: a bad layout leaves all settings as they were.
@@ -715,6 +761,11 @@ impl AppState {
             .get("events")
             .filter(|v| v.is_object())
             .map(|events| crate::config::EventsConfig::changed(&self.config.events, events))
+            .transpose()?;
+        let video = value
+            .get("video")
+            .filter(|v| v.is_object())
+            .map(|video| crate::config::VideoConfig::changed(&self.config.video, video))
             .transpose()?;
         let archive = value
             .get("recording")
@@ -773,6 +824,10 @@ impl AppState {
         }
         if let Some(desktop) = desktop {
             self.config.desktop = desktop;
+        }
+        // Applied when the backend starts (`config.set` restarts it).
+        if let Some(video) = video {
+            self.config.video = video;
         }
         if let Some(dbg) = value.get("debug").filter(|v| v.is_object()) {
             if let Some(s) = dbg["gst_log"].as_str() {
@@ -1155,12 +1210,17 @@ fn install_local_assignment(
     registry: &dyn AssignmentRegistry,
     assignment: &CameraAssignment,
     stop_rx: &watch::Receiver<bool>,
+    mut on_slow: impl FnMut(),
 ) -> Result<bool, AssignmentError> {
-    const INSTALL_ATTEMPTS: usize = 3;
-    for attempt in 1..=INSTALL_ATTEMPTS {
+    // Attempts (each waits up to `REPLACEMENT_WAIT`) before the prior
+    // owner's teardown counts as slow and is reported.
+    const REPORT_AFTER_ATTEMPTS: usize = 3;
+    let mut attempt = 0usize;
+    loop {
         if *stop_rx.borrow() || stop_rx.has_changed().is_err() {
             return Ok(false);
         }
+        attempt += 1;
         let result = registry.install(assignment.clone());
         // A newer quality change or shutdown may arrive while install waits.
         if *stop_rx.borrow() || stop_rx.has_changed().is_err() {
@@ -1168,17 +1228,29 @@ fn install_local_assignment(
         }
         match result {
             Ok(()) => return Ok(true),
-            Err(AssignmentError::TeardownTimeout) if attempt < INSTALL_ATTEMPTS => {
-                tracing::warn!(
-                    cam_id = %assignment.camera_id,
-                    attempt,
-                    "Waiting for prior supervisor teardown acknowledgement before replacement"
-                );
+            // The prior owner still tears down. Never give up while this
+            // replacement is wanted: it would leave the view without a
+            // decoder (it is still listed as running). It never runs before
+            // the prior owner released the camera (fail closed).
+            Err(AssignmentError::TeardownTimeout) => {
+                if attempt == REPORT_AFTER_ATTEMPTS {
+                    tracing::warn!(
+                        cam_id = %assignment.camera_id,
+                        attempt,
+                        "Prior supervisor teardown is slow; the replacement waits for it"
+                    );
+                    on_slow();
+                } else if attempt < REPORT_AFTER_ATTEMPTS || attempt % 30 == 0 {
+                    tracing::warn!(
+                        cam_id = %assignment.camera_id,
+                        attempt,
+                        "Waiting for prior supervisor teardown acknowledgement before replacement"
+                    );
+                }
             }
             Err(error) => return Err(error),
         }
     }
-    Err(AssignmentError::TeardownTimeout)
 }
 
 pub fn expand_user_path(path: &str) -> PathBuf {
@@ -1517,7 +1589,7 @@ mod tests {
             }
         })
         .await
-        .expect("an unreleased prior owner must fail closed after bounded retries");
+        .expect("an unreleased prior owner must be reported after bounded retries");
 
         {
             use crate::stats::CameraHealthSource;
@@ -1529,8 +1601,51 @@ mod tests {
             registry.acquire(&replacement, time::OffsetDateTime::now_utc()),
             Err(crate::assignment::AssignmentError::NotCurrent)
         ));
+
+        // The prior owner's teardown ends late (a slow hardware decoder): the
+        // replacement still starts. Before, it had given up for good and the
+        // camera stayed frozen until its view was stopped and started again.
         unreleased.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state_rx.borrow().as_str() == "teardown_failed" {
+                state_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the waiting replacement must start once the prior owner released");
+        {
+            use crate::stats::CameraHealthSource;
+            let st = state.read().await;
+            assert_ne!(st.stream_health.snapshot()[0].state, "teardown_failed");
+            assert!(!st.view_ended(&cam.id), "the replacement supervisor runs");
+        }
         state.write().await.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_shown_view_whose_supervisor_exited_is_started_again() {
+        use std::time::Duration;
+
+        init_gstreamer();
+        let cam = camera("cam-view-ended");
+        let mut cfg = AppConfig::default();
+        cfg.cameras.push(cam.clone());
+        let mut st = app_state(cfg);
+        st.set_view_demand("ui-test", [cam.id.clone()].into(), Duration::from_secs(10));
+        let first = st.stop_txs[&cam.id].clone();
+        // Lease renewals do not restart a running view.
+        st.reconcile_views();
+        assert!(first.same_channel(&st.stop_txs[&cam.id]));
+        // Its supervisor exited although the wall still shows the camera.
+        st.view_ended[&cam.id].store(true, std::sync::atomic::Ordering::SeqCst);
+        st.reconcile_views();
+        assert!(
+            !first.same_channel(&st.stop_txs[&cam.id]),
+            "a shown camera must get a new desktop view"
+        );
+        assert!(*first.borrow(), "the ended view is stopped");
+        assert!(!st.view_ended(&cam.id));
+        st.stop_all();
     }
 
     #[tokio::test]
@@ -1552,7 +1667,7 @@ mod tests {
         let task_registry = Arc::clone(&registry);
         let task_assignment = replacement.clone();
         let task = tokio::task::spawn_blocking(move || {
-            super::install_local_assignment(&*task_registry, &task_assignment, &stop_rx)
+            super::install_local_assignment(&*task_registry, &task_assignment, &stop_rx, || {})
         });
 
         // Wait for install to revoke the prior owner, without releasing its
@@ -1592,7 +1707,7 @@ mod tests {
         stop_tx.send(true).unwrap();
 
         assert_eq!(
-            super::install_local_assignment(&registry, &assignment, &stop_rx),
+            super::install_local_assignment(&registry, &assignment, &stop_rx, || {}),
             Ok(false)
         );
         assert!(registry
@@ -1637,7 +1752,7 @@ mod tests {
         };
 
         assert_eq!(
-            super::install_local_assignment(&registry, &assignment, &stop_rx),
+            super::install_local_assignment(&registry, &assignment, &stop_rx, || {}),
             Ok(false)
         );
         assert_eq!(registry.attempts.load(Ordering::Relaxed), 1);

@@ -8,7 +8,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from neurowatch.cloud.cloud_link import cloud_indicator
+from neurowatch.cloud.cloud_link import clock_warning, cloud_indicator
 
 
 @dataclass(frozen=True)
@@ -32,4 +32,9 @@ def tray_status(request: Callable[..., Any], endpoint: str) -> CloudTrayStatus:
     linked = isinstance(cloud, Mapping) and cloud.get("phase") == "linked"
     if linked and cloud.get("cloud_reachable") is not True:
         problems = (("Cloud unreachable", "Linked, but can't reach NeuroWatch Cloud"),)
+    # This computer's clock is off NeuroWatch Cloud's by more than a minute:
+    # NeuroWatch copes, but the operator should fix the clock or time zone.
+    warning = clock_warning(cloud if isinstance(cloud, dict) else None)
+    if warning:
+        problems = (*problems, ("Clock is wrong", warning))
     return CloudTrayStatus(detail=f"Cloud: {detail}", problems=problems)

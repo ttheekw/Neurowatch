@@ -48,6 +48,29 @@ def test_a_path_belongs_to_the_longest_mount_it_lies_under() -> None:
     ).drive_of("/x/y") == Drive("/x", "", "", 1, 0, False, False)
 
 
+def test_windows_drive_paths_work_on_either_host_and_show_in_settings(qtbot, monkeypatch) -> None:
+    drive = Drive("C:\\", "C:", "NTFS", 500_000_000_000, 120_000_000_000, True, True)
+    scan = StorageScan(drives=(drive,), storage_path="c:/Users/x/Videos")
+    assert scan.drive_of(scan.storage_path) == drive
+    assert scan.drive_of("c:\\Users\\x\\Videos") == drive
+    assert scan.drive_of("D:/Videos") is None
+    assert scan.drive_of("C:Videos") is None
+    assert scan.folder_on(drive) == "C:\\nw-storage"
+
+    picker = DrivePickerDialog(scan, "c:/NW-STORAGE")
+    qtbot.addWidget(picker)
+    assert len(picker.rows()) == 1
+    assert not picker.rows()[0].button.isEnabled()
+
+    monkeypatch.setattr(SettingsDialog, "_scan_drives", lambda self: None)
+    dialog = SettingsDialog(
+        {"recording": {"storage_path": scan.storage_path}}, ipc_endpoint="unix:/tmp/nw.sock"
+    )
+    qtbot.addWidget(dialog)
+    dialog._on_drives(scan)
+    assert dialog._drive_label.text() == "C:\\ · 120 GB free of 500 GB"
+
+
 def test_small_drives_are_hidden_until_asked(qtbot) -> None:
     picker = DrivePickerDialog(SCAN, SCAN.storage_path)
     qtbot.addWidget(picker)

@@ -1,7 +1,8 @@
 //! Is a discovered device, or a camera being added, already configured?
 //!
 //! **Exact** — the same stored discovery identity (endpoint reference and
-//! profile token) or the same normalized stream URL. **Possible** — only the
+//! profile token, without conflicting literal IP hosts) or the same normalized
+//! stream URL. **Possible** — only the
 //! device identity or the network address matches: an NVR answers with one
 //! endpoint reference for many channels, and one address can serve several
 //! cameras, so neither alone proves it is the same stream.
@@ -103,6 +104,14 @@ fn camera_urls(camera: &CameraConfig) -> impl Iterator<Item = &str> {
         .filter(|url| !url.trim().is_empty())
 }
 
+/// Cloned camera firmware can reuse both UUID and profile token. Distinct
+/// literal IP hosts then take precedence over that identity. Hostnames may
+/// alias an address, so they cannot establish this conflict without DNS.
+fn different_literal_hosts(left: &str, right: &str) -> bool {
+    let host_ip = |url| url_host(url).and_then(|host| host.parse::<std::net::IpAddr>().ok());
+    matches!((host_ip(left), host_ip(right)), (Some(left), Some(right)) if left != right)
+}
+
 /// How a discovered device or stream relates to the configured cameras.
 ///
 /// `identity` with a `source` is a specific stream; without one it is only
@@ -116,7 +125,11 @@ pub fn match_camera(
     let stream_url = stream_url.map(canonical_url);
     for camera in cameras {
         let same_identity = identity.is_some_and(|wanted| {
-            wanted.source.is_some() && camera.discovery.as_ref() == Some(wanted)
+            wanted.source.is_some()
+                && camera.discovery.as_ref() == Some(wanted)
+                && !stream_url
+                    .as_deref()
+                    .is_some_and(|url| different_literal_hosts(&camera.url, url))
         });
         let same_url = stream_url
             .as_deref()
@@ -144,7 +157,8 @@ pub fn match_camera(
 }
 
 /// The configured camera `candidate` would duplicate, for the final check
-/// in `camera.add`: the same discovery identity or the same main stream.
+/// in `camera.add`: the same non-conflicting discovery identity or the same
+/// main stream.
 pub fn duplicate_of<'a>(
     cameras: &'a [CameraConfig],
     candidate: &CameraConfig,
@@ -157,7 +171,8 @@ pub fn duplicate_of<'a>(
                     .discovery
                     .as_ref()
                     .is_some_and(|identity| identity.source.is_some())
-                    && camera.discovery == candidate.discovery))
+                    && camera.discovery == candidate.discovery
+                    && !different_literal_hosts(&camera.url, &candidate.url)))
     })
 }
 
@@ -285,5 +300,24 @@ mod tests {
         assert!(duplicate_of(&cameras, &other_channel).is_none());
         // Updating a camera is not a duplicate of itself.
         assert!(duplicate_of(&cameras, &camera("a", "rtsp://10.0.0.5/main")).is_none());
+    }
+
+    #[test]
+    fn cloned_identities_at_different_addresses_remain_addable() {
+        let mut first = camera("a", "rtsp://10.0.0.5/main");
+        first.discovery = Some(identity("urn:uuid:cloned", Some("main")));
+        let mut second = camera("b", "rtsp://10.0.0.6/main");
+        second.discovery = first.discovery.clone();
+        let cameras = [first];
+        assert!(matches!(
+            match_camera(
+                &cameras,
+                second.discovery.as_ref(),
+                Some(&second.url),
+                Some("10.0.0.6")
+            ),
+            Match::Possible(_)
+        ));
+        assert!(duplicate_of(&cameras, &second).is_none());
     }
 }

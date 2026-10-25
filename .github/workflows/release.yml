@@ -430,6 +430,23 @@ jobs:
           docker buildx imagetools inspect "$image:$version"
           docker buildx imagetools inspect "$image:$version-gui"
 
+      - name: Verify anonymous access to the published images
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/neurowatch"
+          version="${RELEASE_TAG#v}"
+          # Use an empty config so the publishing login cannot mask a private package.
+          anonymous_config="$(mktemp -d)"
+          trap 'rm -rf "$anonymous_config"' EXIT
+          for tag in "$version" latest "$version-headless" headless "$version-gui" gui; do
+            if ! docker --config "$anonymous_config" manifest inspect "$image:$tag" >/dev/null; then
+              echo "::error::Anonymous access failed for $image:$tag. GHCR packages default to private, even for public repositories. Open https://github.com/users/${GITHUB_REPOSITORY_OWNER}/packages/container/package/neurowatch, then Package settings > Danger Zone > Change visibility > Public. After changing visibility, rerun this job."
+              exit 1
+            fi
+          done
+
   # The downloads page (https://neurowatch.app/downloads) reads the private
   # bucket: per version a manifest of both editions (free files link to this
   # release on GitHub) and the unlimited packages, handed only to buyers as

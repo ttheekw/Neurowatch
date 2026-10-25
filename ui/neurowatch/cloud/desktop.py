@@ -4,13 +4,14 @@ Settings → Cloud (linking lives there)."""
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QWidget
 
-from neurowatch.cloud.cloud_link import CloudIndicator, cloud_indicator
+from neurowatch.cloud.cloud_link import CloudIndicator, clock_warning, cloud_indicator
 from neurowatch.ipc.sync_client import SyncIpcClient
 from neurowatch.utils.threads import Worker
 from neurowatch.widgets.status_bar_widget import StatusIndicator
@@ -73,6 +74,14 @@ class CloudIndicatorLabel(StatusIndicator):
         self.setStyleSheet(f"color: {color};")
 
 
+def desktop_indicator(status: dict[str, Any] | None) -> CloudIndicator:
+    """The light for a ``cloud.status`` result; its tooltip also carries the
+    clock warning when this computer's clock is off NeuroWatch Cloud's."""
+    indicator = cloud_indicator(status)
+    warning = clock_warning(status)
+    return replace(indicator, tooltip=f"{indicator.tooltip}\n{warning}") if warning else indicator
+
+
 class _CloudPoll(Worker):
     """``cloud.status`` every 2 s, off the GUI thread."""
 
@@ -103,7 +112,7 @@ def install(window: Any, open_settings: Callable[[], object]) -> None:
     label.clicked.connect(open_settings)
     window.add_status_indicator(label)
     poll = _CloudPoll(window.ipc_endpoint, window)
-    poll.polled.connect(lambda status: label.set_indicator(cloud_indicator(status)))
+    poll.polled.connect(lambda status: label.set_indicator(desktop_indicator(status)))
     poll.start()
 
     def stop() -> None:

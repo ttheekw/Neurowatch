@@ -1875,6 +1875,9 @@ pub struct PublisherSupervisor {
     active: Mutex<HashMap<String, ActivePublication>>,
     status: Mutex<HashMap<String, String>>,
     inactive: tokio::sync::Notify,
+    /// NeuroWatch Cloud's clock: grants are minted and expire by it, so a
+    /// recorder whose own clock is off still honours their ≤ 60 s windows.
+    clock: std::sync::Arc<crate::cloud::link::CloudClock>,
 }
 
 struct ActivePublication {
@@ -1888,12 +1891,14 @@ struct ActivePublication {
 fn spawn_publication_lease(
     mut expires_rx: watch::Receiver<OffsetDateTime>,
     cancel: PublishCancel,
+    clock: std::sync::Arc<crate::cloud::link::CloudClock>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let expires = *expires_rx.borrow_and_update();
-            let remaining = if expires > OffsetDateTime::now_utc() {
-                (expires - OffsetDateTime::now_utc()).unsigned_abs()
+            let now = clock.now();
+            let remaining = if expires > now {
+                (expires - now).unsigned_abs()
             } else {
                 std::time::Duration::ZERO
             };
@@ -1925,7 +1930,16 @@ impl PublisherSupervisor {
             active: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
             inactive: tokio::sync::Notify::new(),
+            clock: std::sync::Arc::new(crate::cloud::link::CloudClock::new()),
         }
+    }
+
+    /// Judge grant windows by the cloud link's clock (see [`CloudClock`]).
+    ///
+    /// [`CloudClock`]: crate::cloud::link::CloudClock
+    pub fn with_clock(mut self, clock: std::sync::Arc<crate::cloud::link::CloudClock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Serve playback directives by playing local recordings.
@@ -1982,7 +1996,7 @@ impl PublisherSupervisor {
             return Err(PublishError::ScopeMismatch);
         }
         grant
-            .is_usable_at(OffsetDateTime::now_utc())
+            .is_usable_at(self.clock.now())
             .map_err(|_| PublishError::Expired)?;
         let session_id = grant.session_id.clone();
         let expires = OffsetDateTime::parse(
@@ -2069,15 +2083,17 @@ impl PublisherSupervisor {
         let supervisor = std::sync::Arc::clone(self);
         tokio::spawn(async move {
             let expiry_cancel = cancel.clone();
-            let expiry = spawn_publication_lease(expires_rx, expiry_cancel);
+            let expiry = spawn_publication_lease(
+                expires_rx,
+                expiry_cancel,
+                std::sync::Arc::clone(&supervisor.clock),
+            );
             supervisor
                 .status
                 .lock()
                 .expect("publisher status poisoned")
                 .insert(session_id.clone(), "publishing".into());
-            let result = publisher
-                .publish(directive, OffsetDateTime::now_utc())
-                .await;
+            let result = publisher.publish(directive, supervisor.clock.now()).await;
             expiry.abort();
             if let Some(run) = live_run {
                 run.stop();
@@ -3878,6 +3894,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn media_grant_windows_follow_the_cloud_clock_without_widening_expiry() {
+        for skew in [time::Duration::minutes(330), -time::Duration::hours(9)] {
+            let (supervisor, _opener, log, signing) = live_supervisor(None);
+            supervisor.clock.set_local_skew(skew);
+            let directive = live_directive(&signing, "session-main", Representation::Main);
+            assert_eq!(
+                supervisor.start(directive.clone(), Some("node-1")),
+                Err(PublishError::Expired)
+            );
+            let sampled = supervisor.clock.system_now();
+            supervisor.clock.observe_server_time(
+                &utc(OffsetDateTime::now_utc()),
+                sampled,
+                supervisor.clock.system_now(),
+            );
+            assert_eq!(supervisor.start(directive.clone(), Some("node-1")), Ok(()));
+            assert_eq!(log.entries(), vec!["open camera-1 main"]);
+            assert_eq!(
+                supervisor.start(directive.clone(), Some("another-node")),
+                Err(PublishError::ScopeMismatch)
+            );
+            // Even after correction, an actually expired grant stays expired.
+            let sampled = supervisor.clock.system_now();
+            supervisor.clock.observe_server_time(
+                &utc(OffsetDateTime::now_utc() + time::Duration::minutes(1)),
+                sampled,
+                supervisor.clock.system_now(),
+            );
+            assert_eq!(
+                supervisor.start(directive, Some("node-1")),
+                Err(PublishError::Expired)
+            );
+            supervisor.cancel_all().await;
+        }
+    }
+
+    #[tokio::test]
     async fn each_live_stream_opens_its_own_encoded_source() {
         let (supervisor, _opener, log, signing) = live_supervisor(None);
 
@@ -4367,6 +4420,7 @@ mod tests {
             PublishCancel {
                 sender: std::sync::Arc::new(cancel_tx),
             },
+            std::sync::Arc::new(crate::cloud::link::CloudClock::new()),
         );
         tokio::task::yield_now().await;
         tokio::time::advance(std::time::Duration::from_secs(20)).await;

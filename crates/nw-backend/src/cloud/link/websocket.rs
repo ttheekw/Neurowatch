@@ -109,6 +109,9 @@ struct Inflight {
     method: String,
     deadline: Instant,
     reply: Option<oneshot::Sender<Result<Value>>>,
+    /// When it was written ([`CloudClock::system_now`]), to learn the cloud's
+    /// clock from the answer's `server_time`.
+    sent: OffsetDateTime,
 }
 
 struct Client {
@@ -291,6 +294,7 @@ impl WsTransport {
         let ended = Arc::new(Mutex::new(None));
         let running_ended = Arc::clone(&ended);
         let signals = Arc::clone(&node.signals);
+        let clock = node.clock();
         let connection = if events { signals.connected() } else { 0 };
         tokio::spawn(async move {
             run(
@@ -300,7 +304,7 @@ impl WsTransport {
                 inner,
                 running_binding,
                 running_ended,
-                (signals, connection),
+                (signals, connection, clock),
             )
             .await;
         });
@@ -379,7 +383,9 @@ async fn connect(
     if events {
         url.set_query(Some("events=1"));
     }
-    let (mut socket, _) = client_async_tls_with_config(
+    let clock = node.clock();
+    let upgrade_sent = clock.system_now();
+    let (mut socket, upgrade) = client_async_tls_with_config(
         url.as_str(),
         stream,
         Some(config),
@@ -391,21 +397,30 @@ async fn connect(
     )
     .await
     .map_err(|_| CloudError::Network("WebSocket upgrade or TLS failed".into()))?;
+    // Learn the cloud's clock before signing: a computer whose clock is off
+    // would otherwise be refused here and on every request after.
+    if let Some(date) = upgrade
+        .headers()
+        .get("date")
+        .and_then(|value| value.to_str().ok())
+    {
+        clock.observe_http_date(date, upgrade_sent, clock.system_now());
+    }
     let key = node.lock()?.key.clone();
-    let now = OffsetDateTime::now_utc();
+    let now = clock.now();
     let mut request = json!({"protocol_version":1,"tenant_id":binding.tenant,"node_id":binding.node,
         "audience":NODE_CHALLENGE_AUDIENCE,"operation":CONNECT_OPERATION,"auth_epoch":binding.epoch,
         "issued_at":fmt_time(now)?,"expires_at":fmt_time(now+TimeDuration::seconds(60))?,
         "nonce":URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes()),"signature":""});
     request["signature"] = Value::String(sign_value(&key, &without_signature(&request))?);
-    let issued = exchange(&mut socket, "challenge", request).await?;
-    let challenge = parse_challenge_response(issued, CONNECT_OPERATION, OffsetDateTime::now_utc())?;
-    let now = OffsetDateTime::now_utc();
+    let issued = exchange(&mut socket, &clock, "challenge", request).await?;
+    let challenge = parse_challenge_response(issued, CONNECT_OPERATION, clock.now())?;
+    let now = clock.now();
     let mut proof = json!({"protocol_version":1,"tenant_id":binding.tenant,"node_id":binding.node,
         "audience":NODE_AUDIENCE,"auth_epoch":binding.epoch,"issued_at":fmt_time(now)?,
         "expires_at":fmt_time(now+TimeDuration::seconds(60))?,"challenge":challenge.challenge,"signature":""});
     proof["signature"] = Value::String(sign_value(&key, &without_signature(&proof))?);
-    let result = exchange(&mut socket, "authenticate", proof).await?;
+    let result = exchange(&mut socket, &clock, "authenticate", proof).await?;
     if result["protocol_version"] != 1
         || result["node_id"] != binding.node
         || result["auth_epoch"] != binding.epoch
@@ -419,10 +434,16 @@ async fn connect(
     Ok((socket, offered))
 }
 
-async fn exchange(socket: &mut Socket, method: &str, body: Value) -> Result<Value> {
+async fn exchange(
+    socket: &mut Socket,
+    clock: &CloudClock,
+    method: &str,
+    body: Value,
+) -> Result<Value> {
     let id = uuid::Uuid::new_v4().simple().to_string();
     let text = json!({"id":id,"method":method,"body":body}).to_string();
     tracing::info!(target: "cloud_ws::message", method, bytes = text.len(), "[ws.message] sent");
+    let sent = clock.system_now();
     socket
         .send(Message::Text(text.into()))
         .await
@@ -440,6 +461,7 @@ async fn exchange(socket: &mut Socket, method: &str, body: Value) -> Result<Valu
                     return Err(CloudError::Network("unexpected WebSocket response".into()));
                 }
                 tracing::info!(target: "cloud_ws::message", method, bytes = text.len(), "[ws.message] received");
+                observe_server_time(clock, &raw, sent);
                 return response_body(&raw);
             }
             Some(Ok(Message::Ping(data))) => {
@@ -454,6 +476,14 @@ async fn exchange(socket: &mut Socket, method: &str, body: Value) -> Result<Valu
                 ))
             }
         }
+    }
+}
+
+/// Portals stamp each answer's envelope with their clock (`server_time`);
+/// older ones do not, and the upgrade's `Date` header has to do.
+fn observe_server_time(clock: &CloudClock, raw: &Value, sent: OffsetDateTime) {
+    if let Some(server_time) = raw.get("server_time").and_then(Value::as_str) {
+        clock.observe_server_time(server_time, sent, clock.system_now());
     }
 }
 
@@ -484,7 +514,7 @@ async fn run(
     inner: Arc<Mutex<Inner>>,
     binding: Binding,
     ended: Arc<Mutex<Option<Instant>>>,
-    (signals, connection): (Arc<CloudSignals>, u64),
+    (signals, connection, clock): (Arc<CloudSignals>, u64, Arc<CloudClock>),
 ) {
     let (mut writer, mut reader) = socket.split();
     let mut pending: HashMap<String, Inflight> = HashMap::new();
@@ -506,8 +536,9 @@ async fn run(
                 }
                 tracing::info!(target: "cloud_ws::message", node_id = %binding.node,
                     method = %command.method, bytes = command.text.len(), "[ws.message] sent");
+                let sent = clock.system_now();
                 if !matches!(tokio::time::timeout(Duration::from_secs(5), writer.send(Message::Text(command.text.into()))).await, Ok(Ok(()))) { break; }
-                pending.insert(command.id, Inflight { method: command.method, deadline: command.deadline, reply: Some(command.reply) });
+                pending.insert(command.id, Inflight { method: command.method, deadline: command.deadline, reply: Some(command.reply), sent });
             }
             frame = reader.next() => {
                 match frame {
@@ -524,6 +555,7 @@ async fn run(
                         }
                         let Some(id) = raw["id"].as_str() else { break; };
                         let Some(request) = pending.remove(id) else { continue; };
+                        observe_server_time(&clock, &raw, request.sent);
                         tracing::info!(target: "cloud_ws::message", node_id = %binding.node,
                             method = %request.method, status = raw["status"].as_u64().unwrap_or(0),
                             bytes = text.len(), "[ws.message] received");
@@ -557,8 +589,9 @@ async fn run(
                     let id = uuid::Uuid::new_v4().simple().to_string();
                     let text = json!({"id":id,"method":"heartbeat","body":{}}).to_string();
                     tracing::info!(target: "cloud_ws::message", node_id = %binding.node, method = "heartbeat", "[ws.message] sent");
+                    let sent = clock.system_now();
                     if !matches!(tokio::time::timeout(Duration::from_secs(5), writer.send(Message::Text(text.into()))).await, Ok(Ok(()))) { break; }
-                    pending.insert(id, Inflight { method: "heartbeat".into(), deadline: now + HEARTBEAT_TIMEOUT, reply: None });
+                    pending.insert(id, Inflight { method: "heartbeat".into(), deadline: now + HEARTBEAT_TIMEOUT, reply: None, sent });
                     next_heartbeat = now + HEARTBEAT_INTERVAL;
                 }
             }

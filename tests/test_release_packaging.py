@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import struct
 import subprocess
 from pathlib import Path
 
@@ -128,7 +129,11 @@ def test_no_workflow_publishes_releases_on_branch_pushes() -> None:
 
 def test_workflow_direct_shell_scripts_are_executable_in_git_index(workflow: str) -> None:
     scripts = _directly_invoked_shell_scripts(workflow)
-    assert scripts == {"scripts/package_release_linux.sh", "scripts/docker.sh", "scripts/docker_smoke.sh"}
+    assert scripts == {
+        "scripts/package_release_linux.sh",
+        "scripts/docker.sh",
+        "scripts/docker_smoke.sh",
+    }
     assert _git_index_modes(scripts) == dict.fromkeys(scripts, "100755")
 
 
@@ -513,6 +518,42 @@ def test_windows_exe_and_installer_carry_the_app_logo() -> None:
     assert shortcuts and all('AppUserModelID: "NeuroWatch.NeuroWatch"' in s for s in shortcuts)
     main = (ROOT / "ui/neurowatch/main.py").read_text()
     assert 'WINDOWS_APP_ID = "NeuroWatch.NeuroWatch"' in main
+
+
+def test_windows_icon_has_classic_dibs_and_a_256_pixel_png() -> None:
+    data = (ROOT / "ui/neurowatch/resources/icons/neurowatch.ico").read_bytes()
+    reserved, kind, count = struct.unpack_from("<HHH", data)
+    assert (reserved, kind, count) == (0, 1, 9)
+    sizes = []
+    next_offset = 6 + count * 16
+    for index in range(count):
+        width, height, colors, reserved, planes, bits, length, offset = struct.unpack_from(
+            "<BBBBHHII", data, 6 + index * 16
+        )
+        size = width or 256
+        sizes.append(size)
+        assert (height or 256, colors, reserved, planes, bits) == (size, 0, 0, 1, 32)
+        assert offset == next_offset and offset + length <= len(data)
+        payload = data[offset : offset + length]
+        if size == 256:
+            assert payload.startswith(b"\x89PNG\r\n\x1a\n")
+            assert struct.unpack_from(">II", payload, 16) == (256, 256)
+        else:
+            # Small sizes, including <=64, must be BMP/DIB, never PNG-compressed.
+            header = struct.unpack_from("<IiiHHIIiiII", payload)
+            assert header[:6] == (40, size, size * 2, 1, 32, 0)
+            assert header[6] == size * size * 4
+            mask_stride = ((size + 31) // 32) * 4
+            assert length == 40 + size * size * 4 + mask_stride * size
+            # The legacy AND mask marks fully transparent pixels, bottom-up too.
+            for y in range(size):
+                for x in range(size):
+                    alpha = payload[40 + (y * size + x) * 4 + 3]
+                    mask = payload[40 + size * size * 4 + y * mask_stride + x // 8]
+                    assert bool(mask & (0x80 >> (x % 8))) == (alpha == 0)
+        next_offset += length
+    assert sizes == [16, 20, 24, 32, 40, 48, 64, 128, 256]
+    assert next_offset == len(data)
 
 
 def test_windows_installer_stops_service_and_preserves_user_data():
