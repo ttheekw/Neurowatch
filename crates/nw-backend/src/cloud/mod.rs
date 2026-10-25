@@ -230,6 +230,7 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
         );
         Arc::new(
             media_publish::PublisherSupervisor::new(media_policy)
+                .with_clock(node.clock())
                 .with_playback(Arc::new(opener))
                 .with_live_sources(Arc::new(live_sources))
                 .with_talk(Arc::new(CameraSpeaker {

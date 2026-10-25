@@ -64,6 +64,7 @@ from neurowatch.models.camera import CameraConfig, WallPosition
 from neurowatch.models.edition import CAMERA_LIMIT_REACHED, Edition, limit_message
 from neurowatch.models.events import ACTIVITY_KINDS, SYSTEM_KINDS, ActivityTracker, Event
 from neurowatch.models.preview_fps import PreviewFps
+from neurowatch.models.video_decoder import restart_reply
 from neurowatch.models.wall_layout import Placement
 from neurowatch.models.window_session import saved_windows
 from neurowatch.service.manager import ServiceController
@@ -182,6 +183,10 @@ def _startup_note() -> str | None:
 class _SettingsSaveWorker(Worker):
     """Persist settings without freezing Qt during pipeline reconfiguration.
 
+    A changed video decoder makes the backend restart after answering
+    ``config.set`` (``restarting``); the window rides that out like any
+    backend restart.
+
     A recording drive picked in Settings is prepared first (``storage.select``
     creates and checks its folder); if that fails, the other settings are
     still saved and the recording location stays as it was.
@@ -208,7 +213,13 @@ class _SettingsSaveWorker(Worker):
                 except IpcError as exc:
                     recording.pop("storage_path", None)
                     self.drive_failed.emit(exc.message)
-            client.call("config.set", self._config)
+            reply = client.call("config.set", self._config)
+            if restart_reply(reply):
+                # The recorder restarts to apply a new video decoder choice:
+                # it saved what was sent, and is not there to ask right now.
+                logger.info("Backend restarting to apply the video decoder choice")
+                self.result.emit(self._config)
+                return
             self.result.emit(client.call("config.get") or self._config)
         except Exception as exc:
             self.result.emit(exc)
@@ -1852,6 +1863,9 @@ class MainWindow(QMainWindow):
         self._apply_autoscroll()
 
     def _apply_settings(self) -> None:
+        self._status_bar.set_storage_path(
+            str(self._config.get("recording", {}).get("storage_path") or "~/Videos/neurowatch")
+        )
         theme = str(self._config.get("ui", {}).get("theme", "dark"))
         app = QApplication.instance()
         if isinstance(app, QApplication):

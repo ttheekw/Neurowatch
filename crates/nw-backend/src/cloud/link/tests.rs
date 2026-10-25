@@ -2194,3 +2194,312 @@ fn a_pinned_node_refuses_a_link_started_with_another_url() {
     assert_eq!(node.status().phase, LinkPhase::Unlinked);
     let _ = fs::remove_dir_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// A recorder whose clock is wrong (e.g. a Windows PC with the wrong time zone)
+// ---------------------------------------------------------------------------
+
+type CloudReply = Box<dyn Fn(&str, &Value) -> (u16, Value) + Send>;
+
+/// A cloud that behaves like the portal on time: every answer carries a `Date`
+/// header from the real clock, enrollment codes expire five minutes from now,
+/// and signed requests whose `issued_at` is more than 15 s ahead of it or
+/// whose `expires_at` has passed are refused with 401.
+fn serve_real_clock_cloud(
+    replies: Vec<CloudReply>,
+) -> (String, StdArc<StdMutex<Vec<Value>>>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let captured = StdArc::new(StdMutex::new(Vec::new()));
+    let output = StdArc::clone(&captured);
+    let task = thread::spawn(move || {
+        for reply in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).unwrap();
+                bytes.extend_from_slice(&buffer[..read]);
+                if let Some(position) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let path = headers
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(str::to_owned)
+                })
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            while bytes.len() - header_end < length {
+                let read = stream.read(&mut buffer).unwrap();
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            let request: Value =
+                serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+            output.lock().unwrap().push(request.clone());
+            let now = OffsetDateTime::now_utc();
+            let parse = |key: &str| {
+                request[key].as_str().map(|raw| {
+                    OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                        .unwrap()
+                })
+            };
+            let skewed = parse("issued_at")
+                .is_some_and(|issued| issued > now + TimeDuration::seconds(15))
+                || parse("expires_at")
+                    .is_some_and(|expires| request.get("issued_at").is_some() && expires <= now);
+            let (status, body) = if skewed {
+                (401, json!({"detail": "node authentication failed"}))
+            } else {
+                reply(&path, &request)
+            };
+            let body = serde_json::to_vec(&body).unwrap();
+            let date = now
+                .format(&time::format_description::well_known::Rfc2822)
+                .unwrap()
+                .replace("+0000", "GMT");
+            write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nDate: {date}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        }
+    });
+    (format!("http://{address}/"), captured, task)
+}
+
+fn in_minutes(minutes: i64) -> String {
+    fmt_time(OffsetDateTime::now_utc() + TimeDuration::minutes(minutes)).unwrap()
+}
+
+fn claim_parameters_reply() -> CloudReply {
+    Box::new(|_, _| {
+        (
+            200,
+            json!({
+                "protocol_version": 1, "audience": ENROLLMENT_AUDIENCE,
+                "enrollment_id": ENROLLMENT, "tenant_id": TENANT,
+                "expires_at": in_minutes(5),
+                "challenge": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            }),
+        )
+    })
+}
+
+fn challenge_reply(operation: &'static str) -> CloudReply {
+    Box::new(move |_, _| {
+        (
+            201,
+            json!({"protocol_version": 1, "audience": NODE_AUDIENCE, "operation": operation,
+                   "challenge": "server-one-time-challenge", "expires_at": in_minutes(2)}),
+        )
+    })
+}
+
+fn check_in_reply() -> CloudReply {
+    Box::new(|_, request| {
+        (
+            200,
+            json!({"node_id": request["node_id"], "auth_epoch": request["auth_epoch"],
+                   "checked_in_at": fmt_time(OffsetDateTime::now_utc()).unwrap()}),
+        )
+    })
+}
+
+/// Sri Lanka is UTC+5:30: a PC showing the right local time with its time
+/// zone set to UTC has a UTC clock 5 h 30 min ahead.
+const WRONG_TIME_ZONE: TimeDuration = TimeDuration::minutes(330);
+
+#[tokio::test]
+async fn a_recorder_whose_clock_is_hours_ahead_links_and_checks_in_by_the_clouds_clock() {
+    let replies: Vec<CloudReply> = vec![
+        claim_parameters_reply(),
+        Box::new(|_, _| {
+            (
+                200,
+                json!({"claim_id": "6ba7b813-9dad-11d1-80b4-00c04fd430c8"}),
+            )
+        }),
+        Box::new(|_, request| {
+            (
+                200,
+                json!({"status": "linked", "node_id": request["node_id"]}),
+            )
+        }),
+        challenge_reply(OPERATION),
+        check_in_reply(),
+    ];
+    let (base, captured, server) = serve_real_clock_cloud(replies);
+    let dir = temp_dir("skewed-link");
+    let options = CloudOptions {
+        endpoint: Some(base.trim_end_matches('/').to_owned()),
+        ..dev_options()
+    };
+    let mut node = CloudNode::open_with_options(dir.clone(), options).unwrap();
+    node.websocket = None;
+    node.clock.set_local_skew(WRONG_TIME_ZONE);
+
+    node.begin_with_code(&code(), "Colombo office".into())
+        .await
+        .expect("the code's expiry is judged by the cloud's clock");
+    node.confirm_remote().await.unwrap();
+    assert_eq!(node.status().phase, LinkPhase::Linked);
+    node.check_in_once()
+        .await
+        .expect("signed times follow the cloud's clock");
+    server.join().unwrap();
+
+    let requests = captured.lock().unwrap();
+    let issued = OffsetDateTime::parse(
+        requests[4]["issued_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert!((issued - OffsetDateTime::now_utc()).abs() < TimeDuration::seconds(5));
+    assert!(requests[4]["issued_at"].as_str().unwrap().ends_with('Z'));
+
+    let report = node.report().unwrap();
+    let offset = report.clock_offset_sec.unwrap();
+    assert!((offset + 330 * 60).abs() <= 2, "{offset}");
+    let warning = report.clock_warning.unwrap();
+    assert!(
+        warning.contains("5 h 30 min ahead of NeuroWatch Cloud"),
+        "{warning}"
+    );
+    assert!(report.status.last_check_in.is_some());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn the_portals_server_time_is_preferred_over_the_date_header() {
+    let replies: Vec<CloudReply> = vec![
+        Box::new(|_, _| {
+            (
+                200,
+                json!({
+                    "protocol_version": 1, "audience": ENROLLMENT_AUDIENCE,
+                    "enrollment_id": ENROLLMENT, "tenant_id": TENANT,
+                    "expires_at": in_minutes(5),
+                    "challenge": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "server_time": OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339).unwrap(),
+                }),
+            )
+        }),
+        Box::new(|_, _| {
+            (
+                200,
+                json!({"claim_id": "6ba7b813-9dad-11d1-80b4-00c04fd430c8"}),
+            )
+        }),
+    ];
+    let (base, _captured, server) = serve_real_clock_cloud(replies);
+    let dir = temp_dir("skewed-server-time");
+    let options = CloudOptions {
+        endpoint: Some(base.trim_end_matches('/').to_owned()),
+        ..dev_options()
+    };
+    let mut node = CloudNode::open_with_options(dir.clone(), options).unwrap();
+    node.websocket = None;
+    node.clock.set_local_skew(-WRONG_TIME_ZONE);
+
+    node.begin_with_code(&code(), "Colombo office".into())
+        .await
+        .unwrap();
+    server.join().unwrap();
+    let estimate = node.clock.measured_offset().unwrap();
+    // Precise to the round trip, not just to the Date header's second.
+    assert!((estimate - WRONG_TIME_ZONE).abs() < TimeDuration::milliseconds(500));
+    assert!(node
+        .report()
+        .unwrap()
+        .clock_warning
+        .unwrap()
+        .contains("5 h 30 min behind"));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_refusal_for_a_wrong_clock_teaches_the_offset_and_the_next_check_in_succeeds() {
+    // Linked earlier, then this computer's clock fell 10 minutes behind.
+    let replies: Vec<CloudReply> = vec![
+        // Never reached: the cloud refuses the stale challenge request first.
+        Box::new(|_, _| (500, json!({}))),
+        challenge_reply(OPERATION),
+        check_in_reply(),
+    ];
+    let (base, captured, server) = serve_real_clock_cloud(replies);
+    let dir = temp_dir("skewed-refusal");
+    let mut node = CloudNode::open(dir.clone()).unwrap();
+    node.install_linked_for_test(&base, TENANT, NODE, 3)
+        .unwrap();
+    node.clock.set_local_skew(-TimeDuration::minutes(10));
+
+    assert!(matches!(
+        node.check_in_once().await,
+        Err(CloudError::Refused(401))
+    ));
+    node.check_in_once().await.unwrap();
+    server.join().unwrap();
+    assert_eq!(captured.lock().unwrap().len(), 3);
+    let report = node.report().unwrap();
+    assert!(report.cloud_reachable);
+    assert!(report.clock_warning.unwrap().contains("10 min behind"));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn without_any_cloud_time_an_expired_looking_code_says_to_check_the_clock() {
+    let (base, _captured, server) = serve_scripted(vec![(
+        200,
+        Some(json!({
+            "protocol_version": 1, "audience": ENROLLMENT_AUDIENCE,
+            "enrollment_id": ENROLLMENT, "tenant_id": TENANT,
+            "expires_at": in_minutes(5),
+            "challenge": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        })),
+    )]);
+    let dir = temp_dir("skewed-no-date");
+    let options = CloudOptions {
+        endpoint: Some(base.trim_end_matches('/').to_owned()),
+        ..dev_options()
+    };
+    let mut node = CloudNode::open_with_options(dir.clone(), options).unwrap();
+    node.clock.set_local_skew(WRONG_TIME_ZONE);
+
+    let error = node
+        .begin_with_code(&code(), "Colombo office".into())
+        .await
+        .unwrap_err()
+        .to_string();
+    server.join().unwrap();
+    assert!(error.contains("enrollment code has expired"), "{error}");
+    assert!(error.contains("time zone"), "{error}");
+    assert_eq!(node.status().phase, LinkPhase::Unlinked);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_correct_clock_reports_no_offset_until_the_cloud_answers_and_no_warning() {
+    let dir = temp_dir("clock-status");
+    let node = CloudNode::open(dir.clone()).unwrap();
+    let report = node.report().unwrap();
+    assert_eq!(report.clock_offset_sec, None);
+    assert_eq!(report.clock_warning, None);
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["clock_offset_sec"], Value::Null);
+    assert!(json.get("clock_warning").is_none());
+    fs::remove_dir_all(dir).unwrap();
+}

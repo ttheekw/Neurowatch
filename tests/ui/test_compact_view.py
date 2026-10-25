@@ -112,6 +112,34 @@ def test_the_status_readings_move_into_the_strip_and_back(win) -> None:
     assert status._version_lbl.isVisibleTo(status)
 
 
+def test_recording_disk_updates_from_settings_in_the_fullscreen_overlay(
+    win, qtbot, tmp_path, monkeypatch
+) -> None:
+    from types import SimpleNamespace
+
+    from neurowatch.widgets import status_bar_widget
+
+    calls = []
+
+    def usage(path):
+        calls.append(path)
+        return SimpleNamespace(free=321 * 1024**3)
+
+    # The initial load uses the default location. Let its reader finish first.
+    qtbot.waitUntil(lambda: not win._status_bar._disk_pending)
+    assert win._status_bar._storage_path == "~/Videos/neurowatch"
+    monkeypatch.setattr(status_bar_widget.shutil, "disk_usage", usage)
+    monkeypatch.setattr(win, "isFullScreen", lambda: True)
+    win._set_compact(True)
+    win._hide_fullscreen_bars()
+    win._on_settings_saved({"recording": {"storage_path": str(tmp_path / "new-recordings")}})
+    qtbot.waitUntil(lambda: not win._status_bar._disk_pending)
+    assert calls == [tmp_path]
+    assert win._status_overlay.isAncestorOf(win._status_bar)
+    assert win._status_bar._disk_lbl.text() == "Disk: 321 GB Free"
+    assert win._status_bar._disk_lbl.toolTip().endswith(str(tmp_path / "new-recordings"))
+
+
 def test_the_strip_pages_through_the_wall(win, qtbot) -> None:
     _load(win, 18)
     win._set_compact(True)

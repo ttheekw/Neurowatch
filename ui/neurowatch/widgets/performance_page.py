@@ -66,6 +66,18 @@ _ACCEL_PRESENTATION = {
         "Hardware video decoding is active through Direct3D 11.",
         "#67e8f9",
     ),
+    "d3d12": (
+        "▣",
+        "Direct3D 12",
+        "Hardware video decoding is active through Direct3D 12.",
+        "#67e8f9",
+    ),
+    "qsv": (
+        "▣",
+        "Intel Quick Sync",
+        "Hardware video decoding is active on Intel Quick Sync.",
+        "#67e8f9",
+    ),
     "v4l2_m2m": (
         "▤",
         "V4L2 M2M",
@@ -648,6 +660,11 @@ class PerformancePage(QWidget):
         reason = info.get("reason")
         if kind == "software" and isinstance(reason, str) and reason:
             detail = reason  # e.g. the graphics card is not available until sign-in
+        elif kind == "software" and info.get("decoder_preference") == "software":
+            detail = "Video is decoded in software: CPU only is chosen in Settings → Video Wall."
+        warning = info.get("decoder_preference_warning")
+        if isinstance(warning, str) and warning:
+            detail = f"{detail} {warning}"  # the chosen decoder is not on this computer
         self._accel_detail_label.setText(detail)
 
     def set_camera_names(self, names: dict[str, str]) -> None:

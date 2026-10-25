@@ -7,6 +7,8 @@ is saved). Drives smaller than the recommended size are hidden unless asked.
 
 from __future__ import annotations
 
+import logging
+import ntpath
 import os
 from dataclasses import dataclass
 
@@ -36,6 +38,7 @@ from neurowatch.widgets.window_chrome import install_dialog_chrome
 
 DEFAULT_FOLDER = "nw-storage"
 DEFAULT_RECOMMENDED_MIN_BYTES = 128_000_000_000
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -86,20 +89,31 @@ class StorageScan:
 
     def folder_on(self, drive: Drive) -> str:
         """The recording folder a drive gets when chosen."""
+        if ntpath.splitdrive(drive.mount_point)[0]:
+            return ntpath.join(drive.mount_point, self.folder)
         return f"{drive.mount_point.rstrip('/')}/{self.folder}"
 
     def drive_of(self, path: str) -> Drive | None:
         """The drive holding ``path``: the longest mount point it lies under."""
         if not path:
             return None
-        full = os.path.normpath(os.path.expanduser(path))
+        full = _normalized_path(path)
         holding = [d for d in self.drives if _under(full, d.mount_point)]
         return max(holding, key=lambda d: len(d.mount_point), default=None)
 
 
+def _normalized_path(path: str) -> str:
+    expanded = os.path.expanduser(path)
+    if ntpath.splitdrive(expanded)[0]:
+        return ntpath.normcase(ntpath.normpath(expanded))
+    return os.path.normpath(expanded)
+
+
 def _under(path: str, mount_point: str) -> bool:
-    mount = mount_point.rstrip("/")
-    return path == mount or path.startswith(f"{mount}/")
+    separator = "\\" if ntpath.splitdrive(mount_point)[0] else "/"
+    mount = _normalized_path(mount_point).rstrip(separator)
+    full = _normalized_path(path)
+    return full == mount or full.startswith(f"{mount}{separator}")
 
 
 def format_bytes(count: int) -> str:
@@ -236,13 +250,13 @@ class DrivePickerDialog(QDialog):
         for row in self.rows():
             row.setParent(None)
             row.deleteLater()
-        pending = os.path.normpath(os.path.expanduser(self._pending_path))
+        pending = _normalized_path(self._pending_path)
         drives = self.visible_drives()
         for drive in drives:
             row = _DriveRow(
                 drive,
                 in_use=drive.selected,
-                pending=os.path.normpath(self._scan.folder_on(drive)) == pending,
+                pending=_normalized_path(self._scan.folder_on(drive)) == pending,
             )
             row.chosen.connect(self._choose)
             self._rows.addWidget(row)

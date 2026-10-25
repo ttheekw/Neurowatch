@@ -147,3 +147,13 @@ def test_the_cloud_light_is_a_status_bar_indicator_level_with_its_text(qtbot):
     qtbot.addWidget(light)
     assert isinstance(light, StatusIndicator)
     assert (light.text(), light.mark()) == ("Cloud", "dot")
+
+
+def test_the_status_bar_tooltip_carries_the_clock_warning():
+    from neurowatch.cloud.desktop import desktop_indicator
+
+    warning = "This computer's clock is 5 h 30 min ahead of NeuroWatch Cloud."
+    indicator = desktop_indicator({**LINKED, "clock_warning": warning})
+    assert indicator.state == "connected"
+    assert indicator.tooltip == f"NeuroWatch Cloud: connected\n{warning}"
+    assert desktop_indicator(LINKED) == cloud_indicator(LINKED)

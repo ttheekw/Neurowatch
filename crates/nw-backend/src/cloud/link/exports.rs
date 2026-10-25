@@ -197,7 +197,7 @@ impl CloudNode {
             .node_challenge(&client, &endpoint, &key, &status, EXPORT_PULL_OPERATION)
             .await?;
         let node_id = status.node_id.clone().ok_or(CloudError::State)?;
-        let issued = OffsetDateTime::now_utc();
+        let issued = self.clock.now();
         let mut proof = json!({
             "protocol_version":1,"tenant_id":status.tenant_id,"node_id":node_id,
             "audience":NODE_AUDIENCE,"auth_epoch":status.auth_epoch,
@@ -250,7 +250,7 @@ impl CloudNode {
             &challenge,
             export_id,
             report,
-            OffsetDateTime::now_utc(),
+            self.clock.now(),
         )?;
         let url = endpoint.join(&format!("v1/nodes/{node_id}/export-reports"))?;
         let response = self

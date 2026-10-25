@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
+
 import neurowatch.widgets.status_bar_widget as status_mod
 
 
@@ -58,6 +62,13 @@ def test_acceleration_badge_distinguishes_hardware_and_software(qtbot):
     bar.set_video_acceleration({"kind": "d3d11", "hardware": True})
     assert (bar._accel_lbl.text(), bar._accel_lbl.mark()) == ("Direct3D 11", "square")
     assert "hardware" in bar._accel_lbl.toolTip().lower()
+
+    bar.set_video_acceleration({"kind": "d3d12", "hardware": True})
+    assert (bar._accel_lbl.text(), bar._accel_lbl.mark()) == ("Direct3D 12", "square")
+
+    bar.set_video_acceleration({"kind": "qsv", "hardware": True})
+    assert (bar._accel_lbl.text(), bar._accel_lbl.mark()) == ("Quick Sync", "square")
+    assert "quick sync" in bar._accel_lbl.toolTip().lower()
 
     bar.set_video_acceleration({"kind": "software", "hardware": False})
     assert (bar._accel_lbl.text(), bar._accel_lbl.mark()) == ("CPU Decode", "ring")
@@ -159,3 +170,137 @@ def test_an_added_indicator_sits_before_the_version(qtbot):
     assert (
         layout.indexOf(bar._backend_lbl) < layout.indexOf(light) < layout.indexOf(bar._version_lbl)
     )
+
+
+def test_recording_disk_path_uses_the_nearest_existing_parent(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    assert status_mod.recording_disk_path("~/not-created/camera") == tmp_path
+    recordings = tmp_path / "recordings"
+    recordings.mkdir()
+    assert status_mod.recording_disk_path(str(recordings / "camera")) == recordings
+    assert status_mod.recording_disk_path(str(recordings)) == recordings
+
+
+def test_disk_label_reads_the_recording_drive_and_refreshes_on_change(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    paths: list[Path] = []
+
+    def usage(path: Path) -> SimpleNamespace:
+        paths.append(path)
+        return SimpleNamespace(free=(120 if path == tmp_path else 42) * 1024**3)
+
+    monkeypatch.setattr(status_mod.shutil, "disk_usage", usage)
+    bar = status_mod.StatusBarWidget()
+    qtbot.addWidget(bar)
+    assert bar._disk_lbl.text() == "Disk: --" and paths == []
+    configured = str(tmp_path / "future-recordings" / "camera")
+    bar.set_storage_path(configured)
+    qtbot.waitUntil(lambda: not bar._disk_pending)
+    assert paths == [tmp_path]
+    assert bar._disk_lbl.text() == "Disk: 120 GB Free"
+    assert bar._disk_lbl.toolTip() == f"Free space where recordings are saved: {configured}"
+
+    other = tmp_path / "other-drive"
+    other.mkdir()
+    bar.set_storage_path(str(other))
+    qtbot.waitUntil(lambda: not bar._disk_pending)
+    assert paths == [tmp_path, other]
+    assert bar._disk_lbl.text() == "Disk: 42 GB Free"
+    bar.set_storage_path("")
+    assert bar._disk_lbl.text() == "Disk: --"
+
+
+def test_disk_read_errors_show_unknown(qtbot, tmp_path, monkeypatch) -> None:
+    def unavailable(path: Path) -> SimpleNamespace:
+        raise OSError("drive disconnected")
+
+    monkeypatch.setattr(status_mod.shutil, "disk_usage", unavailable)
+    bar = status_mod.StatusBarWidget()
+    qtbot.addWidget(bar)
+    bar.set_storage_path(str(tmp_path))
+    qtbot.waitUntil(lambda: not bar._disk_pending)
+    assert bar._disk_lbl.text() == "Disk: --"
+
+
+def test_a_stalled_disk_read_never_blocks_qt_or_starts_more_readers(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    entered, release = Event(), Event()
+    paths: list[Path] = []
+
+    def slow_usage(path: Path) -> SimpleNamespace:
+        paths.append(path)
+        entered.set()
+        assert release.wait(timeout=5), "test must release the stalled disk reader"
+        return SimpleNamespace(free=12 * 1024**3)
+
+    monkeypatch.setattr(status_mod.shutil, "disk_usage", slow_usage)
+    bar = status_mod.StatusBarWidget()
+    qtbot.addWidget(bar)
+    bar.set_storage_path(str(tmp_path))
+    try:
+        qtbot.waitUntil(entered.is_set)
+        monkeypatch.setattr(status_mod, "_DISK_TIMEOUT_SECONDS", 0)
+        bar._poll_disk_result()
+        assert bar._disk_lbl.text() == "Disk: --"
+        bar._update_disk()
+        bar._update_disk()
+        assert paths == [tmp_path] and bar._disk_pending
+    finally:
+        release.set()
+        qtbot.waitUntil(lambda: not bar._disk_pending)
+    assert bar._disk_lbl.text() == "Disk: 12 GB Free"
+
+
+def test_a_result_from_the_previous_path_cannot_replace_the_new_reading(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    entered, release = Event(), Event()
+    other = tmp_path / "other-drive"
+    other.mkdir()
+
+    def usage(path: Path) -> SimpleNamespace:
+        if path == tmp_path:
+            entered.set()
+            assert release.wait(timeout=5)
+        return SimpleNamespace(free=(9 if path == tmp_path else 87) * 1024**3)
+
+    monkeypatch.setattr(status_mod.shutil, "disk_usage", usage)
+    bar = status_mod.StatusBarWidget()
+    qtbot.addWidget(bar)
+    bar.set_storage_path(str(tmp_path))
+    try:
+        qtbot.waitUntil(entered.is_set)
+        bar.set_storage_path(str(other))
+    finally:
+        release.set()
+        qtbot.waitUntil(lambda: not bar._disk_pending)
+    assert bar._disk_lbl.text() == "Disk: 87 GB Free"
+    assert bar._disk_lbl.toolTip().endswith(str(other))
+
+
+def test_a_stalled_previous_drive_does_not_block_a_new_drive(qtbot, tmp_path, monkeypatch) -> None:
+    entered, release = Event(), Event()
+    healthy = tmp_path / "healthy"
+    healthy.mkdir()
+
+    def usage(path: Path) -> SimpleNamespace:
+        if path == tmp_path:
+            entered.set()
+            assert release.wait(timeout=5)
+        return SimpleNamespace(free=(9 if path == tmp_path else 87) * 1024**3)
+
+    monkeypatch.setattr(status_mod.shutil, "disk_usage", usage)
+    bar = status_mod.StatusBarWidget()
+    qtbot.addWidget(bar)
+    bar.set_storage_path(str(tmp_path))
+    try:
+        qtbot.waitUntil(entered.is_set)
+        bar.set_storage_path(str(healthy))
+        qtbot.waitUntil(lambda: bar._disk_lbl.text() == "Disk: 87 GB Free", timeout=1000)
+        assert not release.is_set(), "the healthy drive must not wait for the old drive"
+    finally:
+        release.set()
+        qtbot.waitUntil(lambda: not bar._disk_pending)

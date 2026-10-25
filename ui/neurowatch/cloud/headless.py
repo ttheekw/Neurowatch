@@ -20,7 +20,9 @@ from neurowatch import headless
 from neurowatch.cloud.cloud_link import (
     CloudLinkStatus,
     begin_params,
+    clock_warning,
     cloud_indicator,
+    operator_error,
     parse_enrollment_code,
 )
 from neurowatch.headless import Rpc
@@ -42,6 +44,12 @@ _CODE_REFUSED = (
 
 
 def cloud_line(cloud: dict[str, Any] | None) -> str:
+    line = _cloud_state(cloud)
+    warning = clock_warning(cloud)
+    return f"{line}. {warning}" if warning else line
+
+
+def _cloud_state(cloud: dict[str, Any] | None) -> str:
     if cloud is None:
         return "Cloud: status unavailable from this backend"
     status = CloudLinkStatus.from_result(cloud)
@@ -96,7 +104,8 @@ def _error_text(exc: Exception) -> str:
         return _NOT_CONFIGURED
     if "HTTP 404" in message.upper():
         return _CODE_REFUSED
-    return message
+    # An expired code (perhaps a wrong clock) gets the desktop's plain advice.
+    return operator_error(message)
 
 
 def _code_problem(text: str) -> str:
@@ -153,6 +162,10 @@ def link(rpc: Rpc, code_text: str, name: str, say: Callable[[str], None]) -> int
             result = rpc("cloud.confirm", {}, _CONFIRM_TIMEOUT_S)
     except Exception as exc:
         say(f"Cloud link failed: {_error_text(exc)}")
+        # The attempt may have shown that this computer's clock is off.
+        warning = clock_warning(_optional_status(rpc))
+        if warning:
+            say(f"Cloud link: {warning}")
         return 1
     say(cloud_line(result if isinstance(result, dict) else None))
     return 0

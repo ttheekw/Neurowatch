@@ -47,6 +47,8 @@ _DECODERS = {
     "vaapi": "VA-API hardware",
     "nvdec": "NVIDIA NVDEC hardware",
     "d3d11": "Direct3D 11 hardware",
+    "d3d12": "Direct3D 12 hardware",
+    "qsv": "Intel Quick Sync hardware",
     "v4l2_m2m": "V4L2 hardware",
     "software": "CPU (software)",
     "blocked": "blocked (GStreamer update required)",

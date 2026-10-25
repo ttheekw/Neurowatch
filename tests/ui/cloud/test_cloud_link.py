@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from datetime import timedelta, timezone
+
 import pytest
 
 from neurowatch.cloud.cloud_link import (
     CloudLinkStatus,
     begin_params,
+    clock_warning,
+    local_time,
     operator_error,
     parse_enrollment_code,
 )
@@ -64,7 +68,10 @@ def test_status_describes_each_backend_link_phase_and_the_cloud_url():
         {"phase": "linked", "node_id": "n", "last_check_in": "2026-09-20T12:06:00Z"}
     )
     assert (linked.can_begin, linked.can_confirm, linked.can_unlink) == (False, False, True)
-    assert "Linked" in linked.summary and "2026-09-20T12:06:00Z" in linked.summary
+    assert "Linked" in linked.summary
+    # Shown in this computer's time, not as the raw UTC string.
+    assert local_time("2026-09-20T12:06:00Z") in linked.summary
+    assert "2026-09-20T12:06:00Z" not in linked.summary
 
 
 def test_unknown_phase_offers_no_actions():
@@ -136,3 +143,53 @@ def test_a_refused_enrollment_code_tells_the_operator_what_to_do() -> None:
     text = operator_error("cloud.begin failed: cloud request failed: HTTP 404 Not Found")
     assert "HTTP" not in text
     assert "new enrollment code" in text
+
+
+COLOMBO = timezone(timedelta(hours=5, minutes=30), "+0530")
+TOKYO_NAMED = timezone(timedelta(hours=9), "JST")
+WINDOWS_NAMED = timezone(timedelta(hours=5, minutes=30), "Sri Lanka Standard Time")
+
+
+def test_cloud_times_are_shown_in_local_time_with_the_zone():
+    assert local_time("2026-10-25T12:06:00Z", local_zone=TOKYO_NAMED) == "2026-10-25 21:06 JST"
+    assert local_time("2026-10-25T12:06:00+00:00", local_zone=COLOMBO) == "2026-10-25 17:36 +0530"
+    # Windows' long zone names become an offset.
+    assert (
+        local_time("2026-10-25T23:50:00Z", local_zone=WINDOWS_NAMED) == "2026-10-26 05:20 UTC+05:30"
+    )
+
+
+def test_text_that_is_not_a_cloud_time_is_shown_unchanged():
+    assert local_time("now") == "now"
+    assert local_time("2026-10-25T12:06:00") == "2026-10-25T12:06:00"
+    assert local_time(None) == ""
+
+
+def test_the_clock_warning_and_offset_are_read_from_the_status():
+    warning = "This computer's clock is 5 h 30 min ahead of NeuroWatch Cloud."
+    status = CloudLinkStatus.from_result(
+        {"phase": "linked", "clock_offset_sec": -19800, "clock_warning": warning}
+    )
+    assert status.clock_warning == warning
+    assert status.clock_offset_sec == -19800
+    assert clock_warning({"clock_warning": warning}) == warning
+    assert clock_warning({"clock_warning": ""}) is None
+    assert clock_warning(None) is None
+    older = CloudLinkStatus.from_result({"phase": "linked", "clock_offset_sec": True})
+    assert (older.clock_warning, older.clock_offset_sec) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "cloud.begin failed: invalid params: unsafe or invalid cloud configuration: the "
+        "enrollment code has expired (codes last five minutes): create a new one",
+        # Backends before the cloud clock said only this.
+        "cloud.begin failed: unsafe or invalid cloud configuration: cloud timestamp has expired",
+    ],
+)
+def test_an_expired_code_error_mentions_the_clock_and_time_zone(message):
+    text = operator_error(message)
+    assert "expired" in text
+    assert "time zone" in text
+    assert "invalid cloud configuration" not in text

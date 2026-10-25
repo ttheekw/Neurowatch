@@ -94,6 +94,25 @@ pub struct DiscoveryCandidate {
     /// added from it (see [`DiscoveryIdentity`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_reference: Option<String>,
+    /// How the device was found: `onvif` (it speaks ONVIF), `sadp`
+    /// (Hikvision's discovery), `rtsp` (its RTSP port answered).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub found_by: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    /// `false` for a device that must be activated (its admin password set,
+    /// with its maker's tool or web page) before it can be added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated: Option<bool>,
+    /// Answers RTSP, but the node does not know its stream addresses: it can
+    /// only be added with a typed stream URL.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream_url_needed: bool,
+    /// A short explanation for the operator, e.g. why it cannot be added yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// A search and what it found so far.
@@ -101,9 +120,11 @@ pub struct DiscoveryCandidate {
 pub struct ScanResults {
     pub scan_id: String,
     pub status: ScanStatus,
-    /// The normalized network searched, e.g. `10.0.10.0/24`.
+    /// What was searched, normalized, e.g. `10.0.10.0/24` or
+    /// `192.168.1.10-50, 192.168.1.64`.
     pub scope: String,
-    /// Addresses probed one by one so far, and in all (0 for a multicast-only search).
+    /// Progress through the addresses probed one by one (a WS-Discovery
+    /// probe and an RTSP port check each), and how many there are.
     pub probed: u32,
     pub total: u32,
     pub candidates: Vec<DiscoveryCandidate>,

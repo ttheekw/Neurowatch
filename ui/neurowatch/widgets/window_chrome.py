@@ -848,21 +848,18 @@ def first_content_focus(body: QWidget) -> QWidget | None:
         QTextEdit,
     )
 
-    controls: list[QWidget] = []
-    widget = body.nextInFocusChain()
-    seen: set[int] = set()
-    while widget is not None and id(widget) not in seen:
-        seen.add(id(widget))
-        if (
-            body.isAncestorOf(widget)
-            and widget.isVisibleTo(body)
-            and widget.isEnabled()
-            and widget.focusPolicy() & Qt.FocusPolicy.TabFocus
-        ):
-            controls.append(widget)
-        widget = widget.nextInFocusChain()
-        if widget is body:
-            break
+    # Children in creation order, which is the focus order (nothing calls
+    # setTabOrder). Not nextInFocusChain(): PySide records each widget it
+    # returns as a child of the one it was called on, so a widget deleted
+    # later (e.g. a rebuilt button) invalidated the Python wrappers of the
+    # widgets after it in the chain, such as the dialog's OK button.
+    controls = [
+        widget
+        for widget in body.findChildren(QWidget)
+        if widget.isVisibleTo(body)
+        and widget.isEnabled()
+        and widget.focusPolicy() & Qt.FocusPolicy.TabFocus
+    ]
     fields = (QLineEdit, QAbstractSpinBox, QTextEdit, QPlainTextEdit, QComboBox)
     for control in controls:
         if isinstance(control, fields) and not getattr(control, "isReadOnly", lambda: False)():

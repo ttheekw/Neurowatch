@@ -31,6 +31,7 @@ pub const CONFIG_PULL_OPERATION: &str = "config_pull";
 pub const CONFIG_RESULT_OPERATION: &str = "config_result";
 pub const DIAGNOSTICS_REPORT_OPERATION: &str = "diagnostics_report";
 
+mod clock;
 mod diagnostics;
 #[cfg(windows)]
 mod dpapi;
@@ -38,6 +39,7 @@ mod exports;
 mod inventory;
 pub mod sealed;
 mod websocket;
+pub use clock::CloudClock;
 pub use diagnostics::{diagnostics_snapshot, SystemInfo, MAX_DIAGNOSTICS_BYTES};
 pub use exports::{ExportSource, SegmentLookup, EXPORT_PULL_OPERATION, EXPORT_REPORT_OPERATION};
 #[cfg(test)]
@@ -544,7 +546,7 @@ fn load_state(path: &Path) -> Result<Persisted> {
             if let Some(pending) = &persisted.pending {
                 // Expiry in the past is valid state (discarded after load);
                 // only malformed or non-canonical values are rejected.
-                let canonical = canonical_cloud_time(&pending.expires_at, false)
+                let canonical = canonical_cloud_time(&pending.expires_at, None)
                     .map_err(|_| CloudError::Store("invalid persisted cloud timestamp".into()))?;
                 if canonical != pending.expires_at {
                     return Err(CloudError::Store(
@@ -553,7 +555,7 @@ fn load_state(path: &Path) -> Result<Persisted> {
                 }
             }
             if let Some(last_check_in) = &persisted.status.last_check_in {
-                let canonical = canonical_cloud_time(last_check_in, false)
+                let canonical = canonical_cloud_time(last_check_in, None)
                     .map_err(|_| CloudError::Store("invalid persisted cloud timestamp".into()))?;
                 if canonical != *last_check_in {
                     return Err(CloudError::Store(
@@ -715,6 +717,10 @@ struct ClaimParameters {
     tenant_id: String,
     expires_at: String,
     challenge: String,
+    /// The portal's clock when it answered (newer portals), so a node with a
+    /// wrong clock learns the offset before it judges `expires_at`.
+    #[serde(default)]
+    server_time: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1036,6 +1042,13 @@ pub struct CloudStatusReport {
     /// `endpoint_unusable` (the saved cloud URL is not allowed by current
     /// settings).
     pub cloud_problem: Option<&'static str>,
+    /// NeuroWatch Cloud's clock minus this computer's, in whole seconds, once
+    /// a cloud answer taught it; signed times are corrected by it.
+    pub clock_offset_sec: Option<i64>,
+    /// Plain-language advice when this computer's clock is more than a
+    /// minute off NeuroWatch Cloud's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock_warning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1081,6 +1094,10 @@ struct NodeChallengeResponse {
     operation: String,
     challenge: String,
     expires_at: String,
+    /// Tolerated so a portal may add its clock here later; this node learns
+    /// the cloud's time from the transport instead.
+    #[serde(default, rename = "server_time")]
+    _server_time: Option<String>,
 }
 
 fn parse_challenge_response(
@@ -1121,6 +1138,8 @@ struct Inner {
     refused: bool,
     /// Sealed web-portal requests already opened, so none is run twice.
     sealed_replay: sealed::ReplayGuard,
+    /// The cloud's clock: what every signed or checked cloud time uses.
+    clock: Arc<CloudClock>,
 }
 impl Inner {
     /// Whether a started link attempt outlived its enrollment, so the operator
@@ -1131,7 +1150,7 @@ impl Inner {
                 &pending.expires_at,
                 &time::format_description::well_known::Rfc3339,
             )
-            .map(|expires| expires <= OffsetDateTime::now_utc())
+            .map(|expires| expires <= self.clock.now())
             .unwrap_or(true)
         })
     }
@@ -1158,6 +1177,11 @@ impl Inner {
             } else {
                 None
             },
+            clock_offset_sec: self
+                .clock
+                .measured_offset()
+                .map(|offset| offset.whole_seconds()),
+            clock_warning: self.clock.warning(),
             error: pending_expired.then(|| ENROLLMENT_EXPIRED_ERROR.to_owned()),
             status: self.persisted.status.clone(),
         }
@@ -1260,6 +1284,7 @@ pub struct CloudNode {
     inner: Arc<Mutex<Inner>>,
     websocket: Option<Arc<websocket::WsTransport>>,
     signals: Arc<CloudSignals>,
+    clock: Arc<CloudClock>,
 }
 impl CloudNode {
     /// Production-policy open for tests; the binary uses `open_with_options`.
@@ -1296,6 +1321,7 @@ impl CloudNode {
         };
         // An expired, unconfirmed attempt is kept: startup reports it as an
         // actionable state instead of silently clearing the operator's link.
+        let clock = Arc::new(CloudClock::new());
         let inner = Inner {
             dir,
             key,
@@ -1307,11 +1333,13 @@ impl CloudNode {
             last_contact: None,
             refused: false,
             sealed_replay: sealed::ReplayGuard::default(),
+            clock: Arc::clone(&clock),
         };
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             websocket: Some(Arc::new(websocket::WsTransport::with_events())),
             signals: Arc::default(),
+            clock,
         })
     }
     fn lock(&self) -> Result<MutexGuard<'_, Inner>> {
@@ -1321,6 +1349,11 @@ impl CloudNode {
     }
     pub fn shared(&self) -> Self {
         self.clone()
+    }
+    /// The cloud's clock, shared with everything that checks cloud-issued
+    /// times (media grants, sealed requests).
+    pub fn clock(&self) -> Arc<CloudClock> {
+        Arc::clone(&self.clock)
     }
     /// Whether the portal currently wakes this node with events, so its loops
     /// can ask without long-polling and wait for an event instead.
@@ -1371,7 +1404,8 @@ impl CloudNode {
     pub fn prepare_claim(&mut self, mut input: EnrollmentInput) -> Result<ClaimRequest> {
         let policy = self.lock()?.policy;
         let endpoint = CloudEndpoint::parse_with(&input.endpoint, policy)?;
-        input.expires_at = canonical_cloud_time(&input.expires_at, true)?;
+        let now = self.clock.now();
+        input.expires_at = canonical_cloud_time(&input.expires_at, Some(now))?;
         validate_enrollment(&input)?;
         let mut inner = self.lock()?;
         inner.discard_expired_pending()?;
@@ -1489,7 +1523,7 @@ impl CloudNode {
             "v1/node-enrollments/{}/claim",
             claim.enrollment_id
         ))?;
-        let response: ClaimResponse = post_typed(&client, url, &claim).await?;
+        let response: ClaimResponse = post_typed(&self.clock, &client, url, &claim).await?;
         self.record_claim_response(response)?;
         Ok(self.status())
     }
@@ -1545,12 +1579,20 @@ impl CloudNode {
             "v1/node-enrollments/{}/claim-parameters",
             code.enrollment_id
         ))?;
+        let sent = self.clock.system_now();
         let binding: ClaimParameters = post_typed(
+            &self.clock,
             &client,
             url,
             &json!({"tenant_id": code.tenant_id, "transfer_proof": code.transfer_proof}),
         )
         .await?;
+        // The expiry is judged by the cloud's clock: learn it first, from the
+        // portal's own time when it sends one (the `Date` header otherwise).
+        if let Some(server_time) = binding.server_time.as_deref() {
+            self.clock
+                .observe_server_time(server_time, sent, self.clock.system_now());
+        }
         if binding.protocol_version != 1
             || binding.audience != ENROLLMENT_AUDIENCE
             || binding.enrollment_id != code.enrollment_id
@@ -1581,6 +1623,7 @@ impl CloudNode {
             request.enrollment_id
         ))?;
         let response = post_json(
+            &self.clock,
             &client,
             url,
             &serde_json::to_value(request).map_err(|e| CloudError::Invalid(e.to_string()))?,
@@ -1651,7 +1694,7 @@ impl CloudNode {
         };
         let endpoint = parse_persisted_endpoint(&pending.endpoint, policy)?;
         let client = self.control_client(&endpoint).await?;
-        let issued = OffsetDateTime::now_utc();
+        let issued = self.clock.now();
         let mut request = json!({
             "protocol_version": 1,
             "tenant_id": pending.tenant_id,
@@ -1673,9 +1716,8 @@ impl CloudNode {
                 &request,
             )
             .await?;
-        let challenge =
-            parse_challenge_response(response, UNLINK_OPERATION, OffsetDateTime::now_utc())?;
-        let proof_issued = OffsetDateTime::now_utc();
+        let challenge = parse_challenge_response(response, UNLINK_OPERATION, self.clock.now())?;
+        let proof_issued = self.clock.now();
         let mut proof = json!({
             "protocol_version": 1,
             "tenant_id": pending.tenant_id,
@@ -1775,7 +1817,13 @@ impl CloudNode {
                 )
                 .await
         } else {
-            post_json(client.as_ref().ok_or(CloudError::State)?, url, body).await
+            post_json(
+                &self.clock,
+                client.as_ref().ok_or(CloudError::State)?,
+                url,
+                body,
+            )
+            .await
         };
         let current = self.status();
         if current.phase == LinkPhase::Linked
@@ -1800,7 +1848,13 @@ impl CloudNode {
                 .await
                 .map(|_| ())
         } else {
-            post_no_content(client.as_ref().ok_or(CloudError::State)?, url, body).await
+            post_no_content(
+                &self.clock,
+                client.as_ref().ok_or(CloudError::State)?,
+                url,
+                body,
+            )
+            .await
         }
     }
 
@@ -1816,7 +1870,7 @@ impl CloudNode {
         let tenant_id = status.tenant_id.clone().ok_or(CloudError::State)?;
         let node_id = status.node_id.clone().ok_or(CloudError::State)?;
         let epoch = status.auth_epoch.ok_or(CloudError::State)?;
-        let issued = OffsetDateTime::now_utc();
+        let issued = self.clock.now();
         let mut request = json!({"protocol_version":1,"tenant_id":tenant_id,"node_id":node_id,"audience":NODE_CHALLENGE_AUDIENCE,"operation":operation,"auth_epoch":epoch,"issued_at":fmt_time(issued)?,"expires_at":fmt_time(issued + TimeDuration::seconds(60))?,"nonce":URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes()),"signature":""});
         request["signature"] = Value::String(sign_value(key, &without_signature(&request))?);
         let response = self
@@ -1827,7 +1881,7 @@ impl CloudNode {
                 &request,
             )
             .await?;
-        Ok(parse_challenge_response(response, operation, OffsetDateTime::now_utc())?.challenge)
+        Ok(parse_challenge_response(response, operation, self.clock.now())?.challenge)
     }
 
     /// Tell the cloud this node is shutting down cleanly, so the portal shows
@@ -1850,7 +1904,7 @@ impl CloudNode {
             .node_challenge(&client, &endpoint, &key, &status, DEPARTURE_OPERATION)
             .await?;
         let node_id = status.node_id.clone().ok_or(CloudError::State)?;
-        let issued = OffsetDateTime::now_utc();
+        let issued = self.clock.now();
         let mut proof = json!({
             "protocol_version":1,"tenant_id":status.tenant_id,"node_id":node_id,
             "audience":NODE_AUDIENCE,"auth_epoch":status.auth_epoch,
@@ -1885,7 +1939,7 @@ impl CloudNode {
             .node_challenge(&client, &endpoint, &key, &status, INVENTORY_OPERATION)
             .await?;
         let node_id = status.node_id.clone().ok_or(CloudError::State)?;
-        let issued = OffsetDateTime::now_utc();
+        let issued = self.clock.now();
         let mut snapshot = json!({
             "protocol_version": 1,
             "tenant_id": status.tenant_id,
@@ -1953,7 +2007,7 @@ impl CloudNode {
             )
             .await?;
         let node_id = status.node_id.clone().ok_or(CloudError::State)?;
-        let issued = OffsetDateTime::now_utc();
+        let issued = self.clock.now();
         let mut proof = json!({
             "protocol_version":1,"tenant_id":status.tenant_id,"node_id":node_id,
             "audience":NODE_AUDIENCE,"auth_epoch":status.auth_epoch,
@@ -2017,7 +2071,7 @@ impl CloudNode {
             .node_challenge(&client, &endpoint, &key, &status, THUMBNAIL_BATCH_OPERATION)
             .await?;
         let node_id = status.node_id.clone().ok_or(CloudError::State)?;
-        let issued = OffsetDateTime::now_utc();
+        let issued = self.clock.now();
         let mut batch = json!({
             "protocol_version":1,"tenant_id":status.tenant_id,"node_id":node_id,
             "audience":NODE_AUDIENCE,"auth_epoch":status.auth_epoch,
@@ -2061,7 +2115,7 @@ impl CloudNode {
             .node_challenge(&client, &endpoint, &key, &status, COVERAGE_OPERATION)
             .await?;
         let node_id = status.node_id.clone().ok_or(CloudError::State)?;
-        let issued = OffsetDateTime::now_utc();
+        let issued = self.clock.now();
         let mut report = json!({
             "protocol_version": 1,
             "tenant_id": status.tenant_id,
@@ -2126,7 +2180,7 @@ impl CloudNode {
             .node_challenge(&client, &endpoint, &key, &status, CONFIG_PULL_OPERATION)
             .await?;
         let node_id = status.node_id.clone().ok_or(CloudError::State)?;
-        let issued = OffsetDateTime::now_utc();
+        let issued = self.clock.now();
         let mut proof = json!({
             "protocol_version":1,"tenant_id":status.tenant_id,"node_id":node_id,
             "audience":NODE_AUDIENCE,"auth_epoch":status.auth_epoch,
@@ -2188,7 +2242,7 @@ impl CloudNode {
             &challenge,
             request_id,
             outcome,
-            OffsetDateTime::now_utc(),
+            self.clock.now(),
         )?;
         let url = endpoint.join(&format!("v1/nodes/{node_id}/config-results"))?;
         self.control_post_no_content(&endpoint, &client, url, &body)
@@ -2239,13 +2293,8 @@ impl CloudNode {
             )
             .await?;
         let node_id = status.node_id.clone().ok_or(CloudError::State)?;
-        let body = diagnostics_report_body(
-            &key,
-            &status,
-            &challenge,
-            snapshot_json,
-            OffsetDateTime::now_utc(),
-        )?;
+        let body =
+            diagnostics_report_body(&key, &status, &challenge, snapshot_json, self.clock.now())?;
         let mut url = endpoint.join(&format!("v1/nodes/{node_id}/diagnostics-reports"))?;
         url.query_pairs_mut()
             .append_pair("wait", &wait.as_secs().to_string());
@@ -2268,7 +2317,7 @@ impl CloudNode {
             .clone()
             .ok_or(CloudError::State)?;
         let key = inner.key.clone();
-        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let now = self.clock.now().unix_timestamp();
         sealed::open_request(
             &key,
             &node_id,
@@ -2319,7 +2368,7 @@ impl CloudNode {
         let tenant_id = status.tenant_id.ok_or(CloudError::State)?;
         let node_id = status.node_id.ok_or(CloudError::State)?;
         let epoch = status.auth_epoch.ok_or(CloudError::State)?;
-        let issued = OffsetDateTime::now_utc();
+        let issued = self.clock.now();
         let expires = issued + TimeDuration::seconds(60);
         let nonce = URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes());
         let mut challenge = json!({"protocol_version":1,"tenant_id":tenant_id,"node_id":node_id,"audience":NODE_CHALLENGE_AUDIENCE,"operation":OPERATION,"auth_epoch":epoch,"issued_at":fmt_time(issued)?,"expires_at":fmt_time(expires)?,"nonce":nonce,"signature":""});
@@ -2333,9 +2382,9 @@ impl CloudNode {
             )
             .await?;
         let issued_challenge =
-            parse_challenge_response(issued_challenge, OPERATION, OffsetDateTime::now_utc())?;
+            parse_challenge_response(issued_challenge, OPERATION, self.clock.now())?;
         let server_challenge = issued_challenge.challenge;
-        let issued = OffsetDateTime::now_utc();
+        let issued = self.clock.now();
         let mut proof = json!({"protocol_version":1,"tenant_id":tenant_id,"node_id":node_id,"audience":NODE_AUDIENCE,"auth_epoch":epoch,"issued_at":fmt_time(issued)?,"expires_at":fmt_time(issued+TimeDuration::seconds(60))?,"challenge":server_challenge,"signature":""});
         proof["signature"] = Value::String(sign_value(&key, &without_signature(&proof))?);
         let response = self
@@ -2360,7 +2409,7 @@ impl CloudNode {
         let checked_in = response["checked_in_at"]
             .as_str()
             .ok_or_else(|| CloudError::Network("missing check-in timestamp".into()))?;
-        let checked_in = canonical_cloud_time(checked_in, false)
+        let checked_in = canonical_cloud_time(checked_in, None)
             .map_err(|_| CloudError::Network("invalid check-in timestamp".into()))?;
         let mut candidate = inner.persisted.clone();
         candidate.status.last_check_in = Some(checked_in);
@@ -2407,7 +2456,7 @@ impl CloudNode {
         let tenant_id = status.tenant_id.ok_or(CloudError::State)?;
         let node_id = status.node_id.ok_or(CloudError::State)?;
         let auth_epoch = status.auth_epoch.ok_or(CloudError::State)?;
-        let issued = OffsetDateTime::now_utc();
+        let issued = self.clock.now();
         let mut proof = json!({
             "protocol_version": 1,
             "tenant_id": tenant_id,
@@ -2626,17 +2675,24 @@ fn fmt_time(t: OffsetDateTime) -> Result<String> {
     canonical_cloud_time(
         &t.format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| CloudError::Invalid(e.to_string()))?,
-        false,
+        None,
     )
 }
-fn canonical_cloud_time(raw: &str, require_future: bool) -> Result<String> {
+/// What a node is told when an enrollment code's expiry has passed by the
+/// cloud's clock. The UI recognises "enrollment code has expired".
+pub const ENROLLMENT_CODE_EXPIRED: &str = "the enrollment code has expired (codes last five \
+    minutes): create a new one in the web portal and link again. If it was just created, check \
+    this computer's date, time and time zone";
+/// `raw` as the cloud's canonical UTC rendering; with `must_follow`, it must
+/// also be later than that time (the cloud's clock, see [`CloudClock`]).
+fn canonical_cloud_time(raw: &str, must_follow: Option<OffsetDateTime>) -> Result<String> {
     let parsed = OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
         .map_err(|_| CloudError::Invalid("invalid cloud timestamp".into()))?;
     if parsed.offset() != time::UtcOffset::UTC {
         return Err(CloudError::Invalid("cloud timestamp must be UTC".into()));
     }
-    if require_future && parsed <= OffsetDateTime::now_utc() {
-        return Err(CloudError::Invalid("cloud timestamp has expired".into()));
+    if must_follow.is_some_and(|now| parsed <= now) {
+        return Err(CloudError::Invalid(ENROLLMENT_CODE_EXPIRED.into()));
     }
     let formatted = parsed
         .format(&time::format_description::well_known::Rfc3339)
@@ -2652,13 +2708,29 @@ fn http_error(status: reqwest::StatusCode) -> CloudError {
     }
 }
 
-async fn post_json(client: &reqwest::Client, url: reqwest::Url, body: &Value) -> Result<Value> {
-    let r = client
-        .post(url)
-        .json(body)
+/// Send one request, learning the cloud's clock from the answer's `Date`
+/// header (refusals included: a refusal for a wrong clock teaches the offset
+/// the next attempt signs with).
+async fn send_observed(
+    clock: &CloudClock,
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response> {
+    let sent = clock.system_now();
+    let response = request
         .send()
         .await
         .map_err(|e| CloudError::Network(e.to_string()))?;
+    clock.observe_headers(response.headers(), sent, clock.system_now());
+    Ok(response)
+}
+
+async fn post_json(
+    clock: &CloudClock,
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    body: &Value,
+) -> Result<Value> {
+    let r = send_observed(clock, client.post(url).json(body)).await?;
     if !r.status().is_success() {
         return Err(http_error(r.status()));
     }
@@ -2667,16 +2739,12 @@ async fn post_json(client: &reqwest::Client, url: reqwest::Url, body: &Value) ->
         .map_err(|e| CloudError::Network(e.to_string()))
 }
 async fn post_typed<T: serde::de::DeserializeOwned>(
+    clock: &CloudClock,
     client: &reqwest::Client,
     url: reqwest::Url,
     body: &impl Serialize,
 ) -> Result<T> {
-    let r = client
-        .post(url)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| CloudError::Network(e.to_string()))?;
+    let r = send_observed(clock, client.post(url).json(body)).await?;
     if !r.status().is_success() {
         return Err(http_error(r.status()));
     }
@@ -2684,13 +2752,13 @@ async fn post_typed<T: serde::de::DeserializeOwned>(
         .await
         .map_err(|e| CloudError::Network(e.to_string()))
 }
-async fn post_no_content(client: &reqwest::Client, url: reqwest::Url, body: &Value) -> Result<()> {
-    let response = client
-        .post(url)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| CloudError::Network(e.to_string()))?;
+async fn post_no_content(
+    clock: &CloudClock,
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    body: &Value,
+) -> Result<()> {
+    let response = send_observed(clock, client.post(url).json(body)).await?;
     if response.status() != reqwest::StatusCode::NO_CONTENT {
         return Err(http_error(response.status()));
     }

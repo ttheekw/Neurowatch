@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, tzinfo
 from typing import Any
 
 _PROOF = re.compile(r"[A-Za-z0-9_\-]{8,128}")
@@ -82,6 +83,18 @@ _CODE_REFUSED = (
 )
 
 
+# The backend judges a code's expiry by NeuroWatch Cloud's clock once it has
+# heard from the cloud; an "expired" code that was just created means this
+# computer's clock or time zone is wrong (older backends said "cloud timestamp
+# has expired").
+_CODE_EXPIRED = (
+    "The enrollment code has expired (codes last five minutes). Create a new "
+    "enrollment code in the web portal and link again. If you just created it, "
+    "check this computer's date, time and time zone."
+)
+_EXPIRED_MARKERS = ("ENROLLMENT CODE HAS EXPIRED", "CLOUD TIMESTAMP HAS EXPIRED")
+
+
 def operator_error(message: str) -> str:
     """Return a backend error message that is safe to show to an operator.
 
@@ -94,7 +107,36 @@ def operator_error(message: str) -> str:
         return _NOT_SET_UP
     if "HTTP 404" in upper:
         return _CODE_REFUSED
+    if any(marker in upper for marker in _EXPIRED_MARKERS):
+        return _CODE_EXPIRED
     return message
+
+
+def local_time(value: str | None, *, local_zone: tzinfo | None = None) -> str:
+    """Show a backend UTC time (RFC 3339, e.g. ``2026-10-25T12:06:00Z``) in this
+    computer's local time with its zone, e.g. ``2026-10-25 17:36 IST`` (or
+    ``UTC+05:30`` where the zone has only a long name). Times stay UTC in IPC;
+    only display converts. Anything that is not such a time is returned
+    unchanged.
+
+    ``local_zone`` is for tests; the default is this computer's zone.
+    """
+    if not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        return value  # not a cloud time: those always carry their offset
+    shown = parsed.astimezone(local_zone)
+    zone = shown.tzname() or ""
+    # Windows names zones in full ("Sri Lanka Standard Time"); an offset is
+    # shorter and unambiguous.
+    if not zone or " " in zone:
+        zone = shown.strftime("UTC%z")
+        zone = f"{zone[:-2]}:{zone[-2:]}" if len(zone) == 8 else zone
+    return f"{shown:%Y-%m-%d %H:%M} {zone}"
 
 
 @dataclass(frozen=True)
@@ -107,6 +149,8 @@ class CloudLinkStatus:
     cloud_configured: bool = True
     pending_expired: bool = False
     error: str | None = None
+    clock_warning: str | None = None
+    clock_offset_sec: int | None = None
 
     @classmethod
     def from_result(cls, result: dict[str, Any]) -> CloudLinkStatus:
@@ -118,6 +162,8 @@ class CloudLinkStatus:
             value = result.get(key)
             return value if isinstance(value, bool) else default
 
+        offset = result.get("clock_offset_sec")
+
         return cls(
             phase=text("phase") or "unknown",
             tenant_id=text("tenant_id"),
@@ -128,6 +174,10 @@ class CloudLinkStatus:
             cloud_configured=flag("cloud_configured", True),
             pending_expired=flag("pending_expired", False),
             error=text("error"),
+            clock_warning=text("clock_warning"),
+            clock_offset_sec=(
+                offset if isinstance(offset, int) and not isinstance(offset, bool) else None
+            ),
         )
 
     @property
@@ -159,7 +209,7 @@ class CloudLinkStatus:
             return _EXPIRED
         base = _SUMMARIES.get(self.phase, f"Unknown link state ({self.phase}).")
         if self.phase == "linked":
-            check_in = self.last_check_in or "not yet"
+            check_in = local_time(self.last_check_in) or "not yet"
             return f"{base} Last check-in: {check_in}."
         return base
 
@@ -178,6 +228,15 @@ class CloudIndicator:
 
     state: str
     tooltip: str
+
+
+def clock_warning(status: dict[str, Any] | None) -> str | None:
+    """The backend's advice when this computer's clock is more than a minute
+    off NeuroWatch Cloud's, else ``None``."""
+    if not isinstance(status, dict):
+        return None
+    warning = status.get("clock_warning")
+    return warning if isinstance(warning, str) and warning else None
 
 
 def cloud_indicator(status: dict[str, Any] | None) -> CloudIndicator:

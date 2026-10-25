@@ -70,7 +70,7 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // Probe hardware acceleration once at startup
-    let hwaccel = pipeline::hwaccel::probe();
+    let hwaccel = pipeline::hwaccel::probe(cfg.video.decoder);
     tracing::info!(?hwaccel, "Hardware acceleration probed");
     if pipeline::hwaccel::waiting_for_gpu_access() {
         // Started before sign-in: GStreamer registered no hardware decoders,
@@ -319,6 +319,13 @@ async fn run() -> anyhow::Result<()> {
 /// Set when the backend stops only to start again (`restart_in_place`).
 static RESTART_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Make the next graceful stop start the backend again (`restart_in_place`),
+/// e.g. to apply a changed video decoder choice. The caller then sends the
+/// shutdown signal.
+pub fn request_restart() {
+    RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Exit status asking a service manager to start the backend again, when it
 /// cannot replace itself (systemd `Restart=on-failure`, the dev supervisor).
 const RESTART_EXIT_CODE: i32 = 75;
@@ -327,7 +334,9 @@ const RESTART_EXIT_CODE: i32 = 75;
 /// environment and PID, so the service manager (systemd, the dev supervisor,
 /// a detached start) sees no exit. Called after a graceful stop: recordings
 /// are finished and the IPC socket closed. Should that fail, exit non-zero so
-/// a service manager starts it again.
+/// a service manager starts it again. Windows cannot replace a process: a
+/// detached copy (same program, arguments, environment and log handles)
+/// starts, and this one exits.
 fn restart_in_place() -> ! {
     #[cfg(unix)]
     {
@@ -338,6 +347,38 @@ fn restart_in_place() -> ! {
                     .args(std::env::args_os().skip(1))
                     .exec();
                 tracing::error!(%error, "Could not restart the backend in place; exiting so it is started again");
+            }
+            Err(error) => {
+                tracing::error!(%error, "Could not find the backend program to restart; exiting so it is started again")
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+        match std::env::current_exe() {
+            Ok(program) => {
+                let spawn = |flags: u32| {
+                    std::process::Command::new(&program)
+                        .args(std::env::args_os().skip(1))
+                        .creation_flags(flags)
+                        .spawn()
+                };
+                // A job that forbids breakaway: still detached.
+                match spawn(flags | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(flags)) {
+                    Ok(child) => {
+                        tracing::info!(pid = child.id(), "Started the backend again");
+                        std::process::exit(0);
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "Could not restart the backend; exiting so it is started again")
+                    }
+                }
             }
             Err(error) => {
                 tracing::error!(%error, "Could not find the backend program to restart; exiting so it is started again")

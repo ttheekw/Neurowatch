@@ -59,3 +59,12 @@ def test_only_an_unreachable_linked_cloud_is_a_problem(cloud, problems) -> None:
     assert list(tray_status(_backend(cloud), "unix:/x").problems) == problems
     labels = [p.label for p in read_status(_backend(cloud), endpoint="unix:/x").problems]
     assert labels == ["1 camera offline", *(label for label, _ in problems)]
+
+
+def test_a_wrong_computer_clock_is_a_tray_problem_with_the_backends_advice() -> None:
+    warning = "This computer's clock is 5 h 30 min ahead of NeuroWatch Cloud."
+    cloud = {"phase": "linked", "cloud_reachable": True, "clock_warning": warning}
+    assert list(tray_status(_backend(cloud), "unix:/x").problems) == [("Clock is wrong", warning)]
+    unreachable = {**cloud, "cloud_reachable": False}
+    labels = [label for label, _ in tray_status(_backend(unreachable), "unix:/x").problems]
+    assert labels == ["Cloud unreachable", "Clock is wrong"]

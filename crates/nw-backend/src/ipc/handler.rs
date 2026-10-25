@@ -814,6 +814,9 @@ impl RpcHandler {
             "debug": {
                 "gst_log": cfg.debug.gst_log,
             },
+            "video": {
+                "decoder": cfg.video.decoder.id(),
+            },
             "events": {
                 "retention_days": cfg.events.retention_days,
                 "push_port": cfg.events.push_port,
@@ -823,11 +826,31 @@ impl RpcHandler {
     }
 
     async fn config_set(&self, params: &Value) -> Result<Value, RpcError> {
-        let mut st = self.state.write().await;
-        st.update_config_settings(params)
-            .map_err(|e| RpcError::internal(e.to_string()))?;
+        let restart = {
+            let mut st = self.state.write().await;
+            let before = st.config.video.decoder;
+            st.update_config_settings(params)
+                .map_err(|e| RpcError::internal(e.to_string()))?;
+            crate::pipeline::hwaccel::needs_restart(before, st.config.video.decoder)
+        };
         tracing::debug!("Config saved via config.set");
-        Ok(json!({ "ok": true }))
+        if !restart {
+            return Ok(json!({ "ok": true }));
+        }
+        // The decoder choice changes GStreamer's process-wide registry, which
+        // cannot be undone: stop gracefully and start again in place, after
+        // this answer is sent. Without a shutdown channel (the web portal's
+        // handler), it applies at the next start.
+        let Some(shutdown) = self.shutdown.clone() else {
+            return Ok(json!({ "ok": true, "restart_required": true }));
+        };
+        tracing::info!("Video decoder choice changed; restarting the backend to apply it");
+        crate::runtime::request_restart();
+        tokio::spawn(async move {
+            tokio::time::sleep(SHUTDOWN_REPLY_GRACE).await;
+            let _ = shutdown.send(());
+        });
+        Ok(json!({ "ok": true, "restarting": true }))
     }
 
     /// Force an atomic re-save of the current in-memory config to disk.
@@ -1037,25 +1060,42 @@ fn decode_password(password_b64: Option<&str>) -> String {
 }
 
 pub fn acceleration_json(kind: crate::pipeline::hwaccel::HwAccelKind) -> Value {
-    if let Some(reason) = crate::pipeline::hwaccel::live_view_block_reason() {
-        return json!({
+    let mut value = if let Some(reason) = crate::pipeline::hwaccel::live_view_block_reason() {
+        json!({
             "kind": "blocked",
             "label": "Live view blocked — update GStreamer",
             "hardware": false,
             "available": false,
             "reason": reason,
+        })
+    } else {
+        let mut value = json!({
+            "kind": kind.wire_kind(),
+            "label": kind.to_string(),
+            "hardware": kind.is_hardware(),
+            "available": true,
         });
-    }
-    let mut value = json!({
-        "kind": kind.wire_kind(),
-        "label": kind.to_string(),
-        "hardware": kind.is_hardware(),
-        "available": true,
-    });
-    if !kind.is_hardware() && crate::pipeline::hwaccel::waiting_for_gpu_access() {
-        value["reason"] = json!(crate::pipeline::hwaccel::GPU_NOT_ACCESSIBLE);
-    }
+        if !kind.is_hardware() && crate::pipeline::hwaccel::waiting_for_gpu_access() {
+            value["reason"] = json!(crate::pipeline::hwaccel::GPU_NOT_ACCESSIBLE);
+        }
+        value
+    };
+    add_decoder_choice(&mut value);
     value
+}
+
+/// The decoder choice (`video.decoder`) this backend applied when it started
+/// and the hardware decoders Settings can offer (additive fields).
+fn add_decoder_choice(value: &mut Value) {
+    use crate::pipeline::hwaccel;
+    value["decoder_preference"] = json!(hwaccel::applied_preference().unwrap_or_default().id());
+    value["available_decoders"] = hwaccel::available_decoders()
+        .iter()
+        .map(|family| json!({ "id": family.preference().id(), "label": family.label() }))
+        .collect();
+    if let Some(warning) = hwaccel::preference_warning() {
+        value["decoder_preference_warning"] = json!(warning);
+    }
 }
 
 #[cfg(test)]
@@ -1263,6 +1303,12 @@ mod tests {
         assert_eq!(response["result"]["video_acceleration"]["kind"], "vaapi");
         assert_eq!(response["result"]["video_acceleration"]["label"], "VA-API");
         assert_eq!(response["result"]["video_acceleration"]["hardware"], true);
+        // The decoder choice: never probed in unit tests, so automatic.
+        assert_eq!(
+            response["result"]["video_acceleration"]["decoder_preference"],
+            "auto"
+        );
+        assert!(response["result"]["video_acceleration"]["available_decoders"].is_array());
         assert_eq!(response["result"]["pid"], std::process::id());
         assert!(response["result"]["version"].is_string());
         assert!(response["result"]["uptime_sec"].is_u64());
@@ -2219,6 +2265,46 @@ mod tests {
         assert_eq!(windows[0]["geometry"]["state"], "maximized");
         assert_eq!(windows[0]["cycling"], false);
         assert!(on_disk.contains("\"desktop\""));
+    }
+
+    #[tokio::test]
+    async fn the_video_decoder_choice_is_saved_validated_and_returned() {
+        let (state, handler, cfg_path) = handler_with_config("video-decoder", AppConfig::default());
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handler = handler.with_shutdown(shutdown_tx);
+        let before = dispatch(&handler, "config.get", json!({})).await;
+        let saved = dispatch(
+            &handler,
+            "config.set",
+            json!({"video": {"decoder": "software"}}),
+        )
+        .await;
+        let refused = dispatch(
+            &handler,
+            "config.set",
+            json!({"site_name": "Changed", "video": {"decoder": "cuda"}}),
+        )
+        .await;
+        let got = dispatch(&handler, "config.get", json!({})).await;
+        let on_disk = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+        teardown(&state, &cfg_path).await;
+
+        assert_eq!(before["result"]["video"]["decoder"], "auto");
+        // No probe ran in this process, so there is nothing to restart.
+        assert_eq!(saved["result"], json!({ "ok": true }));
+        assert!(
+            shutdown_rx.try_recv().is_err(),
+            "no restart without a probe"
+        );
+        assert!(refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("video decoder")));
+        assert_eq!(got["result"]["video"]["decoder"], "software");
+        assert_ne!(
+            got["result"]["site_name"], "Changed",
+            "a refused value changes nothing"
+        );
+        assert!(on_disk.contains("\"decoder\": \"software\""), "{on_disk}");
     }
 
     #[test]

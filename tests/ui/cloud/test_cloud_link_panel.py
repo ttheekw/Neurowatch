@@ -114,3 +114,55 @@ def test_the_panel_uses_the_theme_and_names_where_to_find_the_code(app, qtbot):
     # Where to find the code, in the portal's own words.
     texts = " ".join(label.text() for label in dialog.findChildren(type(dialog.status_label)))
     assert "Recorders → Create enrollment code" in texts
+
+
+def test_the_panel_shows_the_clock_warning_only_when_there_is_one(app, qtbot):
+    warning = "This computer's clock is 5 h 30 min ahead of NeuroWatch Cloud."
+    backend = _FakeBackend(
+        {
+            "phase": "linked",
+            "cloud_configured": True,
+            "last_check_in": "2026-10-25T12:06:00Z",
+            "clock_warning": warning,
+        }
+    )
+    dialog = CloudLinkPanel(rpc=backend)
+    qtbot.addWidget(dialog)
+    qtbot.waitUntil(lambda: dialog.clock_label.text() == warning)
+    assert not dialog.clock_label.isHidden()
+    assert "2026-10-25T12:06:00Z" not in dialog.status_label.text()
+
+    plain = CloudLinkPanel(rpc=_FakeBackend({"phase": "linked", "cloud_configured": True}))
+    qtbot.addWidget(plain)
+    qtbot.waitUntil(lambda: plain.unlink_button.isEnabled())
+    assert plain.clock_label.isHidden()
+
+
+class _ClockRefusingBackend(_FakeBackend):
+    """Refuses the link as a computer with a wrong clock sees it; the status
+    read afterwards carries the warning."""
+
+    def __call__(self, method: str, params: dict, timeout: float) -> dict:
+        self.calls.append((method, params, timeout))
+        if method == "cloud.begin":
+            self.result["clock_warning"] = "This computer's clock is 3 h ahead."
+            raise RuntimeError(
+                "invalid params: unsafe or invalid cloud configuration: the enrollment code "
+                "has expired (codes last five minutes)"
+            )
+        return dict(self.result)
+
+
+def test_a_failed_link_keeps_its_error_and_then_shows_the_clock_warning(app, qtbot):
+    backend = _ClockRefusingBackend({"phase": "unlinked", "cloud_configured": True})
+    dialog = CloudLinkPanel(rpc=backend)
+    qtbot.addWidget(dialog)
+    qtbot.waitUntil(lambda: dialog.link_button.isEnabled())
+
+    dialog.code_edit.setText(CODE)
+    dialog.name_edit.setText("Front office")
+    dialog.link_button.click()
+
+    qtbot.waitUntil(lambda: dialog.clock_label.text() == "This computer's clock is 3 h ahead.")
+    assert [call[0] for call in backend.calls][-2:] == ["cloud.begin", "cloud.status"]
+    assert "time zone" in dialog.error_label.text()

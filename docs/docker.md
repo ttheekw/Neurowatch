@@ -275,12 +275,32 @@ configuration and Qt aborts ("Could not initialize GLX").
 - `publish-docker` (after `publish`) joins the architectures into
   `:<version>`, `:latest`, `:<version>-headless`, `:headless`,
   `:<version>-gui` and `:gui`. Every release, betas included, moves `latest`
-  (as the GitHub Release is marked Latest).
+  (as the GitHub Release is marked Latest). It checks every tag's manifest with
+  an empty Docker configuration to verify anonymous access.
 
 Manual workflow runs build and check the images without pushing. Only the free
 edition is published; NeuroWatch Unlimited buyers build their own image from
-their `.deb` (`scripts/docker.sh build --deb FILE`). The first push creates the
-GHCR package; make it public in the package settings once.
+their `.deb` (`scripts/docker.sh build --deb FILE`).
+
+### First publication: enable public pulls
+
+GHCR creates packages as **private**, even when the source repository is public.
+A successful authenticated push does not mean users can pull the image.
+After the first push, open the
+[NeuroWatch package](https://github.com/users/ttheekw/packages/container/package/neurowatch)
+(forks: use your owner's package page), then **Package settings → Danger Zone →
+Change visibility → Public**. Confirm with the package name `neurowatch`.
+This applies to all tags, including `latest` and `gui`; no rebuild is needed.
+See [GitHub's package visibility documentation](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility#configuring-visibility-of-packages-for-your-personal-account).
+
+If `publish-docker` failed its anonymous access check, rerun that job after the
+visibility change. You can verify access locally without using saved logins:
+
+```bash
+anonymous_config="$(mktemp -d)"
+docker --config "$anonymous_config" manifest inspect ghcr.io/ttheekw/neurowatch:latest
+rm -rf "$anonymous_config"
+```
 
 ## Not tested
 
