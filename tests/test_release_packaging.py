@@ -601,6 +601,30 @@ def test_windows_installer_announces_updates_and_removes_leftovers() -> None:
     assert "Removed [1-9][0-9]* file\\(s\\) left over" in smoke
 
 
+def test_windows_installer_recognizes_every_packaged_top_level_entry() -> None:
+    package = WINDOWS_SCRIPT.read_text()
+    installer = (ROOT / "scripts/installer/windows.iss").read_text()
+    packaged = {
+        name.casefold()
+        for name in re.findall(r"Join-Path \$(?:BundleDir|BundleRoot) '([^']+)'", package)
+        if "/" not in name and "\\" not in name
+    }
+    # The portable marker is removed before the installer is compiled.
+    assert "Remove-Item -Force $PortableMarker" in package
+    packaged.discard(".portable")
+    assert "third_party_notices.md" in packaged
+    classification = installer.split("function IsOwnTopLevel", 1)[1].split(
+        "function AppFolderIsOwn", 1
+    )[0]
+    recognized = set(re.findall(r"Lower = '([^']+)'", classification))
+    manifest = re.search(r"ManifestName = '([^']+)'", installer)
+    assert manifest is not None
+    recognized.add(manifest[1])
+    assert not (packaged - recognized), (
+        f"The installer mistakes bundle entries for unrelated files: {packaged - recognized}"
+    )
+
+
 def test_windows_exe_and_installer_carry_the_app_logo() -> None:
     icon = ROOT / "ui/neurowatch/resources/icons/neurowatch.ico"
     assert icon.read_bytes()[:4] == b"\x00\x00\x01\x00", "an ICO file"
