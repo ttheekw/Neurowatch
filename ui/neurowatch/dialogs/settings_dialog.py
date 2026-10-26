@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import sys
 from copy import deepcopy
+from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTime, Signal
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QSize, Qt, QTime, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -506,17 +507,7 @@ class SettingsDialog(QDialog):
         # ------------------------------------------------------------------
         # Debug
         # ------------------------------------------------------------------
-        debug, debug_form = self._card("Logging", "How much the recorder's media engine logs.")
-        self._gst_log = QComboBox()
-        self._gst_log.addItems(["error", "warning", "info", "debug"])
-        gst_level = self._config.get("debug", {}).get("gst_log", "warning")
-        if gst_level == "warn":
-            gst_level = "warning"
-        idx = self._gst_log.findText(gst_level)
-        if idx >= 0:
-            self._gst_log.setCurrentIndex(idx)
-        debug_form.addRow("GStreamer Log Level:", self._gst_log)
-        self._pages["debug"].addWidget(debug)
+        self._build_debug()
 
         self._build_startup(startup or StartupPrefs(), startup_note)
         self._build_cloud()
@@ -713,6 +704,75 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------------
     # Cloud
     # ------------------------------------------------------------------
+
+    def _build_debug(self) -> None:
+        """Extended debug logging (``debug.extended``): the recorder writes a
+        detailed debug log next to its service log, at once, no restart."""
+        debug_cfg = self._config.get("debug", {})
+        card, form = self._card(
+            "Extended debug logging",
+            "A detailed log for finding problems, such as the recorder stopping or not answering.",
+        )
+        self._extended_debug = QCheckBox("Write an extended debug log")
+        self._extended_debug.setChecked(bool(debug_cfg.get("extended", False)))
+        form.addRow(self._extended_debug)
+        note = QLabel(
+            "Adds the recorder's detailed activity, the media engine's messages, its memory, "
+            "handle and thread use every 30 seconds, and a note whenever it stops answering. "
+            "Takes effect at once. Uses up to 100 MB of disk and a little processor time: "
+            "turn it off when you are done."
+        )
+        note.setWordWrap(True)
+        set_label_role(note, "hint")
+        form.addRow(note)
+
+        self._gst_log = QComboBox()
+        self._gst_log.addItems(["error", "warning", "info", "debug"])
+        gst_level = debug_cfg.get("gst_log", "warning")
+        if gst_level == "warn":
+            gst_level = "warning"
+        idx = self._gst_log.findText(gst_level)
+        if idx >= 0:
+            self._gst_log.setCurrentIndex(idx)
+        self._gst_log.setAccessibleName("GStreamer log level in the debug log")
+        self._gst_log.setEnabled(self._extended_debug.isChecked())
+        self._extended_debug.toggled.connect(self._gst_log.setEnabled)
+        form.addRow("GStreamer Log Level:", self._gst_log)
+
+        log_path = debug_cfg.get("log_path")
+        self._debug_log_path = str(log_path) if isinstance(log_path, str) and log_path else None
+        if self._debug_log_path is not None:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            path_label = QLabel(self._debug_log_path)
+            path_label.setWordWrap(True)
+            path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            set_label_role(path_label, "hint")
+            row_layout.addWidget(path_label, stretch=1)
+            open_folder = QPushButton("Open Folder")
+            open_folder.setAccessibleName("Open the folder with the logs")
+            set_button_variant(open_folder, "secondary")
+            open_folder.clicked.connect(self._open_log_folder)
+            row_layout.addWidget(open_folder)
+            form.addRow("Debug Log:", row)
+        self._pages["debug"].addWidget(card)
+
+    def log_folder(self) -> Path | None:
+        """The folder holding the debug log (and the service log), or its
+        nearest existing parent before the first log is written."""
+        if self._debug_log_path is None:
+            return None
+        folder = Path(self._debug_log_path).parent
+        while not folder.is_dir() and folder != folder.parent:
+            folder = folder.parent
+        return folder
+
+    def _open_log_folder(self) -> None:
+        folder = self.log_folder()
+        if folder is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def _build_cloud(self) -> None:
         """The link panel is made when the tab is first shown (it asks the
@@ -1114,6 +1174,8 @@ class SettingsDialog(QDialog):
         cfg["recording"]["archive"] = self.archive_settings().to_json()
         cfg.setdefault("debug", {})
         cfg["debug"]["gst_log"] = self._gst_log.currentText()
+        cfg["debug"]["extended"] = self._extended_debug.isChecked()
+        cfg["debug"].pop("log_path", None)  # the recorder's to say, not a setting
         cfg.setdefault("video", {})
         cfg["video"]["decoder"] = self.video_decoder()
         return cfg

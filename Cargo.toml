@@ -6,9 +6,11 @@ members  = [
     "crates/nw-cloud-protocol",
     "crates/nw-api",
 ]
+# Vendored, patched LiveKit crate (see [patch] below): not a member.
+exclude = ["third_party/webrtc-sys"]
 
 [workspace.package]
-version      = "0.1.4"
+version      = "0.1.5"
 edition      = "2021"
 authors      = ["Neurowatch Contributors"]
 license      = "Apache-2.0"
@@ -56,3 +58,8 @@ panic         = "abort"
 
 [profile.dev]
 opt-level = 1
+
+# H.265 browser live view: LiveKit's webrtc-sys with pass-through formats
+# always offered (third_party/webrtc-sys/README.md).
+[patch."https://github.com/livekit/rust-sdks"]
+webrtc-sys = { path = "third_party/webrtc-sys" }

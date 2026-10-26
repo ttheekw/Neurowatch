@@ -19,9 +19,7 @@ use nw_core::camera::{CameraConfig, Transport};
 
 use super::{lock, Hub, Media, Phase, SharedUnit};
 use crate::pipeline::builder::{self, gst_quote, is_local_file_url, url_with_credentials_str};
-use crate::pipeline::supervisor::{
-    backoff_duration, backoff_slice, jittered, probe_source, NO_FRAME_TIMEOUT,
-};
+use crate::pipeline::supervisor::{backoff_slice, probe_source, retry_delay, NO_FRAME_TIMEOUT};
 
 const VIDEO_SINK: &str = "hub_video";
 const AUDIO_SINK: &str = "hub_audio";
@@ -193,8 +191,9 @@ pub(super) fn run(hub: Arc<Hub>) {
                 let attempt = failures;
                 failures = failures.saturating_add(1);
                 tracing::debug!(cam_id = %cam_id, attempt = failures, reason = %reason, "Camera connection failed");
+                let wait = retry_delay(attempt, &reason, &cam_id);
                 hub.set_state(Phase::Retrying, failures, Some(reason), delivered);
-                if !rest(&hub, jittered(backoff_duration(attempt), &cam_id, attempt)) {
+                if !rest(&hub, wait) {
                     break;
                 }
             }

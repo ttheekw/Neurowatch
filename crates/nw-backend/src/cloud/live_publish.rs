@@ -97,6 +97,19 @@ impl StreamCodecs {
     /// its codec once seen (`None` until then). A stream with no compressed
     /// video, or one seen in a codec browsers are not sent, is left out.
     pub fn live_streams(&self, camera: &CameraConfig) -> Vec<(Representation, Option<VideoCodec>)> {
+        self.live_streams_described(camera, None)
+    }
+
+    /// [`Self::live_streams`], taking the main stream's codec from what the
+    /// recording connection saw (`described_main`) while no publication has
+    /// opened it yet. Reported as unknown, an H.265 stream was offered to
+    /// browsers and its first live view always failed (the media server
+    /// accepts no H.265), with a publication built and torn down for nothing.
+    pub fn live_streams_described(
+        &self,
+        camera: &CameraConfig,
+        described_main: Option<VideoCodec>,
+    ) -> Vec<(Representation, Option<VideoCodec>)> {
         let seen = self.seen.lock().ok();
         [Representation::Main, Representation::Sub]
             .into_iter()
@@ -113,6 +126,9 @@ impl StreamCodecs {
                 match known {
                     Some(Err(_)) => None,
                     Some(Ok(codec)) => Some((representation, Some(codec))),
+                    None if representation == Representation::Main => {
+                        Some((representation, described_main))
+                    }
                     None => Some((representation, None)),
                 }
             })
@@ -754,6 +770,32 @@ mod tests {
             .live_streams(&camera("http://10.0.0.5/mjpeg", None))
             .is_empty());
         assert!(codecs.live_streams(&camera("/dev/video0", None)).is_empty());
+    }
+
+    #[test]
+    fn the_recordings_codec_is_reported_before_any_live_view() {
+        let codecs = StreamCodecs::default();
+        let cam = camera("rtsp://10.0.0.5/main", Some("rtsp://10.0.0.5/sub"));
+        // Known from the recording connection: the portal will not offer an
+        // H.265 main stream to a browser it cannot reach.
+        assert_eq!(
+            codecs.live_streams_described(&cam, Some(VideoCodec::H265)),
+            vec![
+                (Representation::Main, Some(VideoCodec::H265)),
+                (Representation::Sub, None)
+            ]
+        );
+        // What a publication saw wins.
+        codecs.record(
+            "cam-1",
+            Representation::Main,
+            "rtsp://10.0.0.5/main",
+            Ok(VideoCodec::H264),
+        );
+        assert_eq!(
+            codecs.live_streams_described(&cam, Some(VideoCodec::H265))[0],
+            (Representation::Main, Some(VideoCodec::H264))
+        );
     }
 
     #[test]

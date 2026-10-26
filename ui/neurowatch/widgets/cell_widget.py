@@ -114,6 +114,8 @@ class CellStatus:
     STREAMING = "streaming"
     ERROR = "error"
     RECONNECTING = "reconnecting"
+    # The camera refused the username or password: retrying cannot help.
+    UNAUTHORIZED = "unauthorized"
     NO_SUB = "no_sub"  # grid view but camera has no sub stream configured
 
 
@@ -556,7 +558,7 @@ class CellWidget(QWidget):
                 self._draw_grid_placeholder(painter, rect)
 
             # Dim overlay for OFFLINE / RECONNECTING / NO_SUB states
-            if self._status in (CellStatus.OFFLINE, CellStatus.ERROR):
+            if self._status in (CellStatus.OFFLINE, CellStatus.ERROR, CellStatus.UNAUTHORIZED):
                 painter.fillRect(rect, QColor(0, 0, 0, 100))
                 self._draw_offline_text(painter, rect)
             elif self._status == CellStatus.RECONNECTING:
@@ -943,6 +945,17 @@ class CellWidget(QWidget):
     def _draw_offline_text(self, painter: QPainter, rect: QRect) -> None:
         painter.setPen(_OFFLINE_TEXT)
         painter.setFont(ui_font(14, QFont.Weight.Bold))
+        if self._status == CellStatus.UNAUTHORIZED:
+            painter.drawText(
+                rect.adjusted(0, -14, 0, 0), Qt.AlignmentFlag.AlignCenter, "WRONG PASSWORD"
+            )
+            painter.setFont(ui_font(9))
+            painter.drawText(
+                rect.adjusted(0, 22, 0, 0),
+                Qt.AlignmentFlag.AlignCenter,
+                "The camera refused the username or password. Edit the camera to fix them.",
+            )
+            return
         text = "ERROR" if self._status == CellStatus.ERROR else "OFFLINE"
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
@@ -969,6 +982,8 @@ class CellWidget(QWidget):
             return "NO SUB", QColor(120, 55, 10)
         if self._status == CellStatus.ERROR:
             return "ERROR", _OFFLINE_BADGE_BG
+        if self._status == CellStatus.UNAUTHORIZED:
+            return "WRONG PASSWORD", _OFFLINE_BADGE_BG
         return "OFFLINE", _OFFLINE_BADGE_BG
 
     def _cached_strip(

@@ -164,6 +164,7 @@ class _CameraItem(QWidget):
             "connecting": _DOT_AMBER,
             "reconnecting": _DOT_AMBER,
             "error": _DOT_RED,
+            "unauthorized": _DOT_RED,
             "offline": _DOT_GRAY,
         }
         self._dot.setStyleSheet(f"color: {colors.get(status, _DOT_GRAY)}; font-size: 9px;")
@@ -198,8 +199,8 @@ class _CameraItem(QWidget):
                 "background: #78350f; color: #fde68a; font-size: 9px;"
                 " padding: 0 5px; border-radius: 3px;"
             )
-        elif status == "error":
-            self._badge.setText("Error")
+        elif status in {"error", "unauthorized"}:
+            self._badge.setText("Wrong password" if status == "unauthorized" else "Error")
             self._badge.setStyleSheet(
                 "background: #3f1414; color: #fca5a5; font-size: 9px;"
                 " padding: 0 5px; border-radius: 3px;"
@@ -422,6 +423,7 @@ class CameraPanel(QWidget):
             "reconnecting": 2,
             "offline": 3,
             "error": 4,
+            "unauthorized": 4,
         }
         key = self._sort_key
         if key == "name_asc":

@@ -417,7 +417,8 @@ pub trait PublishedVideoTrack: Send + Sync {
     }
 
     /// The codec this track is actually sent in (`video/h264`, …), once
-    /// negotiated; `None` until then.
+    /// negotiated; `None` until then. [`NO_CODEC`] once the server clearly
+    /// agreed on none (see [`CODEC_NEGOTIATION_LIMIT`]).
     fn negotiated_codec(&self) -> BoxFuture<'_, Option<String>> {
         Box::pin(async { None })
     }
@@ -978,6 +979,12 @@ async fn connect_room(
     // Nothing is received unless asked for: only a viewer's talk track,
     // in a live room, ever is (the token of other rooms cannot subscribe).
     options.auto_subscribe = false;
+    // Publish on a connection of its own. In single-connection mode the SDK
+    // opens with receive-only video sections listing what libwebrtc can
+    // decode, and LiveKit's server takes a session's video codecs from its
+    // first video section, so a forwarded H.265 camera was answered with
+    // VP8. Here the camera's track is the first video section.
+    options.single_peer_connection = false;
     let (room, events) = Room::connect(signaling_url, participant_token, options)
         .await
         .map_err(|error| {
@@ -1102,6 +1109,7 @@ async fn connect_room(
             publication,
             track,
             source,
+            published_at: std::time::Instant::now(),
         })),
         messages: Mutex::new(Some(messages_rx)),
         camera_id: grant.scope.camera_id.clone(),
@@ -1152,6 +1160,7 @@ struct LiveKitSession {
     /// Held so the published track outlives the publication handle.
     track: LocalVideoTrack,
     source: NativeVideoSource,
+    published_at: std::time::Instant,
 }
 
 struct LiveKitPublishedTrack {
@@ -1212,24 +1221,37 @@ impl PublishedVideoTrack for LiveKitPublishedTrack {
     fn negotiated_codec(&self) -> BoxFuture<'_, Option<String>> {
         // The publication's own mime type is not filled in for the publisher,
         // so the sender's RTP stats are asked which codec it sends in.
-        let track = self
-            .session
-            .lock()
-            .ok()
-            .and_then(|session| session.as_ref().map(|session| session.track.clone()));
+        let session = self.session.lock().ok().and_then(|session| {
+            session
+                .as_ref()
+                .map(|session| (session.track.clone(), session.published_at))
+        });
         Box::pin(async move {
-            let stats = track?.get_stats().await.ok()?;
-            let codec_id = stats.iter().find_map(|stat| match stat {
-                livekit::webrtc::stats::RtcStats::OutboundRtp(rtp) => {
-                    Some(rtp.stream.codec_id.clone()).filter(|id| !id.is_empty())
-                }
-                _ => None,
-            })?;
-            stats.iter().find_map(|stat| match stat {
-                livekit::webrtc::stats::RtcStats::Codec(codec) if codec.rtc.id == codec_id => {
-                    Some(codec.codec.mime_type.to_ascii_lowercase()).filter(|mime| !mime.is_empty())
-                }
-                _ => None,
+            let (track, published_at) = session?;
+            let stats = track.get_stats().await.ok()?;
+            let sent_in = stats
+                .iter()
+                .find_map(|stat| match stat {
+                    livekit::webrtc::stats::RtcStats::OutboundRtp(rtp) => {
+                        Some(rtp.stream.codec_id.clone()).filter(|id| !id.is_empty())
+                    }
+                    _ => None,
+                })
+                .and_then(|codec_id| {
+                    stats.iter().find_map(|stat| match stat {
+                        livekit::webrtc::stats::RtcStats::Codec(codec)
+                            if codec.rtc.id == codec_id =>
+                        {
+                            Some(codec.codec.mime_type.to_ascii_lowercase())
+                                .filter(|mime| !mime.is_empty())
+                        }
+                        _ => None,
+                    })
+                });
+            // No codec in common leaves the sender without a send stream,
+            // so it never reports one.
+            sent_in.or_else(|| {
+                (published_at.elapsed() >= CODEC_NEGOTIATION_LIMIT).then(|| NO_CODEC.to_owned())
             })
         })
     }
@@ -1384,6 +1406,13 @@ const MIN_FRAME_SPACING_US: i64 = 1_000;
 /// Longest a publication holds its pictures waiting for a viewer's first
 /// keyframe request; past it, it sends anyway.
 const AWAIT_VIEWER_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Longest a published track's sender may report no codec. A camera's
+/// track offers only the camera's codec, so a media server without it
+/// agrees on none, and the sender then never sends: past this, the track
+/// reports [`NO_CODEC`] and the publication is refused.
+const CODEC_NEGOTIATION_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// What a track reports as its codec when negotiation settled on none.
+const NO_CODEC: &str = "none";
 
 /// Least real time between two units handed to the track. WebRTC encodes
 /// only the newest of frames that arrive while its encoder queue is busy, so
@@ -1523,6 +1552,7 @@ impl<C: RoomConnector> EncodedMediaBridge<C> {
                         );
                         return Err(PublishError::CodecRefused);
                     }
+                    tracing::debug!(session = %grant.session_id, %negotiated, "media server accepted the camera's codec");
                     codec_confirmed = true;
                 }
             }
@@ -3224,7 +3254,7 @@ mod tests {
         let units = std::sync::Arc::clone(&submitter);
         let source = format!(
             "videotestsrc name=camera_source is-live=true num-buffers=600 ! \
-             video/x-raw,width=320,height=240,framerate=30/1 ! \
+             video/x-raw,format=I420,width=320,height=240,framerate=30/1 ! \
              {encoder} name=camera_encoder tune=zerolatency key-int-max=30 {rate}! {payloader} name=camera_pay ! \
              application/x-rtp,media=video ! parsebin name=encoded_parse"
         );
@@ -3279,6 +3309,23 @@ mod tests {
             expected,
             "the camera's own codec reaches the viewer"
         );
+
+        if codec == VideoCodec::H265 {
+            // This viewer decodes with libwebrtc, which has no H.265 decoder
+            // (a browser decodes it itself), so the server sends it no video.
+            // A sender not sending H.265 is refused within the limit.
+            tokio::time::sleep(CODEC_NEGOTIATION_LIMIT + std::time::Duration::from_secs(1)).await;
+            cancel.cancel();
+            assert_eq!(
+                publishing.await.unwrap(),
+                Ok(()),
+                "the sender sends the camera's H.265"
+            );
+            pipeline.set_state(gstreamer::State::Null).unwrap();
+            let _ = viewer.close().await;
+            assert_eq!(submitter.dropped(), 0, "nothing was dropped on the way");
+            return;
+        }
 
         let mut stream =
             livekit::webrtc::video_stream::native::NativeVideoStream::new(track.rtc_track());

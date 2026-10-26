@@ -64,3 +64,8 @@ use it.
 
 Third-party software (GStreamer, Qt/PySide6, FFmpeg and the Rust and Python
 libraries this program uses) is under its own licences.
+
+The vendored LiveKit webrtc-sys bindings are Copyright LiveKit, Inc. and
+licensed under Apache-2.0, with additional attributions in their NOTICE.md.
+Release packages include THIRD_PARTY_NOTICES.md with those notices and the
+licences of the native libwebrtc build and its dependencies.

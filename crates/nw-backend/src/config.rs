@@ -196,15 +196,23 @@ fn default_status_opacity() -> u8 {
     DEFAULT_STATUS_OPACITY
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DebugConfig {
+    /// How much GStreamer's own log adds to the debug log, while
+    /// `extended` is on (`logging`).
     pub gst_log: String,
+    /// Extended debug logging: a detailed, size-capped debug log next to the
+    /// service log, with GStreamer's messages, resource heartbeats and stall
+    /// reports (`logging`, `debug_monitor`). Applied at once, no restart.
+    #[serde(default)]
+    pub extended: bool,
 }
 
 impl Default for DebugConfig {
     fn default() -> Self {
         Self {
             gst_log: "warn".into(),
+            extended: false,
         }
     }
 }

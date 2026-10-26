@@ -141,6 +141,7 @@ class CameraSidebar(QWidget):
             "streaming": "#32dc50",
             "connecting": "#e6c820",
             "error": "#dc3232",
+            "unauthorized": "#dc3232",
             "offline": "#606070",
         }
         color = color_map.get(status, "#606070")

@@ -112,3 +112,41 @@ def test_the_settings_window_opens_wide_and_resizes(qtbot, monkeypatch) -> None:
     assert dlg.width() >= wanted
     assert dlg.width() <= screen.width() * 0.75 or dlg.width() <= 900
     assert dlg.findChild(window_chrome.EdgeResizer) is not None, "drag its edges"
+
+
+def test_extended_debug_logging_is_a_setting(qtbot, monkeypatch, tmp_path) -> None:
+    log_path = tmp_path / "state" / "logs" / "backend-debug.log"
+    dlg = _dialog(
+        qtbot,
+        monkeypatch,
+        {"debug": {"gst_log": "warn", "extended": False, "log_path": str(log_path)}},
+    )
+    assert dlg._stack.widget(6).isAncestorOf(dlg._extended_debug)
+    assert not dlg._extended_debug.isChecked()
+    assert not dlg._gst_log.isEnabled(), "GStreamer's level matters only in the debug log"
+    assert dlg._gst_log.currentText() == "warning"
+
+    dlg._extended_debug.setChecked(True)
+    assert dlg._gst_log.isEnabled()
+    dlg._gst_log.setCurrentText("info")
+    debug = dlg.get_config()["debug"]
+    assert debug == {"gst_log": "info", "extended": True}, "the log's path is not a setting"
+
+    # Before the first debug log, the folder offered is the nearest one there.
+    assert dlg.log_folder() == tmp_path
+    log_path.parent.mkdir(parents=True)
+    assert dlg.log_folder() == log_path.parent
+    opened: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog.QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile())
+    )
+    dlg._open_log_folder()
+    assert opened == [str(log_path.parent)]
+
+
+def test_an_older_recorder_without_a_debug_log_path_shows_no_folder(qtbot, monkeypatch) -> None:
+    dlg = _dialog(qtbot, monkeypatch, {"debug": {"gst_log": "debug", "extended": True}})
+    assert dlg._extended_debug.isChecked() and dlg._gst_log.isEnabled()
+    assert dlg.log_folder() is None
+    labels = [label.text() for label in dlg._stack.widget(6).findChildren(QLabel)]
+    assert "Debug Log:" not in labels

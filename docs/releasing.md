@@ -147,7 +147,9 @@ manually publishing while its run is in progress.
 - Clean containers install and remove the actual packages: Ubuntu 22.04/24.04,
   Debian 12/13, Fedora 43 and Arch (x86_64); Ubuntu 24.04, Debian 13 and
   Fedora 43 (arm64). Every generated Linux package therefore has a native
-  install, packaged-service/media, removal and residue check.
+  install, packaged-service/media, update, removal and residue check: the
+  update reinstalls the package over planted stale files (an old
+  `neurowatch-*.dist-info`, an old plugin) and requires them gone.
 - Both Docker images (headless, gui) are built from the free `.deb` on both
   architectures and run with `scripts/docker_smoke.sh`: healthy backend as a
   non-root user on mounted volumes, the expected mode and edition, the gui
@@ -155,7 +157,8 @@ manually publishing while its run is in progress.
   `publish-docker` tags the multi-architecture images after it.
 - Windows silently installs into a path with spaces, exercises the installed
   service and media runtime with the build SDK removed from `PATH` and temporarily
-  renamed on the disposable runner, and uninstalls.
+  renamed on the disposable runner, installs again over planted stale files
+  (they must be gone and the setup log must report the update), and uninstalls.
 - Checks use temporary configuration and IPC locations, no cameras, and
   `--no-autostart`. Linux data/cache locations are also temporary. Windows checks
   run only on the disposable Actions account because Rust uses Windows Known
@@ -169,6 +172,13 @@ Windows ARM, macOS, Alpine, RHEL and openSUSE are not qualified by this
 workflow.
 
 ## Bundled media runtime
+
+Every bundle also includes `THIRD_PARTY_NOTICES.md`: the LiveKit bindings'
+licence and notices, plus the native libwebrtc SDK's dependency licences for
+that build target. Cargo exports these during the build; packaging fails if
+they are missing. The vendored bindings omit the separately licensed NVIDIA
+SDK samples and disable their optional CUDA/Jetson codec build paths (desktop
+hardware decoding still uses GStreamer).
 
 Linux builds matched GStreamer core/base/good/bad/libav **1.24.13**, including the
 fixed `va` plugin, and a minimal LGPL FFmpeg **6.1.5**. See

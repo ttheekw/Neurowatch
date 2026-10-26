@@ -332,7 +332,7 @@ From a copy of this repository, `scripts/docker.sh headless` or `scripts/docker.
 
 **The tray icon doesn't appear (Ubuntu/GNOME).** GNOME needs the *AppIndicator* extension to show tray icons. Ubuntu includes it. On other GNOME desktops, install "AppIndicator and KStatusNotifierItem Support". NeuroWatch keeps recording either way.
 
-**NeuroWatch doesn't start, or stops.** Run `neurowatch service status`. The service log is at `~/.local/state/neurowatch/logs/service.log` (Linux) or `%LOCALAPPDATA%\Neurowatch\logs\service.log` (Windows). On Linux with the system service, `journalctl --user -u neurowatch-backend` also shows it.
+**NeuroWatch doesn't start, or stops.** Run `neurowatch service status`. The service log is at `~/.local/state/neurowatch/logs/service.log` (Linux) or `%LOCALAPPDATA%\Neurowatch\logs\service.log` (Windows). On Linux with the system service, `journalctl --user -u neurowatch-backend` also shows it. If the recorder stops unexpectedly, it starts again by itself, and the log says how it stopped. To find out more, turn on Settings → **Debug** → **Write an extended debug log**: it writes `backend-debug.log` in the same folder (**Open Folder**). Turn it off when you are done.
 
 **A headless computer doesn't start NeuroWatch at boot.** Some systems don't let an account start its services at boot. Run `sudo loginctl enable-linger $USER` once.
 

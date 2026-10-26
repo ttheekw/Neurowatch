@@ -54,9 +54,9 @@ Write-Host '[1/6] Building backend (release)'
 $BackendManifest = if ($env:NW_BACKEND_MANIFEST) { $env:NW_BACKEND_MANIFEST } else { Join-Path $Root 'Cargo.toml' }
 $BackendPackage = if ($env:NW_BACKEND_PACKAGE) { $env:NW_BACKEND_PACKAGE } else { 'nw-backend' }
 $BackendTarget = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path (Split-Path -Parent $BackendManifest) 'target' }
-$CargoArgs = @('build', '--manifest-path', $BackendManifest, '--release', '--locked', '-p', $BackendPackage)
+$CargoArgs = @('build', '--manifest-path', $BackendManifest, '--release', '--locked', '-p', $BackendPackage, '--message-format=json-render-diagnostics')
 if ($Edition -eq 'unlimited') { $CargoArgs += @('--features', 'nw-backend/unlimited') }
-Invoke-Native 'cargo' $CargoArgs
+Invoke-Native 'cargo' $CargoArgs | Set-Content -Encoding utf8 (Join-Path $WorkDir 'backend-build.jsonl')
 Copy-Item (Join-Path $BackendTarget 'release/nw-backend.exe') (Join-Path $BundleDir 'bin/nw-backend.exe') -Force
 # The licence and notice ship with every artifact.
 Copy-Item (Join-Path $Root 'LICENSE') (Join-Path $BundleDir 'LICENSE') -Force
@@ -64,6 +64,7 @@ Copy-Item (Join-Path $Root 'NOTICE') (Join-Path $BundleDir 'NOTICE') -Force
 
 Write-Host '[2/6] Packaging UI from pyproject.toml with PyInstaller'
 $Python = if ($env:PYTHON) { $env:PYTHON } else { 'python' }
+Invoke-Native $Python @((Join-Path $Root 'scripts/collect_backend_notices.py'), (Join-Path $WorkDir 'backend-build.jsonl'), (Join-Path $BundleDir 'THIRD_PARTY_NOTICES.md'))
 Invoke-Native $Python @('-m', 'venv', $Venv)
 $VenvPython = Join-Path $Venv 'Scripts/python.exe'
 Invoke-Native $VenvPython @('-m', 'pip', 'install', '--upgrade', 'pip')
@@ -149,10 +150,30 @@ exit /b %ERRORLEVEL%
 '@
 Set-Content -Path (Join-Path $BundleDir 'neurowatch.cmd') -Value $Cmd -Encoding ASCII
 
+# Every build lists its own program files: after an update the installer (and
+# a portable copy, when it starts) removes anything else under these folders
+# (windows.iss RemoveLeftovers, ui/neurowatch/service/leftovers.py).
+$BundleRoot = (Resolve-Path $BundleDir).Path.TrimEnd('\')
+$Listed = foreach ($dir in @('app', 'bin', 'gstreamer')) {
+    "$dir\"
+    Get-ChildItem -LiteralPath (Join-Path $BundleRoot $dir) -Recurse -Force | ForEach-Object {
+        $relative = $_.FullName.Substring($BundleRoot.Length + 1)
+        if ($_.PSIsContainer) { "$relative\" } else { $relative }
+    }
+}
+# The installer reads it as plain ASCII.
+$NonAscii = @($Listed | Where-Object { $_ -match '[^\x20-\x7E]' })
+if ($NonAscii.Count -gt 0) { throw "Bundle file names must be ASCII: $($NonAscii[0])" }
+Set-Content -Path (Join-Path $BundleRoot '.neurowatch-files') -Value $Listed -Encoding ascii
+
 Write-Host '[5/6] Creating zip'
 $ZipPath = Join-Path $OutDir "neurowatch-$Version-windows-x86_64.zip"
 if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
+# Only the portable copy cleans up after itself when it starts.
+$PortableMarker = Join-Path $BundleRoot '.portable'
+Set-Content -Path $PortableMarker -Value '' -Encoding ascii
 Compress-Archive -Path (Join-Path $WorkDir 'bundle/neurowatch') -DestinationPath $ZipPath
+Remove-Item -Force $PortableMarker
 Write-Host "Zip ready: $ZipPath"
 
 Write-Host '[6/6] Creating Windows installer'

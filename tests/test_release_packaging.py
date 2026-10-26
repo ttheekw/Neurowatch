@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import struct
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -501,6 +503,104 @@ def test_windows_installer_code_section_has_no_ini_style_comments() -> None:
     assert not [line for line in code.splitlines() if line.lstrip().startswith(";")]
 
 
+def test_every_build_lists_its_own_files_and_only_portable_copies_clean_themselves() -> None:
+    # An update must leave nothing of the old version: copying over it kept a
+    # neurowatch-<old>.dist-info and the window showed the old version.
+    linux = LINUX_SCRIPT.read_text()
+    listing = linux.index('> "$BUNDLE_DIR/.neurowatch-files"')
+    assert listing < linux.index('cp -a "$BUNDLE_DIR/." "$STAGE$INSTALL_PREFIX/"')
+    assert "find app bin gstreamer" in linux
+    portable = linux[linux.index("build_portable() {") : linux.index("build_deb() {")]
+    assert portable.index('touch "$BUNDLE_DIR/.portable"') < portable.index("tar -C")
+    assert portable.index("tar -C") < portable.index('rm -f "$BUNDLE_DIR/.portable"')
+    windows = WINDOWS_SCRIPT.read_text()
+    assert "foreach ($dir in @('app', 'bin', 'gstreamer'))" in windows
+    assert windows.index("'.neurowatch-files'") < windows.index("Compress-Archive")
+    marker = windows.index("$PortableMarker = Join-Path $BundleRoot '.portable'")
+    unmarked = windows.index("Remove-Item -Force $PortableMarker")
+    zipped = windows.index("Compress-Archive")
+    assert marker < zipped < unmarked < windows.index("Invoke-Native $ISCC")
+    main = (ROOT / "ui/neurowatch/main.py").read_text()
+    cleaned = main.index("leftovers = clean_portable_copy()")
+    assert cleaned < main.index('if launch.mode == "service":')
+
+
+def test_linux_packages_announce_updates_and_remove_leftovers() -> None:
+    linux = LINUX_SCRIPT.read_text()
+    deb = linux[linux.index("build_deb() {") : linux.index("build_rpm() {")]
+    assert 'neurowatch_update_notice "$2"' in deb and 'DEBIAN/preinst"' in deb
+    postinst = deb[deb.index('"$GPU_ACCESS" "$LEFTOVERS"') : deb.index('DEBIAN/postinst"')]
+    assert "neurowatch_remove_leftovers" in postinst
+    rpm = linux[linux.index("build_rpm() {") : linux.index("build_arch() {")]
+    pre = rpm[rpm.index("\n%pre\n") : rpm.index("\n%post\n")]
+    assert 'neurowatch_update_notice "" "$RPM_VERSION"' in pre
+    posttrans = rpm[rpm.index("\n%posttrans\n") : rpm.index("\n%postun\n")]
+    assert "neurowatch_remove_leftovers" in posttrans
+    arch = linux[linux.index("build_arch() {") :]
+    assert "pre_upgrade() {\\n    neurowatch_update_notice" in arch
+    assert arch.count("neurowatch_remove_leftovers") == 2  # post_install, post_upgrade
+    # Inside rpm scriptlets a percent sign is a macro.
+    assert "%" not in (ROOT / "scripts/installer/linux/leftovers.sh").read_text()
+    smoke = (ROOT / "scripts/smoke_linux_package.sh").read_text()
+    assert "--reinstall" in smoke and "The update left old files behind" in smoke
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+def test_linux_leftover_cleanup_removes_only_unlisted_program_files(tmp_path: Path) -> None:
+    internal = tmp_path / "app/neurowatch-ui/_internal"
+    for name in ("neurowatch-0.1.2.dist-info", "neurowatch-0.1.4.dist-info"):
+        (internal / name).mkdir(parents=True)
+        (internal / name / "METADATA").write_text("")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin/nw-backend").write_text("")
+    (tmp_path / "bin/name with space").write_text("")
+    (tmp_path / "bin/backend-link").symlink_to("nw-backend")
+    (tmp_path / "gstreamer/lib/old").mkdir(parents=True)
+    (tmp_path / "gstreamer/lib/old/libgstold.so").write_text("")
+    (tmp_path / "gstreamer/lib/kept-empty").mkdir()
+    (tmp_path / "notes.txt").write_text("")
+    listed = [
+        "app/", "app/neurowatch-ui/", "app/neurowatch-ui/_internal/",
+        "app/neurowatch-ui/_internal/neurowatch-0.1.4.dist-info/",
+        "app/neurowatch-ui/_internal/neurowatch-0.1.4.dist-info/METADATA",
+        "bin/", "bin/backend-link", "bin/name with space", "bin/nw-backend",
+        "gstreamer/", "gstreamer/lib/", "gstreamer/lib/kept-empty/",
+    ]  # fmt: skip
+    (tmp_path / ".neurowatch-files").write_text("\n".join(listed) + "\n")
+    script = ROOT / "scripts/installer/linux/leftovers.sh"
+    result = subprocess.run(
+        ["sh", "-c", f'set -e; . "{script}"; neurowatch_remove_leftovers "$1"', "sh", tmp_path],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "removed 2 file(s) left over from an earlier version" in result.stdout
+    assert not (internal / "neurowatch-0.1.2.dist-info").exists()
+    assert not (tmp_path / "gstreamer/lib/old").exists()
+    for kept in [*listed, "notes.txt"]:
+        assert (tmp_path / kept).exists() or (tmp_path / kept).is_symlink(), kept
+
+
+def test_windows_installer_announces_updates_and_removes_leftovers() -> None:
+    script = (ROOT / "scripts/installer/windows.iss").read_text()
+    # The previous installation's version, before this one replaces the record.
+    assert "{CDAA8C42-A8C6-4F7F-8A44-53B962D38052}_is1" in script
+    assert "AppId={{CDAA8C42-A8C6-4F7F-8A44-53B962D38052}" in script
+    assert "RegQueryStringValue(HKA, UninstallKey, 'DisplayVersion', PreviousVersion)" in script
+    assert "CreateOutputMsgPage(wpWelcome, 'Update NeuroWatch'" in script
+    assert "Your settings, cameras and recordings are kept." in script
+    post_install = script[script.index("procedure CurStepChanged") :]
+    assert "CurStep = ssPostInstall" in post_install and "RemoveLeftovers();" in post_install
+    assert "'NeuroWatch was updated from '" in script
+    # Never whole folders by name: NeuroWatch may share {app} with other programs.
+    assert "[InstallDelete]" not in script
+    assert "if AppFolderIsOwn(Root) then" in script
+    assert "RemoveUnlisted(Root, 'app\\neurowatch-ui', Listed);" in script
+    smoke = (ROOT / "scripts/smoke_windows_installer.ps1").read_text()
+    assert "The update left old files behind" in smoke
+    assert "Removed [1-9][0-9]* file\\(s\\) left over" in smoke
+
+
 def test_windows_exe_and_installer_carry_the_app_logo() -> None:
     icon = ROOT / "ui/neurowatch/resources/icons/neurowatch.ico"
     assert icon.read_bytes()[:4] == b"\x00\x00\x01\x00", "an ICO file"
@@ -645,7 +745,7 @@ def test_linux_packages_give_users_the_graphics_card_from_boot() -> None:
     script = (ROOT / "scripts/package_release_linux.sh").read_text()
     access = (ROOT / "scripts/installer/linux/gpu-access.sh").read_text()
     assert 'GPU_ACCESS="$(cat "$LINUX_FILES/gpu-access.sh")"' in script
-    assert "configure) neurowatch_grant_gpu_access" in script
+    assert "configure)\\n        neurowatch_grant_gpu_access" in script
     assert "remove|purge) neurowatch_revoke_gpu_access" in script
     assert '"$root/DEBIAN/postinst"' in script and '"$root/DEBIAN/postrm"' in script
     assert "%post\n$GPU_ACCESS\nneurowatch_grant_gpu_access" in script
@@ -813,3 +913,62 @@ def test_the_release_manifest_lists_both_editions(tmp_path: Path) -> None:
     assert [v["version"] for v in index["versions"]] == ["v1.2.3", "v1.2.2"]
     assert index["versions"][0]["free"] == data["free"]
     assert module.merged_index("garbage", data)["versions"] == [data]
+
+
+COLLECTOR = ROOT / "scripts/collect_backend_notices.py"
+
+
+@pytest.mark.parametrize("bom", [False, True])
+@pytest.mark.parametrize("package", ["webrtc-sys@0.3.46", "0.3.46"])
+def test_collects_notices_from_the_selected_build(tmp_path: Path, bom: bool, package: str) -> None:
+    out = tmp_path / "build with spaces"
+    out.mkdir()
+    expected = "LiveKit, WebRTC and dependency notices\nCopyright holders\n"
+    (out / "THIRD_PARTY_NOTICES.md").write_text(expected, encoding="utf-8")
+    messages = tmp_path / "build.jsonl"
+    messages.write_text(
+        "\n".join(
+            json.dumps(message)
+            for message in [
+                {"reason": "compiler-artifact", "package_id": "other"},
+                {
+                    "reason": "build-script-executed",
+                    "package_id": "path+file:///repo/third_party/another-sys#0.3.46",
+                    "out_dir": str(tmp_path / "unrelated"),
+                },
+                {
+                    "reason": "build-script-executed",
+                    "package_id": f"path+file:///repo/third_party/webrtc-sys#{package}",
+                    "out_dir": str(out),
+                },
+            ]
+        ),
+        encoding="utf-8-sig" if bom else "utf-8",
+    )
+    destination = tmp_path / "bundle notices.md"
+    subprocess.run([sys.executable, str(COLLECTOR), str(messages), str(destination)], check=True)
+    assert destination.read_text(encoding="utf-8") == expected
+
+
+@pytest.mark.parametrize("missing_file", [False, True])
+def test_missing_notices_fail_packaging(tmp_path: Path, missing_file: bool) -> None:
+    message = (
+        {
+            "reason": "build-script-executed",
+            "package_id": "webrtc-sys 0.3.46 (path+file:///repo)",
+            "out_dir": str(tmp_path),
+        }
+        if missing_file
+        else {"reason": "compiler-artifact", "package_id": "other"}
+    )
+    messages = tmp_path / "build.jsonl"
+    messages.write_text(json.dumps(message), encoding="utf-8")
+    destination = tmp_path / "notices.md"
+    result = subprocess.run(
+        [sys.executable, str(COLLECTOR), str(messages), str(destination)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "did not provide webrtc-sys dependency notices" in result.stderr
+    assert not destination.exists()

@@ -522,6 +522,8 @@ async fn run(
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
     let mut refusal = None;
+    // Why the connection ended, for the log.
+    let mut reason = String::from("stopped");
     loop {
         tokio::select! {
             changed = stop.changed() => {
@@ -537,23 +539,23 @@ async fn run(
                 tracing::info!(target: "cloud_ws::message", node_id = %binding.node,
                     method = %command.method, bytes = command.text.len(), "[ws.message] sent");
                 let sent = clock.system_now();
-                if !matches!(tokio::time::timeout(Duration::from_secs(5), writer.send(Message::Text(command.text.into()))).await, Ok(Ok(()))) { break; }
+                if !matches!(tokio::time::timeout(Duration::from_secs(5), writer.send(Message::Text(command.text.into()))).await, Ok(Ok(()))) { reason = "send failed".into(); break; }
                 pending.insert(command.id, Inflight { method: command.method, deadline: command.deadline, reply: Some(command.reply), sent });
             }
             frame = reader.next() => {
                 match frame {
                     Some(Ok(Message::Text(text))) => {
-                        let Ok(raw) = serde_json::from_str::<Value>(text.as_str()) else { break; };
+                        let Ok(raw) = serde_json::from_str::<Value>(text.as_str()) else { reason = "invalid message".into(); break; };
                         if raw.get("id").is_none() {
                             // An event carries no data, so an unknown topic is only skipped.
-                            let Some(topic) = raw["event"].as_str() else { break; };
+                            let Some(topic) = raw["event"].as_str() else { reason = "invalid message".into(); break; };
                             if let Some(topic) = signals.wake(topic) {
                                 tracing::info!(target: "cloud_ws::message", node_id = %binding.node,
                                     event = topic, "[ws.event] received");
                             }
                             continue;
                         }
-                        let Some(id) = raw["id"].as_str() else { break; };
+                        let Some(id) = raw["id"].as_str() else { reason = "invalid message".into(); break; };
                         let Some(request) = pending.remove(id) else { continue; };
                         observe_server_time(&clock, &raw, request.sent);
                         tracing::info!(target: "cloud_ws::message", node_id = %binding.node,
@@ -567,30 +569,36 @@ async fn run(
                             }
                         }
                         if let Some(reply) = request.reply { let _ = reply.send(result); }
-                        if refusal.is_some() { break; }
+                        if refusal.is_some() { reason = "refused".into(); break; }
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        if !matches!(tokio::time::timeout(Duration::from_secs(5), writer.send(Message::Pong(data))).await, Ok(Ok(()))) { break; }
+                        if !matches!(tokio::time::timeout(Duration::from_secs(5), writer.send(Message::Pong(data))).await, Ok(Ok(()))) { reason = "send failed".into(); break; }
                     }
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Close(close))) => {
+                        reason = match &close {
+                            Some(frame) => format!("closed by the cloud ({})", u16::from(frame.code)),
+                            None => "closed by the cloud".into(),
+                        };
                         if close.is_some_and(|c| u16::from(c.code) == 4401) { refusal = Some(401); }
                         break;
                     }
-                    _ => break,
+                    Some(Err(error)) => { reason = format!("read failed: {error}"); break; }
+                    None => { reason = "connection ended".into(); break; }
+                    _ => { reason = "unexpected frame".into(); break; }
                 }
             }
             _ = check.tick() => {
-                if !inner.lock().is_ok_and(|state| binding.still_linked(&state)) { break; }
+                if !inner.lock().is_ok_and(|state| binding.still_linked(&state)) { reason = "unlinked".into(); break; }
                 let now = Instant::now();
-                if pending.values().any(|p| p.reply.is_none() && p.deadline <= now) { break; }
+                if pending.values().any(|p| p.reply.is_none() && p.deadline <= now) { reason = "heartbeat not answered in time".into(); break; }
                 pending.retain(|_, p| p.deadline > now && p.reply.as_ref().map_or(true, |r| !r.is_closed()));
                 if now >= next_heartbeat {
                     let id = uuid::Uuid::new_v4().simple().to_string();
                     let text = json!({"id":id,"method":"heartbeat","body":{}}).to_string();
                     tracing::info!(target: "cloud_ws::message", node_id = %binding.node, method = "heartbeat", "[ws.message] sent");
                     let sent = clock.system_now();
-                    if !matches!(tokio::time::timeout(Duration::from_secs(5), writer.send(Message::Text(text.into()))).await, Ok(Ok(()))) { break; }
+                    if !matches!(tokio::time::timeout(Duration::from_secs(5), writer.send(Message::Text(text.into()))).await, Ok(Ok(()))) { reason = "send failed".into(); break; }
                     pending.insert(id, Inflight { method: "heartbeat".into(), deadline: now + HEARTBEAT_TIMEOUT, reply: None, sent });
                     next_heartbeat = now + HEARTBEAT_INTERVAL;
                 }
@@ -625,7 +633,7 @@ async fn run(
             .send(Err(CloudError::Network("WebSocket disconnected".into())));
     }
     let _ = tokio::time::timeout(Duration::from_secs(1), writer.close()).await;
-    tracing::info!(target: "cloud_ws::connection", node_id = %binding.node, "[ws.connection] disconnected");
+    tracing::info!(target: "cloud_ws::connection", node_id = %binding.node, %reason, "[ws.connection] disconnected");
 }
 
 #[cfg(test)]

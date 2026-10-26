@@ -254,7 +254,7 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
                 |camera| {
                     Some(
                         codecs
-                            .live_streams(camera)
+                            .live_streams_described(camera, st.camera_main_codec(&camera.id))
                             .into_iter()
                             .map(|(representation, codec)| {
                                 (representation.code(), codec.map(|c| c.code()))

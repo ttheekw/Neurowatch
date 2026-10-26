@@ -230,6 +230,12 @@ pub const DIRECTIVE_EVENT_FALLBACK: Duration = Duration::from_secs(10);
 /// Directive pulls are at least this far apart however often events arrive,
 /// which keeps them inside the cloud's per-node challenge allowance.
 pub const DIRECTIVE_MIN_GAP: Duration = Duration::from_secs(2);
+/// How long active publications outlive failed directive pulls. A control
+/// connection that drops and reconnects (usually within 1-3 s, and pulls again
+/// at once) must not end every live view; past this they stop. Grants are
+/// refreshed with 30 s to spare and each publication's lease still ends it at
+/// its grant's expiry, so nothing is published longer than a grant allows.
+pub const DIRECTIVE_OUTAGE_GRACE: Duration = Duration::from_secs(30);
 
 /// Pause a scheduler loop until `deadline`, or until `wake` fires, but never
 /// resume before `earliest`: an event that arrives sooner is kept and acted
@@ -3159,6 +3165,7 @@ impl CloudScheduler {
             let directive_period = self.interval.min(Duration::from_secs(5));
             let signals = Arc::clone(&self.node.signals);
             let mut last_directive_pull: Option<tokio::time::Instant> = None;
+            let mut last_directive_success: Option<tokio::time::Instant> = None;
             // An event asked for a pull, made once the minimum gap allows.
             let mut directive_wanted = false;
             let mut change_tick = Self::ticker(INVENTORY_CHANGE_CHECK);
@@ -3252,19 +3259,23 @@ impl CloudScheduler {
                         directive_wanted = false;
                         if self.node.status().phase == LinkPhase::Linked {
                             let sink = self.directives.as_ref().expect("guarded directive sink");
-                            match tokio::time::timeout(budget, self.node.pull_publish_directives()).await {
+                            let failure = match tokio::time::timeout(budget, self.node.pull_publish_directives()).await {
                                 Ok(Ok(batch)) => {
+                                    last_directive_success = Some(tokio::time::Instant::now());
                                     sink(batch.clone()).await;
                                     if let Err(error) = self.node.acknowledge_consumed_directives(&batch) {
                                         tracing::warn!(error = %error, "Could not persist directive acknowledgements");
                                     }
+                                    None
                                 },
-                                Ok(Err(error)) => {
-                                    tracing::warn!(error = %error, "Cloud publish-directive pull failed; stopping active publications");
-                                    sink(empty_publish_directive_batch()).await;
-                                }
-                                Err(_) => {
-                                    tracing::warn!("Cloud publish-directive pull timed out; stopping active publications");
+                                Ok(Err(error)) => Some(error.to_string()),
+                                Err(_) => Some("timed out".to_owned()),
+                            };
+                            if let Some(error) = failure {
+                                if last_directive_success.is_some_and(|at| at.elapsed() < DIRECTIVE_OUTAGE_GRACE) {
+                                    tracing::warn!(%error, "Cloud publish-directive pull failed; keeping active publications while the cloud is retried");
+                                } else {
+                                    tracing::warn!(%error, "Cloud publish-directive pull failed; stopping active publications");
                                     sink(empty_publish_directive_batch()).await;
                                 }
                             }

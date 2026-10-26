@@ -82,7 +82,7 @@ livekit-api        = { version = "0.8.0", default-features = false, features = [
 # Windows frame rings use named pagefile-backed sections (no /dev/shm); the
 # performance readings use the CPU time, memory and network adapter counters.
 [target.'cfg(windows)'.dependencies]
-windows-sys        = { version = "0.60", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys        = { version = "0.60", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [build-dependencies]
 # Host dependency; build.rs compiles resources only for Windows targets.

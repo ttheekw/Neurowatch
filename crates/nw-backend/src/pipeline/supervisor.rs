@@ -991,6 +991,33 @@ pub(crate) fn jittered(base: Duration, cam_id: &CameraId, attempt: u32) -> Durat
     Duration::from_millis((millis + millis * offset / 1000).max(0) as u64)
 }
 
+/// Status of a camera that refused the username or password (RTSP 401):
+/// retrying cannot help until they change. Shown as "Wrong password", not as
+/// an offline or reconnecting camera.
+pub(crate) const UNAUTHORIZED: &str = "unauthorized";
+
+/// The wait after a refused username or password. Cameras lock a client out
+/// after a few wrong logins (Hikvision for 30 minutes), and every attempt
+/// builds a connection: retrying every half minute kept the account locked
+/// and the CPU busy. Saving new credentials reconnects at once.
+pub(crate) const REFUSED_RETRY: Duration = Duration::from_secs(300);
+
+/// Whether a connection failed because the camera refused the credentials.
+pub(crate) fn refused_credentials(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("unauthorized") || reason.contains("not authorized")
+}
+
+/// The wait before the next connection attempt after a failure for `reason`.
+pub(crate) fn retry_delay(attempt: u32, reason: &str, cam_id: &CameraId) -> Duration {
+    let base = if refused_credentials(reason) {
+        REFUSED_RETRY
+    } else {
+        backoff_duration(attempt)
+    };
+    jittered(base, cam_id, attempt)
+}
+
 /// Published status after `failures` consecutive failed connections.
 pub(super) fn failure_status(failures: u32) -> &'static str {
     if failures >= OFFLINE_AFTER_FAILURES {
@@ -1173,9 +1200,24 @@ pub(crate) mod tests {
     use nw_core::camera::CameraId;
 
     use super::{
-        backoff_duration, backoff_slice, failure_status, jittered, probe_source, source_endpoint,
-        BACKOFF_POLL_SLICE, OFFLINE_AFTER_FAILURES,
+        backoff_duration, backoff_slice, failure_status, jittered, probe_source,
+        refused_credentials, retry_delay, source_endpoint, BACKOFF_POLL_SLICE,
+        OFFLINE_AFTER_FAILURES, REFUSED_RETRY,
     };
+
+    #[test]
+    fn a_refused_password_waits_minutes_before_asking_again() {
+        let cam = CameraId::from("cam-door".to_owned());
+        assert!(refused_credentials(
+            "Unauthorized: gstrtspsrc.c(7071): Unauthorized (401)"
+        ));
+        assert!(refused_credentials("Not Authorized"));
+        assert!(!refused_credentials("Could not read from resource."));
+        let refused = retry_delay(0, "Unauthorized (401)", &cam);
+        assert!(refused >= REFUSED_RETRY * 4 / 5 && refused <= REFUSED_RETRY * 6 / 5);
+        // Other failures keep the quick backoff.
+        assert!(retry_delay(0, "Could not read from resource.", &cam) <= Duration::from_secs(2));
+    }
 
     #[test]
     fn camera_goes_offline_after_repeated_failures_and_stays_there() {

@@ -374,6 +374,8 @@ impl RpcHandler {
             "site_name": st.config.site_name,
             "video_acceleration": acceleration_json(st.hwaccel),
             "pid": std::process::id(),
+            // `nw-backend --supervise` (`supervise.rs`), when it runs this one.
+            "supervisor_pid": crate::supervise::supervisor_pid(),
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_sec": self.started.elapsed().as_secs(),
             "headless": st.headless(),
@@ -607,7 +609,7 @@ impl RpcHandler {
                 tracing::warn!(error = %error, "Camera test failed");
                 Ok(json!({
                     "ok": false,
-                    "error": error,
+                    "error": test_failure_message(error),
                 }))
             }
         }
@@ -813,6 +815,8 @@ impl RpcHandler {
             },
             "debug": {
                 "gst_log": cfg.debug.gst_log,
+                "extended": cfg.debug.extended,
+                "log_path": crate::logging::debug_log_path(),
             },
             "video": {
                 "decoder": cfg.video.decoder.id(),
@@ -826,13 +830,18 @@ impl RpcHandler {
     }
 
     async fn config_set(&self, params: &Value) -> Result<Value, RpcError> {
-        let restart = {
+        let (restart, debug) = {
             let mut st = self.state.write().await;
             let before = st.config.video.decoder;
             st.update_config_settings(params)
                 .map_err(|e| RpcError::internal(e.to_string()))?;
-            crate::pipeline::hwaccel::needs_restart(before, st.config.video.decoder)
+            (
+                crate::pipeline::hwaccel::needs_restart(before, st.config.video.decoder),
+                st.config.debug.clone(),
+            )
         };
+        // Extended debug logging switches at once.
+        crate::logging::apply(&debug);
         tracing::debug!("Config saved via config.set");
         if !restart {
             return Ok(json!({ "ok": true }));
@@ -1044,6 +1053,16 @@ impl RpcHandler {
             }
             _ => Err(RpcError::method_not_found()),
         }
+    }
+}
+
+/// What a failed camera test tells the operator: a refused password in plain
+/// words (GStreamer says "Unauthorized: ../gst/rtsp/gstrtspsrc.c(7071): …").
+fn test_failure_message(error: String) -> String {
+    if pipeline::supervisor::refused_credentials(&error) {
+        "The camera refused the username or password. Check them and try again.".into()
+    } else {
+        error
     }
 }
 
@@ -1310,6 +1329,10 @@ mod tests {
         );
         assert!(response["result"]["video_acceleration"]["available_decoders"].is_array());
         assert_eq!(response["result"]["pid"], std::process::id());
+        assert!(
+            response["result"]["supervisor_pid"].is_null(),
+            "not supervised"
+        );
         assert!(response["result"]["version"].is_string());
         assert!(response["result"]["uptime_sec"].is_u64());
         assert_eq!(response["result"]["headless"], false);
@@ -2354,10 +2377,38 @@ mod tests {
             );
         }
         assert!(result["debug"].get("gst_log").is_some());
+        assert_eq!(result["debug"]["extended"], false);
+        assert!(result["debug"]["log_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("backend-debug.log")));
         assert_eq!(result["events"]["retention_days"], 30);
         assert_eq!(result["events"]["push_port"], 7681);
         assert!(result.get("cameras").is_none());
         assert!(!response.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn extended_debug_logging_is_a_saved_setting() {
+        let (state, handler, cfg_path) = handler_with_config("config-debug", AppConfig::default());
+
+        let set = dispatch(
+            &handler,
+            "config.set",
+            json!({"debug": {"extended": true, "gst_log": "info"}}),
+        )
+        .await;
+        let got = dispatch(&handler, "config.get", json!({})).await;
+        let on_disk = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+        teardown(&state, &cfg_path).await;
+
+        assert_eq!(
+            set["result"],
+            json!({"ok": true}),
+            "applied at once, no restart"
+        );
+        assert_eq!(got["result"]["debug"]["extended"], true);
+        assert_eq!(got["result"]["debug"]["gst_log"], "info");
+        assert!(on_disk.contains("\"extended\": true"), "{on_disk}");
     }
 
     #[tokio::test]
@@ -2511,5 +2562,21 @@ mod tests {
         assert_eq!(tcp["error"]["code"], -32601, "never over plain TCP");
         assert_eq!(error_code(&without_cloud), -32601);
         assert_eq!(error_code(&unknown), -32601);
+    }
+}
+
+#[cfg(test)]
+mod test_message_tests {
+    use super::test_failure_message;
+
+    #[test]
+    fn a_refused_password_is_said_in_plain_words() {
+        let raw =
+            "Unauthorized: ../gst/rtsp/gstrtspsrc.c(7071): gst_rtspsrc_send (): Unauthorized (401)";
+        assert_eq!(
+            test_failure_message(raw.into()),
+            "The camera refused the username or password. Check them and try again."
+        );
+        assert_eq!(test_failure_message("timed out".into()), "timed out");
     }
 }
