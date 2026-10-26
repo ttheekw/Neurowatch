@@ -120,7 +120,8 @@ var
 begin
   Lower := Lowercase(Name);
   Result := (Lower = 'app') or (Lower = 'bin') or (Lower = 'gstreamer') or
-    (Lower = 'license') or (Lower = 'notice') or (Lower = 'neurowatch.ps1') or
+    (Lower = 'license') or (Lower = 'notice') or (Lower = 'third_party_notices.md') or
+    (Lower = 'neurowatch.ps1') or
     (Lower = 'neurowatch.cmd') or (Lower = ManifestName) or (Pos('unins', Lower) = 1);
 end;
 
