@@ -27,7 +27,6 @@ use super::{
     AUDIO_DESCRIBE_GRACE, POLL_SLICE,
 };
 use crate::pipeline::builder;
-use crate::pipeline::supervisor::failure_status;
 use crate::streams::{Delivery, Media, Phase, SharedUnit, SubscriberPolicy, Subscription, Unit};
 
 /// Most bytes waiting inside the recording's `appsrc` before the recorder
@@ -158,13 +157,16 @@ impl IngestSupervisor {
             }
             Phase::Retrying => {
                 self.failures = state.failures;
-                let status = failure_status(state.failures);
                 let reason = state.reason.unwrap_or_default();
+                let status = self.failed_status(&reason);
                 tracing::warn!(cam_id = %self.cam_id, attempt = state.failures, reason = %reason, "Ingest attempt failed");
                 self.publish_state(status);
                 self.notify_state(status, Some(&reason));
             }
-            Phase::Streaming => self.failures = 0,
+            Phase::Streaming => {
+                self.failures = 0;
+                self.refused = false;
+            }
             Phase::Closed => {}
         }
     }

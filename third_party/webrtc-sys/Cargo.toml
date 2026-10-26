@@ -1,0 +1,28 @@
+# LiveKit's webrtc-sys at rust-sdks 5a656c4b, with NeuroWatch changes
+# (README.md). Used through [patch] in the workspace Cargo.toml; its other
+# fields replace upstream's workspace inheritance.
+[package]
+name = "webrtc-sys"
+version = "0.3.46"
+edition = "2021"
+homepage = "https://livekit.io"
+license = "Apache-2.0"
+description = "Unsafe bindings to libwebrtc (NeuroWatch: H.265 pass-through)"
+repository = "https://github.com/livekit/rust-sdks"
+
+[features]
+default = []
+
+[dependencies]
+cxx = "1.0"
+log = "0.4"
+
+[build-dependencies]
+webrtc-sys-build = { git = "https://github.com/livekit/rust-sdks", rev = "5a656c4bc4bc5c4f7fad17ab69044db3b487dfeb" }
+cxx-build = "1.0"
+glob = "0.3"
+cc = { version = "1.0", features = ["parallel"] }
+pkg-config = "0.3.22"
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+pkg-config = "0.3.22"

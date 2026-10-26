@@ -183,8 +183,8 @@ async fn shared_socket_multiplexes_requests_and_matches_out_of_order_responses()
     });
     let (inventory, coverage) =
         tokio::join!(node.push_inventory(vec![]), node.push_coverage(vec![]));
-    assert_eq!(inventory.unwrap(), true);
-    assert_eq!(coverage.unwrap(), false);
+    assert!(inventory.unwrap());
+    assert!(!coverage.unwrap());
     node.close_websocket().await;
     server.await.unwrap();
     fs::remove_dir_all(dir).unwrap();
@@ -587,7 +587,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedWsLogs {
 fn capture_ws_logs() -> (CapturedWsLogs, tracing::subscriber::DefaultGuard) {
     let output = CapturedWsLogs(Arc::new(Mutex::new(Vec::new())));
     // What the backend uses when `RUST_LOG` is unset.
-    let filter = crate::runtime::default_log_filter("warn");
+    let filter = crate::logging::default_log_filter();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .without_time()
@@ -689,6 +689,8 @@ async fn woken(notify: &tokio::sync::Notify, within: Duration) -> bool {
 }
 
 #[tokio::test]
+// tungstenite's handshake callback fixes the error type (an HTTP response).
+#[allow(clippy::result_large_err)]
 async fn the_node_asks_for_events_and_an_event_wakes_only_its_loop() {
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -886,6 +888,72 @@ async fn an_event_pulls_directives_at_once_and_the_timer_becomes_a_fallback() {
     assert!(tokio::time::timeout(Duration::from_secs(7), pulls.recv())
         .await
         .is_err());
+
+    scheduler.shutdown().await;
+    node.close_websocket().await;
+    server.abort();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_dropped_control_connection_keeps_active_publications_within_the_grace() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (node, dir) = events_node(&format!("http://{}/", listener.local_addr().unwrap()));
+    let public = URL_SAFE_NO_PAD.encode(node.lock().unwrap().key.verifying_key().to_bytes());
+    let session = uuid::Uuid::new_v4().simple().to_string();
+    // A portal that answers the first pull with one live session, then the
+    // connection is gone (and stays gone: the listener accepts only once).
+    let server = {
+        let session = session.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            handshake_with(&mut ws, &public, json!({"events": true})).await;
+            loop {
+                let request: Value = match ws.next().await {
+                    Some(Ok(Message::Text(text))) => serde_json::from_str(text.as_str()).unwrap(),
+                    Some(Ok(Message::Ping(bytes))) => {
+                        ws.send(Message::Pong(bytes)).await.unwrap();
+                        continue;
+                    }
+                    _ => break,
+                };
+                match request["method"].as_str().unwrap() {
+                    "challenge" => respond(&mut ws, &request, 201, json!({"protocol_version": 1,
+                        "audience": NODE_AUDIENCE, "operation": request["body"]["operation"],
+                        "challenge": uuid::Uuid::new_v4().simple().to_string(),
+                        "expires_at": fmt_time(OffsetDateTime::now_utc() + TimeDuration::seconds(120)).unwrap()})).await,
+                    "publish_directives" => {
+                        respond(&mut ws, &request, 200, json!({"protocol_version": 2,
+                            "directives": [], "active_session_ids": [session]})).await;
+                        break;
+                    }
+                    _ => respond(&mut ws, &request, 503, json!({"code": "unavailable"})).await,
+                }
+            }
+        })
+    };
+    let (batches_tx, mut batches) = tokio::sync::mpsc::unbounded_channel();
+    let sink: DirectiveSink = Arc::new(move |batch| {
+        let _ = batches_tx.send(batch.active_session_ids);
+        Box::pin(async {})
+    });
+    let scheduler = CloudScheduler::new(node.shared(), Duration::from_secs(60), Arc::default())
+        .with_directives(sink)
+        .spawn();
+    let first = tokio::time::timeout(Duration::from_secs(5), batches.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, vec![session]);
+
+    // Later pulls fail while the connection is down (one every 5 s without
+    // events): the session must not be handed an empty batch, which stops it.
+    let within = tokio::time::timeout(Duration::from_secs(12), batches.recv()).await;
+    assert!(
+        within.is_err(),
+        "publications were stopped by a failed pull within the grace: {within:?}"
+    );
 
     scheduler.shutdown().await;
     node.close_websocket().await;

@@ -238,11 +238,13 @@ BACKEND_MANIFEST="${NW_BACKEND_MANIFEST:-$ROOT/Cargo.toml}"
 BACKEND_TARGET="${CARGO_TARGET_DIR:-$(dirname "$BACKEND_MANIFEST")/target}"
 # --edition unlimited: no camera limit (the `unlimited` feature, edition.rs).
 cargo build --manifest-path "$BACKEND_MANIFEST" --release --locked -p "${NW_BACKEND_PACKAGE:-nw-backend}" \
-    "${BACKEND_FEATURES[@]}"
+    --message-format=json-render-diagnostics "${BACKEND_FEATURES[@]}" > "$WORK_DIR/backend-build.jsonl"
 install -m 0755 "$BACKEND_TARGET/release/nw-backend" "$BUNDLE_DIR/bin/nw-backend"
 # The licence and notice ship with every artifact.
 install -m 0644 "$ROOT/LICENSE" "$BUNDLE_DIR/LICENSE"
 install -m 0644 "$ROOT/NOTICE" "$BUNDLE_DIR/NOTICE"
+"$PYTHON" "$ROOT/scripts/collect_backend_notices.py" "$WORK_DIR/backend-build.jsonl" \
+    "$BUNDLE_DIR/THIRD_PARTY_NOTICES.md"
 
 echo "[3/5] Packaging UI from pyproject.toml with PyInstaller"
 "$PYTHON" -m venv "$VENV"
@@ -296,6 +298,15 @@ StartupNotify=true
 DESKTOP
 cp "$WORK_DIR/neurowatch.desktop" "$BUNDLE_DIR/neurowatch.desktop"
 
+# Every build lists its own program files: after an update, the packages (and
+# a portable copy, when it starts) remove anything else under these folders
+# (scripts/installer/linux/leftovers.sh, ui/neurowatch/service/leftovers.py).
+(
+    cd "$BUNDLE_DIR"
+    find app bin gstreamer -type d -exec sh -c 'for d in "$@"; do echo "$d/"; done' sh {} +
+    find app bin gstreamer ! -type d -print
+) | LC_ALL=C sort > "$BUNDLE_DIR/.neurowatch-files"
+
 # Shared install tree used by every native format.
 STAGE="$WORK_DIR/stage"
 mkdir -p "$STAGE$INSTALL_PREFIX" "$STAGE/usr/bin" "$STAGE/usr/share/applications"
@@ -341,6 +352,8 @@ LONG_DESCRIPTION_DEB="$(printf '%s\n' "$LONG_DESCRIPTION" | sed '2,$s/^/ /')"
 # Package scripts: the `render` group, so recording can use the graphics card
 # from boot (scripts/installer/linux/gpu-access.sh). Same functions in every format.
 GPU_ACCESS="$(cat "$LINUX_FILES/gpu-access.sh")"
+# Updates: say so, and remove what the old version leaves behind.
+LEFTOVERS="$(cat "$LINUX_FILES/leftovers.sh")"
 
 join_by() {
     local separator="$1"
@@ -353,7 +366,11 @@ join_by() {
 build_portable() {
     local output
     output="$(artifact_path portable)"
+    # A portable copy cleans up after itself when it starts (unpacked over an
+    # older one); package installs leave that to the package manager scripts.
+    touch "$BUNDLE_DIR/.portable"
     tar -C "$WORK_DIR/bundle" -czf "$output" "$PKG_NAME"
+    rm -f "$BUNDLE_DIR/.portable"
     echo "  portable: $output"
 }
 
@@ -384,14 +401,19 @@ Description: $PKG_SUMMARY
  $LONG_DESCRIPTION_DEB
 CONTROL
     {
-        printf '#!/bin/sh\nset -e\n%s\n' "$GPU_ACCESS"
-        printf 'case "$1" in\n    configure) neurowatch_grant_gpu_access ;;\nesac\nexit 0\n'
+        printf '#!/bin/sh\nset -e\n%s\n' "$LEFTOVERS"
+        # upgrade <old version>; install <old version> after a removal kept its config.
+        printf 'if [ -n "${2:-}" ]; then\n    neurowatch_update_notice "$2" "%s"\nfi\nexit 0\n' "$DEB_VERSION"
+    } > "$root/DEBIAN/preinst"
+    {
+        printf '#!/bin/sh\nset -e\n%s\n%s\n' "$GPU_ACCESS" "$LEFTOVERS"
+        printf 'case "$1" in\n    configure)\n        neurowatch_grant_gpu_access\n        neurowatch_remove_leftovers\n        ;;\nesac\nexit 0\n'
     } > "$root/DEBIAN/postinst"
     {
         printf '#!/bin/sh\nset -e\n%s\n' "$GPU_ACCESS"
         printf 'case "$1" in\n    remove|purge) neurowatch_revoke_gpu_access ;;\nesac\nexit 0\n'
     } > "$root/DEBIAN/postrm"
-    chmod 0755 "$root/DEBIAN/postinst" "$root/DEBIAN/postrm"
+    chmod 0755 "$root/DEBIAN/preinst" "$root/DEBIAN/postinst" "$root/DEBIAN/postrm"
     dpkg-deb --root-owner-group --build "$root" "$output" >/dev/null
     echo "  deb: $output"
 }
@@ -427,9 +449,23 @@ $LONG_DESCRIPTION
 mkdir -p %{buildroot}
 cp -a "$STAGE/." %{buildroot}/
 
+%pre
+$LEFTOVERS
+# 2 or more: an update.
+if [ "\$1" -ge 2 ]; then
+    neurowatch_update_notice "" "$RPM_VERSION"
+fi
+exit 0
+
 %post
 $GPU_ACCESS
 neurowatch_grant_gpu_access
+exit 0
+
+%posttrans
+$LEFTOVERS
+# After the whole transaction: the old package's own files are gone by now.
+neurowatch_remove_leftovers
 exit 0
 
 %postun
@@ -490,9 +526,11 @@ build_arch() {
         done
     } > "$root/.PKGINFO"
     {
-        printf '%s\n\n' "$GPU_ACCESS"
-        printf 'post_install() {\n    neurowatch_grant_gpu_access\n}\n\n'
-        printf 'post_upgrade() {\n    neurowatch_grant_gpu_access\n}\n\n'
+        printf '%s\n\n%s\n\n' "$GPU_ACCESS" "$LEFTOVERS"
+        printf 'post_install() {\n    neurowatch_grant_gpu_access\n    neurowatch_remove_leftovers\n}\n\n'
+        # pacman passes the new version, then the old one.
+        printf 'pre_upgrade() {\n    neurowatch_update_notice "$2" "$1"\n}\n\n'
+        printf 'post_upgrade() {\n    neurowatch_grant_gpu_access\n    neurowatch_remove_leftovers\n}\n\n'
         printf 'post_remove() {\n    neurowatch_revoke_gpu_access\n}\n'
     } > "$root/.INSTALL"
     # Same metadata layout makepkg produces: .PKGINFO, .MTREE, then the payload.

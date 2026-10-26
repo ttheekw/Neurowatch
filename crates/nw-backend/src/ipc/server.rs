@@ -11,6 +11,10 @@ use super::handler::RpcHandler;
 use super::token;
 use crate::stats::IpcMetricsRecorder;
 
+/// With extended debug logging on, requests slower than this are reported:
+/// the desktop app gives up on a reply after a few seconds.
+const SLOW_REQUEST: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(test)]
 mod tests;
 
@@ -216,9 +220,23 @@ where
             Some(token) if token::presented(&request, token) => IpcTransport::Protected,
             _ => transport,
         };
+        // Long polls (`timeout_ms`, e.g. `events.wait`) take long on purpose.
+        let method = (crate::logging::extended() && request["params"]["timeout_ms"].is_null())
+            .then(|| request["method"].as_str().unwrap_or("?").to_owned());
+        let started = std::time::Instant::now();
         let (response, idle) =
             crate::stats::ipc_metrics::measure_handler(handler.dispatch_gated(request, transport))
                 .await;
+        if let Some(method) = method {
+            let elapsed = started.elapsed();
+            if elapsed >= SLOW_REQUEST {
+                tracing::warn!(
+                    method = %method,
+                    elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    "IPC request was slow"
+                );
+            }
+        }
         let mut out = serde_json::to_string(&response).context("Failed to serialize response")?;
         out.push('\n');
         writer.write_all(out.as_bytes()).await?;

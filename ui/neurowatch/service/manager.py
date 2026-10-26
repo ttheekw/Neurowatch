@@ -11,6 +11,11 @@ UI, so cameras keep recording with the window closed:
   desktop, so the service is started by the tray at login instead (a ``Run``
   entry).
 
+A detached backend runs as ``nw-backend --supervise`` (``SUPERVISE_FLAG``):
+a small supervisor process that runs the backend and starts it again when it
+stops unexpectedly, as systemd does for its unit (``crates/nw-backend/src/
+supervise.rs``). Stopping the backend on request ends the supervisor too.
+
 The tray (``neurowatch.tray``) is registered to start at login on both
 platforms. ``autostart=False`` (``--no-autostart``) starts the service for
 this session only and registers nothing.
@@ -40,7 +45,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +93,8 @@ _RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _RUN_VALUE = "NeuroWatch"
 
 DESKTOP, HEADLESS = "desktop", "headless"
+#: Makes a packaged backend supervise itself (restarted after a crash).
+SUPERVISE_FLAG = "--supervise"
 _MODE_FILE = "service-mode"
 
 Sleep = Callable[[float], None]
@@ -128,6 +135,56 @@ def save_mode(mode: str) -> None:
 def running_mode(status: Mapping[str, Any]) -> str:
     """The mode of a running backend (an older one reports none: desktop)."""
     return HEADLESS if status.get("headless") is True else DESKTOP
+
+
+def supervised(command: ServiceCommand) -> ServiceCommand:
+    """``command`` restarted after a crash when no service manager does it: a
+    packaged backend under its own supervisor. The dev supervisor already
+    restarts a crashed backend."""
+    if command.dev or SUPERVISE_FLAG in command.argv:
+        return command
+    return replace(command, argv=[*command.argv, SUPERVISE_FLAG])
+
+
+def process_alive(pid: int) -> bool:
+    """Whether process ``pid`` still runs (a zombie waiting to be reaped has
+    ended)."""
+    if pid <= 0:
+        return False
+    if IS_WINDOWS:
+        import ctypes
+
+        kernel32: Any = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False  # gone, or another user's: not ours
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state != "Z"
+
+
+def service_pids(status: Mapping[str, Any]) -> list[int]:
+    """The backend's process and, when it runs under one, its supervisor's."""
+    return [
+        pid
+        for pid in (status.get("pid"), status.get("supervisor_pid"))
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+    ]
 
 
 def backend_environment() -> dict[str, str]:
@@ -535,6 +592,7 @@ class ServiceController:
         status: Callable[[str], Mapping[str, Any] | None] | None = None,
         shutdown: Callable[[str], Any] | None = None,
         sleep: Sleep = time.sleep,
+        alive: Callable[[int], bool] = process_alive,
     ) -> None:
         self.endpoint = endpoint or service_endpoint()
         self.systemd = systemd if systemd is not None else SystemdUser()
@@ -543,6 +601,7 @@ class ServiceController:
         self._status = status or (lambda ep: probe.backend_status(ep, timeout=1.0))
         self._shutdown = shutdown or (lambda ep: probe.request("system.shutdown", endpoint=ep))
         self._sleep = sleep
+        self._alive = alive
         self._systemd_ok: bool | None = None
         self._process: Any = None  # a detached service started here
         self._started_at = 0.0
@@ -708,15 +767,25 @@ class ServiceController:
         return self.ensure_running(autostart=False, mode=mode, timeout=timeout)
 
     def stop(self, *, timeout: float = STOP_TIMEOUT_S) -> bool:
-        """Stop the service; True once it no longer answers (and, in
-        development, its supervisor has exited, so a start right after
-        never finds the old one still finishing)."""
+        """Stop the service; True once it no longer answers and its processes
+        have exited: the backend (which stops answering before it has
+        finished its recordings) and its supervisor (``--supervise``), or in
+        development the dev supervisor. So a start right after never finds
+        the old one still finishing, and an update never finds its files in
+        use (nor kills a backend its supervisor would start again)."""
         deadline = time.monotonic() + timeout
+        pids: list[int] = []
         if self.uses_systemd() and self.systemd.installed() and self.systemd.active():
             self.systemd.stop()
-        elif self.running():
-            self._shutdown(self.endpoint)
+        else:
+            status = self.status()
+            if status is not None:
+                pids = service_pids(status)
+                self._shutdown(self.endpoint)
         if not self._wait(lambda: not self.running(), deadline):
+            return False
+        if pids and not self._wait(lambda: not any(self._alive(p) for p in pids), deadline):
+            logger.warning("The NeuroWatch service still runs (process %s)", pids)
             return False
         if source_root() is not None:
             return self._wait(_dev_supervisor_gone, deadline)
@@ -745,6 +814,7 @@ class ServiceController:
             self._started_at = time.time()
             self.systemd.start()
             return
+        command = supervised(command)
         log = log_path("service")
         logger.info("Starting NeuroWatch service: %s (log %s)", shlex.join(command.argv), log)
         self._started_at = time.time()

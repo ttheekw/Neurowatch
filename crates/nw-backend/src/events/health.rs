@@ -93,7 +93,11 @@ impl HealthTracker {
             let failed_key = Key::RecordingFailed(camera.id.clone());
             known.insert(offline_key.clone());
             known.insert(failed_key.clone());
-            let offline = camera.state == "offline";
+            // A camera refusing its password is as unreachable as an offline one.
+            let offline = matches!(
+                camera.state.as_str(),
+                "offline" | crate::pipeline::supervisor::UNAUTHORIZED
+            );
             let online = matches!(camera.state.as_str(), "streaming" | "recording_ready");
             if offline || (self.open.contains_key(&offline_key) && !online) {
                 wanted.insert(
@@ -285,9 +289,14 @@ pub async fn run(
     hub: Arc<EventHub>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
+    let mut detail = format!("NeuroWatch {}", env!("CARGO_PKG_VERSION"));
+    if let Some((reason, _restarts)) = crate::supervise::previous_exit() {
+        detail.push_str(&format!(
+            "; started again after the backend stopped unexpectedly: {reason}"
+        ));
+    }
     hub.instant(
-        NewEvent::new(None, EventKind::BackendStarted, EventSource::System)
-            .detail(format!("NeuroWatch {}", env!("CARGO_PKG_VERSION"))),
+        NewEvent::new(None, EventKind::BackendStarted, EventSource::System).detail(detail),
         super::now_ms(),
     );
     let mut tracker = HealthTracker::default();

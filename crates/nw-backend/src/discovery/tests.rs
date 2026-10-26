@@ -692,3 +692,34 @@ fn an_interface_search_probes_its_network_or_the_part_around_the_recorder() {
     let slash22 = interface_plan(Ipv4Addr::new(10, 0, 5, 20), 22);
     assert_eq!(slash22.unicast.count(), 1022);
 }
+
+#[test]
+fn the_grid_stream_is_suggested_even_when_sizes_are_unknown() {
+    let address = Ipv4Addr::new(192, 168, 1, 64);
+    // Hikvision with ONVIF off: its 101/102 paths, sizes unknown.
+    let (main, sub) = suggested_streams(&hikvision_streams(address));
+    assert_eq!(main.as_deref(), Some("s1"));
+    assert_eq!(sub.as_deref(), Some("s2"));
+    let (main, sub) = suggested_streams(&numbered(onvif::dahua_profiles(address)));
+    assert_eq!((main.as_deref(), sub.as_deref()), (Some("s1"), Some("s2")));
+
+    // Known sizes still decide: the largest is main, the smallest the grid.
+    let sized = |w: u32, h: u32| MediaProfile {
+        token: format!("{w}x{h}"),
+        name: String::new(),
+        width: Some(w),
+        height: Some(h),
+        encoding: None,
+    };
+    let streams = numbered(vec![
+        (sized(640, 360), "rtsp://cam/sub".into()),
+        (sized(2560, 1440), "rtsp://cam/main".into()),
+        (sized(1280, 720), "rtsp://cam/third".into()),
+    ]);
+    let (main, sub) = suggested_streams(&streams);
+    assert_eq!((main.as_deref(), sub.as_deref()), (Some("s2"), Some("s1")));
+
+    // One stream: no separate grid stream.
+    let (main, sub) = suggested_streams(&streams[1..2]);
+    assert_eq!((main.as_deref(), sub), (Some("s2"), None));
+}

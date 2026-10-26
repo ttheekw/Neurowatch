@@ -1,4 +1,5 @@
 """Recording readiness is online; recording must not recolor connectivity."""
+
 from __future__ import annotations
 
 import pytest
@@ -60,3 +61,24 @@ def test_recording_updates_do_not_modify_connection_dot(qtbot):
         assert item._dot.styleSheet() == connection_style
         assert item._badge.text() == "Live"
     assert item._recording_dot.isHidden()
+
+
+def test_a_refused_password_is_shown_as_such(qtbot):
+    # The backend reports "unauthorized" when the camera refuses the username
+    # or password (RTSP 401); it used to look like an offline camera.
+    from neurowatch.widgets.camera_panel import _CameraItem
+    from neurowatch.widgets.cell_widget import CellWidget
+
+    camera = CameraConfig(id="door", name="Door", url="rtsp://door")
+    assert connection_status("unauthorized") == "unauthorized"
+    item = _CameraItem(camera)
+    qtbot.addWidget(item)
+    item.set_status("unauthorized")
+    assert item._badge.text() == "Wrong password"
+    assert "#ef4444" in item._dot.styleSheet()
+
+    cell = CellWidget()
+    qtbot.addWidget(cell)
+    cell.set_camera(camera)
+    cell.set_status("unauthorized")
+    assert cell._badge()[0] == "WRONG PASSWORD"

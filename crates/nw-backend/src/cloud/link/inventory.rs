@@ -103,7 +103,8 @@ fn cloud_status(state: Option<&str>) -> &'static str {
         Some("streaming" | "recording_ready") => "streaming",
         Some("connecting") => "connecting",
         Some("reconnecting") => "reconnecting",
-        Some("error" | "teardown_failed") => "error",
+        // The portal knows no "unauthorized" (wrong password): an error.
+        Some("error" | "teardown_failed" | crate::pipeline::supervisor::UNAUTHORIZED) => "error",
         Some("offline") => "offline",
         _ => "stopped",
     }
@@ -209,4 +210,18 @@ fn utc_second(seconds: i64) -> Option<String> {
     let at = time::OffsetDateTime::from_unix_timestamp(seconds).ok()?;
     at.format(&time::format_description::well_known::Rfc3339)
         .ok()
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::cloud_status;
+
+    #[test]
+    fn a_camera_refusing_its_password_is_an_error_to_the_portal() {
+        // The portal accepts only its own states; an unknown one would refuse
+        // the whole inventory.
+        assert_eq!(cloud_status(Some("unauthorized")), "error");
+        assert_eq!(cloud_status(Some("offline")), "offline");
+        assert_eq!(cloud_status(Some("recording_ready")), "streaming");
+    }
 }

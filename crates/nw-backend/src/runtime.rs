@@ -6,12 +6,14 @@
 //! - Wire up pipeline supervisors, IPC server, shared memory
 //! - Run NeuroWatch Cloud ([`crate::cloud`])
 //! - Handle SIGTERM / SIGINT for graceful shutdown
+//!
+//! `nw-backend --supervise` runs [`crate::supervise`] instead, which runs
+//! the backend as its child and starts it again after a crash.
 
 use anyhow::Context as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
-use tracing_subscriber::EnvFilter;
 
 use crate::app_state::AppState;
 use crate::cloud::{Cloud, Services};
@@ -26,6 +28,9 @@ use crate::{discovery, events, ipc, pipeline, playback, recording, resource_limi
 
 /// Run the backend until it is stopped.
 pub fn main() -> anyhow::Result<()> {
+    if crate::supervise::requested() {
+        std::process::exit(crate::supervise::main());
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -44,7 +49,14 @@ async fn run() -> anyhow::Result<()> {
     }));
 
     let cfg = crate::config::AppConfig::load_or_default(&config_path)?;
-    init_tracing(&cfg.debug.gst_log);
+    crate::logging::init(&cfg.debug);
+    if let Some((reason, restarts)) = crate::supervise::previous_exit() {
+        tracing::warn!(
+            reason = %reason,
+            restarts,
+            "Started again: the previous backend stopped unexpectedly"
+        );
+    }
     resource_limits::configure();
 
     // Initialize GStreamer — must happen before any gst:: calls
@@ -53,6 +65,8 @@ async fn run() -> anyhow::Result<()> {
         version = %gstreamer::version_string(),
         "GStreamer initialized"
     );
+    // GStreamer's own log joins the debug log, when that is on.
+    crate::logging::apply(&cfg.debug);
 
     // Graceful shutdown channel
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -98,6 +112,7 @@ async fn run() -> anyhow::Result<()> {
     let cloud = Cloud::new();
     cloud.prepare(&mut initial_state);
     let state = Arc::new(RwLock::new(initial_state));
+    crate::debug_monitor::spawn(Arc::clone(&state));
     {
         let policy_state = Arc::clone(&state);
         let mut policy_shutdown = shutdown_tx.subscribe();
@@ -327,8 +342,9 @@ pub fn request_restart() {
 }
 
 /// Exit status asking a service manager to start the backend again, when it
-/// cannot replace itself (systemd `Restart=on-failure`, the dev supervisor).
-const RESTART_EXIT_CODE: i32 = 75;
+/// cannot replace itself (systemd `Restart=on-failure`, the dev supervisor,
+/// [`crate::supervise`]).
+const RESTART_EXIT_CODE: i32 = crate::supervise::RESTART_EXIT_CODE;
 
 /// Replace this process with a fresh backend: same program, arguments,
 /// environment and PID, so the service manager (systemd, the dev supervisor,
@@ -336,8 +352,13 @@ const RESTART_EXIT_CODE: i32 = 75;
 /// are finished and the IPC socket closed. Should that fail, exit non-zero so
 /// a service manager starts it again. Windows cannot replace a process: a
 /// detached copy (same program, arguments, environment and log handles)
-/// starts, and this one exits.
+/// starts, and this one exits. Under [`crate::supervise`] it exits with
+/// [`RESTART_EXIT_CODE`] and the supervisor starts it again.
 fn restart_in_place() -> ! {
+    if crate::supervise::supervised() {
+        tracing::info!("Restarting: the supervisor starts the backend again");
+        std::process::exit(RESTART_EXIT_CODE);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -436,86 +457,4 @@ async fn wait_for_shutdown_signal() {
         }
     }
     tokio::signal::ctrl_c().await.ok();
-}
-
-fn init_tracing(default_level: &str) {
-    let gst_level = normalize_tracing_level(default_level);
-    let fallback_filter = default_log_filter(gst_level);
-    let env_filter = std::env::var("RUST_LOG")
-        .ok()
-        .map(|value| normalize_env_filter(&value))
-        .and_then(|value| EnvFilter::try_new(value).ok());
-    let filter = env_filter.unwrap_or_else(|| {
-        EnvFilter::try_new(&fallback_filter)
-            .unwrap_or_else(|_| EnvFilter::new("nw_backend=info,neurowatch=info,gstreamer=warn"))
-    });
-    let json = std::env::var("NW_LOG_JSON").is_ok();
-    if json {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .pretty()
-            .with_env_filter(filter)
-            .init();
-    }
-}
-
-/// Default directives when `RUST_LOG` is unset: this crate's own target at
-/// info (it logs as `nw_backend::…`), with `neurowatch` kept for compatibility.
-pub fn default_log_filter(gst_level: &str) -> String {
-    // `cloud_ws` is the cloud's WebSocket control plane's own target.
-    format!("nw_backend=info,neurowatch=info,cloud_ws=info,gstreamer={gst_level}")
-}
-
-fn normalize_tracing_level(level: &str) -> &str {
-    match level.trim().to_ascii_lowercase().as_str() {
-        "warning" => "warn",
-        "err" => "error",
-        "off" => "off",
-        "error" => "error",
-        "warn" => "warn",
-        "info" => "info",
-        "debug" => "debug",
-        "trace" => "trace",
-        "0" => "0",
-        "1" => "1",
-        "2" => "2",
-        "3" => "3",
-        "4" => "4",
-        "5" => "5",
-        _ => "warn",
-    }
-}
-
-fn normalize_env_filter(filter: &str) -> String {
-    filter
-        .split(',')
-        .map(|directive| {
-            let Some((target, level)) = directive.rsplit_once('=') else {
-                return directive.to_owned();
-            };
-            format!("{target}={}", normalize_tracing_level(level))
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_log_filter_enables_this_crates_own_log_target() {
-        // Events are emitted under the crate target `nw_backend::…`; a filter
-        // that only names `neurowatch` silently drops every backend log line.
-        let filter = default_log_filter("warn");
-        assert!(
-            filter.split(',').any(|d| d == "nw_backend=info"),
-            "{filter}"
-        );
-        assert!(EnvFilter::try_new(&filter).is_ok());
-    }
 }

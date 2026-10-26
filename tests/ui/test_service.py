@@ -227,10 +227,63 @@ def test_systemd_unit_restarts_on_failure_and_starts_at_login() -> None:
         )
     )
     assert "ExecStart=/opt/neurowatch/bin/nw-backend" in unit
+    assert "--supervise" not in unit, "systemd restarts it itself"
     assert "WorkingDirectory=/opt/neurowatch/bin" in unit
     assert 'Environment="PATH=/a b:%%x"' in unit, "spaces quoted, % escaped for systemd"
     assert "Restart=on-failure" in unit
     assert "WantedBy=default.target" in unit
+
+
+def test_only_a_packaged_backend_supervises_itself(packaged, monkeypatch) -> None:
+    from neurowatch.service.manager import supervised
+
+    packaged_command = supervised(service_command())
+    assert packaged_command.argv == [str(packaged), "--supervise"]
+    assert supervised(packaged_command).argv == packaged_command.argv, "once"
+    monkeypatch.delenv("NW_SOURCE_ROOT", raising=False)
+    dev = service_command()
+    assert supervised(dev).argv == dev.argv, "the dev supervisor restarts it already"
+
+
+def test_stopping_waits_for_the_backend_and_its_supervisor_to_exit(tmp_path, packaged) -> None:
+    """The backend stops answering before it has finished its recordings; an
+    update must not find its files in use, nor kill a backend its supervisor
+    would then start again."""
+
+    class Supervised(FakeBackend):
+        def status(self, endpoint: str) -> dict[str, Any] | None:
+            status = super().status(endpoint)
+            return None if status is None else {**status, "pid": 4242, "supervisor_pid": 4241}
+
+    running = {4242: 3, 4241: 5}  # pid: polls until it has exited
+
+    def alive(pid: int) -> bool:
+        running[pid] = max(0, running[pid] - 1)
+        return running[pid] > 0
+
+    backend = Supervised(running=True)
+    controller, _ = _controller(tmp_path, FakeSystemctl(available=False), backend, alive=alive)
+
+    assert controller.stop()
+    assert backend.shutdowns == 1
+    assert running == {4242: 0, 4241: 0}, "waited for both"
+
+    running.update({4242: 10**9, 4241: 1})
+    backend.running = True
+    assert not controller.stop(timeout=0), "a process that does not exit: not stopped"
+
+
+def test_service_pids_and_process_liveness() -> None:
+    from neurowatch.service.manager import process_alive, service_pids
+
+    assert service_pids({"pid": 10, "supervisor_pid": None}) == [10]
+    assert service_pids({"pid": 10, "supervisor_pid": 9}) == [10, 9]
+    assert service_pids({"pid": True}) == [] and service_pids({}) == []
+    assert process_alive(os.getpid())
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    assert not process_alive(child.pid)
+    assert not process_alive(0)
 
 
 def test_tray_login_entry_runs_the_tray() -> None:
@@ -284,7 +337,8 @@ def test_without_systemd_the_service_is_a_detached_process(tmp_path, packaged) -
 
     assert controller.ensure_running(autostart=True)
 
-    assert len(spawned) == 1 and spawned[0].argv == [str(packaged)]
+    # Nothing restarts a detached backend: it supervises itself.
+    assert len(spawned) == 1 and spawned[0].argv == [str(packaged), "--supervise"]
     assert not (tmp_path / "units").exists()
     # The tray starts at login and starts the service from there.
     assert (tmp_path / "autostart" / "neurowatch-tray.desktop").is_file()

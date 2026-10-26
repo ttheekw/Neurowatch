@@ -36,8 +36,9 @@ use tokio::sync::watch;
 
 use super::builder;
 use super::supervisor::{
-    backoff_duration, backoff_slice, codec_from_structure, failure_status, jittered, probe_source,
-    resolution_from_structure, StreamInfo, NO_FRAME_TIMEOUT, OFFLINE_AFTER_FAILURES,
+    backoff_slice, codec_from_structure, failure_status, probe_source, refused_credentials,
+    resolution_from_structure, retry_delay, StreamInfo, NO_FRAME_TIMEOUT, OFFLINE_AFTER_FAILURES,
+    UNAUTHORIZED,
 };
 use crate::stats::HealthCounters;
 
@@ -81,6 +82,9 @@ pub struct IngestSupervisor {
     reachability: Option<Arc<super::reachability::Reachability>>,
     metadata_interval: Duration,
     failures: u32,
+    /// The last attempt failed on the username or password: the status stays
+    /// "unauthorized" while it retries, until the camera lets it in.
+    refused: bool,
     /// The camera's audio track label, once described (`Some(None)`: none).
     audio: Option<Option<String>>,
     /// Recording with audio failed before a segment opened: record video only.
@@ -114,6 +118,7 @@ impl IngestSupervisor {
             reachability: None,
             metadata_interval: METADATA_INTERVAL,
             failures: 0,
+            refused: false,
             audio: None,
             audio_failed: false,
             segment_opened: false,
@@ -186,6 +191,7 @@ impl IngestSupervisor {
                 Attempt::Stopped => break,
                 Attempt::Healthy => {
                     self.failures = 0;
+                    self.refused = false;
                     (self.metadata_interval, false)
                 }
                 Attempt::Failed { reason, delivered } => {
@@ -194,14 +200,11 @@ impl IngestSupervisor {
                     }
                     let attempt = self.failures;
                     self.failures = self.failures.saturating_add(1);
-                    let status = failure_status(self.failures);
+                    let status = self.failed_status(&reason);
                     tracing::warn!(cam_id = %self.cam_id, attempt = self.failures, reason = %super::sanitize_credentials(&reason), "Ingest attempt failed");
                     self.publish_state(status);
                     self.notify_state(status, Some(&super::sanitize_credentials(&reason)));
-                    (
-                        jittered(backoff_duration(attempt), &self.cam_id, attempt),
-                        true,
-                    )
+                    (retry_delay(attempt, &reason, &self.cam_id), true)
                 }
             };
             if !self.rest(wait, after_failure) {
@@ -275,8 +278,19 @@ impl IngestSupervisor {
         });
     }
 
+    /// The status after a failed attempt for `reason`.
+    fn failed_status(&mut self, reason: &str) -> &'static str {
+        self.refused = refused_credentials(reason);
+        if self.refused {
+            UNAUTHORIZED
+        } else {
+            failure_status(self.failures)
+        }
+    }
+
     fn announce_attempt(&self) {
-        if self.failures < OFFLINE_AFTER_FAILURES {
+        // A refused password stays shown while it retries.
+        if !self.refused && self.failures < OFFLINE_AFTER_FAILURES {
             // Once offline, stay offline until the camera answers again.
             self.publish_state(if self.failures > 0 {
                 "reconnecting"
@@ -711,6 +725,38 @@ mod tests {
             infos,
             task: std::thread::spawn(move || ingest.run()),
         }
+    }
+
+    #[test]
+    fn a_refused_password_is_shown_as_such_until_the_camera_lets_it_in() {
+        let (_stop, stop_rx) = watch::channel(false);
+        let (state_tx, states) = watch::channel(String::new());
+        let (info_tx, _infos) = watch::channel(StreamInfo::default());
+        let mut ingest = IngestSupervisor::new(
+            CameraConfig::new("Door", "rtsp://127.0.0.1:9/unreachable"),
+            Arc::new(LogEventBus),
+            stop_rx,
+            state_tx,
+            info_tx,
+        );
+        // What rtspsrc reports for a 401 (seen from a Hikvision camera).
+        let refused = "Unauthorized: ../gst/rtsp/gstrtspsrc.c(7071): gst_rtspsrc_send (): \
+            /GstPipeline:pipeline0/GstRTSPSrc:recording_src:\nUnauthorized (401)";
+        ingest.failures = 1;
+        let status = ingest.failed_status(refused);
+        assert_eq!(status, UNAUTHORIZED);
+        ingest.publish_state(status);
+        // The next attempt does not flip it back to "reconnecting".
+        ingest.announce_attempt();
+        assert_eq!(states.borrow().as_str(), UNAUTHORIZED);
+
+        // Any other failure is a connection problem again.
+        assert_eq!(
+            ingest.failed_status("Could not read from resource."),
+            "reconnecting"
+        );
+        ingest.announce_attempt();
+        assert_eq!(states.borrow().as_str(), "reconnecting");
     }
 
     #[test]

@@ -19,7 +19,7 @@ _DEFAULTS: dict[str, Any] = {
     "wall": {"rows": 4, "cols": 8, "auto_fit": True, "page_interval_sec": 0},
     "cameras": [],
     "ui": {"theme": "dark", "fullscreen": True},
-    "debug": {"gst_log": "warning"},
+    "debug": {"gst_log": "warning", "extended": False},
 }
 
 

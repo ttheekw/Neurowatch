@@ -667,17 +667,20 @@ fn stream_choice(stream: &CachedStream, include_url: bool) -> StreamChoice {
     }
 }
 
-/// Main: the largest picture. Grid: the smallest, if it is another stream.
+/// Main: the largest picture. Grid: the smallest of the others.
 fn suggested_streams(streams: &[CachedStream]) -> (Option<String>, Option<String>) {
     let area = |s: &&CachedStream| {
         u64::from(s.profile.width.unwrap_or(0)) * u64::from(s.profile.height.unwrap_or(0))
     };
-    // Ties keep the device's order: its first profile is its main stream.
+    // Ties keep the device's order: its first profile is its main stream, the
+    // next its grid stream. Sizes are unknown for maker stream paths (ONVIF
+    // off) and some ONVIF profiles: the grid stream was dropped, so the grid
+    // decoded every camera's main stream.
     let main = streams.iter().rev().max_by_key(area);
     let sub = streams
         .iter()
-        .min_by_key(area)
-        .filter(|s| Some(s.stream_id.as_str()) != main.map(|m| m.stream_id.as_str()));
+        .filter(|s| Some(s.stream_id.as_str()) != main.map(|m| m.stream_id.as_str()))
+        .min_by_key(area);
     (
         main.map(|s| s.stream_id.clone()),
         sub.map(|s| s.stream_id.clone()),

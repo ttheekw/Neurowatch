@@ -67,6 +67,7 @@ from neurowatch.models.preview_fps import PreviewFps
 from neurowatch.models.video_decoder import restart_reply
 from neurowatch.models.wall_layout import Placement
 from neurowatch.models.window_session import saved_windows
+from neurowatch.service.leftovers import clean_portable_copy, leftovers_message
 from neurowatch.service.manager import ServiceController
 from neurowatch.service.paths import service_endpoint
 from neurowatch.service.startup import StartupPrefs, load_prefs
@@ -2506,6 +2507,11 @@ def main() -> None:
         _config_path,
         _socket_path,
     )
+    # A portable copy unpacked over an older one removes what that one left
+    # before anything (the service among them) can load it.
+    leftovers = clean_portable_copy()
+    if leftovers and terminal:
+        print(leftovers_message(leftovers), file=sys.stderr)
     if launch.mode == "service":
         from neurowatch.service.cli import main as service_main
 
@@ -2548,6 +2554,11 @@ def main() -> None:
         with shutdown.during_startup():
             window = _start_main_window(app, _version, launch if launch.manage_service else None)
         single_instance.activate_requested.connect(window.bring_to_front)
+        if leftovers:
+            QTimer.singleShot(
+                0,
+                lambda: show_message(window, "NeuroWatch Updated", leftovers_message(leftovers)),
+            )
         if shutdown.requested:
             # Signalled before the main loop existed: exit instead of app.exec().
             logger.info("Shutdown requested during startup; exiting")

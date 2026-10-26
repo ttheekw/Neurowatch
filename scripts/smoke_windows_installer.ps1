@@ -10,6 +10,25 @@ $Process = Start-Process $Setup[0].FullName -Wait -PassThru -ArgumentList @(
     "/DIR=`"$Destination`"", "/LOG=`"$InstallLog`""
 )
 if ($Process.ExitCode -ne 0) { Get-Content $InstallLog; throw "Installer failed: $($Process.ExitCode)" }
+
+# An update says so and removes what the old version left behind (here the
+# same installer again over the installation it made).
+$StaleMeta = Join-Path $Destination 'app\neurowatch-ui\_internal\neurowatch-0.0.1.dist-info'
+$StalePlugin = Join-Path $Destination 'gstreamer\lib\gstreamer-1.0\gstneurowatchold.dll'
+New-Item -ItemType Directory -Force -Path $StaleMeta | Out-Null
+Set-Content -Path (Join-Path $StaleMeta 'METADATA') -Value "Name: neurowatch`nVersion: 0.0.1" -Encoding ascii
+Set-Content -Path $StalePlugin -Value '' -Encoding ascii
+$UpdateLog = Join-Path $env:RUNNER_TEMP 'neurowatch-update.log'
+$Process = Start-Process $Setup[0].FullName -Wait -PassThru -ArgumentList @(
+    '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
+    "/DIR=`"$Destination`"", "/LOG=`"$UpdateLog`""
+)
+if ($Process.ExitCode -ne 0) { Get-Content $UpdateLog; throw "Update failed: $($Process.ExitCode)" }
+if ((Test-Path $StaleMeta) -or (Test-Path $StalePlugin)) { Get-Content $UpdateLog; throw 'The update left old files behind' }
+$Updated = Get-Content $UpdateLog -Raw
+if ($Updated -notmatch 'Updating NeuroWatch .+ to ') { throw 'The update did not notice the installed version' }
+if ($Updated -notmatch 'Removed [1-9][0-9]* file\(s\) left over') { throw 'The update did not report the removed files' }
+if (-not (Test-Path (Join-Path $Destination 'bin/nw-backend.exe'))) { throw 'The update removed the backend' }
 # The build SDK must not satisfy missing runtime DLLs or plugins during testing.
 $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'gstreamer' }) -join ';'
 $Sdk = $env:GSTREAMER_1_0_ROOT_MSVC_X86_64

@@ -672,6 +672,17 @@ impl AppState {
             .collect()
     }
 
+    /// The main stream's video codec as the camera's ingest saw it, once it
+    /// connected (`StreamInfo::codec`, e.g. "H265"); None before that.
+    pub fn camera_main_codec(&self, camera_id: &str) -> Option<nw_core::encoded::VideoCodec> {
+        use nw_core::encoded::VideoCodec;
+        match self.ingest.get(camera_id)?.info_rx.borrow().codec.as_str() {
+            "H264" => Some(VideoCodec::H264),
+            "H265" => Some(VideoCodec::H265),
+            _ => None,
+        }
+    }
+
     /// The camera's audio track as its ingest described it, if it sends one.
     pub fn camera_audio(&self, camera_id: &str) -> Option<String> {
         self.ingest.get(camera_id)?.info_rx.borrow().audio.clone()
@@ -832,6 +843,9 @@ impl AppState {
         if let Some(dbg) = value.get("debug").filter(|v| v.is_object()) {
             if let Some(s) = dbg["gst_log"].as_str() {
                 self.config.debug.gst_log = s.to_owned();
+            }
+            if let Some(v) = dbg["extended"].as_bool() {
+                self.config.debug.extended = v;
             }
         }
         if let Some(rec) = value.get("recording").filter(|v| v.is_object()) {
