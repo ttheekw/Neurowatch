@@ -347,6 +347,9 @@ class MainWindow(QMainWindow):
         if isinstance(app, QApplication):
             apply_app_theme(app, "dark")
         cloud_desktop.install(self, lambda: self._open_settings(tab="cloud"))
+        from neurowatch.widgets.update_notice import install as install_updates
+
+        self._update_checker = install_updates(self)
         self._progress(StartupStage.LOADING_CAMERAS, "")
         # Startup load errors are deferred until the welcome screen is gone.
         self._startup_load_error: tuple[bool, str, str] | None = None
@@ -2079,6 +2082,7 @@ class MainWindow(QMainWindow):
         """Remember the recorder's edition; show the camera-limit notice
         while it holds cameras back."""
         self._edition = edition
+        self._update_checker.notice.edition = edition.edition
         if self._edition_notice is None:
             if not edition.notice:
                 return
