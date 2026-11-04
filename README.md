@@ -7,7 +7,7 @@
 <p align="center">
   <b>Turn the computer you already have into a security camera recorder.</b><br>
   Watch every camera live, record around the clock to your own drive, and find any moment in seconds.<br>
-  Free for up to 16 cameras; NeuroWatch Unlimited is USD 50 once. Open source. No account needed for local use.
+  Free for up to 16 cameras; NeuroWatch Unlimited is now USD 0 (normally USD 50), with sign-up required to download. Open source. No account needed for local use.
 </p>
 
 <p align="center">
@@ -160,7 +160,7 @@ Email alerts, dedicated Home Assistant and MQTT integrations, a local web interf
 Each link below opens the [downloads page](https://neurowatch.app/downloads) at the newest version. It offers two editions of every download:
 
 - **NeuroWatch** (free): everything described here, for up to 16 cameras.
-- **NeuroWatch Unlimited** (USD 50, once): the same app with **no software camera limit**; capacity depends on your hardware. Includes a **support response within 24 hours** at [hello@neurowatch.app](mailto:hello@neurowatch.app). Buy it on the downloads page while signed in to your NeuroWatch account; its downloads (this version and later ones) then appear there for you. Install it over the free version: your cameras and recordings stay.
+- **NeuroWatch Unlimited** (~~USD 50~~ USD 0): the same app with **no software camera limit**; capacity depends on your hardware. Includes a **support response within 24 hours** at [hello@neurowatch.app](mailto:hello@neurowatch.app). Create a NeuroWatch account and sign in on the downloads page to download it. No payment is required. Install it over the free version: your cameras and recordings stay.
 
 The desktop purchase and optional NeuroWatch Cloud plans are separate.
 
@@ -359,7 +359,7 @@ NeuroWatch is free, open-source software provided **as is, without any warranty*
 
 This is a summary, not legal advice; the licence texts govern.
 
-- **The NeuroWatch app is open source** under the [Apache License 2.0](LICENSE): live view, recording, playback, export and headless mode, free for any use, including business use. The free downloads run up to 16 cameras; NeuroWatch Unlimited, sold on the [downloads page](https://neurowatch.app/downloads), has no software camera limit. Capacity depends on your hardware.
+- **The NeuroWatch app is open source** under the [Apache License 2.0](LICENSE): live view, recording, playback, export and headless mode, free for any use, including business use. The free downloads run up to 16 cameras; NeuroWatch Unlimited, available for USD 0 after sign-up on the [downloads page](https://neurowatch.app/downloads), has no software camera limit. Capacity depends on your hardware.
 - **You may use, change and share it**, also in your own products, open or closed. When you share it, keep the [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) files and mark the files you changed. The licence includes a patent grant from contributors.
 - **NeuroWatch Cloud is an online service with its own terms.** The cloud-related code in this repository is open source under the same licence. Hosted service plans are separate from the desktop purchase; see [neurowatch.app](https://neurowatch.app) for current plans.
 - **Trademark:** "NeuroWatch" and its logo are not licensed under the Apache License (see [`NOTICE`](NOTICE)). A modified version must use another name and must not be presented as the official NeuroWatch.

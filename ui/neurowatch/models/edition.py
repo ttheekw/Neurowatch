@@ -13,8 +13,9 @@ from typing import Any
 CAMERA_LIMIT_REACHED = -32010
 DOWNLOADS_URL = "https://neurowatch.app/downloads"
 UNLIMITED_OFFER = (
-    "NeuroWatch Unlimited costs USD 50 once and has no software camera limit. "
-    "Capacity depends on your hardware. Includes a support response within 24 hours. "
+    "NeuroWatch Unlimited is now USD 0 (normally USD 50), with no software camera limit. "
+    "Sign up before downloading. Capacity depends on your hardware. "
+    "Includes a support response within 24 hours. "
     "Contact hello@neurowatch.app for support."
 )
 

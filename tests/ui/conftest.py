@@ -76,6 +76,22 @@ def _no_alert_network():
 
 
 @pytest.fixture(autouse=True)
+def _no_update_network():
+    """Update checks in widget tests never reach the public service."""
+    from neurowatch.models import updates
+
+    def offline(*args, **kwargs):
+        raise OSError("Offline update test")
+
+    original = updates.urlopen
+    updates.urlopen = offline
+    try:
+        yield
+    finally:
+        updates.urlopen = original
+
+
+@pytest.fixture(autouse=True)
 def _no_cloud_poll():
     """The main window's cloud light never asks a recorder for ``cloud.status``
     (tests/ui/cloud tests its poll on its own).
