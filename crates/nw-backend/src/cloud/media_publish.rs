@@ -62,6 +62,8 @@ use nw_cloud_protocol::media_session::{
     PLAYBACK_SPEEDS_PERCENT,
 };
 use nw_core::encoded::{EncodedAccessUnit, VideoCodec};
+
+use crate::plugin_host::OverlayStore;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -404,6 +406,10 @@ pub trait PublishedVideoTrack: Send + Sync {
     /// Hands one compressed access unit to the pre-encoded track, unchanged.
     fn capture_encoded(&self, unit: &EncodedAccessUnit) -> Result<(), PublishError>;
 
+    fn frame_timings(&self) -> Vec<FrameTiming> {
+        Vec::new()
+    }
+
     /// Whether a viewer asked for a keyframe (PLI/FIR) since the last call.
     fn take_keyframe_request(&self) -> bool {
         false
@@ -434,6 +440,15 @@ pub trait PublishedVideoTrack: Send + Sync {
 
     /// Send a reliable data message on [`PLAYBACK_TOPIC`] to the room.
     fn send_data(&self, _payload: Vec<u8>) -> BoxFuture<'_, Result<(), PublishError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Send `payload` to every viewer on `topic` (analytics drawings).
+    fn send_topic(
+        &self,
+        _topic: &'static str,
+        _payload: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), PublishError>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -480,6 +495,67 @@ pub struct ViewerMessage {
 /// `viewer:{user}:{viewer}`; an empty identity is an unresolved sender.
 /// The name of a viewer's microphone track that talks through the camera.
 pub const TALK_TRACK: &str = "talk";
+/// Data topic of analytics plugins' drawings over a live camera, node to
+/// viewers: `{"overlays": [{plugin, layer, items, frame?, ttl_ms, lifetime_ms}],
+/// "figures": [{plugin, label, value}]}` (`ttl_ms` left from now, `lifetime_ms`
+/// declared from the picture), all the camera shows now (an empty list clears
+/// it); figures are shown beside the picture. Sent when it changes.
+pub const OVERLAY_TOPIC: &str = "nw.overlays.v1";
+pub const FRAME_TOPIC: &str = "nw.frames.v1";
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FrameTiming {
+    #[serde(skip)]
+    serial: u64,
+    pub rtp_timestamp: u32,
+    #[serde(flatten)]
+    pub identity: nw_core::frame::FrameIdentity,
+}
+
+#[derive(Default)]
+struct FrameTimings {
+    pending: std::collections::VecDeque<nw_core::frame::FrameIdentity>,
+    sent: std::collections::VecDeque<FrameTiming>,
+    serial: u64,
+}
+
+impl FrameTimings {
+    fn submit(&mut self, frame: nw_core::frame::FrameIdentity) {
+        self.pending.push_back(frame);
+        while self.pending.len() > 512 {
+            self.pending.pop_front();
+        }
+    }
+
+    fn packetized(&mut self, time_us: u64, frame_id: u32, rtp_timestamp: u32) {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|frame| frame.time_us as u64 == time_us && frame.seq as u32 == frame_id)
+        else {
+            return;
+        };
+        let Some(identity) = self.pending.remove(index) else {
+            return;
+        };
+        self.serial = self.serial.wrapping_add(1);
+        self.sent.push_back(FrameTiming {
+            serial: self.serial,
+            rtp_timestamp,
+            identity,
+        });
+        while self.sent.len() > 96 {
+            self.sent.pop_front();
+        }
+    }
+}
+/// Largest drawing message; past it, the largest drawings lose items.
+const MAX_OVERLAY_MESSAGE: usize = 14_000;
+/// At most this often per live session: as fast as a plugin may draw (25 a
+/// second per layer, `plugin_host::session`), so a viewer gets every result
+/// and the portal can show each result's picture at the plugin's own rate.
+const OVERLAY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+
 /// Data topic telling a viewer why its talk track is not played:
 /// `{"refused": "<reason>"}`, sent to that viewer only.
 pub const TALK_TOPIC: &str = "nw.talk.v1";
@@ -1103,6 +1179,25 @@ async fn connect_room(
         codec,
         "publishing camera to livekit"
     );
+    let frames = std::sync::Arc::new(Mutex::new(FrameTimings::default()));
+    let mut timing_events = track.publish_timing_events();
+    let observed = std::sync::Arc::clone(&frames);
+    let timing_task = tokio::spawn(async move {
+        use futures_util::StreamExt;
+        use livekit::track::PublishTimingStage;
+        while let Some(event) = timing_events.next().await {
+            if event.stage == PublishTimingStage::WebrtcPacketize && event.capture_timestamp_us > 0
+            {
+                if let Ok(mut frames) = observed.lock() {
+                    frames.packetized(
+                        event.capture_timestamp_us,
+                        event.frame_id.unwrap_or(0),
+                        event.rtp_timestamp,
+                    );
+                }
+            }
+        }
+    });
     Ok(Box::new(LiveKitPublishedTrack {
         session: Mutex::new(Some(LiveKitSession {
             room,
@@ -1110,10 +1205,12 @@ async fn connect_room(
             track,
             source,
             published_at: std::time::Instant::now(),
+            timing_task,
         })),
         messages: Mutex::new(Some(messages_rx)),
         camera_id: grant.scope.camera_id.clone(),
         viewed,
+        frames,
     }) as Box<dyn PublishedVideoTrack>)
 }
 
@@ -1161,6 +1258,13 @@ struct LiveKitSession {
     track: LocalVideoTrack,
     source: NativeVideoSource,
     published_at: std::time::Instant,
+    timing_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LiveKitSession {
+    fn drop(&mut self) {
+        self.timing_task.abort();
+    }
 }
 
 struct LiveKitPublishedTrack {
@@ -1171,9 +1275,16 @@ struct LiveKitPublishedTrack {
     camera_id: String,
     /// LiveKit has told this publisher a participant subscribed to its track.
     viewed: std::sync::Arc<AtomicBool>,
+    frames: std::sync::Arc<Mutex<FrameTimings>>,
 }
 
 impl PublishedVideoTrack for LiveKitPublishedTrack {
+    fn frame_timings(&self) -> Vec<FrameTiming> {
+        self.frames
+            .lock()
+            .map(|frames| frames.sent.iter().cloned().collect())
+            .unwrap_or_default()
+    }
     fn viewer_attached(&self) -> Option<bool> {
         Some(self.viewed.load(Ordering::Relaxed))
     }
@@ -1185,6 +1296,11 @@ impl PublishedVideoTrack for LiveKitPublishedTrack {
         };
         // `false` means the adapter dropped the unit (frame-rate adaptation);
         // the stream carries on, as with raw capture.
+        if let Some(frame) = unit.frame {
+            if let Ok(mut frames) = self.frames.lock() {
+                frames.submit(frame);
+            }
+        }
         session.source.capture_encoded_frame(&EncodedVideoFrame {
             codec: match unit.codec {
                 VideoCodec::H264 => EncodedVideoCodec::H264,
@@ -1201,7 +1317,13 @@ impl PublishedVideoTrack for LiveKitPublishedTrack {
                 width: unit.width,
                 height: unit.height,
             },
-            frame_metadata: None,
+            frame_metadata: unit
+                .frame
+                .map(|frame| livekit::webrtc::video_frame::FrameMetadata {
+                    user_timestamp: Some(frame.time_us.max(0) as u64),
+                    frame_id: Some(frame.seq as u32),
+                    user_data: None,
+                }),
         });
         Ok(())
     }
@@ -1261,6 +1383,14 @@ impl PublishedVideoTrack for LiveKitPublishedTrack {
     }
 
     fn send_data(&self, payload: Vec<u8>) -> BoxFuture<'_, Result<(), PublishError>> {
+        self.send_topic(PLAYBACK_TOPIC, payload)
+    }
+
+    fn send_topic(
+        &self,
+        topic: &'static str,
+        payload: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), PublishError>> {
         // The participant handle is cloned out, so no lock is held across the send.
         let participant = self
             .session
@@ -1272,7 +1402,7 @@ impl PublishedVideoTrack for LiveKitPublishedTrack {
             participant
                 .publish_data(DataPacket {
                     payload,
-                    topic: Some(PLAYBACK_TOPIC.to_owned()),
+                    topic: Some(topic.to_owned()),
                     reliable: true,
                     ..Default::default()
                 })
@@ -1473,6 +1603,8 @@ pub struct EncodedMediaBridge<C> {
     cancel: watch::Receiver<bool>,
     captured: AtomicU64,
     control: Option<std::sync::Arc<dyn DataControl>>,
+    /// Live view: the drawing store and the camera whose drawings go out.
+    overlays: Option<(std::sync::Arc<OverlayStore>, String)>,
 }
 
 impl<C: RoomConnector> EncodedMediaBridge<C> {
@@ -1485,6 +1617,7 @@ impl<C: RoomConnector> EncodedMediaBridge<C> {
                 cancel,
                 captured: AtomicU64::new(0),
                 control: None,
+                overlays: None,
             },
             PublishCancel {
                 sender: std::sync::Arc::new(sender),
@@ -1501,6 +1634,12 @@ impl<C: RoomConnector> EncodedMediaBridge<C> {
     /// Serve the session's data channel with `control` (recorded playback).
     pub fn with_control(mut self, control: std::sync::Arc<dyn DataControl>) -> Self {
         self.control = Some(control);
+        self
+    }
+
+    /// Send `camera_id`'s analytics drawings to the viewers (live view).
+    pub fn with_overlays(mut self, store: std::sync::Arc<OverlayStore>, camera_id: String) -> Self {
+        self.overlays = Some((store, camera_id));
         self
     }
 
@@ -1567,6 +1706,9 @@ impl<C: RoomConnector> EncodedMediaBridge<C> {
                     // Held: no viewer could decode it yet (see `awaiting_viewer`).
                     gop.push(&unit);
                 } else {
+                    if unit.timestamp_us < last_timestamp_us.saturating_add(MIN_FRAME_SPACING_US) {
+                        unit.frame = None; // cached catch-up pictures carry no current drawings
+                    }
                     unit.timestamp_us = unit
                         .timestamp_us
                         .max(last_timestamp_us.saturating_add(MIN_FRAME_SPACING_US));
@@ -1628,6 +1770,7 @@ impl<C: RoomConnector> EncodedMediaBridge<C> {
                     .max(now_us().saturating_sub(count * MIN_FRAME_SPACING_US));
                 for cached in &gop.units {
                     let mut replayed = cached.clone();
+                    replayed.frame = None;
                     replayed.timestamp_us = stamp;
                     last_timestamp_us = stamp;
                     stamp = stamp.saturating_add(MIN_FRAME_SPACING_US);
@@ -1701,6 +1844,7 @@ impl<C: RoomConnector> MediaBridge for EncodedMediaBridge<C> {
                 result = connect => result?,
             };
             let track: std::sync::Arc<dyn PublishedVideoTrack> = std::sync::Arc::from(track);
+            let timings = spawn_frame_timings(std::sync::Arc::clone(&track));
             let channel =
                 self.control
                     .clone()
@@ -1715,9 +1859,20 @@ impl<C: RoomConnector> MediaBridge for EncodedMediaBridge<C> {
                     grant.session_id.clone(),
                 )
             });
+            let drawings = self.overlays.as_ref().map(|(store, camera_id)| {
+                spawn_overlays(
+                    std::sync::Arc::clone(store),
+                    camera_id.clone(),
+                    std::sync::Arc::clone(&track),
+                )
+            });
             let result = self.pump(track.as_ref(), first, grant).await;
+            timings.abort();
             if let Some(channel) = channel {
                 channel.abort();
+            }
+            if let Some(drawings) = drawings {
+                drawings.abort();
             }
             if let Some(audio) = audio {
                 audio.abort();
@@ -1757,6 +1912,97 @@ fn spawn_audio(
             next = samples.recv().await;
         }
     })
+}
+
+/// Send `camera_id`'s drawings to the session's viewers whenever they
+/// change, at most every [`OVERLAY_INTERVAL`].
+fn spawn_frame_timings(
+    track: std::sync::Arc<dyn PublishedVideoTrack>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut seen = 0;
+        let mut tick = tokio::time::interval(OVERLAY_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let frames: Vec<_> = track
+                .frame_timings()
+                .into_iter()
+                .filter(|frame| frame.serial > seen)
+                .collect();
+            let Some(last) = frames.last() else {
+                continue;
+            };
+            let next = last.serial;
+            let Ok(message) = serde_json::to_vec(&serde_json::json!({"frames":frames})) else {
+                continue;
+            };
+            if track.send_topic(FRAME_TOPIC, message).await.is_ok() {
+                seen = next;
+            }
+        }
+    })
+}
+
+fn spawn_overlays(
+    store: std::sync::Arc<OverlayStore>,
+    camera_id: String,
+    track: std::sync::Arc<dyn PublishedVideoTrack>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let cameras = [camera_id];
+        let mut seen = 0;
+        let mut sent: Option<Vec<u8>> = None;
+        loop {
+            seen = store.wait(seen, std::time::Duration::from_secs(5)).await;
+            let message =
+                overlay_message(store.snapshot(Some(&cameras)), &store.figures(&cameras[0]));
+            if sent.as_ref() != Some(&message) {
+                if let Err(error) = track.send_topic(OVERLAY_TOPIC, message.clone()).await {
+                    tracing::debug!(%error, "Could not send analytics drawings");
+                }
+                sent = Some(message);
+            }
+            tokio::time::sleep(OVERLAY_INTERVAL).await;
+        }
+    })
+}
+
+/// The [`OVERLAY_TOPIC`] message for `shown`, kept under
+/// [`MAX_OVERLAY_MESSAGE`]: the largest drawings lose their last items.
+fn overlay_message(
+    mut shown: Vec<crate::plugin_host::overlays::Shown>,
+    figures: &[crate::plugin_host::overlays::ShownFigure],
+) -> Vec<u8> {
+    loop {
+        let message = serde_json::json!({
+            "overlays": shown.iter().map(|drawing| serde_json::json!({
+                "plugin": drawing.plugin,
+                "layer": drawing.layer,
+                "items": drawing.items,
+                "frame": drawing.frame,
+                "time_us": drawing.time_us,
+                "observed_us": drawing.observed_us,
+                "ttl_ms": drawing.ttl_ms,
+                "lifetime_ms": drawing.lifetime_ms,
+                "on_wall": drawing.on_wall,
+            })).collect::<Vec<_>>(),
+            "figures": figures,
+        })
+        .to_string()
+        .into_bytes();
+        if message.len() <= MAX_OVERLAY_MESSAGE {
+            return message;
+        }
+        let Some(largest) = shown.iter_mut().max_by_key(|drawing| drawing.items.len()) else {
+            return message;
+        };
+        if largest.items.is_empty() {
+            return message;
+        }
+        let keep = largest.items.len() / 2;
+        largest.items.truncate(keep);
+    }
 }
 
 /// Serve a session's data channel: hand each viewer message to `control`,
@@ -1902,6 +2148,8 @@ pub struct PublisherSupervisor {
     connector: std::sync::Arc<dyn RoomConnector>,
     playback: Option<std::sync::Arc<dyn PlaybackOpener>>,
     live_sources: Option<std::sync::Arc<dyn LiveSourceOpener>>,
+    /// Analytics drawings for live viewers.
+    overlays: Option<std::sync::Arc<OverlayStore>>,
     active: Mutex<HashMap<String, ActivePublication>>,
     status: Mutex<HashMap<String, String>>,
     inactive: tokio::sync::Notify,
@@ -1957,6 +2205,7 @@ impl PublisherSupervisor {
             connector: std::sync::Arc::new(LiveKitRoomConnector::default()),
             playback: None,
             live_sources: None,
+            overlays: None,
             active: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
             inactive: tokio::sync::Notify::new(),
@@ -1981,6 +2230,12 @@ impl PublisherSupervisor {
     /// Serve live directives from the cameras' own compressed streams.
     pub fn with_live_sources(mut self, opener: std::sync::Arc<dyn LiveSourceOpener>) -> Self {
         self.live_sources = Some(opener);
+        self
+    }
+
+    /// Send analytics plugins' drawings to live viewers ([`OVERLAY_TOPIC`]).
+    pub fn with_overlays(mut self, store: std::sync::Arc<OverlayStore>) -> Self {
+        self.overlays = Some(store);
         self
     }
 
@@ -2086,7 +2341,13 @@ impl PublisherSupervisor {
                         grant.scope.representation,
                         std::sync::Arc::new(submitter),
                     )?;
-                    let (bridge, cancel) = EncodedMediaBridge::new(feed, connector);
+                    let (mut bridge, cancel) = EncodedMediaBridge::new(feed, connector);
+                    if let Some(store) = &self.overlays {
+                        bridge = bridge.with_overlays(
+                            std::sync::Arc::clone(store),
+                            grant.scope.camera_id.clone(),
+                        );
+                    }
                     (Box::new(bridge), cancel, None, Some(run))
                 }
             };
@@ -2212,6 +2473,58 @@ impl PublisherSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn figures_reach_viewers_beside_the_drawings() {
+        let figure = crate::plugin_host::overlays::ShownFigure {
+            plugin: "vcount".into(),
+            label: "Total today".into(),
+            value: "15".into(),
+            icon: Some("total".into()),
+            style: Some(nw_analytics_protocol::messages::Style::Series3),
+        };
+        let message: serde_json::Value =
+            serde_json::from_slice(&overlay_message(vec![], &[figure])).unwrap();
+        assert_eq!(message["overlays"], serde_json::json!([]));
+        assert_eq!(
+            message["figures"],
+            serde_json::json!([{"plugin": "vcount", "label": "Total today", "value": "15",
+                "icon": "total", "style": "series3"}])
+        );
+    }
+
+    #[test]
+    fn browser_frame_mapping_uses_packetized_timestamps_and_full_stream_identities() {
+        let mut timings = FrameTimings::default();
+        let a = nw_core::frame::FrameIdentity {
+            observed_us: 0,
+            seq: u64::from(u32::MAX) + 1,
+            time_us: 1_700_000_000_000_000,
+        };
+        let b = nw_core::frame::FrameIdentity {
+            observed_us: 0,
+            seq: a.seq + 1,
+            time_us: a.time_us + 40_000,
+        };
+        timings.submit(a);
+        timings.submit(b);
+        timings.packetized(b.time_us as u64, b.seq as u32, 14);
+        timings.packetized(a.time_us as u64, a.seq as u32, u32::MAX - 5);
+        assert_eq!(timings.sent[0].identity, b);
+        assert_eq!(timings.sent[1].identity, a);
+        assert_eq!(timings.sent[1].rtp_timestamp, u32::MAX - 5);
+        assert!(timings.sent[1].serial > timings.sent[0].serial);
+        timings.packetized(10, 99, 22);
+        assert_eq!(timings.sent.len(), 2, "unknown pictures cannot be mapped");
+        for index in 0..1000 {
+            timings.submit(nw_core::frame::FrameIdentity {
+                observed_us: 0,
+                seq: index,
+                time_us: index as i64 + 1,
+            });
+        }
+        assert_eq!(timings.pending.len(), 512);
+    }
 
     #[test]
     fn a_talk_refusal_is_a_short_json_reason() {
@@ -2402,6 +2715,7 @@ mod tests {
 
     fn unit(index: u8, keyframe: bool) -> EncodedAccessUnit {
         EncodedAccessUnit {
+            frame: None,
             codec: VideoCodec::H264,
             payload: vec![0, 0, 0, 1, index],
             keyframe,
@@ -2694,6 +3008,7 @@ mod tests {
             EncodedMediaBridge::new(feed, EncodedConnector(std::sync::Arc::clone(&log)));
         submitter.submit(unit(1, true));
         submitter.submit(EncodedAccessUnit {
+            frame: None,
             codec: VideoCodec::H265,
             ..unit(2, true)
         });
@@ -4131,6 +4446,142 @@ mod tests {
             ]
         );
         supervisor.cancel_all().await;
+    }
+
+    // -- analytics drawings for live viewers -----------------------------------
+
+    struct TopicTrack {
+        sent: std::sync::Arc<Mutex<Vec<(&'static str, serde_json::Value)>>>,
+    }
+    impl PublishedVideoTrack for TopicTrack {
+        fn capture_encoded(&self, _: &EncodedAccessUnit) -> Result<(), PublishError> {
+            Ok(())
+        }
+        fn close(&self) -> BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+        fn send_topic(
+            &self,
+            topic: &'static str,
+            payload: Vec<u8>,
+        ) -> BoxFuture<'_, Result<(), PublishError>> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((topic, serde_json::from_slice(&payload).unwrap()));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn boxed(x: f32) -> nw_analytics_protocol::messages::OverlayItem {
+        nw_analytics_protocol::messages::OverlayItem::Box {
+            rect: [x, 0.1, 0.1, 0.1],
+            label: Some("Motion 12%".into()),
+            style: nw_analytics_protocol::messages::Style::Warning,
+            fill: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_viewers_get_their_cameras_drawings_as_they_change() {
+        let store = std::sync::Arc::new(OverlayStore::default());
+        store.put(
+            "cam-1",
+            "motion",
+            "detections",
+            vec![boxed(0.1)],
+            Some(4),
+            None,
+        );
+        store.put(
+            "cam-2",
+            "motion",
+            "detections",
+            vec![boxed(0.2)],
+            None,
+            None,
+        );
+        store.set_wall_layers([("cam-1".into(), "motion".into(), "detections".into())].into());
+        let sent = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let track: std::sync::Arc<dyn PublishedVideoTrack> = std::sync::Arc::new(TopicTrack {
+            sent: std::sync::Arc::clone(&sent),
+        });
+        let task = spawn_overlays(std::sync::Arc::clone(&store), "cam-1".into(), track);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sent.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        {
+            let first = sent.lock().unwrap();
+            let (topic, message) = &first[0];
+            assert_eq!(*topic, OVERLAY_TOPIC);
+            let overlays = message["overlays"].as_array().unwrap();
+            assert_eq!(overlays.len(), 1, "only this camera's drawings");
+            assert_eq!(overlays[0]["layer"], "detections");
+            assert_eq!(overlays[0]["frame"], 4);
+            assert_eq!(overlays[0]["items"][0]["type"], "box");
+            assert_eq!(overlays[0]["on_wall"], true);
+            assert!(overlays[0]["ttl_ms"].as_u64().unwrap() > 1000);
+            assert!(
+                overlays[0]["lifetime_ms"].as_u64().unwrap()
+                    >= overlays[0]["ttl_ms"].as_u64().unwrap()
+            );
+        }
+        // Another camera's change sends nothing new; clearing this one does.
+        store.put(
+            "cam-2",
+            "motion",
+            "detections",
+            vec![boxed(0.3)],
+            None,
+            None,
+        );
+        store.put("cam-1", "motion", "detections", vec![], None, None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sent.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let all = sent.lock().unwrap().clone();
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert_eq!(all[1].1["overlays"], serde_json::json!([]));
+        task.abort();
+    }
+
+    #[test]
+    fn large_drawings_are_trimmed_to_fit_a_data_message() {
+        let store = OverlayStore::default();
+        let many: Vec<_> = (0..256).map(|i| boxed(i as f32 / 300.0)).collect();
+        store.put("cam-1", "motion", "debug", many, None, None);
+        store.put(
+            "cam-1",
+            "motion",
+            "detections",
+            vec![boxed(0.5)],
+            None,
+            None,
+        );
+        let message = overlay_message(store.snapshot(None), &[]);
+        assert!(message.len() <= MAX_OVERLAY_MESSAGE, "{}", message.len());
+        let value: serde_json::Value = serde_json::from_slice(&message).unwrap();
+        let layers: Vec<_> = value["overlays"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| {
+                (
+                    o["layer"].as_str().unwrap().to_owned(),
+                    o["items"].as_array().unwrap().len(),
+                )
+            })
+            .collect();
+        assert!(
+            layers.contains(&("detections".to_owned(), 1)),
+            "the small layer is kept whole"
+        );
+        assert!(layers
+            .iter()
+            .any(|(l, n)| l == "debug" && *n > 0 && *n < 256));
     }
 
     // -- the playback data channel ---------------------------------------------

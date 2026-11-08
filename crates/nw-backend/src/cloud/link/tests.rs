@@ -751,16 +751,69 @@ fn camera_inventory_reports_which_streams_a_browser_can_be_sent() {
         camera("cam-a", "Front door", true),
         camera("cam-b", "Gate", false),
     ];
-    let snapshot =
-        camera_inventory_with_live(&cameras, &std::collections::HashMap::new(), |camera| {
+    let snapshot = camera_inventory_with_live(
+        &cameras,
+        &std::collections::HashMap::new(),
+        |camera| {
             (camera.id == "cam-a")
                 .then(|| std::collections::BTreeMap::from([("main", Some("h265")), ("sub", None)]))
-        });
+        },
+        |_| None,
+    );
     let json = serde_json::to_value(&snapshot).unwrap();
     assert_eq!(json[0]["live"], json!({"main": "h265", "sub": null}));
     // Not known: left out, so a cloud keeps its earlier assumption and older
     // signed payloads are unchanged.
     assert!(json[1].get("live").is_none());
+}
+
+#[test]
+fn camera_inventory_reports_each_streams_size_and_measured_rates() {
+    use crate::streams::VideoFormat;
+    let cameras = vec![
+        camera("cam-a", "Front door", true),
+        camera("cam-b", "Gate", false),
+    ];
+    let snapshot = camera_inventory_with_live(
+        &cameras,
+        &std::collections::HashMap::new(),
+        |_| None,
+        |camera| {
+            Some(match camera.id.as_str() {
+                "cam-a" => std::collections::BTreeMap::from([
+                    (
+                        "main",
+                        StreamVideo::from(VideoFormat {
+                            width: Some(2560),
+                            height: Some(1440),
+                            fps: Some(24.987),
+                            video_bps: Some(4_096_000),
+                        }),
+                    ),
+                    (
+                        "sub",
+                        StreamVideo::from(VideoFormat {
+                            width: Some(640),
+                            height: Some(360),
+                            fps: None,
+                            video_bps: None,
+                        }),
+                    ),
+                ]),
+                // No stream seen yet.
+                _ => std::collections::BTreeMap::new(),
+            })
+        },
+    );
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(
+        json[0]["formats"],
+        json!({"main": {"width": 2560, "height": 1440, "fps": 25.0, "bitrate_bps": 4_096_000},
+               "sub": {"width": 640, "height": 360}})
+    );
+    assert!(json[1].get("formats").is_none(), "nothing seen: left out");
+    let text = json.to_string();
+    assert!(!text.contains("rtsp") && !text.contains("192.168") && !text.contains("hunter2"));
 }
 
 #[test]
@@ -1911,6 +1964,7 @@ fn a_camera_status_change_is_reported_within_seconds_but_not_more_than_every_ten
             status,
             recording: false,
             live: None,
+            formats: None,
         }]
     };
     let reported = (snap("connecting"), start);
@@ -2081,6 +2135,7 @@ async fn a_sealed_portal_request_runs_in_plaintext_here_and_goes_back_sealed() {
         handler,
         RemoteConfigRequest {
             request_id: "a".repeat(32),
+            requester: None,
             method: "camera.discovery.profiles".into(),
             params: json!({"sealed": envelope}),
         },

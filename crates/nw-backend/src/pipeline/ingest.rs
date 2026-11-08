@@ -500,6 +500,18 @@ impl IngestSupervisor {
 
     // -- metadata check ------------------------------------------------------------
 
+    /// Before a metadata check: [`Self::announce_attempt`], except for the
+    /// routine re-check of a camera that answered the last one. It stays
+    /// `streaming`: every 30 s it read `connecting` for as long as the camera
+    /// took to describe itself, which the portal showed (a remote camera:
+    /// seconds, and a report lasts 10 s at least).
+    fn announce_check(&self) {
+        if self.failures == 0 && self.state_tx.borrow().as_str() == "streaming" {
+            return;
+        }
+        self.announce_attempt();
+    }
+
     fn check(&mut self) -> Attempt {
         let url = self.source.url.clone();
         let failed = |reason: String| Attempt::Failed {
@@ -510,7 +522,7 @@ impl IngestSupervisor {
             if let Err(reason) = probe_source(&url) {
                 return failed(reason);
             }
-            self.announce_attempt();
+            self.announce_check();
             describe(&self.source).map(Some)
         } else if url.starts_with("http://")
             || url.starts_with("https://")
@@ -757,6 +769,40 @@ mod tests {
         );
         ingest.announce_attempt();
         assert_eq!(states.borrow().as_str(), "reconnecting");
+    }
+
+    #[test]
+    fn a_healthy_camera_stays_streaming_while_it_is_checked_again() {
+        let (_stop, stop_rx) = watch::channel(false);
+        let (state_tx, states) = watch::channel(String::new());
+        let (info_tx, _infos) = watch::channel(StreamInfo::default());
+        let mut ingest = IngestSupervisor::new(
+            CameraConfig::new("Door", "rtsp://127.0.0.1:9/unreachable"),
+            Arc::new(LogEventBus),
+            stop_rx,
+            state_tx,
+            info_tx,
+        );
+        // The first check says it is connecting.
+        ingest.announce_check();
+        assert_eq!(states.borrow().as_str(), "connecting");
+        // A camera that answered stays live through the next check.
+        ingest.publish_state("streaming");
+        ingest.announce_check();
+        assert_eq!(states.borrow().as_str(), "streaming");
+        // After a failure the retry says so, as before.
+        ingest.failures = 1;
+        ingest.publish_state("reconnecting");
+        ingest.announce_check();
+        assert_eq!(states.borrow().as_str(), "reconnecting");
+        ingest.failures = 3;
+        ingest.publish_state("offline");
+        ingest.announce_check();
+        assert_eq!(
+            states.borrow().as_str(),
+            "offline",
+            "offline until it answers"
+        );
     }
 
     #[test]

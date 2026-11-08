@@ -360,6 +360,15 @@ async fn websocket_real_portal_contract() {
             ("main", Some("h264")),
             ("sub", None),
         ])),
+        formats: Some(std::collections::BTreeMap::from([(
+            "main",
+            StreamVideo {
+                width: Some(1920),
+                height: Some(1080),
+                fps: Some(24.9),
+                bitrate_bps: Some(2_048_000),
+            },
+        )])),
     };
     assert!(node.push_inventory(vec![camera]).await.unwrap());
     assert!(node.push_coverage(vec![]).await.unwrap());
@@ -958,5 +967,49 @@ async fn a_dropped_control_connection_keeps_active_publications_within_the_grace
     scheduler.shutdown().await;
     node.close_websocket().await;
     server.abort();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A linked recorder asks for its Cloud Backup plan over the WebSocket, like
+/// every other signed request (over HTTP it was never tried once linked).
+#[tokio::test]
+async fn the_backup_plan_check_goes_over_the_websocket() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (node, dir) = ws_node(&format!("http://{}/", listener.local_addr().unwrap()));
+    let public = URL_SAFE_NO_PAD.encode(node.lock().unwrap().key.verifying_key().to_bytes());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        handshake(&mut ws, &public).await;
+        let request = read_request(&mut ws).await;
+        assert_eq!(request["method"], "challenge");
+        assert_eq!(
+            request["body"]["operation"],
+            backup::BACKUP_TICKET_OPERATION
+        );
+        respond(&mut ws, &request, 201, json!({"protocol_version": 1, "audience": NODE_AUDIENCE,
+            "operation": backup::BACKUP_TICKET_OPERATION, "challenge": "backup-once",
+            "expires_at": fmt_time(OffsetDateTime::now_utc() + TimeDuration::seconds(120)).unwrap()})).await;
+        let ticket = read_request(&mut ws).await;
+        assert_eq!(ticket["method"], backup::BACKUP_TICKET_OPERATION);
+        assert_eq!(ticket["body"]["challenge"], "backup-once");
+        assert!(verify_signed(
+            &public,
+            ticket["body"]["signature"].as_str().unwrap(),
+            &without_signature(&ticket["body"])
+        ));
+        respond(
+            &mut ws,
+            &ticket,
+            200,
+            json!({"backup": {"ticket": "claims.signature",
+            "ingest": {"name": "localhost", "quic": "127.0.0.1:7443", "tcp": "127.0.0.1:7443"}}}),
+        )
+        .await;
+    });
+    let assignment = node.backup_assignment().await.unwrap().unwrap();
+    assert_eq!(assignment.ticket, "claims.signature");
+    server.await.unwrap();
+    node.close_websocket().await;
     fs::remove_dir_all(dir).unwrap();
 }

@@ -161,32 +161,29 @@ jobs:
             }
           }
           where.exe cl link
+      # GStreamer 1.28 ships one Inno Setup installer per architecture (no MSIs):
+      # /TYPE=devel adds the headers and pkg-config files; /DIR is the
+      # msvc_x86_64 root itself.
       - name: Install GStreamer (MSVC)
         shell: pwsh
         run: |
-          $ver = "1.24.13"
-          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$ver/msvc"
-          Invoke-WebRequest "$base/gstreamer-1.0-msvc-x86_64-$ver.msi" -OutFile gst-runtime.msi
-          Invoke-WebRequest "$base/gstreamer-1.0-devel-msvc-x86_64-$ver.msi" -OutFile gst-devel.msi
-          $hashes = @{
-            'gst-runtime.msi' = '66915d82adda34189703c36a5d2ef145d2e3afb7afc12c66fcf2ea506e2466d2'
-            'gst-devel.msi' = '0afb4394c2cba3999c0f5e74f28c2ac5d98f03131140e09246d4dcd60a0a0395'
+          $ver = "1.28.8"
+          $installer = "gstreamer-1.0-msvc-x86_64-$ver.exe"
+          Invoke-WebRequest "https://gstreamer.freedesktop.org/data/pkg/windows/$ver/msvc/$installer" -OutFile $installer
+          $hash = 'e4c41ee6ee9c6c32a45d198463ec08d79bac3bd5fa58adc93d13fe4a08abc9d9'
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne $hash) { throw "Checksum mismatch: $installer" }
+          $gstRoot = 'C:\gstreamer\1.0\msvc_x86_64'
+          $log = Join-Path $env:RUNNER_TEMP 'gstreamer-install.log'
+          $p = Start-Process ".\$installer" -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/TYPE=devel', "/DIR=$gstRoot", "/LOG=$log")
+          if ($p.ExitCode -ne 0) {
+            if (Test-Path $log) { Get-Content $log -Tail 40 }
+            throw "$installer failed: $($p.ExitCode)"
           }
-          foreach ($msi in @('gst-runtime.msi', 'gst-devel.msi')) {
-            if ((Get-FileHash $msi -Algorithm SHA256).Hash -ne $hashes[$msi]) { throw "Checksum mismatch: $msi" }
-            $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/i $msi /qn /norestart ADDLOCAL=ALL"
-            if ($p.ExitCode -notin @(0, 3010)) { throw "$msi failed: $($p.ExitCode)" }
+          foreach ($file in @('bin\gst-launch-1.0.exe', 'bin\gstreamer-1.0-0.dll', 'lib\pkgconfig\gstreamer-1.0.pc',
+              'include\gstreamer-1.0\gst\gst.h', 'lib\gstreamer-1.0\gstlibav.dll')) {
+            if (-not (Test-Path (Join-Path $gstRoot $file))) { throw "GStreamer install lacks $file" }
           }
-          # The installer records where it put GStreamer in a machine-wide
-          # variable that later steps do not inherit; read it, then try the
-          # usual locations.
-          $candidates = @(
-            [Environment]::GetEnvironmentVariable('GSTREAMER_1_0_ROOT_MSVC_X86_64', 'Machine'),
-            "$env:ProgramFiles\gstreamer\1.0\msvc_x86_64",
-            "C:\gstreamer\1.0\msvc_x86_64"
-          ) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }
-          $gstRoot = $candidates | Where-Object { Test-Path (Join-Path $_ 'bin\gst-launch-1.0.exe') } | Select-Object -First 1
-          if (-not $gstRoot) { throw "GStreamer not found after installing; looked in: $($candidates -join ', ')" }
           Write-Host "GStreamer: $gstRoot"
           echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" >> $env:GITHUB_ENV
           echo "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" >> $env:GITHUB_ENV

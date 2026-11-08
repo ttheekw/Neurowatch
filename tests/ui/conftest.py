@@ -18,6 +18,27 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _no_playback_drawing_network():
+    """Playback widgets never query the user's drawing database in UI tests."""
+    from neurowatch.ipc import playback_analytics
+    from neurowatch.models.drawing_history import DrawingWindow
+
+    original = playback_analytics._HistoryWorker
+
+    class OfflineHistoryWorker(original):
+        def run(self):
+            self.done.emit(
+                DrawingWindow(tuple(self.cameras), self.at_ms - 10_000, self.at_ms + 30_000, {})
+            )
+
+    playback_analytics._HistoryWorker = OfflineHistoryWorker
+    try:
+        yield original
+    finally:
+        playback_analytics._HistoryWorker = original
+
+
+@pytest.fixture(autouse=True)
 def _no_event_image_network():
     """New preview widgets must never query a user's real event database.
 

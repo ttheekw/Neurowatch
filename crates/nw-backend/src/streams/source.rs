@@ -164,6 +164,7 @@ fn connect_sink(
                     buffer,
                     caps,
                     arrived_us: now_us(),
+                    frame: None,
                 });
                 Ok(gstreamer::FlowSuccess::Ok)
             })
@@ -184,6 +185,7 @@ pub(super) fn run(hub: Arc<Hub>) {
             Outcome::Closed => break,
             Outcome::Failed { reason, delivered } => {
                 let reason = crate::pipeline::sanitize_credentials(&reason);
+                lock(&hub.frames).restart();
                 lock(&hub.core).disconnect(&reason);
                 if delivered {
                     failures = 0;

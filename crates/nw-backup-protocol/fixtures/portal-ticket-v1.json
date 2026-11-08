@@ -1,0 +1,31 @@
+{
+  "portal_public_key": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+  "audience": "ingest-1.neurowatch.app",
+  "now_ms": 1790000060000,
+  "ticket": "eyJ2IjoxLCJpZCI6InQtZml4dHVyZSIsIm9yZ19pZCI6IjZiYTdiODExLTlkYWQtMTFkMS04MGI0LTAwYzA0ZmQ0MzBjOCIsIm5vZGVfaWQiOiI2YmE3YjgxMC05ZGFkLTExZDEtODBiNC0wMGMwNGZkNDMwYzgiLCJub2RlX2tleSI6IjJmYTQ2OTBlZmM4NWU3ZWY0OWZhNzBkMDZjNWNkZDhhZjczMmFiOTNjMWFhMmI1MDc4ZWUxZTFjNzQyZTFhY2IiLCJhdWRpZW5jZSI6ImluZ2VzdC0xLm5ldXJvd2F0Y2guYXBwIiwiaXNzdWVkX2F0X21zIjoxNzkwMDAwMDAwMDAwLCJleHBpcmVzX2F0X21zIjoxNzkwMDAzNjAwMDAwLCJjYW1lcmFzIjpbeyJjYW1lcmFfaWQiOiJjYW0tMSIsInJldGVudGlvbl9zIjo3MjAwLCJzb3VuZCI6dHJ1ZSwibGltaXRzIjp7Im1heF9sb25nX3NpZGUiOjE5MjAsIm1heF9zaG9ydF9zaWRlIjoxMDgwLCJtYXhfZnBzIjoxMC4wLCJtYXhfYml0cmF0ZV9icHMiOjIwMDAwMDB9fV19.DLo7ZNAYZa4LcoQ7zMl447EcxD3uK5XzWjc45_S9HNxu_kYpbnD2BAmrDEvpJt4iV0uv0BGhI6tQ4lZYnYA9Aw",
+  "claims": {
+    "v": 1,
+    "id": "t-fixture",
+    "org_id": "6ba7b811-9dad-11d1-80b4-00c04fd430c8",
+    "node_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "node_key": "2fa4690efc85e7ef49fa70d06c5cdd8af732ab93c1aa2b5078ee1e1c742e1acb",
+    "audience": "ingest-1.neurowatch.app",
+    "issued_at_ms": 1790000000000,
+    "expires_at_ms": 1790003600000,
+    "cameras": [
+      {
+        "camera_id": "cam-1",
+        "retention_s": 7200,
+        "sound": true,
+        "limits": {
+          "max_long_side": 1920,
+          "max_short_side": 1080,
+          "max_fps": 10.0,
+          "max_bitrate_bps": 2000000
+        }
+      }
+    ]
+  },
+  "file_token": "eyJ2IjoxLCJhdWQiOiJpbmdlc3QtMS5uZXVyb3dhdGNoLmFwcCIsInByZWZpeCI6ImJhY2t1cC82YmE3YjgxMS05ZGFkLTExZDEtODBiNC0wMGMwNGZkNDMwYzgvY2FtLTEvIiwiZXhwX21zIjoxNzkwMDAwNjAwMDAwfQ.QCiY4kG8c7rWc_9_fUK2hAUHD1nDmira3GA2hC3xxvuUYukA-autFEdVuO7n5SyngYRxU-mNx0mB9emKWpEFBw",
+  "file_key": "backup/6ba7b811-9dad-11d1-80b4-00c04fd430c8/cam-1/2026-09-21/120000Z-1-p0-0.mp4"
+}

@@ -8,6 +8,8 @@
 //! the local services run and before the IPC server accepts connections, and
 //! [`RunningCloud::shutdown`] when the backend stops, before the cameras stop.
 
+pub mod backup;
+pub mod backup_sound;
 pub mod cloud_handler;
 pub mod encoded_replay;
 pub mod link;
@@ -41,6 +43,11 @@ pub struct Services {
     pub discovery: Arc<DiscoveryService>,
     /// Clip export jobs, shared by every client.
     pub exports: Arc<crate::export::ExportService>,
+    /// Analytics plugins' drawings, sent to browsers watching a camera live.
+    pub overlays: Arc<crate::plugin_host::OverlayStore>,
+    /// Cloud Backup's status, shared with health events and `system.status`
+    /// (`AppState::backup`).
+    pub backup: Arc<backup::BackupStatus>,
     pub config_path: PathBuf,
     /// No desktop UI (`--headless`).
     pub headless: bool,
@@ -110,6 +117,13 @@ impl Cloud {
 /// The running cloud: what is stopped when the backend stops.
 pub struct RunningCloud {
     scheduler: Mutex<Option<SchedulerHandle>>,
+    /// Cloud Backup's loop and its stop signal.
+    backup: Mutex<
+        Option<(
+            tokio::sync::watch::Sender<bool>,
+            tokio::task::JoinHandle<()>,
+        )>,
+    >,
     departing_node: Option<CloudNode>,
     publisher: Option<Arc<media_publish::PublisherSupervisor>>,
     rpc: Option<Arc<cloud_handler::CloudHandler>>,
@@ -124,6 +138,18 @@ impl RunningCloud {
     /// The backend is stopping: stop checking in, tell the cloud this
     /// recorder is going offline, end browser sessions.
     pub async fn shutdown(&self) {
+        // First, while the cameras still run: the backup says goodbye, so the
+        // portal does not take a clean stop for a stolen recorder.
+        let backup = self.backup.lock().ok().and_then(|mut backup| backup.take());
+        if let Some((stop, task)) = backup {
+            let _ = stop.send(true);
+            if tokio::time::timeout(std::time::Duration::from_secs(8), task)
+                .await
+                .is_err()
+            {
+                tracing::warn!("Cloud Backup did not stop in time");
+            }
+        }
         let scheduler = self
             .scheduler
             .lock()
@@ -168,6 +194,8 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
         stats: aggregator,
         discovery,
         exports: export_service,
+        overlays,
+        backup: backup_status,
         config_path,
         headless,
     } = services;
@@ -203,6 +231,7 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
     let Some(node) = cloud_node else {
         return RunningCloud {
             scheduler: Mutex::new(None),
+            backup: Mutex::new(None),
             departing_node: None,
             publisher: None,
             rpc: None,
@@ -233,14 +262,16 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
                 .with_clock(node.clock())
                 .with_playback(Arc::new(opener))
                 .with_live_sources(Arc::new(live_sources))
+                .with_overlays(overlays)
                 .with_talk(Arc::new(CameraSpeaker {
                     state: Arc::clone(&state),
                 })),
         )
     };
 
-    // Only the allowlisted inventory (id, name, status, recording, and
-    // which streams a browser can be sent) leaves the node.
+    // Only the allowlisted inventory (id, name, status, recording, which
+    // streams a browser can be sent, and each stream's size and rates) leaves
+    // the node.
     let inventory_state = Arc::clone(&state);
     let inventory_codecs = Arc::clone(&stream_codecs);
     let inventory: link::InventorySource = Arc::new(move || {
@@ -259,6 +290,15 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
                             .map(|(representation, codec)| {
                                 (representation.code(), codec.map(|c| c.code()))
                             })
+                            .collect(),
+                    )
+                },
+                |camera| {
+                    Some(
+                        st.streams
+                            .video_formats(camera)
+                            .into_iter()
+                            .map(|(stream, format)| (stream, link::StreamVideo::from(format)))
                             .collect(),
                     )
                 },
@@ -299,12 +339,13 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
         let state = Arc::clone(&preview_state);
         let snapshots = Arc::clone(&snapshots);
         Box::pin(async move {
-            let (states, decoding, cameras) = {
+            let (states, decoding, cameras, streams) = {
                 let st = state.read().await;
                 (
                     st.supervisor_states(),
                     st.viewed_cameras(),
                     st.config.cameras.clone(),
+                    (*st.streams).clone(),
                 )
             };
             let mut jobs = tokio::task::JoinSet::new();
@@ -316,13 +357,14 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
                     .find(|camera| camera.id == camera_id)
                     .cloned();
                 let decoded = decoding.contains(&camera_id);
+                let streams = streams.clone();
                 jobs.spawn(async move {
                     let jpeg_b64 = if decoded {
                         hub.capture(&camera_id, std::time::Duration::from_secs(4))
                             .await
                     } else {
                         match camera {
-                            Some(camera) => snapshots.fetch(&camera).await,
+                            Some(camera) => snapshots.fetch(&camera, &streams).await,
                             None => None,
                         }
                     };
@@ -350,12 +392,20 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
         let state = Arc::clone(&diagnostics_state);
         let aggregator = Arc::clone(&diagnostics_aggregator);
         Box::pin(async move {
-            let (hwaccel, reported_ids, storage_path) = {
+            let (hwaccel, reported_ids, storage_path, stream_connections) = {
                 let st = state.read().await;
+                let mut streams = st.streams.diagnostics(&st.config.cameras);
+                // Plugin names, paths and decoders per stream, as the desktop shows them.
+                crate::streams::diagnostics::with_plugins(
+                    &mut streams,
+                    &st.plugins
+                        .stream_consumers(&st.config.plugins, &st.config.cameras),
+                );
                 (
                     st.hwaccel,
                     link::reported_camera_ids(&st.config.cameras),
                     app_state::expand_user_path(&st.config.recording.storage_path),
+                    streams,
                 )
             };
             let (system, drives) = tokio::task::spawn_blocking(move || {
@@ -366,13 +416,26 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
             })
             .await
             .unwrap_or_default();
-            link::diagnostics_snapshot(
+            let mut snapshot = link::diagnostics_snapshot(
                 aggregator.snapshot(),
                 ipc::handler::acceleration_json(hwaccel),
                 &reported_ids,
                 system,
                 &drives,
-            )
+            );
+            let streams = stream_connections
+                .into_iter()
+                .filter_map(|mut row| {
+                    row.camera_id = reported_ids.get(&row.camera_id)?.clone();
+                    Some(row)
+                })
+                .collect();
+            crate::streams::diagnostics::attach(
+                &mut snapshot,
+                streams,
+                link::MAX_DIAGNOSTICS_BYTES,
+            );
+            snapshot
         })
     });
     scheduler = scheduler.with_diagnostics(diagnostics);
@@ -427,11 +490,25 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
     }
     let scheduler_handle = scheduler.spawn();
 
+    // Cloud Backup: the cameras the portal says have a plan, copied live.
+    let (backup_stop, backup_stopped) = tokio::sync::watch::channel(false);
+    let backup_task = tokio::spawn(backup::run_loop(
+        node.shared(),
+        backup::BackupSource {
+            state: Arc::clone(&state),
+            outage_dir: backup::default_outage_dir(),
+            status: Arc::clone(&backup_status),
+        },
+        backup_stopped,
+    ));
+
     let departing_node = node.shared();
-    let cloud_handler =
-        cloud_handler::CloudHandler::new(node).with_publisher(Arc::clone(&publisher));
+    let cloud_handler = cloud_handler::CloudHandler::new(node)
+        .with_publisher(Arc::clone(&publisher))
+        .with_backup_status(backup_status);
     RunningCloud {
         scheduler: Mutex::new(Some(scheduler_handle)),
+        backup: Mutex::new(Some((backup_stop, backup_task))),
         departing_node: Some(departing_node),
         publisher: Some(publisher),
         rpc: Some(Arc::new(cloud_handler)),

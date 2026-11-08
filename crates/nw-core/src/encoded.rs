@@ -35,6 +35,8 @@ impl VideoCodec {
 /// sets repeated before every keyframe so a viewer can start at any one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedAccessUnit {
+    /// The picture's shared identity, or its recording capture time on replay.
+    pub frame: Option<crate::frame::FrameIdentity>,
     pub codec: VideoCodec,
     pub payload: Vec<u8>,
     /// A random-access point: decoding can start here.

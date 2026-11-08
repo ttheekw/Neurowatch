@@ -7,7 +7,11 @@
 //! joins mid-stream starts on a keyframe at once instead of waiting for the
 //! camera's next one.
 
+use super::queue::ConsumerKind;
+use super::rates::{RateSample, Rates};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::queue::{Media, SubscriberPolicy, SubscriberQueue, Unit};
 
@@ -17,22 +21,30 @@ pub const GOP_CACHE_BYTES: usize = 16 * 1024 * 1024;
 pub const GOP_CACHE_UNITS: usize = 1024;
 
 pub struct HubCore<U> {
+    rates: Rates,
     subscribers: Vec<(u64, Arc<SubscriberQueue<U>>)>,
     next_id: u64,
     gop: Vec<U>,
     gop_bytes: usize,
     /// The cache overflowed: stays empty until the next keyframe.
     gop_overflowed: bool,
+    /// The video codec of the latest keyframe (diagnostics).
+    codec: Option<&'static str>,
+    /// The picture size of the latest keyframe.
+    size: Option<(u32, u32)>,
 }
 
 impl<U: Unit> Default for HubCore<U> {
     fn default() -> Self {
         Self {
+            rates: Rates::new(Instant::now()),
             subscribers: Vec::new(),
             next_id: 1,
             gop: Vec::new(),
             gop_bytes: 0,
             gop_overflowed: false,
+            codec: None,
+            size: None,
         }
     }
 }
@@ -64,6 +76,8 @@ impl<U: Unit> HubCore<U> {
 
     /// A unit from the camera: cache it, hand it to every subscriber.
     pub fn publish(&mut self, unit: U) {
+        self.rates
+            .record(unit.media() == Media::Video, unit.bytes(), Instant::now());
         self.cache(&unit);
         for (_, queue) in &self.subscribers {
             queue.push(unit.clone());
@@ -72,6 +86,13 @@ impl<U: Unit> HubCore<U> {
 
     fn cache(&mut self, unit: &U) {
         if unit.media() == Media::Video && unit.keyframe() {
+            // Once a GOP, and only a caps name: cheap on the source's thread.
+            if let Some(codec) = unit.video_codec() {
+                self.codec = Some(codec);
+            }
+            if let Some(size) = unit.video_size() {
+                self.size = Some(size);
+            }
             self.gop.clear();
             self.gop_bytes = 0;
             self.gop_overflowed = false;
@@ -110,9 +131,30 @@ impl<U: Unit> HubCore<U> {
         }
     }
 
+    /// Read-only: multiple diagnostics viewers never reset each other's rates.
+    pub fn metrics(&self, now: Instant) -> (BTreeMap<ConsumerKind, u32>, Option<RateSample>, u64) {
+        let mut roles = BTreeMap::new();
+        let mut drops = 0u64;
+        for (_, queue) in &self.subscribers {
+            *roles.entry(queue.policy().consumer).or_insert(0u32) += 1;
+            drops = drops.saturating_add(queue.dropped());
+        }
+        (roles, self.rates.snapshot(now), drops)
+    }
+
     /// Units and bytes in the GOP cache.
     pub fn cached(&self) -> (usize, usize) {
         (self.gop.len(), self.gop_bytes)
+    }
+
+    /// The video codec of the latest keyframe (`h264`, `h265`), if known.
+    pub fn codec(&self) -> Option<&'static str> {
+        self.codec
+    }
+
+    /// The picture size of the latest keyframe, if the parser reported it.
+    pub fn size(&self) -> Option<(u32, u32)> {
+        self.size
     }
 }
 
@@ -124,8 +166,71 @@ mod tests {
     use super::super::queue::{Delivery, Overflow};
     use super::*;
 
+    /// A unit that names its codec, as camera units do.
+    #[derive(Clone)]
+    struct Coded(Fake, Option<&'static str>);
+    impl Unit for Coded {
+        fn media(&self) -> Media {
+            self.0.media()
+        }
+        fn keyframe(&self) -> bool {
+            self.0.keyframe()
+        }
+        fn bytes(&self) -> usize {
+            self.0.bytes()
+        }
+        fn time_ns(&self) -> Option<u64> {
+            self.0.time_ns()
+        }
+        fn video_codec(&self) -> Option<&'static str> {
+            self.1
+        }
+        fn video_size(&self) -> Option<(u32, u32)> {
+            // The codec stands in for a size: h265 pictures are 4K here.
+            self.1.map(|codec| {
+                if codec == "h265" {
+                    (3840, 2160)
+                } else {
+                    (1920, 1080)
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn the_codec_is_the_latest_keyframes() {
+        let mut core = HubCore::<Coded>::default();
+        assert_eq!(core.codec(), None);
+        core.publish(Coded(video(0, true), Some("h264")));
+        assert_eq!(core.codec(), Some("h264"));
+        // Read on keyframes only; a delta unit never changes it.
+        core.publish(Coded(video(40, false), Some("h265")));
+        assert_eq!(core.codec(), Some("h264"));
+        core.publish(Coded(video(80, true), Some("h265")));
+        assert_eq!(core.codec(), Some("h265"), "the camera changed codec");
+        core.publish(Coded(audio(90), None));
+        assert_eq!(core.codec(), Some("h265"));
+    }
+
+    #[test]
+    fn the_size_is_the_latest_keyframes() {
+        let mut core = HubCore::<Coded>::default();
+        assert_eq!(core.size(), None);
+        core.publish(Coded(video(0, true), Some("h264")));
+        assert_eq!(core.size(), Some((1920, 1080)));
+        core.publish(Coded(video(40, false), Some("h265")));
+        assert_eq!(core.size(), Some((1920, 1080)), "read on keyframes only");
+        core.publish(Coded(video(80, true), Some("h265")));
+        assert_eq!(
+            core.size(),
+            Some((3840, 2160)),
+            "the camera changed resolution"
+        );
+    }
+
     fn viewer() -> SubscriberPolicy {
         SubscriberPolicy {
+            consumer: ConsumerKind::Desktop,
             max_bytes: 1_000_000,
             max_units: 3,
             max_span: Duration::from_secs(10),
@@ -143,6 +248,39 @@ mod tests {
                 Delivery::Discontinuity { .. } => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn diagnostics_count_subscription_roles_without_changing_delivery() {
+        let mut hub = HubCore::default();
+        let (recording, recorder) = hub.subscribe(SubscriberPolicy::recorder());
+        let (plugin, _) = hub.subscribe(SubscriberPolicy::plugin());
+        let (browser, _) = hub.subscribe(SubscriberPolicy::live_video());
+        hub.publish(video(0, true));
+        let (roles, _, drops) = hub.metrics(Instant::now());
+        assert_eq!(roles[&ConsumerKind::Recording], 1);
+        assert_eq!(roles[&ConsumerKind::Plugin], 1);
+        assert_eq!(roles[&ConsumerKind::Browser], 1);
+        assert_eq!(drops, 0);
+        assert_eq!(hub.cached(), (1, 100));
+        assert_eq!(
+            units(&recorder),
+            vec![0],
+            "diagnostics never drain subscriber queues"
+        );
+        hub.unsubscribe(plugin);
+        hub.unsubscribe(browser);
+        hub.unsubscribe(recording);
+        assert!(hub.metrics(Instant::now()).0.is_empty());
+        assert_eq!(
+            SubscriberPolicy::snapshot().consumer,
+            ConsumerKind::Snapshot
+        );
+        assert_eq!(SubscriberPolicy::live_sound().consumer, ConsumerKind::Audio);
+        assert_eq!(
+            SubscriberPolicy::plugin_reliable(1000).consumer,
+            ConsumerKind::Plugin
+        );
     }
 
     #[test]

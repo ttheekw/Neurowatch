@@ -1,7 +1,7 @@
 # System requirements for release builds
 
-What each downloadable release needs to run. Python, Qt, GStreamer 1.24.13 and
-FFmpeg 6.1.5 are bundled; nothing else from that stack needs to be installed.
+What each downloadable release needs to run. Python, Qt, GStreamer 1.28.8 (with
+Orc 0.4.44) and FFmpeg 6.1.5 are bundled; nothing else from that stack needs to be installed.
 Building from source has different requirements (see "For developers" in the README).
 
 The Linux minimums come from the build machine (see [How the minimums are

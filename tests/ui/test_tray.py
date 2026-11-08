@@ -369,6 +369,32 @@ def test_ensure_service_waits_off_the_gui_thread(qapp, monkeypatch) -> None:
     assert shown == ["Starting the NeuroWatch background service"]
 
 
+def test_service_start_wait_message_reaches_the_welcome_screen(qapp, monkeypatch) -> None:
+    import threading
+
+    monkeypatch.setattr(app_launch.probe, "backend_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(app_launch, "dev_mode", lambda: False)
+    released = threading.Event()
+    shown: list[str] = []
+
+    class WaitingController:
+        endpoint = "unix:/unused/startup-test.sock"
+        startup_message = None
+
+        def ensure_running(self, **_kwargs):
+            self.startup_message = "Waiting for another NeuroWatch launch to start the recorder."
+            return released.wait(1)
+
+    def progress(detail):
+        shown.append(detail)
+        if "another NeuroWatch" in detail:
+            released.set()
+
+    ok, error = app_launch.ensure_service(progress, autostart=False, controller=WaitingController())
+    assert ok and not error
+    assert any("another NeuroWatch" in detail for detail in shown)
+
+
 # ---------------------------------------------------------------------------
 # Prompts from the tray: the app's dialog style, centred
 # ---------------------------------------------------------------------------
@@ -443,3 +469,57 @@ def test_closing_the_app_stops_a_development_service(monkeypatch) -> None:
     controller = FakeController()
     assert app_launch.stop_service(controller)  # type: ignore[arg-type]
     assert controller.calls == ["stop"]
+
+
+def test_a_plugin_offline_turns_the_dot_amber_and_is_named() -> None:
+    system = {
+        "status": "running",
+        "cameras": 1,
+        "plugins_offline": [{"id": "motion", "name": "Motion detection"}, {"bad": 1}],
+    }
+    status = read_status(
+        _backend(**{"system.status": system, "camera.status_all": {"a": "streaming"}})
+    )
+    assert status.state == WARNING, "every camera fine, one plugin offline: amber"
+    assert [p.label for p in status.problems] == ["Plugin offline: Motion detection"]
+    assert "Plugin offline: Motion detection" in status.lines()[-1]
+    back = read_status(
+        _backend(
+            **{"system.status": {**system, "plugins_offline": []}},
+            **{"camera.status_all": {"a": "streaming"}},
+        )
+    )
+    assert back.problems == () and back.state != WARNING
+
+
+def test_the_status_bar_names_the_plugins_offline_and_opens_plugins(qtbot) -> None:
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    from neurowatch.models.plugins import offline_plugin_names
+    from neurowatch.widgets.plugin_notice import PluginOfflineNotice
+
+    notice = PluginOfflineNotice()
+    qtbot.addWidget(notice)
+    notice.set_offline(offline_plugin_names({"plugins_offline": [{"name": "Motion detection"}]}))
+    assert not notice.isHidden() and notice.text() == "Plugin offline: Motion detection"
+    notice.set_offline(["Motion detection", "Licence plates"])
+    assert notice.text() == "2 plugins offline"
+    assert "Motion detection, Licence plates" in notice.toolTip()
+    clicks: list[bool] = []
+    notice.clicked.connect(lambda: clicks.append(True))
+    press = QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress,
+        QPointF(2, 2),
+        QPointF(2, 2),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    notice.mousePressEvent(press)
+    assert clicks == [True]
+    notice.set_offline(["Motion detection"], can_open=False)  # a viewer: nothing to open
+    notice.mousePressEvent(press)
+    assert clicks == [True]
+    notice.set_offline([])
+    assert notice.isHidden()

@@ -45,6 +45,9 @@ class ExportJob:
     skipped_files: int = 0
     truncated: bool = False
     error: str = ""
+    analytics_path: str = ""
+    analytics_error: str = ""
+    analytics_truncated: bool = False
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> ExportJob:
@@ -68,6 +71,9 @@ class ExportJob:
             skipped_files=int(value.get("skipped_files", 0) or 0),
             truncated=bool(value.get("truncated", False)),
             error=str(value.get("error", "") or ""),
+            analytics_path=str(value.get("analytics_path", "") or ""),
+            analytics_error=str(value.get("analytics_error", "") or ""),
+            analytics_truncated=bool(value.get("analytics_truncated", False)),
         )
 
     @property
@@ -168,6 +174,16 @@ def result_text(job: ExportJob) -> str:
 def result_notes(job: ExportJob) -> list[str]:
     """What a done clip holds that the user might not expect."""
     notes = []
+    if job.analytics_path:
+        notes.append(f"Drawings saved as {os.path.basename(job.analytics_path)}")
+    if job.analytics_error:
+        notes.append(
+            f"The video was saved, but drawings could not be exported: {job.analytics_error}"
+        )
+    if job.analytics_truncated:
+        notes.append(
+            "The drawings sidecar reached its size limit; its footer marks it as incomplete"
+        )
     if job.first_ms is not None and job.start_ms - job.first_ms >= 500:
         early = (job.start_ms - job.first_ms) / 1000
         notes.append(f"It starts {early:.1f} s early, at the previous keyframe")

@@ -119,6 +119,30 @@ def _storage_missing(p: QPainter) -> None:
     p.drawLine(QPointF(3.0, 3.0), QPointF(21.0, 21.0))
 
 
+def _plugin_offline(p: QPainter) -> None:
+    """The plugin hexagon, struck through."""
+    hexagon = QPainterPath(QPointF(12.0, 3.0))
+    for x, y in ((19.8, 7.5), (19.8, 16.5), (12.0, 21.0), (4.2, 16.5), (4.2, 7.5)):
+        hexagon.lineTo(x, y)
+    hexagon.closeSubpath()
+    p.drawPath(hexagon)
+    p.drawLine(QPointF(3.0, 3.0), QPointF(21.0, 21.0))
+
+
+def _backup_failed(p: QPainter) -> None:
+    """A cloud with an upward arrow, struck through."""
+    cloud = QPainterPath(QPointF(7.0, 18.0))
+    cloud.cubicTo(QPointF(3.0, 18.0), QPointF(2.5, 12.0), QPointF(6.8, 11.5))
+    cloud.cubicTo(QPointF(7.2, 6.0), QPointF(14.5, 4.5), QPointF(16.2, 9.6))
+    cloud.cubicTo(QPointF(21.5, 9.6), QPointF(22.0, 18.0), QPointF(17.0, 18.0))
+    cloud.closeSubpath()
+    p.drawPath(cloud)
+    p.drawLine(QPointF(12.0, 16.5), QPointF(12.0, 10.5))
+    p.drawLine(QPointF(9.8, 12.7), QPointF(12.0, 10.5))
+    p.drawLine(QPointF(14.2, 12.7), QPointF(12.0, 10.5))
+    p.drawLine(QPointF(3.0, 3.0), QPointF(21.0, 21.0))
+
+
 def _backend_started(p: QPainter) -> None:
     arc = QRectF(4.0, 4.5, 16.0, 16.0)
     p.drawArc(arc, 125 * 16, 290 * 16)
@@ -152,6 +176,8 @@ _GLYPHS: dict[str, _Glyph] = {
     "recording_failed": _recording_failed,
     "disk_low": _disk_low,
     "storage_missing": _storage_missing,
+    "plugin_offline": _plugin_offline,
+    "backup_failed": _backup_failed,
     "backend_started": _backend_started,
     "bookmark": _bookmark,
 }

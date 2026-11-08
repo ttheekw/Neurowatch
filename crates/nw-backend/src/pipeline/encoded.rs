@@ -284,6 +284,7 @@ pub fn access_unit(sample: &gstreamer::Sample, codec: VideoCodec) -> Option<Enco
             .filter(|value| *value > 0)
     };
     Some(EncodedAccessUnit {
+        frame: None,
         codec,
         payload: map.to_vec(),
         keyframe: !buffer.flags().contains(gstreamer::BufferFlags::DELTA_UNIT),

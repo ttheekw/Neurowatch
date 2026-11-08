@@ -40,6 +40,7 @@ pub struct RpcHandler {
     playback: PlaybackHandler,
     export: ExportHandler,
     alerts: super::alerts_handler::AlertsHandler,
+    plugins: super::plugins_handler::PluginsHandler,
     accounts: super::accounts_handler::AccountsHandler,
     events: EventsHandler,
     viewer: ViewerHandler,
@@ -70,6 +71,55 @@ pub enum IpcTransport {
     Tcp,
 }
 
+/// Cloud Backup in a line for the status bar and tray: `state` is "off" (no
+/// camera has a plan), "ok", "starting" (troubled, not yet for
+/// `cloud::backup::FAIL_AFTER`) or "failing"; failing cameras by name, with
+/// why. Names and reasons only: the tray reads this without signing in.
+fn backup_summary(st: &AppState) -> Value {
+    let report = st.backup.report();
+    let name = |id: &str| {
+        st.config
+            .cameras
+            .iter()
+            .find(|camera| camera.id == id)
+            .map_or_else(|| id.to_owned(), |camera| camera.name.clone())
+    };
+    let failing: Vec<Value> = report
+        .cameras
+        .iter()
+        .filter(|camera| camera.failing)
+        .map(|camera| json!({"id": camera.camera_id, "name": name(&camera.camera_id), "why": camera.trouble}))
+        .collect();
+    let state = if report.cameras.is_empty() {
+        "off"
+    } else if !failing.is_empty() {
+        "failing"
+    } else if report.cameras.iter().any(|camera| camera.trouble.is_some()) {
+        "starting"
+    } else {
+        "ok"
+    };
+    // Each camera with a plan, for its tile's symbol.
+    let states: serde_json::Map<String, Value> = report
+        .cameras
+        .iter()
+        .map(|camera| {
+            let state = if camera.failing {
+                "failing"
+            } else if camera.trouble.is_some() {
+                "starting"
+            } else {
+                "ok"
+            };
+            (
+                camera.camera_id.clone(),
+                json!({"state": state, "why": camera.trouble}),
+            )
+        })
+        .collect();
+    json!({"state": state, "cameras": report.cameras.len(), "failing": failing, "states": states})
+}
+
 impl RpcHandler {
     pub fn new(
         state: Arc<RwLock<AppState>>,
@@ -81,6 +131,7 @@ impl RpcHandler {
         let playback = PlaybackHandler::new(Arc::clone(&state));
         let export = ExportHandler::new(Arc::clone(&state));
         let alerts = super::alerts_handler::AlertsHandler::new(Arc::clone(&state));
+        let plugins = super::plugins_handler::PluginsHandler::new(Arc::clone(&state));
         let accounts = super::accounts_handler::AccountsHandler::new(Arc::clone(&state));
         let events = EventsHandler::new(Arc::clone(&state));
         let viewer = ViewerHandler::new(Arc::clone(&state), Arc::clone(&viewer_manager));
@@ -91,6 +142,7 @@ impl RpcHandler {
             playback,
             export,
             alerts,
+            plugins,
             accounts,
             events,
             viewer,
@@ -183,6 +235,7 @@ impl RpcHandler {
             m if m.starts_with("playback.") => self.playback.dispatch(m, params).await,
             m if m.starts_with("export.") => self.export.dispatch(m, params).await,
             m if m.starts_with("alerts.") => self.alerts.dispatch(m, params).await,
+            m if m.starts_with("plugins.") => self.plugins.dispatch(m, params).await,
             m if m.starts_with("talk.") => self.talk_dispatch(m, params).await,
             m if m.starts_with("auth.") || m.starts_with("accounts.") => {
                 self.accounts.dispatch(m, params).await
@@ -223,6 +276,9 @@ impl RpcHandler {
     pub async fn dispatch_gated(&self, mut req: Value, transport: IpcTransport) -> Value {
         use crate::accounts::access;
         let method = req["method"].as_str().unwrap_or("").to_owned();
+        if let Some(params) = req["params"].as_object_mut() {
+            params.remove("_nw_web_viewer");
+        }
         let id = req["id"].clone();
         let refuse = |code: i64, message: String| json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}});
         let session = {
@@ -239,6 +295,11 @@ impl RpcHandler {
                 }
             }
         };
+        if (method == "plugins.pages" || method.starts_with("plugins.web."))
+            && !req["params"].is_object()
+        {
+            return refuse(-32602, "Plugin page parameters must be an object".into());
+        }
         let Some(session) = session else {
             return self.dispatch_from(&req, transport).await;
         };
@@ -265,6 +326,19 @@ impl RpcHandler {
             .await
         {
             return refuse(i64::from(error.code), error.message);
+        }
+        if method == "plugins.pages" || method.starts_with("plugins.web.") {
+            req["params"]["_nw_web_viewer"] = json!(crate::plugin_host::web::Viewer {
+                user: format!("local:{}", session.username),
+                role: match session.role {
+                    crate::accounts::Role::Admin => "admin",
+                    crate::accounts::Role::Operator => "operator",
+                    crate::accounts::Role::Viewer => "viewer",
+                }
+                .into(),
+                cameras: session.cameras.clone(),
+                session: req["session"].as_str().map(str::to_owned),
+            });
         }
         let mut response = self.dispatch_from(&req, transport).await;
         if let Some(result) = response.get_mut("result") {
@@ -388,6 +462,13 @@ impl RpcHandler {
                 .map(|c| json!({ "id": c.id, "name": c.name }))
                 .collect::<Vec<_>>(),
             "downloads_url": crate::edition::DOWNLOADS_URL,
+            // Enabled analytics plugins that stopped answering (names only:
+            // the tray reads this without signing in).
+            "plugins_offline": st
+                .plugins
+                .offline(&st.config.plugins.servers, crate::plugin_host::OFFLINE_AFTER),
+            // Cloud Backup at a glance (the status bar's and the tray's symbol).
+            "backup": backup_summary(&st),
         }))
     }
 
@@ -414,12 +495,13 @@ impl RpcHandler {
 
     async fn camera_add(&self, params: &Value) -> Result<Value, RpcError> {
         if let Some(motion) = params.get("motion") {
-            crate::motion::validate_settings(motion).map_err(RpcError::invalid_params)?;
+            crate::onvif_events::validate_settings(motion).map_err(RpcError::invalid_params)?;
         }
         let cam: CameraConfig = serde_json::from_value(params.clone())
             .map_err(|e| RpcError::invalid_params(e.to_string()))?;
         crate::recording::policy::validate_settings(&cam.recording)
             .map_err(RpcError::invalid_params)?;
+        validate_always_decode(&cam).map_err(RpcError::invalid_params)?;
         self.add_camera(cam).await
     }
 
@@ -472,6 +554,10 @@ impl RpcHandler {
             // Over the camera limit: never started, so nothing to stop.
             tracing::info!(cam_id = %id, "Camera removed (over the camera limit)");
             st.config.cameras_over_limit.remove(held);
+            st.config
+                .plugins
+                .bindings
+                .retain(|binding| binding.camera_id != id);
             st.save_config()
                 .map_err(|e| RpcError::internal(e.to_string()))?;
             return Ok(json!({ "removed": true }));
@@ -487,6 +573,10 @@ impl RpcHandler {
         st.clear_live_stream(&id);
         st.stream_health.forget(&id);
         st.config.cameras.remove(idx);
+        st.config
+            .plugins
+            .bindings
+            .retain(|binding| binding.camera_id != id);
         // A camera held over the limit takes the freed place.
         for camera in crate::edition::apply(&mut st.config) {
             tracing::info!(cam_id = %camera.id, "Camera runs again: within the camera limit");
@@ -617,7 +707,7 @@ impl RpcHandler {
 
     async fn camera_update(&self, params: &Value) -> Result<Value, RpcError> {
         if let Some(motion) = params.get("motion") {
-            crate::motion::validate_settings(motion).map_err(RpcError::invalid_params)?;
+            crate::onvif_events::validate_settings(motion).map_err(RpcError::invalid_params)?;
         }
         let mut cam: CameraConfig = serde_json::from_value(params.clone())
             .map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -664,6 +754,11 @@ impl RpcHandler {
         if params.get("onvif").is_none() && same_host {
             cam.onvif = old.onvif.clone();
         }
+        // Clients that do not know it (older desktops and portals) keep it.
+        if params.get("always_decode").is_none() {
+            cam.always_decode = old.always_decode.clone();
+        }
+        validate_always_decode(&cam).map_err(RpcError::invalid_params)?;
         let mut pipeline_config = cam.clone();
         pipeline_config.recording.mode = old.recording.mode;
         pipeline_config
@@ -678,6 +773,9 @@ impl RpcHandler {
         // camera's connection and recording restarted.
         pipeline_config.motion = old.motion.clone();
         pipeline_config.wall_position = old.wall_position.clone();
+        // Always-on decoding follows within a second (`reconcile_always_decoders`):
+        // the camera's connection and recording go on.
+        pipeline_config.always_decode = old.always_decode.clone();
         if pipeline_config == *old {
             // A policy-only edit needs the scheduler, not a new connection.
             // Persist first so a failed Save leaves memory and ingest alone.
@@ -804,6 +902,10 @@ impl RpcHandler {
                 "fullscreen_status": cfg.ui.fullscreen_status,
                 "fullscreen_status_opacity": cfg.ui.fullscreen_status_opacity,
                 "preview_fps": cfg.ui.preview_fps,
+                "wall_drawings": cfg.ui.wall_drawings,
+                "show_counts": cfg.ui.show_counts,
+                "tile_plugins": cfg.ui.tile_plugins,
+                "drawings_on_analysed": cfg.ui.drawings_on_analysed,
             },
             "recording": {
                 "storage_path": cfg.recording.storage_path,
@@ -873,29 +975,31 @@ impl RpcHandler {
     }
 
     async fn stats_get_performance(&self) -> Result<Value, RpcError> {
-        let mut snap = self.stats.snapshot();
-        let (hwaccel, views, motion) = {
+        let snap = self.stats.snapshot();
+        let (hwaccel, views, mut streams, plugin_consumers) = {
             let st = self.state.read().await;
             (
                 st.hwaccel,
                 st.active_views(),
-                Arc::clone(&st.builtin_motion),
+                st.streams.diagnostics(&st.config.cameras),
+                st.plugins
+                    .stream_consumers(&st.config.plugins, &st.config.cameras),
             )
         };
-        let motion = motion.metrics();
-        snap.bottleneck = crate::stats::bottleneck::with_motion(snap.bottleneck, &motion);
         let mut value =
             serde_json::to_value(snap).map_err(|e| RpcError::internal(e.to_string()))?;
         value["video_acceleration"] = acceleration_json(hwaccel);
         // Additive runtime details, like desktop_decoders below. Keep the
         // shared snapshot's existing Rust construction contract compatible
         // with external extensions as well as older JSON consumers.
-        value["motion_decoders"] = json!(motion.iter().filter(|m| m.decoder_running).count());
-        value["motion"] = json!(motion);
-        // Video decoders the node runs right now: one per camera a desktop
-        // view shows, and one per native overlay session. Opt-in analysis is
-        // counted independently in motion_decoders; snapshots are one-shot.
+        // Analytics processes own their decoding; only desktop views decode here.
         value["desktop_decoders"] = json!(views + self.viewer_manager.session_count());
+        crate::streams::diagnostics::with_plugins(&mut streams, &plugin_consumers);
+        value["stream_connections"] =
+            serde_json::to_value(streams).map_err(|e| RpcError::internal(e.to_string()))?;
+        // Per binding (with the camera's local id) for the desktop; the rows carry them per stream.
+        value["plugin_stream_consumers"] = serde_json::to_value(plugin_consumers)
+            .map_err(|e| RpcError::internal(e.to_string()))?;
         Ok(value)
     }
 
@@ -1117,6 +1221,23 @@ fn add_decoder_choice(value: &mut Value) {
     }
 }
 
+/// `always_decode`: streams of this camera, each once, at most one per stream.
+fn validate_always_decode(camera: &CameraConfig) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    if camera.always_decode.len() > 16 {
+        return Err("Choose at most 16 streams to decode all the time".into());
+    }
+    for selector in &camera.always_decode {
+        if selector.is_empty() || selector.len() > 64 || camera.stream_url(selector).is_none() {
+            return Err(format!("\"{selector}\" is not a stream of this camera"));
+        }
+        if !seen.insert(selector) {
+            return Err(format!("\"{selector}\" is listed twice"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     include!("access_tests.rs");
@@ -1300,8 +1421,8 @@ mod tests {
         assert_eq!(result["video_acceleration"]["kind"], json!("software"));
         assert_eq!(result["video_acceleration"]["hardware"], json!(false));
         assert_eq!(result["bottleneck"]["severity"], json!("ok"));
-        assert_eq!(result["motion_decoders"], json!(0));
-        assert_eq!(result["motion"], json!([]));
+        assert!(result.get("motion_decoders").is_none());
+        assert!(result.get("motion").is_none());
     }
 
     #[tokio::test]
@@ -1911,6 +2032,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn always_decode_is_kept_when_left_out_checked_and_restarts_nothing() {
+        let mut config = config_with_camera("cam-always", "rtsp://example.invalid/a");
+        config.cameras[0].sub_url = Some("rtsp://example.invalid/b".into());
+        let (state, handler, cfg_path) = handler_with_config("always", config);
+        let stored = serde_json::to_value(&state.read().await.config.cameras[0]).unwrap();
+
+        let mut chosen = stored.clone();
+        chosen["always_decode"] = json!(["sub"]);
+        let reply = dispatch(&handler, "camera.update", chosen).await;
+        assert!(reply["result"].is_object(), "{reply}");
+        // An edit from a client that does not know the field keeps it.
+        let mut renamed = stored.clone();
+        renamed["name"] = json!("Renamed");
+        renamed.as_object_mut().unwrap().remove("always_decode");
+        dispatch(&handler, "camera.update", renamed).await;
+        let kept = state.read().await.config.cameras[0].always_decode.clone();
+        let mut bad = stored.clone();
+        bad["always_decode"] = json!(["third"]);
+        let unknown = dispatch(&handler, "camera.update", bad.clone()).await;
+        bad["always_decode"] = json!(["sub", "sub"]);
+        let twice = dispatch(&handler, "camera.update", bad).await;
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        teardown(&state, &cfg_path).await;
+
+        assert_eq!(kept, vec!["sub".to_owned()]);
+        assert_eq!(error_code(&unknown), -32602, "{unknown}");
+        assert_eq!(error_code(&twice), -32602, "{twice}");
+        assert_eq!(saved["cameras"][0]["always_decode"], json!(["sub"]));
+    }
+
+    #[tokio::test]
     async fn editing_a_camera_keeps_its_place_on_the_wall_and_saves_motion() {
         let mut config = config_with_camera("cam-place", "rtsp://example.invalid/a");
         config.cameras[0].wall_position = Some(nw_core::camera::WallPosition {
@@ -1932,7 +2085,7 @@ mod tests {
         let mut motion_only = stored.clone();
         motion_only.as_object_mut().unwrap().remove("wall_position");
         motion_only["name"] = json!("Renamed");
-        motion_only["motion"]["source"] = json!("builtin");
+        motion_only["motion"]["source"] = json!("onvif");
         let reply = dispatch(&handler, "camera.update", motion_only).await;
         let after = state.read().await.config.cameras[0].clone();
         // An explicit position still applies.
@@ -1944,7 +2097,7 @@ mod tests {
 
         assert!(reply["result"].is_object(), "{reply}");
         assert_eq!(after.wall_position, placed, "edits never move a camera");
-        assert_eq!(after.motion.source, nw_core::camera::MotionSource::Builtin);
+        assert_eq!(after.motion.source, nw_core::camera::MotionSource::Onvif);
         assert_eq!(after.name, "Renamed");
         assert_eq!(
             last.wall_position.map(|p| (p.page, p.row, p.col)),
@@ -2359,6 +2512,7 @@ mod tests {
         assert_eq!(result["ui"]["fullscreen"], true);
         assert_eq!(result["ui"]["fullscreen_status"], true);
         assert_eq!(result["ui"]["fullscreen_status_opacity"], 50);
+        assert_eq!(result["ui"]["wall_drawings"], "chosen");
         assert_eq!(
             result["ui"]["preview_fps"],
             json!({"single": 25, "wall": 15, "dense": 4, "hidden": 2})

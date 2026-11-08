@@ -49,38 +49,11 @@ class _StubClient:
         return head
 
 
-def test_motion_diagnostics_distinguish_analysis_from_desktop_decode(qtbot):
-    snapshot = _snapshot(
-        motion_decoders=1,
-        motion=[
-            {
-                "camera_id": "front-door",
-                "state": "running",
-                "low_cpu": True,
-                "using_substream": True,
-                "decoder": "avdec_h264",
-                "analysis_fps": 0.5,
-                "analysis_ms": 0.7,
-                "dropped_frames": 3,
-                "dropped_fps": 0,
-            }
-        ],
-        bottleneck={"kind": "motion", "severity": "warning", "explanation": "Analysis queue loss"},
-    )
-    page = PerformancePage(ipc_client=_StubClient(snapshot))
+def test_analytics_status_is_available_on_the_plugins_page(qtbot):
+    page = PerformancePage(ipc_client=_StubClient(_snapshot()))
     qtbot.addWidget(page)
     _wait_render(qtbot, page)
-    text = page.snapshot_text()
-    for expected in (
-        "1 analysis decoder running",
-        "Keyframes only · substream",
-        "avdec_h264",
-        "0.5 fps",
-        "0.7 ms / picture",
-        "3 (0.0/s)",
-    ):
-        assert expected in text
-    assert "Motion detection" in page.bottleneck_text()
+    assert "Analytics run in separate processes" in page.snapshot_text()
 
 
 def _snapshot(**overrides: Any) -> dict:
@@ -257,7 +230,7 @@ def test_performance_page_renders_per_camera_health(qtbot):
     text = page.snapshot_text()
     assert "cam-1" in text
     assert "24.5" in text or "25" in text
-    assert "streaming" in text
+    assert "streaming" in text.lower()
 
 
 def test_performance_page_shows_bottleneck_severity_and_explanation(qtbot):
@@ -375,3 +348,23 @@ def test_performance_page_refresh_does_not_block_main_thread(qtbot):
 
     qtbot.waitUntil(lambda: rendered == [True], timeout=2000)
     assert "NVIDIA Test GPU" in page.snapshot_text()
+
+
+def test_stream_connections_show_roles_rates_and_disconnected_streams(qtbot):
+    snap = _snapshot(stream_connections=[{
+        "camera_id": "cam-1", "stream": "main", "state": "streaming", "consumers": 2,
+        "roles": {"recording": 1, "browser": 1}, "video_bps": 2_000_000,
+        "audio_bps": 64_000, "fps": 25.0, "buffer_bytes": 1_048_576, "buffer_units": 25,
+        "queue_drops": 3,
+    }, {"camera_id": "cam-1", "stream": "sub", "state": "disconnected", "consumers": 0,
+         "roles": {}, "buffer_bytes": 0, "buffer_units": 0, "queue_drops": 0}])
+    page = PerformancePage(ipc_client=_StubClient(snap), refresh_interval_ms=0)
+    qtbot.addWidget(page)
+    page.set_camera_names({"cam-1": "Gate"})
+    _wait_render(qtbot, page)
+    text = page.snapshot_text()
+    for value in (
+        "Gate", "Main", "Sub", "2 consumers", "Recording", "Web", "Frame buffer",
+        "2 Mbps", "64 Kbps", "Not in use", "1.0 MiB · 25 frames · 3 drops",
+    ):
+        assert value in text, (value, text)

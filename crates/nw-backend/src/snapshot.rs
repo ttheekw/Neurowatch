@@ -132,6 +132,16 @@ fn shared_keyframe(
     camera: &nw_core::camera::CameraConfig,
 ) -> Result<Keyframe, String> {
     use crate::streams::{Delivery, SubscriberPolicy, Unit};
+    // A stream already connected gives its cached keyframe at once: never
+    // connect to the camera's main stream only for a picture (a thumbnail is
+    // small) while its sub stream is open.
+    if let Some((caps, buffer)) = streams.open_keyframe(camera, Duration::from_secs(2)) {
+        return Ok(Keyframe {
+            caps,
+            buffer,
+            seen: Instant::now(),
+        });
+    }
     let subscription = streams.subscribe(camera, SubscriberPolicy::snapshot(), None)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -309,6 +319,44 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::taps::KeyframeSink;
+
+    /// A camera whose sub stream is open (a plugin watches it) gives its
+    /// snapshot from there: its main stream is never connected for a picture.
+    #[tokio::test]
+    async fn a_snapshot_uses_the_open_sub_stream_instead_of_connecting_main() {
+        use crate::streams::{Delivery, StreamHubs, SubscriberPolicy};
+        let fixture = crate::streams::testing::CameraFile::new(150);
+        let streams = Arc::new(StreamHubs::default());
+        let service = SnapshotService::new(Arc::clone(&streams));
+        let mut camera = fixture.camera.clone();
+        let sub = camera.url.clone();
+        // Main: nothing answers there; connecting would only fail.
+        camera.url = "rtsp://127.0.0.1:9/main".into();
+        camera.sub_url = Some(sub.clone());
+        let mut sub_source = camera.clone();
+        sub_source.url = sub;
+        let watcher = streams
+            .subscribe(&sub_source, SubscriberPolicy::plugin(), None)
+            .unwrap();
+        let watcher = tokio::task::spawn_blocking(move || {
+            assert!(matches!(
+                watcher.recv(Duration::from_secs(3)),
+                Some(Delivery::Unit { .. })
+            ));
+            watcher
+        })
+        .await
+        .unwrap();
+        let started = Instant::now();
+        let jpeg = service.capture_from(camera, true).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the cached keyframe, at once"
+        );
+        assert!(jpeg.starts_with(&[255, 216]));
+        assert_eq!(streams.open_count(), 1, "main was never connected");
+        drop(watcher);
+    }
 
     #[tokio::test]
     async fn snapshot_fallback_reuses_an_open_hub_and_closes_an_unwatched_one() {

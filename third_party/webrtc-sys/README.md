@@ -49,6 +49,11 @@ from the same git revision. The manifest replaces upstream workspace inheritance
 
 ## Licensing and release packaging
 
+Analytics frame matching adds the final RTP timestamp to the existing publish
+timing observer (`packet_trailer.rs`, `packet_trailer.cpp`, and its header).
+This is used with packet trailers disabled; the observer forwards camera bytes
+unchanged. The safe Rust event gains the same field in `../libwebrtc`.
+
 The LiveKit bindings are Apache-2.0; the notices also include MIT code.
 These licences permit commercial use and modified redistribution when their
 licences, copyright notices and required attributions are retained. The two

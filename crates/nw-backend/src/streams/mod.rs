@@ -18,11 +18,15 @@
 //! browser live view). [`annexb`] turns video units into what WebRTC sends,
 //! [`sound`] decodes sound units for listening.
 
+pub mod always;
 pub mod annexb;
 pub mod core;
 pub(crate) mod decoded;
+pub mod diagnostics;
 pub mod feed;
+pub mod frames;
 pub mod queue;
+mod rates;
 pub mod sound;
 mod source;
 #[cfg(test)]
@@ -59,6 +63,8 @@ pub struct SharedUnit {
     pub caps: gstreamer::Caps,
     /// When it reached the hub, µs since the Unix epoch.
     pub arrived_us: i64,
+    /// Assigned by the hub, shared unchanged by every consumer.
+    pub frame: Option<frames::Identity>,
 }
 
 impl Unit for SharedUnit {
@@ -81,6 +87,32 @@ impl Unit for SharedUnit {
             .or_else(|| self.buffer.dts())
             .map(gstreamer::ClockTime::nseconds)
     }
+    fn video_codec(&self) -> Option<&'static str> {
+        match self.caps.structure(0)?.name().as_str() {
+            "video/x-h264" => Some("h264"),
+            "video/x-h265" => Some("h265"),
+            _ => None,
+        }
+    }
+    fn video_size(&self) -> Option<(u32, u32)> {
+        let structure = self.caps.structure(0)?;
+        let width = structure.get::<i32>("width").ok()?;
+        let height = structure.get::<i32>("height").ok()?;
+        (width > 0 && height > 0).then_some((width as u32, height as u32))
+    }
+}
+
+/// What a camera stream looks like, as last seen: its picture size and
+/// measured rates. Kept after the stream closes, so a stream opened now and
+/// then (a sub stream shown on a wall) is still known.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct VideoFormat {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// Pictures a second, measured from what arrived.
+    pub fps: Option<f64>,
+    /// Compressed video bits a second, measured.
+    pub video_bps: Option<u64>,
 }
 
 /// Where a hub's connection is.
@@ -138,6 +170,7 @@ pub struct Hub {
     registry: Weak<HubMap>,
     core: Mutex<core::HubCore<SharedUnit>>,
     decoded: Arc<decoded::Channel>,
+    frames: Mutex<frames::History>,
     state: Mutex<HubState>,
     /// The camera's audio track label once described (`Some(None)`: none).
     audio_label: Mutex<Option<Option<String>>>,
@@ -174,7 +207,14 @@ impl Hub {
         };
     }
 
-    fn publish(&self, unit: SharedUnit) {
+    fn publish(&self, mut unit: SharedUnit) {
+        if unit.media == Media::Video {
+            unit.frame = Some(lock(&self.frames).record(
+                unit.buffer.pts().map(gstreamer::ClockTime::nseconds),
+                unit.buffer.dts().map(gstreamer::ClockTime::nseconds),
+                unit.arrived_us,
+            ));
+        }
         lock(&self.core).publish(unit);
     }
 
@@ -236,6 +276,10 @@ pub struct Subscription {
 }
 
 impl Subscription {
+    pub fn frame(&self, seq: u64) -> Option<frames::Identity> {
+        lock(&self.hub.frames).get(seq)
+    }
+
     /// The next unit or discontinuity, waiting up to `timeout`; `None` when
     /// nothing came (or the hub closed: see [`Subscription::state`]).
     pub fn recv(&self, timeout: Duration) -> Option<Delivery<SharedUnit>> {
@@ -248,15 +292,6 @@ impl Subscription {
 
     pub(crate) fn decoded(&self) -> Arc<decoded::Channel> {
         Arc::clone(&self.hub.decoded)
-    }
-
-    /// Resume decoding from the cached GOP rather than an old, full queue.
-    pub(crate) fn restart_video(&mut self) {
-        let policy = self.queue.policy();
-        let (id, queue) = lock(&self.hub.core).subscribe(policy);
-        self.hub.leave(self.id);
-        self.id = id;
-        self.queue = queue;
     }
 
     /// The camera's audio track label, once its stream was described.
@@ -277,13 +312,74 @@ impl Drop for Subscription {
 }
 
 /// Every open camera connection, one per resolved source.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StreamHubs {
     hubs: Arc<HubMap>,
     shutdown: Arc<AtomicBool>,
+    /// The last format seen of each source (see [`StreamHubs::video_format`]).
+    formats: Arc<Mutex<HashMap<SourceKey, VideoFormat>>>,
 }
 
 impl StreamHubs {
+    /// A stream of `camera` already connected and streaming, if any: its own
+    /// URL first, else another (its sub stream). Asking opens nothing.
+    pub fn streaming_source(&self, camera: &CameraConfig) -> Option<CameraConfig> {
+        let hubs = lock(&self.hubs);
+        let mut open: Vec<&Arc<Hub>> = hubs
+            .iter()
+            .filter(|(key, hub)| {
+                !hub.closed.load(Ordering::SeqCst)
+                    && key.camera_id == camera.id
+                    && key.username == camera.username
+                    && key.password_b64 == camera.password_b64
+                    && hub.state().phase == Phase::Streaming
+            })
+            .map(|(_, hub)| hub)
+            .collect();
+        open.sort_by_key(|hub| hub.camera.url != camera.url);
+        open.first().map(|hub| hub.camera.clone())
+    }
+
+    /// A keyframe from a stream of `camera` that is already streaming (its
+    /// GOP cache gives one at once), or `None`: never opens a connection.
+    /// Blocking, at most `timeout`.
+    pub fn open_keyframe(
+        &self,
+        camera: &CameraConfig,
+        timeout: Duration,
+    ) -> Option<(gstreamer::Caps, gstreamer::Buffer)> {
+        let source = self.streaming_source(camera)?;
+        let subscription = self
+            .subscribe(&source, SubscriberPolicy::snapshot(), None)
+            .ok()?;
+        let deadline = Instant::now() + timeout;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match subscription.recv(left) {
+                Some(Delivery::Unit { unit, .. }) if unit.keyframe() => {
+                    return Some((unit.caps, unit.buffer));
+                }
+                Some(_) => {}
+                None => return None,
+            }
+        }
+        None
+    }
+
+    /// Existing channels only: asking never opens or decodes another stream.
+    pub(crate) fn decoded_candidates(&self, camera: &CameraConfig) -> Vec<Arc<decoded::Channel>> {
+        lock(&self.hubs)
+            .iter()
+            .filter(|(key, hub)| {
+                !hub.closed.load(Ordering::SeqCst)
+                    && key.camera_id == camera.id
+                    && key.username == camera.username
+                    && key.password_b64 == camera.password_b64
+                    && (key.url == camera.url
+                        || camera.sub_url.as_deref() == Some(key.url.as_str()))
+            })
+            .map(|(_, hub)| Arc::clone(&hub.decoded))
+            .collect()
+    }
     /// Subscribe to `camera`'s stream (its `url`), opening the connection if
     /// none is open. `reachability` lets a hub waiting out a backoff retry at
     /// once when the camera answered elsewhere (its first subscriber's is used).
@@ -307,6 +403,7 @@ impl StreamHubs {
                     registry: Arc::downgrade(&self.hubs),
                     core: Mutex::default(),
                     decoded: Arc::default(),
+                    frames: Mutex::default(),
                     state: Mutex::new(HubState {
                         phase: Phase::Connecting,
                         failures: 0,

@@ -93,8 +93,15 @@ impl Thumbnails {
         }
     }
 
-    /// A JPEG thumbnail (base64) for `camera`, or `None`.
-    pub async fn fetch(&self, camera: &CameraConfig) -> Option<String> {
+    /// A JPEG thumbnail (base64) for `camera`, or `None`: its recording's
+    /// latest keyframe, else one from a stream of it already open (no new
+    /// connection), else its own JPEG snapshot, else one keyframe from a
+    /// connection made for it.
+    pub async fn fetch(
+        &self,
+        camera: &CameraConfig,
+        streams: &crate::streams::StreamHubs,
+    ) -> Option<String> {
         if let Some((caps, buffer)) = self.keyframes.latest(&camera.id) {
             let decoded = tokio::task::spawn_blocking(move || decode_keyframe(&caps, &buffer))
                 .await
@@ -103,6 +110,17 @@ impl Thumbnails {
             if decoded.is_some() {
                 return decoded;
             }
+        }
+        let open = (streams.clone(), camera.clone());
+        let decoded = tokio::task::spawn_blocking(move || {
+            let (caps, buffer) = open.0.open_keyframe(&open.1, Duration::from_secs(2))?;
+            decode_keyframe(&caps, &buffer)
+        })
+        .await
+        .ok()
+        .flatten();
+        if decoded.is_some() {
+            return decoded;
         }
         if let Some(jpeg) = self.snapshots.fetch(camera).await {
             return Some(jpeg);
@@ -266,6 +284,46 @@ mod tests {
         let (caps, keyframe) = grab_keyframe(&url).expect("a keyframe");
         assert!(decode_keyframe(&caps, &keyframe).is_some());
         eprintln!("rtsp thumbnail in {} ms", started.elapsed().as_millis());
+    }
+
+    /// A camera not recording, with no JPEG snapshot of its own, whose
+    /// other stream is open (a plugin watches it): the portal's thumbnail
+    /// comes from that stream's buffer, with no connection made for it.
+    #[tokio::test]
+    async fn a_portal_thumbnail_comes_from_a_stream_already_open() {
+        use crate::streams::{Delivery, StreamHubs, SubscriberPolicy};
+        let fixture = crate::streams::testing::CameraFile::new(150);
+        let hubs = StreamHubs::default();
+        let mut camera = fixture.camera.clone();
+        let open = camera.url.clone();
+        // Its main stream answers nowhere: a connection made for the
+        // thumbnail would fail, so a picture proves the open stream was used.
+        camera.url = "rtsp://127.0.0.1:9/main".into();
+        camera.sub_url = None;
+        let mut watched = camera.clone();
+        watched.url = open;
+        let watcher = hubs
+            .subscribe(&watched, SubscriberPolicy::plugin(), None)
+            .unwrap();
+        let watcher = tokio::task::spawn_blocking(move || {
+            assert!(matches!(
+                watcher.recv(Duration::from_secs(3)),
+                Some(Delivery::Unit { .. })
+            ));
+            watcher
+        })
+        .await
+        .unwrap();
+        let thumbnails = Thumbnails::new(std::sync::Arc::new(KeyframeStore::default()));
+        let started = Instant::now();
+        let jpeg = thumbnails.fetch(&camera, &hubs).await;
+        assert!(
+            jpeg.is_some_and(|jpeg| !jpeg.is_empty()),
+            "a thumbnail from the open stream"
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(hubs.open_count(), 1, "no connection was opened for it");
+        drop(watcher);
     }
 
     #[test]

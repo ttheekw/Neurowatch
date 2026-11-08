@@ -459,6 +459,7 @@ mod tests {
             buffer,
             caps: gstreamer::Caps::new_empty_simple("video/x-h264"),
             arrived_us: arrived_ms * 1000,
+            frame: None,
         }
     }
 

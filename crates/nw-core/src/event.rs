@@ -57,12 +57,18 @@ pub enum EventKind {
     /// A recording location is not there (an unmounted drive or network
     /// share): nothing is recorded to it until it is back.
     StorageMissing,
+    /// An analytics plugin stopped answering; the recorder keeps trying.
+    PluginOffline,
+    /// A camera with a Cloud Backup plan is not being backed up (no
+    /// connection to the backup server, a camera problem, or footage piling
+    /// up unsent); the recorder keeps trying.
+    BackupFailed,
     BackendStarted,
     Bookmark,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 12] = [
+    pub const ALL: [EventKind; 14] = [
         Self::Motion,
         Self::Intrusion,
         Self::LineCrossing,
@@ -73,6 +79,8 @@ impl EventKind {
         Self::RecordingFailed,
         Self::DiskLow,
         Self::StorageMissing,
+        Self::PluginOffline,
+        Self::BackupFailed,
         Self::BackendStarted,
         Self::Bookmark,
     ];
@@ -89,6 +97,8 @@ impl EventKind {
             Self::RecordingFailed => "recording_failed",
             Self::DiskLow => "disk_low",
             Self::StorageMissing => "storage_missing",
+            Self::PluginOffline => "plugin_offline",
+            Self::BackupFailed => "backup_failed",
             Self::BackendStarted => "backend_started",
             Self::Bookmark => "bookmark",
         }
@@ -111,6 +121,8 @@ pub enum EventSource {
     System,
     /// A person (bookmarks).
     User,
+    /// An analytics plugin; the event's `topic` holds the plugin's id.
+    Plugin,
 }
 
 impl EventSource {
@@ -120,13 +132,20 @@ impl EventSource {
             Self::Onvif => "onvif",
             Self::System => "system",
             Self::User => "user",
+            Self::Plugin => "plugin",
         }
     }
 
     pub fn parse(name: &str) -> Option<Self> {
-        [Self::Builtin, Self::Onvif, Self::System, Self::User]
-            .into_iter()
-            .find(|source| source.as_str() == name)
+        [
+            Self::Builtin,
+            Self::Onvif,
+            Self::System,
+            Self::User,
+            Self::Plugin,
+        ]
+        .into_iter()
+        .find(|source| source.as_str() == name)
     }
 }
 

@@ -437,6 +437,11 @@ fn play(
             None => units.last_timestamp_us(),
         };
         unit.timestamp_us = previous.map_or(now_us, |last| last + CATCH_UP_STAMP_US);
+        unit.frame = (!catching_up).then_some(nw_core::frame::FrameIdentity {
+            observed_us: 0,
+            seq: 0,
+            time_us: segment.start_ts.saturating_mul(1000).saturating_add(pts),
+        });
         last_stamp_us = Some(unit.timestamp_us);
         units.submit(unit);
         sound.collect(sound_sink);

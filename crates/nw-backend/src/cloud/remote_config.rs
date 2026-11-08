@@ -22,7 +22,9 @@
 //!   another viewer's control to stop;
 //! * `talk.probe` (sealed) only asks whether a camera has a speaker; the
 //!   sound itself arrives over the live view room, never through this relay;
-//! * event lists say whether a picture was saved (`has_image`), never its file.
+//! * event lists say whether a picture was saved (`has_image`), never its file;
+//! * analytics plugins (`plugins.*`, sealed: their addresses are local) are
+//!   managed as on the desktop's Plugins tab.
 
 use std::sync::Arc;
 
@@ -54,6 +56,7 @@ impl RemoteConfig {
                 || method.starts_with("ptz.")
                 || method.starts_with("talk.")
                 || method.starts_with("alerts.")
+                || method.starts_with("plugins.")
                 || carries_secret(params))
         {
             return Err(
@@ -69,6 +72,46 @@ impl RemoteConfig {
             .as_object()
             .ok_or_else(|| "params must be an object".to_owned())?;
         match method {
+            "plugins.pages" | "plugins.web.request" | "plugins.web.read" => {
+                let principal = params
+                    .get("_portal_viewer")
+                    .ok_or("Authenticated portal viewer context is missing")?;
+                let id = principal["id"]
+                    .as_str()
+                    .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+                    .ok_or("Invalid portal viewer")?;
+                let tenant = principal["tenant_id"]
+                    .as_str()
+                    .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+                    .ok_or("Invalid portal tenant")?;
+                let role = match principal["role"].as_str() {
+                    Some("owner" | "admin") => "admin",
+                    Some("viewer") => "viewer",
+                    _ => return Err("Invalid portal viewer role".into()),
+                };
+                let mut request = pick(
+                    params,
+                    &[
+                        "server",
+                        "path",
+                        "method",
+                        "content_type",
+                        "body_b64",
+                        "token",
+                        "offset",
+                    ],
+                );
+                request.insert(
+                    "_nw_web_viewer".into(),
+                    json!(crate::plugin_host::web::Viewer {
+                        user: format!("portal:{tenant}:{id}"),
+                        role: role.into(),
+                        cameras: vec![],
+                        session: None
+                    }),
+                );
+                self.call(method, Value::Object(request)).await
+            }
             "events.list" => {
                 // Take the cursor first: notices arriving during the DB read
                 // are replayed rather than lost between snapshot and polling.
@@ -176,6 +219,40 @@ impl RemoteConfig {
             "alerts.history" => {
                 self.call("alerts.history", Value::Object(pick(params, &["limit"])))
                     .await
+            }
+            // Analytics plugins (sealed: a plugin's address is a local path
+            // or port): the same settings and status as the desktop.
+            "plugins.get" | "plugins.status" | "plugins.cameras" | "plugins.discover" => {
+                self.call(method, json!({})).await
+            }
+            "plugins.inspect" | "plugins.add" => {
+                self.call(method, Value::Object(pick(params, &["id", "address"])))
+                    .await
+            }
+            "plugins.history" => {
+                self.call("plugins.history", Value::Object(params.clone()))
+                    .await
+            }
+            "plugins.set" => {
+                self.call(
+                    "plugins.set",
+                    Value::Object(pick(params, &["servers", "bindings"])),
+                )
+                .await
+            }
+            "plugins.approve" => {
+                self.call(
+                    method,
+                    Value::Object(pick(params, &["server", "public_key"])),
+                )
+                .await
+            }
+            "plugins.credentials" => {
+                self.call(
+                    method,
+                    Value::Object(pick(params, &["server", "credential"])),
+                )
+                .await
             }
             "config.get" => self.config_get().await,
             "config.set" => self.config_set(params).await,
@@ -391,7 +468,7 @@ impl RemoteConfig {
 
     async fn camera_add(&self, params: &Map<String, Value>) -> Outcome {
         if let Some(motion) = params.get("motion") {
-            crate::motion::validate_settings(motion)?;
+            crate::onvif_events::validate_settings(motion)?;
         }
         let mut camera = params.clone();
         if !camera.contains_key("id") {
@@ -419,7 +496,7 @@ impl RemoteConfig {
     /// Changes only the fields sent; a password left out is kept.
     async fn camera_update(&self, params: &Map<String, Value>) -> Outcome {
         if let Some(motion) = params.get("motion") {
-            crate::motion::validate_settings(motion)?;
+            crate::onvif_events::validate_settings(motion)?;
         }
         let id = id_of(params)?;
         let current = {
@@ -948,6 +1025,53 @@ mod tests {
             .await
             .unwrap();
         assert!(history["deliveries"].is_array());
+        done(&state, &path).await;
+    }
+
+    #[tokio::test]
+    async fn plugins_are_managed_from_the_portal_only_sealed() {
+        let (remote, state, path) = remote("plugins");
+        let mut camera = nw_core::camera::CameraConfig::new("Door", "rtsp://127.0.0.1:1/door");
+        camera.id = "cam-1".into();
+        state.write().await.config.cameras.push(camera);
+        let settings = json!({
+            "servers": [{"id": "motion", "address": "unix:/run/user/1000/neurowatch/plugins/m.sock"}],
+            "bindings": [{"server": "motion", "camera_id": "cam-1", "stream": "main",
+                          "config": {"sensitivity": 7}}],
+            "unexpected": true
+        });
+        for method in [
+            "plugins.get",
+            "plugins.status",
+            "plugins.cameras",
+            "plugins.set",
+        ] {
+            let refused = remote.execute_from_portal(method, &settings, false).await;
+            assert!(
+                refused.unwrap_err().contains("encrypted"),
+                "{method} needs a sealed request"
+            );
+        }
+        let saved = remote
+            .execute_from_portal("plugins.set", &settings, true)
+            .await
+            .unwrap();
+        assert_eq!(saved["bindings"][0]["stream"], "main");
+        let got = remote
+            .execute_from_portal("plugins.get", &json!({}), true)
+            .await
+            .unwrap();
+        assert_eq!(got["servers"][0]["id"], "motion");
+        let status = remote
+            .execute_from_portal("plugins.status", &json!({}), true)
+            .await
+            .unwrap();
+        assert_eq!(status["plugins"][0]["id"], "motion");
+        let cameras = remote
+            .execute_from_portal("plugins.cameras", &json!({}), true)
+            .await
+            .unwrap();
+        assert_eq!(cameras["cameras"]["cam-1"][0]["plugin"], "motion");
         done(&state, &path).await;
     }
 

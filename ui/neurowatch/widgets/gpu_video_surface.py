@@ -195,93 +195,106 @@ class GpuVideoSurface(QOpenGLWidget):
     def paintGL(self) -> None:  # noqa: N802
         if self._failed or self._program is None or self._buffer is None or self._frame is None:
             return
+        painter = QPainter(self)
         try:
-            gl = self.context().functions()
-            gl.glDisable(0x0BE2)  # blending may have been enabled by QPainter
-            gl.glDisable(0x0B71)  # depth test
-            gl.glDisable(0x0C11)  # scissor test
-            gl.glColorMask(True, True, True, True)
-            gl.glClearColor(18 / 255, 18 / 255, 28 / 255, 1.0)
-            gl.glClear(0x00004000)
-            dpr = self.devicePixelRatioF()
-            gl.glViewport(0, 0, round(self.width() * dpr), round(self.height() * dpr))
-            data, width, height, descriptor = self._frame
-            cw, ch = (width + 1) // 2, (height + 1) // 2
-            planes = memoryview(data)  # slicing a view does not copy pixels
-            gl.glPixelStorei(0x0CF5, 1)  # tightly packed planes, including odd widths
-            for plane, (pw, ph, fmt, offset) in enumerate(
-                [(width, height, _LUMINANCE, 0), (cw, ch, _LUMINANCE_ALPHA, width * height)]
-            ):
-                gl.glActiveTexture(_TEXTURE0 + plane)
-                gl.glBindTexture(_TEXTURE_2D, self._textures[plane].textureId())
-                if self._texture_size != (width, height):
-                    gl.glTexParameteri(_TEXTURE_2D, 0x2801, 0x2601)  # min/mag linear
-                    gl.glTexParameteri(_TEXTURE_2D, 0x2800, 0x2601)
-                    gl.glTexParameteri(_TEXTURE_2D, 0x2802, 0x812F)  # clamp to edge
-                    gl.glTexParameteri(_TEXTURE_2D, 0x2803, 0x812F)
-                    # PySide accepts the buffer protocol; its stub incorrectly says int.
-                    gl.glTexImage2D(
-                        _TEXTURE_2D,
-                        0,
-                        fmt,
-                        pw,
-                        ph,
-                        0,
-                        fmt,
-                        _UNSIGNED_BYTE,
-                        planes[offset:],  # type: ignore[arg-type]
-                    )
-                elif self._dirty:
-                    gl.glTexSubImage2D(
-                        _TEXTURE_2D,
-                        0,
-                        0,
-                        0,
-                        pw,
-                        ph,
-                        fmt,
-                        _UNSIGNED_BYTE,
-                        planes[offset:],  # type: ignore[arg-type]
-                    )
-            if self._dirty:
-                self.upload_count += 1
-            self._dirty = False
-            self._texture_size = width, height
-            program = self._program
-            program.bind()
-            gl.glUniform1i(program.uniformLocation("yPlane"), 0)
-            gl.glUniform1i(program.uniformLocation("uvPlane"), 1)
-            levels, coefficients = colour_parameters(descriptor)
-            program.setUniformValue(program.uniformLocation("levels"), *levels)
-            program.setUniformValue(program.uniformLocation("coefficients"), *coefficients)
-            program.setUniformValue(
-                program.uniformLocation("chromaCoords"),
-                width / (2 * cw),
-                height / (2 * ch),
-                0.25 / cw if descriptor & 32 else 0.0,
-                0.25 / ch if descriptor & 64 else 0.0,
-            )
-            rect = self._target_rect(width, height)
-            program.setUniformValue(
-                program.uniformLocation("targetRect"),
-                (2 * rect.x() + rect.width()) / self.width() - 1,
-                1 - (2 * rect.y() + rect.height()) / self.height(),
-                rect.width() / self.width(),
-                rect.height() / self.height(),
-            )
-            self._buffer.bind()
-            program.enableAttributeArray(0)
-            program.setAttributeBuffer(0, _FLOAT, 0, 4, 16)
-            gl.glDrawArrays(0x0005, 0, 4)  # triangle strip
-            program.disableAttributeArray(0)
-            self._buffer.release()
-            program.release()
-            gl.glActiveTexture(_TEXTURE0)
-            painter = QPainter(self)
+            painter.beginNativePainting()
+            try:
+                self._paint_video()
+            finally:
+                # NV12 rows are tightly packed, whereas Qt's alpha glyph images
+                # have four-byte row padding. Native-paint boundaries do not
+                # reset pixel-store state: leaking alignment=1 stripes the text.
+                self.context().functions().glPixelStorei(0x0CF5, 4)
+                painter.endNativePainting()
             self._draw_overlays(painter)
-            painter.end()
         except Exception as error:
             self._fail(error)
+        finally:
+            painter.end()
+
+    def _paint_video(self) -> None:
+        assert self._program is not None and self._buffer is not None and self._frame is not None
+        gl = self.context().functions()
+        gl.glDisable(0x0BE2)  # blending may have been enabled by QPainter
+        gl.glDisable(0x0B71)  # depth test
+        gl.glDisable(0x0C11)  # scissor test
+        gl.glColorMask(True, True, True, True)
+        gl.glClearColor(18 / 255, 18 / 255, 28 / 255, 1.0)
+        gl.glClear(0x00004000)
+        dpr = self.devicePixelRatioF()
+        gl.glViewport(0, 0, round(self.width() * dpr), round(self.height() * dpr))
+        data, width, height, descriptor = self._frame
+        cw, ch = (width + 1) // 2, (height + 1) // 2
+        planes = memoryview(data)  # slicing a view does not copy pixels
+        gl.glPixelStorei(0x0CF5, 1)  # tightly packed planes, including odd widths
+        for plane, (pw, ph, fmt, offset) in enumerate(
+            [(width, height, _LUMINANCE, 0), (cw, ch, _LUMINANCE_ALPHA, width * height)]
+        ):
+            gl.glActiveTexture(_TEXTURE0 + plane)
+            gl.glBindTexture(_TEXTURE_2D, self._textures[plane].textureId())
+            if self._texture_size != (width, height):
+                gl.glTexParameteri(_TEXTURE_2D, 0x2801, 0x2601)  # min/mag linear
+                gl.glTexParameteri(_TEXTURE_2D, 0x2800, 0x2601)
+                gl.glTexParameteri(_TEXTURE_2D, 0x2802, 0x812F)  # clamp to edge
+                gl.glTexParameteri(_TEXTURE_2D, 0x2803, 0x812F)
+                # PySide accepts the buffer protocol; its stub incorrectly says int.
+                gl.glTexImage2D(
+                    _TEXTURE_2D,
+                    0,
+                    fmt,
+                    pw,
+                    ph,
+                    0,
+                    fmt,
+                    _UNSIGNED_BYTE,
+                    planes[offset:],  # type: ignore[arg-type]
+                )
+            elif self._dirty:
+                gl.glTexSubImage2D(
+                    _TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    pw,
+                    ph,
+                    fmt,
+                    _UNSIGNED_BYTE,
+                    planes[offset:],  # type: ignore[arg-type]
+                )
+        if self._dirty:
+            self.upload_count += 1
+        self._dirty = False
+        self._texture_size = width, height
+        program = self._program
+        program.bind()
+        gl.glUniform1i(program.uniformLocation("yPlane"), 0)
+        gl.glUniform1i(program.uniformLocation("uvPlane"), 1)
+        levels, coefficients = colour_parameters(descriptor)
+        program.setUniformValue(program.uniformLocation("levels"), *levels)
+        program.setUniformValue(program.uniformLocation("coefficients"), *coefficients)
+        program.setUniformValue(
+            program.uniformLocation("chromaCoords"),
+            width / (2 * cw),
+            height / (2 * ch),
+            0.25 / cw if descriptor & 32 else 0.0,
+            0.25 / ch if descriptor & 64 else 0.0,
+        )
+        rect = self._target_rect(width, height)
+        program.setUniformValue(
+            program.uniformLocation("targetRect"),
+            (2 * rect.x() + rect.width()) / self.width() - 1,
+            1 - (2 * rect.y() + rect.height()) / self.height(),
+            rect.width() / self.width(),
+            rect.height() / self.height(),
+        )
+        self._buffer.bind()
+        program.enableAttributeArray(0)
+        program.setAttributeBuffer(0, _FLOAT, 0, 4, 16)
+        gl.glDrawArrays(0x0005, 0, 4)  # triangle strip
+        program.disableAttributeArray(0)
+        self._buffer.release()
+        program.release()
+        gl.glActiveTexture(_TEXTURE0)
 
     def cleanup(self) -> None:
         if self.context() is None:

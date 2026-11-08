@@ -155,13 +155,34 @@ pub struct PipelineSupervisor {
     /// reconnect the camera.
     subscription: Option<crate::streams::Subscription>,
     feed: Option<crate::streams::feed::VideoFeed>,
+    frame_ids: Arc<StdMutex<crate::streams::frames::DecoderFrames>>,
     /// The unit at which the stream's format changed: the rebuilt decoder
     /// starts with it.
     pending_unit: Option<crate::streams::SharedUnit>,
     hub_seen: u64,
     /// The hub lost the camera since the last decoded frame.
     hub_lost: bool,
+    /// The recorder decodes this view's stream all the time: show those
+    /// pictures instead of decoding it again (`with_borrowed_pictures`).
+    borrow: bool,
+    /// They stopped arriving while the camera streamed: decode it here for
+    /// the rest of this view.
+    borrow_failed: bool,
+    /// This run shows borrowed pictures (its subscription has that role).
+    borrowing: bool,
+    raw_input: Option<gstreamer_app::AppSrc>,
+    raw_caps: Option<gstreamer::Caps>,
+    borrowed: Option<crate::streams::decoded::Receiver>,
+    /// When a borrowed picture last arrived (or the run began).
+    borrow_seen: Instant,
+    /// The run's time origin for borrowed pictures' timestamps.
+    raw_start: Instant,
 }
+
+/// No borrowed picture this long while the camera streams: the always-on
+/// decoder is not delivering, so the view decodes the camera itself. Long
+/// enough for a just-started decoder to reach its first keyframe.
+const BORROW_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Most bytes waiting in a shared view's `appsrc` before units are left in
 /// its subscription (whose bound then skips to the next keyframe).
@@ -203,10 +224,26 @@ impl PipelineSupervisor {
             shared_any: false,
             subscription: None,
             feed: None,
+            frame_ids: Arc::default(),
             pending_unit: None,
             hub_seen: u64::MAX,
             hub_lost: false,
+            borrow: false,
+            borrow_failed: false,
+            borrowing: false,
+            raw_input: None,
+            raw_caps: None,
+            borrowed: None,
+            borrow_seen: Instant::now(),
+            raw_start: Instant::now(),
         }
+    }
+
+    /// The recorder decodes this view's stream all the time
+    /// (`CameraConfig::always_decode`): show those pictures, decode nothing.
+    pub fn with_borrowed_pictures(mut self, borrow: bool) -> Self {
+        self.borrow = borrow;
+        self
     }
 
     /// Decode RTSP/RTMP cameras from their shared connection (`hubs`).
@@ -364,15 +401,22 @@ impl PipelineSupervisor {
                 return;
             }
         }
+        let borrowing = shared && self.borrow && !self.borrow_failed;
+        if self.subscription.is_some() && self.borrowing != borrowing {
+            // Its role says whether it decodes: subscribe again.
+            self.subscription = None;
+        }
+        self.borrowing = borrowing;
         if shared && self.subscription.is_none() {
             let Some(hubs) = &self.hubs else {
                 return;
             };
-            match hubs.subscribe(
-                &self.config,
-                crate::streams::SubscriberPolicy::desktop_view(),
-                self.reachability.clone(),
-            ) {
+            let policy = if borrowing {
+                crate::streams::SubscriberPolicy::shared_view()
+            } else {
+                crate::streams::SubscriberPolicy::desktop_view()
+            };
+            match hubs.subscribe(&self.config, policy, self.reachability.clone()) {
                 Ok(subscription) => {
                     self.subscription = Some(subscription);
                     self.hub_seen = u64::MAX;
@@ -395,7 +439,9 @@ impl PipelineSupervisor {
         tracing::info!(cam_id = %self.cam_id, state = "connecting", "Supervisor state changed");
         self.stream_info_complete = false;
         self.publish_stream_info(StreamInfo::default());
-        let pipeline_str = if shared {
+        let pipeline_str = if borrowing {
+            builder::borrowed_view_pipeline_str(self.hwaccel)
+        } else if shared {
             builder::shared_view_pipeline_str(self.hwaccel)
         } else {
             builder::select_pipeline(&self.config, self.hwaccel)
@@ -416,6 +462,7 @@ impl PipelineSupervisor {
             }
         };
 
+        self.frame_ids = Arc::default();
         // Wire appsink → SHM ring buffer before going to PLAYING
         let (shm_writer, frames_counted) = self.wire_appsink(&pipeline);
         if shared {
@@ -428,7 +475,22 @@ impl PipelineSupervisor {
                 };
                 return;
             };
-            self.feed = Some(crate::streams::feed::VideoFeed::new(input));
+            if borrowing {
+                tracing::info!(cam_id = %self.cam_id, "Desktop view shows the always-on decoder's pictures");
+                self.borrowed = self
+                    .subscription
+                    .as_ref()
+                    .map(|subscription| subscription.decoded().subscribe());
+                self.raw_input = Some(input);
+                self.raw_caps = None;
+                self.raw_start = Instant::now();
+                self.borrow_seen = Instant::now();
+            } else {
+                self.feed = Some(
+                    crate::streams::feed::VideoFeed::new(input)
+                        .with_frames(Arc::clone(&self.frame_ids)),
+                );
+            }
         }
 
         if !self.assignment_is_current() {
@@ -531,9 +593,18 @@ impl PipelineSupervisor {
         else {
             return (None, false);
         };
-        let decoded = self.subscription.as_ref().map(|subscription| {
-            crate::streams::decoded::Publisher::new(subscription.decoded(), pipeline)
-        });
+        // Borrowed pictures are not offered again: they are the plugins' own source.
+        let decoded = self
+            .subscription
+            .as_ref()
+            .filter(|_| !self.borrowing)
+            .map(|subscription| {
+                crate::streams::decoded::Publisher::with_frames(
+                    subscription.decoded(),
+                    pipeline,
+                    Arc::clone(&self.frame_ids),
+                )
+            });
         if self.headless {
             return (None, self.wire_headless_appsink(&appsink, decoded));
         }
@@ -547,6 +618,7 @@ impl PipelineSupervisor {
         };
 
         let writer_clone = Arc::clone(&writer);
+        let frame_ids = Arc::clone(&self.frame_ids);
         self.frame_counter.store(0, AtomicOrdering::Relaxed);
         super::preview_format::install(&appsink, Arc::clone(&writer));
         let preview_gate = super::preview_rate::install(
@@ -594,6 +666,10 @@ impl PipelineSupervisor {
                         .map_err(|_| gstreamer::FlowError::Error)?;
 
                     if let Ok(mut w) = writer_clone.lock() {
+                        let identity = buffer
+                            .pts()
+                            .and_then(|pts| frame_ids.try_lock().ok()?.get(pts.nseconds()));
+                        w.set_identity(identity);
                         let written = if info.format() == gstreamer_video::VideoFormat::Nv12 {
                             let uv_stride = usize::try_from(frame.plane_stride()[1])
                                 .map_err(|_| gstreamer::FlowError::Error)?;
@@ -710,8 +786,13 @@ impl PipelineSupervisor {
                 }
             }
 
-            if self.feed.is_some() {
-                if let Some(next) = self.pump_shared() {
+            if self.feed.is_some() || self.raw_input.is_some() {
+                let next = if self.raw_input.is_some() {
+                    self.pump_borrowed()
+                } else {
+                    self.pump_shared()
+                };
+                if let Some(next) = next {
                     self.state = next;
                     return;
                 }
@@ -860,6 +941,72 @@ impl PipelineSupervisor {
         }
     }
 
+    /// Move the always-on decoder's latest picture into the view; `Some`
+    /// state to move to. The subscription's compressed units are discarded:
+    /// it is kept for the connection's state only.
+    fn pump_borrowed(&mut self) -> Option<State> {
+        use crate::streams::Phase;
+        let subscription = self.subscription.as_ref()?;
+        let mut closed = false;
+        if subscription.recv(Duration::from_millis(10)).is_none()
+            && subscription.state().phase == Phase::Closed
+        {
+            closed = true;
+        }
+        while subscription.recv(Duration::ZERO).is_some() {}
+        let streaming = subscription.state().phase == Phase::Streaming;
+        if closed {
+            self.subscription = None;
+            if !self.destroy_pipeline() {
+                return Some(State::Stopped);
+            }
+            return Some(State::Reconnecting {
+                attempt: self.reconnect_attempt,
+            });
+        }
+        let Some((frame, _)) = self.borrowed.as_mut().and_then(|receiver| receiver.take()) else {
+            if !streaming {
+                // The camera is reconnecting: no fault of the decoder.
+                self.borrow_seen = Instant::now();
+            } else if self.borrow_seen.elapsed() >= BORROW_TIMEOUT {
+                tracing::warn!(cam_id = %self.cam_id, "The always-on decoder's pictures stopped; this view decodes the camera itself");
+                self.borrow_failed = true;
+                if !self.destroy_pipeline() {
+                    return Some(State::Stopped);
+                }
+                return Some(State::Reconnecting {
+                    attempt: self.reconnect_attempt,
+                });
+            }
+            return None;
+        };
+        self.borrow_seen = Instant::now();
+        let input = self.raw_input.as_ref()?;
+        let caps = frame.sample.caps()?.to_owned();
+        if self.raw_caps.as_ref() != Some(&caps) {
+            input.set_caps(Some(&caps));
+            self.raw_caps = Some(caps);
+        }
+        let buffer = frame.sample.buffer()?;
+        let pts = u64::try_from(self.raw_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // A shallow copy: new timestamps, the same picture memory.
+        let mut out = buffer.copy();
+        if let Some(writable) = out.get_mut() {
+            writable.set_pts(gstreamer::ClockTime::from_nseconds(pts));
+            writable.set_dts(gstreamer::ClockTime::NONE);
+            writable.set_duration(gstreamer::ClockTime::NONE);
+        }
+        if let (Some(identity), Ok(mut ids)) = (frame.identity, self.frame_ids.lock()) {
+            ids.put(pts, identity);
+        }
+        match input.push_buffer(out) {
+            Ok(_) | Err(gstreamer::FlowError::Flushing) => None,
+            Err(error) => Some(State::Error {
+                reason: format!("the view did not take the decoded pictures: {error:?}"),
+            }),
+        }
+    }
+
     /// Return true only after GStreamer reports that the pipeline is NULL.
     fn destroy_pipeline(&mut self) -> bool {
         if let Some(pipeline) = self.pipeline.take() {
@@ -889,6 +1036,9 @@ impl PipelineSupervisor {
         }
         // Drop after pipeline so callback is unregistered first.
         self.feed = None;
+        self.raw_input = None;
+        self.raw_caps = None;
+        self.borrowed = None;
         self.shm_writer = None;
         self.frames_counted = false;
         true
@@ -1370,6 +1520,102 @@ pub(crate) mod tests {
         let registry = std::sync::Arc::new(crate::assignment::LocalAssignmentRegistry::new());
         registry.install(assignment.clone()).unwrap();
         (assignment, registry)
+    }
+
+    /// A desktop view of a stream the recorder decodes all the time shows
+    /// those pictures with no decoder of its own, and decodes again when they
+    /// stop coming.
+    #[test]
+    fn a_view_of_an_always_decoded_stream_borrows_its_pictures_then_falls_back() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        use crate::streams::queue::ConsumerKind;
+        use crate::streams::StreamHubs;
+
+        #[derive(Default)]
+        struct Count(AtomicU64);
+        impl crate::taps::FrameTap for Count {
+            fn wants(&self, _camera_id: &str) -> bool {
+                true
+            }
+            fn submit_sample(&self, _camera_id: &str, _sample: &gstreamer::Sample) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let fixture = crate::streams::testing::CameraFile::new(1000);
+        let camera = fixture.camera.clone();
+        let hubs = Arc::new(StreamHubs::default());
+        let decoder = crate::streams::always::AlwaysDecoder::start(
+            (*hubs).clone(),
+            camera.clone(),
+            "main".into(),
+        )
+        .unwrap();
+        let (assignment, registry) = fenced(&camera);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (state_tx, state_rx) = tokio::sync::watch::channel(String::new());
+        let (info_tx, _info_rx) = tokio::sync::watch::channel(super::StreamInfo::default());
+        let frames = Arc::new(Count::default());
+        let health = Arc::new(crate::stats::health::HealthCounters::default());
+        let supervisor = super::PipelineSupervisor::new(
+            camera.clone(),
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+            Arc::new(nw_core::traits::LogEventBus),
+            stop_rx,
+            state_tx,
+            info_tx,
+        )
+        .with_assignment(assignment, registry)
+        .with_headless(true)
+        .with_frame_tap(frames.clone())
+        .with_stream_hubs(Arc::clone(&hubs))
+        .with_shared_any()
+        .with_health_counters(Arc::clone(&health))
+        .with_borrowed_pictures(true);
+        let view = std::thread::spawn(move || supervisor.run());
+        let row = || hubs.diagnostics(std::slice::from_ref(&camera)).remove(0);
+        let wait = |what: &str, done: &dyn Fn() -> bool, seconds: u64| {
+            let deadline = Instant::now() + Duration::from_secs(seconds);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out: {what}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        wait(
+            "borrowed pictures on screen",
+            &|| state_rx.borrow().as_str() == "streaming" && frames.0.load(Ordering::Relaxed) > 5,
+            20,
+        );
+        assert!(
+            health.decoded_frames.load(Ordering::Relaxed) > 0,
+            "pictures shown count as the view's frames"
+        );
+        let borrowed = row();
+        assert!(borrowed.always_decoded, "{borrowed:?}");
+        assert_eq!(borrowed.shared_views, 1, "{borrowed:?}");
+        assert!(
+            !borrowed.roles.contains_key(&ConsumerKind::Desktop),
+            "the view runs no decoder of its own: {borrowed:?}"
+        );
+
+        // The always-on decoder stops: the view decodes the camera itself.
+        drop(decoder);
+        wait(
+            "the view decoding again",
+            &|| row().roles.get(&ConsumerKind::Desktop) == Some(&1),
+            30,
+        );
+        let before = frames.0.load(Ordering::Relaxed);
+        wait(
+            "pictures from its own decoder",
+            &|| frames.0.load(Ordering::Relaxed) > before + 5,
+            20,
+        );
+        assert_eq!(row().shared_views, 0);
+        stop_tx.send(true).unwrap();
+        view.join().unwrap();
     }
 
     /// Shared-streams stage 3 gate: a desktop view decodes the camera's

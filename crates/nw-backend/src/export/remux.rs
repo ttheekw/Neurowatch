@@ -811,7 +811,7 @@ fn clock(us: i64) -> gstreamer::ClockTime {
 
 /// The AAC encoder element for a pipeline description: FFmpeg's in its fast
 /// mode (its default coder costs about twice the CPU for no gain here).
-fn aac_encoder_description() -> String {
+pub(crate) fn aac_encoder_description() -> String {
     let encoder = aac_encoder().unwrap_or("avenc_aac");
     let fast = encoder == "avenc_aac"
         && gstreamer::ElementFactory::make(encoder)

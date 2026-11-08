@@ -47,6 +47,7 @@ SOURCE_LABELS = {
     "builtin": "NeuroWatch motion detection",
     "system": "NeuroWatch",
     "user": "You",
+    "plugin": "Analytics plugin",
 }
 
 
@@ -390,7 +391,11 @@ class EventPreview(QWidget):
         else:
             facts.append(("Duration", "Instant"))
         if not self._compact and event.source:
-            facts.append(("Source", SOURCE_LABELS.get(event.source, event.source)))
+            source = SOURCE_LABELS.get(event.source, event.source)
+            if event.source == "plugin" and event.topic:
+                # A plugin's events carry its id (e.g. nw.motion) as the topic.
+                source = f"{source} ({event.topic})"
+            facts.append(("Source", source))
         if event.kind == "bookmark":
             facts.append(
                 (

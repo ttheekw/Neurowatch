@@ -227,6 +227,7 @@ mod tests {
                 buffer,
                 caps: caps.clone(),
                 arrived_us,
+                frame: None,
             }
         };
         // A joining hub's old GOP does not establish the decoder's clock.
@@ -291,6 +292,7 @@ mod tests {
                     buffer,
                     caps: caps.clone(),
                     arrived_us: 0,
+                    frame: None,
                 })
                 .unwrap();
         }

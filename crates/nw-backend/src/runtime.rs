@@ -112,6 +112,10 @@ async fn run() -> anyhow::Result<()> {
     let cloud = Cloud::new();
     cloud.prepare(&mut initial_state);
     let state = Arc::new(RwLock::new(initial_state));
+    tokio::spawn(crate::plugin_host::bundled::run(
+        Arc::clone(&state),
+        shutdown_tx.subscribe(),
+    ));
     crate::debug_monitor::spawn(Arc::clone(&state));
     {
         let policy_state = Arc::clone(&state);
@@ -147,6 +151,26 @@ async fn run() -> anyhow::Result<()> {
             // Old events: every 10 minutes is plenty.
             if passes % 20 == 0 {
                 events::prune_old(&retention_state).await;
+                let db = Arc::clone(&retention_state.read().await.db);
+                let history = retention_state
+                    .read()
+                    .await
+                    .plugins
+                    .overlays
+                    .history
+                    .clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let starts = db
+                        .lock()
+                        .ok()
+                        .and_then(|conn| crate::plugin_host::history::recording_starts(&conn).ok());
+                    if let (Some(history), Some(starts)) = (history, starts) {
+                        if let Err(error) = history.prune(&starts) {
+                            tracing::warn!(%error, "Could not prune drawing history");
+                        }
+                    }
+                })
+                .await;
             }
             passes = passes.wrapping_add(1);
         }
@@ -175,11 +199,11 @@ async fn run() -> anyhow::Result<()> {
             shutdown_tx.subscribe(),
         ));
         tokio::spawn(onvif.run(Arc::clone(&state), hub, shutdown_tx.subscribe()));
-        let (hub, builtin) = {
+        let (hub, plugins) = {
             let st = state.read().await;
-            (Arc::clone(&st.events), Arc::clone(&st.builtin_motion))
+            (Arc::clone(&st.events), Arc::clone(&st.plugins))
         };
-        tokio::spawn(builtin.run(Arc::clone(&state), hub, shutdown_tx.subscribe()));
+        tokio::spawn(plugins.run(Arc::clone(&state), hub, shutdown_tx.subscribe()));
         tokio::spawn(crate::snapshot::run(
             Arc::clone(&state),
             shutdown_tx.subscribe(),
@@ -226,10 +250,11 @@ async fn run() -> anyhow::Result<()> {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let lapsed = state
-                    .write()
-                    .await
-                    .expire_view_demand(std::time::Instant::now());
+                let lapsed = {
+                    let mut st = state.write().await;
+                    st.reconcile_always_decoders();
+                    st.expire_view_demand(std::time::Instant::now())
+                };
                 for client in lapsed {
                     let detached = viewer_manager.detach_owner(&client);
                     if detached > 0 {
@@ -263,13 +288,22 @@ async fn run() -> anyhow::Result<()> {
     // One camera-search service for every client: they share its result
     // cache and its one-search-at-a-time limit.
     let discovery = Arc::new(discovery::DiscoveryService::new());
-    let exports = Arc::clone(&state.read().await.exports);
+    let (exports, overlays, backup) = {
+        let st = state.read().await;
+        (
+            Arc::clone(&st.exports),
+            Arc::clone(&st.plugins.overlays),
+            Arc::clone(&st.backup),
+        )
+    };
     let running_cloud = cloud.start(Services {
         state: Arc::clone(&state),
         viewer_manager: Arc::clone(&viewer_manager),
         stats: Arc::clone(&aggregator),
         discovery: Arc::clone(&discovery),
         exports,
+        overlays,
+        backup,
         config_path: config_path.clone(),
         headless,
     });

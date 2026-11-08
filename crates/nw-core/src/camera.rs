@@ -52,6 +52,11 @@ pub struct CameraConfig {
     /// is added from a network search or found later (camera events, PTZ).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onvif: Option<OnvifEndpoint>,
+    /// Streams the recorder keeps decoding whether or not a desktop shows
+    /// them (`"main"`, `"sub"` or a stream id), so analytics plugins can use
+    /// the recorder's pictures instead of decoding the camera again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub always_decode: Vec<String>,
 }
 
 /// Where a camera answers ONVIF. URLs are pinned to the camera's address.
@@ -156,6 +161,7 @@ impl CameraConfig {
             streams: Vec::new(),
             discovery: None,
             onvif: None,
+            always_decode: Vec::new(),
         }
     }
 }
@@ -228,20 +234,13 @@ pub struct ScheduleRule {
 pub enum MotionSource {
     #[default]
     Off,
-    /// NeuroWatch's own detector, on decoded pictures.
-    Builtin,
     /// The camera's own detection, reported as ONVIF events.
     Onvif,
-    Both,
 }
 
 impl MotionSource {
     pub fn uses_onvif(self) -> bool {
-        matches!(self, Self::Onvif | Self::Both)
-    }
-
-    pub fn uses_builtin(self) -> bool {
-        matches!(self, Self::Builtin | Self::Both)
+        matches!(self, Self::Onvif)
     }
 }
 
@@ -301,10 +300,7 @@ impl CameraMotionConfig {
     /// The detection in use: [`Self::source`], or the built-in detector for
     /// a config that only set the legacy `enabled` switch.
     pub fn effective_source(&self) -> MotionSource {
-        match self.source {
-            MotionSource::Off if self.enabled => MotionSource::Builtin,
-            source => source,
-        }
+        self.source
     }
 }
 
@@ -571,25 +567,26 @@ mod motion_tests {
     }
 
     #[test]
-    fn legacy_enabled_switch_means_the_builtin_detector() {
-        let mut cam = CameraConfig::new("Cam", "rtsp://example/stream");
-        cam.motion.enabled = true;
-        assert_eq!(cam.motion.effective_source(), MotionSource::Builtin);
-        cam.motion.source = MotionSource::Onvif;
-        assert_eq!(cam.motion.effective_source(), MotionSource::Onvif);
+    fn runtime_sources_cannot_enable_the_removed_detector() {
+        for source in ["builtin", "both"] {
+            assert!(serde_json::from_value::<super::CameraMotionConfig>(
+                serde_json::json!({"source":source})
+            )
+            .is_err());
+        }
     }
 
     #[test]
     fn zones_keep_valid_polygons_only() {
         let raw = serde_json::json!({"sensitivity": 5, "cooldown_sec": 10.0, "min_duration_sec": 0.5,
-        "source": "both",
+        "source": "onvif",
         "zones": [
             {"id": "z1", "name": "Gate", "kind": "exclude", "points": [[0.0,0.0],[0.5,0.0],[0.5,0.5]]},
             {"id": "z2", "points": [[0.0,0.0],[0.5,0.0]]},
             {"id": "z3", "points": [[0.0,0.0],[1.5,0.0],[0.5,0.5]]}
         ]});
         let motion: super::CameraMotionConfig = serde_json::from_value(raw).unwrap();
-        assert_eq!(motion.source, MotionSource::Both);
+        assert_eq!(motion.source, MotionSource::Onvif);
         assert_eq!(motion.zones.len(), 1);
         assert_eq!(motion.zones[0].kind, ZoneKind::Exclude);
         let saved = serde_json::to_value(&motion).unwrap();

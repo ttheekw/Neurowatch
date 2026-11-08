@@ -44,6 +44,8 @@ pub mod ffi {
         pub timestamp_us: u64,
         pub capture_timestamp_us: u64,
         pub frame_id: u32,
+        /// NeuroWatch: final RTP timestamp, after the sender offset.
+        pub rtp_timestamp: u32,
     }
 
     #[derive(Debug, Clone, Copy)]

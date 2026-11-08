@@ -112,6 +112,19 @@ def test_load_recordings_explains_missing_camera_selection(qtbot):
     assert "Select at least one camera" in view._placeholder.text()
 
 
+def test_recordings_play_without_plugin_drawings_until_switched_on(qtbot):
+    # Drawings are stored beside the recording, never in it: playback shows the
+    # recording as recorded unless the Drawings menu turns them on.
+    class FakeClient:
+        endpoint = "unix:/tmp/custom-neurowatch.sock"
+
+    view = playback_view.PlaybackView(FakeClient(), [])
+    qtbot.addWidget(view)
+    assert view._drawing_mode == "off"
+    view._set_drawing_mode("chosen")
+    assert view._drawing_mode == "chosen"
+
+
 class _Ipc:
     endpoint = "unix:/tmp/custom-neurowatch.sock"
 
@@ -600,3 +613,38 @@ def test_leaving_playback_pauses_the_video(qtbot, monkeypatch):
     MainWindow._on_tab_changed(window, "playback")
     MainWindow._on_tab_changed(window, "settings")  # a dialog over Playback
     window._playback_view.pause.assert_not_called()
+
+
+def test_playback_lists_the_areas_drawn_in_a_key_under_the_pictures(qtbot) -> None:
+    """Names are not written on recorded video either; off clears them at once."""
+    from neurowatch.models.analytics import Drawing
+    from neurowatch.widgets import playback_view
+
+    class FakeClient:
+        endpoint = "unix:/tmp/neurowatch-test.sock"
+
+    view = playback_view.PlaybackView(FakeClient(), [])
+    qtbot.addWidget(view)
+
+    area = {"type": "polygon", "points": [[0, 0], [1, 0], [1, 1]], "label": "Lane 1"}
+    drawing = Drawing("c1", "vcount", "lines", (area,), float("inf"))
+
+    class _Cell:
+        def set_drawings(self, _drawings: list[Drawing]) -> None:
+            pass
+
+    class _Window:
+        def at(self, _camera: str, _at: int, mode: str) -> list[Drawing]:
+            return [] if mode == "off" else [drawing]
+
+    view._cells["s1"] = _Cell()
+    view._camera_by_session["s1"] = "c1"
+    view._active_playhead_ms = 1000
+    view._analytics.window = _Window()
+    view._analytics.request = lambda *_args: None
+    view._set_drawing_mode("chosen")
+    assert view._drawings_key.key() == ["Lane 1"]
+    view._set_drawing_mode("off")
+    assert view._drawings_key.key() == []
+    assert view._drawings_key.isHidden()
+    del view._cells["s1"]

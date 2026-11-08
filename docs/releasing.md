@@ -180,13 +180,18 @@ they are missing. The vendored bindings omit the separately licensed NVIDIA
 SDK samples and disable their optional CUDA/Jetson codec build paths (desktop
 hardware decoding still uses GStreamer).
 
-Linux builds matched GStreamer core/base/good/bad/libav **1.24.13**, including the
-fixed `va` plugin, and a minimal LGPL FFmpeg **6.1.5**. See
+Linux builds matched GStreamer core/base/good/bad/libav **1.28.8**, including the
+fixed `va` plugin, Orc **0.4.44** (1.28 needs Orc ≥ 0.4.34; Ubuntu 22.04 has 0.4.32)
+and a minimal LGPL FFmpeg **6.1.5**, with Meson **1.6.1** (1.28 needs ≥ 1.4).
+GStreamer was moved from 1.24.13 to 1.28.8 for the parser, RTP and RTSP security
+fixes that exist only in the 1.28 series (see `Bug_fix_25_oct.md` item 10). See
 [`scripts/build_release_gstreamer.sh`](../scripts/build_release_gstreamer.sh) and
 [`scripts/packaging/media-sources.sha256`](../scripts/packaging/media-sources.sha256).
 The private checkout VA workaround is not used in release builds.
 
-Windows uses the upstream MSVC **1.24.13** runtime/development installers and
+Windows uses the upstream MSVC **1.28.8** Inno Setup installer (one `.exe`
+since 1.28, no MSIs; installed silently with `/TYPE=devel` into
+`C:\gstreamer\1.0\msvc_x86_64`; checksum pinned in `release.yml`) and
 ships the runtime DLLs, plugins, GIO TLS modules, scanner and app-local MSVC runtime. The Inno
 Setup compiler is available on the Windows hosted runner. Installed builds
 select `<bundle>/gstreamer` in the service manager, including when started by

@@ -22,6 +22,8 @@ EVENT_LABELS: dict[str, str] = {
     "recording_failed": "Recording failed",
     "disk_low": "Recording drive almost full",
     "storage_missing": "Recording storage missing",
+    "plugin_offline": "Plugin offline",
+    "backup_failed": "Cloud Backup failed",
     "backend_started": "NeuroWatch started",
     "bookmark": "Bookmark",
 }
@@ -31,10 +33,18 @@ END_LABELS: dict[str, str] = {
     "recording_failed": "Recording recovered",
     "disk_low": "Recording drive has space again",
     "storage_missing": "Recording storage is back",
+    "plugin_offline": "Plugin back online",
+    "backup_failed": "Cloud Backup working again",
 }
 #: Kinds a tile shows as movement in the picture.
 ACTIVITY_KINDS = frozenset({"motion", "intrusion", "line_crossing"})
-PLAYBACK_KINDS = frozenset(EVENT_LABELS) - {"disk_low", "storage_missing", "backend_started"}
+PLAYBACK_KINDS = frozenset(EVENT_LABELS) - {
+    "disk_low",
+    "storage_missing",
+    "plugin_offline",
+    "backup_failed",
+    "backend_started",
+}
 EVENT_PRIORITY = {
     "camera_offline": 5,
     "recording_failed": 5,
@@ -55,11 +65,21 @@ EVENT_COLORS = {
     "bookmark": "#3b82f6",
     "disk_low": "#f59e0b",
     "storage_missing": "#ef4444",
+    "plugin_offline": "#f59e0b",
+    "backup_failed": "#ef4444",
     "backend_started": "#64748b",
 }
 #: Kinds about the system rather than the picture.
 SYSTEM_KINDS = frozenset(
-    {"camera_offline", "recording_failed", "disk_low", "storage_missing", "backend_started"}
+    {
+        "camera_offline",
+        "recording_failed",
+        "disk_low",
+        "storage_missing",
+        "plugin_offline",
+        "backup_failed",
+        "backend_started",
+    }
 )
 #: An event without duration (a line crossed) shows as activity this long.
 INSTANT_ACTIVITY_S = 5.0

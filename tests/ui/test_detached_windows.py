@@ -621,3 +621,249 @@ def test_empty_slots_in_a_window_invite_a_tile_not_a_new_camera(win, monkeypatch
     empty.add_camera_requested.emit()
     assert opened == []  # cameras are added in the main window
     assert win._wall._cells[0]._empty_hint == "Click to Add Camera"
+
+
+def _no_worker_saves(window, monkeypatch) -> list[dict]:
+    class _NoWorker:
+        finished = type("Signal", (), {"connect": staticmethod(lambda _slot: None)})
+
+        def start(self) -> None:
+            pass
+
+        def deleteLater(self) -> None:  # noqa: N802
+            pass
+
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        "neurowatch.main._IpcCallWorker",
+        lambda _method, params, _endpoint: saved.append(params) or _NoWorker(),
+    )
+    return saved
+
+
+def _counting(count: str = "5"):
+    from neurowatch.models.analytics import CameraPlugin, Figure
+
+    return CameraPlugin(
+        "vcount",
+        "Counting",
+        "running",
+        wall_layers=frozenset({"lines"}),
+        figures=(Figure("Cars", count, "car", "series1"), Figure("Total", count, "total")),
+    )
+
+
+def _named_area(camera: str):
+    import time
+
+    from neurowatch.models.analytics import Drawing
+
+    area = {"type": "polygon", "points": [[0, 0], [1, 0], [1, 1]], "label": "Lane 1"}
+    return Drawing(camera, "vcount", "lines", (area,), time.monotonic() + 60)
+
+
+def _click(cell, name: str, qtbot) -> None:
+    from PySide6.QtCore import Qt
+
+    qtbot.mouseClick(cell, Qt.MouseButton.LeftButton, pos=cell._top_control_rects()[name].center())
+
+
+def test_the_toolbar_has_no_plugin_buttons(win) -> None:
+    assert not hasattr(win._toolbar, "_drawings_btn")
+    assert not hasattr(win._toolbar, "_counts_btn")
+
+
+def test_only_a_tile_with_a_plugin_has_the_buttons_and_they_work_on_that_camera(
+    win, monkeypatch, qtbot
+) -> None:
+    window = win
+    window._cameras = [
+        CameraConfig(id=i, name=i.title(), url="rtsp://x") for i in ("door", "gate", "yard")
+    ]
+    window._refresh_all()
+    saved = _no_worker_saves(window, monkeypatch)
+    window._on_analytics_cameras({"door": [_counting("5")], "gate": [_counting("7")]})
+    window._on_analytics_drawings({"door": [_named_area("door")], "gate": [_named_area("gate")]})
+    door = window._wall._cell_for_cam_id("door")
+    gate = window._wall._cell_for_cam_id("gate")
+    yard = window._wall._cell_for_cam_id("yard")
+
+    assert {"drawings", "counts"} <= set(door._top_control_rects())
+    assert not {"drawings", "counts"} & set(yard._top_control_rects()), "no plugin, no buttons"
+    assert yard._plugin_info is None
+    assert (door._plugin_drawings, door._plugin_counts) == (True, False), "the defaults"
+    assert door._plugin_info.summary() == [], "counts off until asked for"
+    assert door._plugin_info.key() == ["Cars", "Lane 1"], "what the colours mean"
+    assert door.drawings
+
+    # Counts on one tile: that camera only.
+    _click(door, "counts", qtbot)
+    assert saved[-1] == {"ui": {"tile_plugins": {"door": {"drawings": True, "counts": True}}}}, (
+        "kept per camera"
+    )
+    assert door._plugin_counts is True
+    assert door._plugin_info.summary() == [("Cars", "5"), ("Total", "5")]
+    assert door._plugin_info.key() == ["Lane 1"], "the cars' cell shows their colour"
+    assert gate._plugin_counts is False and gate._plugin_info.summary() == []
+
+    # Drawings off on one tile: that camera only, its key and held pictures too.
+    _click(door, "drawings", qtbot)
+    assert saved[-1]["ui"]["tile_plugins"]["door"] == {"drawings": False, "counts": True}
+    assert door._plugin_drawings is False
+    assert door.drawings == [], "nothing over this video"
+    assert gate.drawings, "the other camera keeps its drawings"
+    assert "door" in window._wall._plain_ids, "plain live video, no pictures held"
+    assert "gate" not in window._wall._plain_ids
+    assert door._plugin_info.key() == []
+    assert door._plugin_info.summary() == [("Cars", "5"), ("Total", "5")], "counts are separate"
+    assert "drawings" in door._top_control_rects(), "still there, to turn them back on"
+
+    # New results do not bring them back.
+    window._on_analytics_drawings({"door": [_named_area("door")], "gate": [_named_area("gate")]})
+    assert door.drawings == []
+
+    # A click on a button is only that: it does not select or open the tile.
+    from PySide6.QtCore import Qt
+
+    opened: list[str] = []
+    door.expand_requested.connect(opened.append)
+    door.single_click_requested.connect(opened.append)
+    _click(door, "drawings", qtbot)
+    qtbot.mouseDClick(
+        door, Qt.MouseButton.LeftButton, pos=door._top_control_rects()["counts"].center()
+    )
+    assert opened == []
+    assert door._plugin_drawings is True and door.drawings
+
+    # Back on, and the same after a restart: it comes from the config.
+    window._config["ui"]["tile_plugins"]["door"] = {"drawings": True, "counts": False}
+    window._apply_settings()
+    assert (door._plugin_drawings, door._plugin_counts) == (True, False)
+
+
+def test_only_a_plugin_that_will_draw_and_is_starting_is_waited_for(win, monkeypatch) -> None:
+    import dataclasses
+
+    from neurowatch.models.analytics import Layer
+
+    window = win
+    window._cameras = [CameraConfig(id="door", name="Door", url="rtsp://x")]
+    window._refresh_all()
+    _no_worker_saves(window, monkeypatch)
+    starting = dataclasses.replace(_counting(), state="starting")
+    window._on_analytics_cameras({"door": [starting]})
+    assert window._wall._awaited_ids == {"door"}
+    window._on_analytics_cameras({"door": [dataclasses.replace(starting, state="running")]})
+    assert window._wall._awaited_ids == set(), "running: what it draws, it has drawn"
+    layer = Layer("lines", "Lines")
+    chose_none = dataclasses.replace(starting, wall_layers=frozenset(), layers=(layer,))
+    window._on_analytics_cameras({"door": [chose_none]})
+    assert window._wall._awaited_ids == set(), "nothing chosen for the wall: nothing to wait for"
+    offline = dataclasses.replace(starting, state="offline", wall_layers=frozenset())
+    window._on_analytics_cameras({"door": [offline]})
+    assert window._wall._awaited_ids == {"door"}, (
+        "just opened and not connected: it cannot say yet what it draws, and it is on its way"
+    )
+    window._analytics_since -= 3600
+    window._on_analytics_cameras({"door": [offline]})
+    assert window._wall._awaited_ids == set(), "an hour later it is simply off"
+    window._analytics_since += 3600
+    window._on_analytics_cameras({"door": [starting]})
+    window._toggle_tile_drawings("door")
+    assert window._wall._awaited_ids == set(), "its drawings are off on this tile"
+
+
+def test_a_tile_has_its_buttons_in_its_menu_too(win, monkeypatch) -> None:
+    window = win
+    window._cameras = [CameraConfig(id="door", name="Door", url="rtsp://x")]
+    window._refresh_all()
+    _no_worker_saves(window, monkeypatch)
+    window._on_analytics_cameras({"door": [_counting()]})
+    door = window._wall._cell_for_cam_id("door")
+    menu = door._build_context_menu()
+    items = {a.text(): a for a in menu.actions()}
+    assert items["Show Plugin Drawings"].isChecked()
+    assert not items["Show Plugin Counts"].isChecked()
+    items["Show Plugin Counts"].trigger()
+    assert door._plugin_counts is True
+    menu.deleteLater()
+
+
+def test_a_plugin_that_reports_no_numbers_has_no_counts_button(win, monkeypatch) -> None:
+    from neurowatch.models.analytics import CameraPlugin
+
+    window = win
+    window._cameras = [CameraConfig(id="door", name="Door", url="rtsp://x")]
+    window._refresh_all()
+    _no_worker_saves(window, monkeypatch)
+    window._on_analytics_cameras({"door": [CameraPlugin("motion", "Motion", "running")]})
+    door = window._wall._cell_for_cam_id("door")
+    assert "drawings" in door._top_control_rects()
+    assert "counts" not in door._top_control_rects()
+
+
+def test_settings_turning_drawings_off_for_the_wall_removes_the_tiles_button(
+    win, monkeypatch
+) -> None:
+    window = win
+    window._cameras = [CameraConfig(id="door", name="Door", url="rtsp://x")]
+    window._refresh_all()
+    _no_worker_saves(window, monkeypatch)
+    window._on_analytics_cameras({"door": [_counting()]})
+    door = window._wall._cell_for_cam_id("door")
+    window._config.setdefault("ui", {})["wall_drawings"] = "off"
+    window._apply_tile_choices()
+    assert "drawings" not in door._top_control_rects(), "a button that could do nothing"
+    assert "counts" in door._top_control_rects(), "counts do not depend on it"
+    window._config["ui"]["wall_drawings"] = "chosen"
+    window._apply_tile_choices()
+    assert "drawings" in door._top_control_rects()
+
+
+def test_counts_stay_on_their_own_tile_and_the_plugins_page_shares_the_choice(
+    win, monkeypatch
+) -> None:
+    window = win
+    window._cameras = [CameraConfig(id=i, name=i.title(), url="rtsp://x") for i in ("door", "gate")]
+    window._refresh_all()
+    saved = _no_worker_saves(window, monkeypatch)
+    window._on_analytics_cameras({"door": [_counting("5")], "gate": [_counting("7")]})
+    door = window._wall._cell_for_cam_id("door")
+    gate = window._wall._cell_for_cam_id("gate")
+
+    window._toggle_tile_counts("door")
+    window._toggle_tile_counts("gate")
+    assert door._plugin_info.summary() == [("Cars", "5"), ("Total", "5")], "its own"
+    assert gate._plugin_info.summary() == [("Cars", "7"), ("Total", "7")], "not added up"
+
+    window._on_camera_selected("gate")
+    assert door._plugin_info.summary() == [("Cars", "5"), ("Total", "5")], (
+        "selecting a tile moves nothing"
+    )
+    window._set_compact(True)
+    assert door._plugin_info.summary() == [("Cars", "5"), ("Total", "5")], (
+        "over the video in the compact view too"
+    )
+    window._set_compact(False)
+
+    # The Plugins page's Show counts is that camera's same choice, both ways.
+    view = window._plugins_view
+    view._selection = ("vcount", "door")
+    view.refresh_counts_choice()
+    assert view.figures_shown.isChecked()
+    window._toggle_tile_counts("door")
+    assert not view.figures_shown.isChecked()
+    window._set_selected_camera_counts(True)
+    assert door._plugin_counts is True
+    assert saved[-1]["ui"]["tile_plugins"]["door"]["counts"] is True
+
+
+def test_an_older_show_counts_choice_is_the_default_for_cameras_without_their_own() -> None:
+    from neurowatch.models.analytics import tile_choice
+
+    assert tile_choice({}, "door") == (True, False)
+    assert tile_choice({"show_counts": True}, "door") == (True, True)
+    ui = {"show_counts": True, "tile_plugins": {"door": {"drawings": False, "counts": False}}}
+    assert tile_choice(ui, "door") == (False, False)
+    assert tile_choice(ui, "gate") == (True, True)
+    assert tile_choice({"tile_plugins": "nonsense"}, "door") == (True, False)

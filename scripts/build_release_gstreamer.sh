@@ -6,8 +6,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="${1:?usage: build_release_gstreamer.sh PREFIX WORK_DIR}"
 WORK="${2:?usage: build_release_gstreamer.sh PREFIX WORK_DIR}"
-GST_VERSION=1.24.13
+GST_VERSION=1.28.8
 FFMPEG_VERSION=6.1.5
+# GStreamer 1.28 needs orc >= 0.4.34; Ubuntu 22.04 (the x86_64 build machine) has 0.4.32.
+ORC_VERSION=0.4.44
+MESON_VERSION=1.6.1
 [[ ! -e "$PREFIX" ]] || { echo "prefix already exists: $PREFIX" >&2; exit 1; }
 mkdir -p "$PREFIX" "$WORK/sources"
 PREFIX="$(realpath "$PREFIX")"
@@ -15,22 +18,24 @@ WORK="$(realpath "$WORK")"
 PYTHON="${PYTHON:-python3}"
 if [[ -n "${MEDIA_BUILD_TOOLS:-}" ]]; then
     export PATH="$MEDIA_BUILD_TOOLS:$PATH"
-    [[ "$(meson --version)" == 1.3.2 ]] || { echo 'Meson 1.3.2 required' >&2; exit 1; }
+    [[ "$(meson --version)" == "$MESON_VERSION" ]] || { echo "Meson $MESON_VERSION required" >&2; exit 1; }
 else
     "$PYTHON" -m venv "$WORK/tools"
-    "$WORK/tools/bin/python" -m pip install meson==1.3.2 ninja==1.11.1.4
+    "$WORK/tools/bin/python" -m pip install "meson==$MESON_VERSION" ninja==1.11.1.4
     export PATH="$WORK/tools/bin:$PATH"
 fi
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 export LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 JOBS="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"
 
-for project in gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav ffmpeg; do
+for project in orc gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav ffmpeg; do
     version="$GST_VERSION"
     url="https://gstreamer.freedesktop.org/src/$project"
     if [[ "$project" == ffmpeg ]]; then
         version="$FFMPEG_VERSION"
         url=https://ffmpeg.org/releases
+    elif [[ "$project" == orc ]]; then
+        version="$ORC_VERSION"
     fi
     archive="$project-$version.tar.xz"
     if [[ ! -f "$WORK/sources/$archive" ]]; then
@@ -54,6 +59,14 @@ for archive in "$WORK/sources/"*.tar.xz; do tar -xf "$archive" -C "$WORK"; done
     make install
 )
 
+# Orc (BSD), the SIMD code generator video conversion uses, ships with the
+# runtime like FFmpeg: the build machine's own is too old for 1.28.
+meson setup "$WORK/build-orc" "$WORK/orc-$ORC_VERSION" \
+    --prefix="$PREFIX" --libdir=lib --buildtype=release --wrap-mode=nofallback \
+    -Dauto_features=disabled -Dtools=disabled
+meson compile -C "$WORK/build-orc" -j "$JOBS"
+meson install -C "$WORK/build-orc"
+
 build_gst() {
     local project="$1"
     shift
@@ -67,7 +80,7 @@ build_gst gstreamer -Dtools=enabled
 build_gst gst-plugins-base \
     -Dapp=enabled -Daudioconvert=enabled -Daudioresample=enabled \
     -Daudiotestsrc=enabled -Dplayback=enabled -Dtypefind=enabled \
-    -Dvideoconvertscale=enabled -Dvideotestsrc=enabled -Dvolume=enabled \
+    -Dvideoconvertscale=enabled -Dvideorate=enabled -Dvideotestsrc=enabled -Dvolume=enabled \
     -Dtcp=enabled -Dgio=enabled -Dopus=enabled -Dalsa=enabled \
     -Dx11=enabled -Dxshm=enabled -Dxvideo=enabled -Dorc=enabled \
     -Dgl=enabled -Dgl_api=opengl,gles2 -Dgl_platform=egl,glx -Dgl_winsys=x11
@@ -106,13 +119,15 @@ for project in gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-l
     cp "$WORK/$project-$GST_VERSION/COPYING" "$PREFIX/share/licenses/neurowatch-media/$project.txt"
 done
 cp "$WORK/ffmpeg-$FFMPEG_VERSION/COPYING.LGPLv2.1" "$PREFIX/share/licenses/neurowatch-media/ffmpeg.txt"
+cp "$WORK/orc-$ORC_VERSION/COPYING" "$PREFIX/share/licenses/neurowatch-media/orc.txt"
 cp /usr/share/doc/libjpeg-turbo8/copyright "$PREFIX/share/licenses/neurowatch-media/libjpeg-turbo.txt"
 cp /usr/share/doc/librtmp1/copyright "$PREFIX/share/licenses/neurowatch-media/librtmp.txt"
 # libnettle8 on Ubuntu 22.04, libnettle8t64 on 24.04.
 nettle_copyright="$(ls /usr/share/doc/libnettle8*/copyright | head -n 1)"
 cp "$nettle_copyright" "$PREFIX/share/licenses/neurowatch-media/nettle.txt"
 cp "$ROOT/scripts/packaging/media-sources.sha256" "$PREFIX/share/licenses/neurowatch-media/"
-printf 'GStreamer %s\nFFmpeg %s (LGPL, no external codecs)\n' "$GST_VERSION" "$FFMPEG_VERSION" > "$PREFIX/VERSIONS.txt"
+printf 'GStreamer %s\nFFmpeg %s (LGPL, no external codecs)\nOrc %s\n' \
+    "$GST_VERSION" "$FFMPEG_VERSION" "$ORC_VERSION" > "$PREFIX/VERSIONS.txt"
 
 # Keep the SDK intact until cargo has linked; packaging copies only runtime files.
 export GST_PLUGIN_SYSTEM_PATH_1_0="$PREFIX/lib/gstreamer-1.0"

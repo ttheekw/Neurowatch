@@ -73,6 +73,12 @@ Usage: ./neurowatch.sh [--no-autostart]
 
 System package installation is never attempted unless both --system and --yes
 are supplied. Install Rust and uv using their official instructions if absent.
+
+The backend runs on the GStreamer release packages bundle when it is there
+(.cache/gstreamer-sdk-<version>; build it once with
+scripts/install_gstreamer_dev_sdk.sh). NW_GSTREAMER_SDK=0 uses the system's
+instead, =1 insists on that build, a directory selects another. Restart the
+service after changing it.
 USAGE
 }
 
@@ -180,6 +186,40 @@ configure_local_gstreamer_va_runtime() {
     export LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export GST_PLUGIN_PATH_1_0="$plugin_dir${GST_PLUGIN_PATH_1_0:+:$GST_PLUGIN_PATH_1_0}"
     export GST_REGISTRY_1_0="$ROOT/.cache/gstreamer-registry-1.24.13.bin"
+}
+
+# The backend runs on the release's GStreamer, built into
+# .cache/gstreamer-sdk-<version> by scripts/install_gstreamer_dev_sdk.sh, when it
+# is there (NW_GSTREAMER_SDK: 0 the system's, 1 insist on it, or a directory). The service
+# sets it up for the backend process alone (service/manager.py
+# gstreamer_sdk_env); --headless --foreground does it here. Prints the folder.
+gstreamer_sdk_dir() {
+    local value="${NW_GSTREAMER_SDK:-}" release
+    [[ "$value" != 0 ]] || return 1
+    release="$ROOT/.cache/gstreamer-sdk-$(sed -n 's/^GST_VERSION=//p' "$ROOT/scripts/build_release_gstreamer.sh")"
+    if [[ -z "$value" ]]; then
+        [[ -d "$release/lib/gstreamer-1.0" ]] || return 1
+        value="$release"
+    elif [[ "$value" == 1 ]]; then
+        value="$release"
+    fi
+    printf '%s\n' "$value"
+}
+
+# The environment that runs a process on that SDK alone, as KEY=VALUE words.
+gstreamer_sdk_env() {
+    local sdk="$1" libs="$1/lib"
+    # Its nettle 3 (for librtmp) only where the system has none, as installed builds do.
+    if [[ -d "$sdk/lib/nettle3" ]] && ! ldconfig -p 2>/dev/null | grep -q 'libnettle\.so\.8 '; then
+        libs="$libs:$sdk/lib/nettle3"
+    fi
+    printf '%s\n' \
+        "PATH=$sdk/bin:$PATH" \
+        "LD_LIBRARY_PATH=$libs" \
+        "GST_PLUGIN_PATH_1_0=$sdk/lib/gstreamer-1.0" \
+        "GST_PLUGIN_SYSTEM_PATH_1_0=$sdk/lib/gstreamer-1.0" \
+        "GST_PLUGIN_SCANNER_1_0=$sdk/libexec/gstreamer-1.0/gst-plugin-scanner" \
+        "GST_REGISTRY_1_0=$ROOT/.cache/gstreamer-registry-$(basename "$sdk").bin"
 }
 
 # The cloud's LiveKit publisher links libwebrtc, which is built against
@@ -434,7 +474,17 @@ NW_STARTUP_TIMEOUT="${NW_STARTUP_TIMEOUT:-15}"
 # Host-built Rust/Python processes must use the host glibc instead.
 sanitize_snap_library_paths
 restore_vscode_host_environment
-configure_local_gstreamer_va_runtime
+GSTREAMER_SDK=""
+if GSTREAMER_SDK="$(gstreamer_sdk_dir)"; then
+    [[ -d "$GSTREAMER_SDK/lib/gstreamer-1.0" ]] \
+        || fail "NW_GSTREAMER_SDK: no GStreamer runtime at $GSTREAMER_SDK (scripts/install_gstreamer_dev_sdk.sh builds it)"
+    printf '==> GStreamer for the backend: %s\n' "$GSTREAMER_SDK"
+else
+    GSTREAMER_SDK=""
+    configure_local_gstreamer_va_runtime
+    [[ "${NW_GSTREAMER_SDK:-}" == 0 ]] \
+        || printf '==> GStreamer for the backend: the system'"'"'s; build the release one with scripts/install_gstreamer_dev_sdk.sh\n'
+fi
 
 case "$MODE" in
     service)
@@ -474,7 +524,7 @@ case "$MODE" in
             # service (started now, or running already) uses this build and
             # rebuilds by itself after later changes.
             printf '%s\n' '==> Building Rust backend'
-            (cd "$BACKEND_WORKSPACE" && cargo build -p "$BACKEND_PACKAGE" --locked)
+            (cd "$BACKEND_WORKSPACE" && cargo build -p "$BACKEND_PACKAGE" -p nw-motion --locked)
         fi
         if (( HEADLESS && ! FOREGROUND )); then
             printf '%s\n' '==> Headless: NeuroWatch runs as a background service; status follows'
@@ -504,9 +554,13 @@ case "$MODE" in
         backend_log="$(mktemp "${TMPDIR:-/tmp}/neurowatch-backend.XXXXXX.log")"
         printf '%s\n' '==> Building Rust backend'
         cd "$BACKEND_WORKSPACE"
-        cargo build -p "$BACKEND_PACKAGE" --locked
+        cargo build -p "$BACKEND_PACKAGE" -p nw-motion --locked
         printf '%s\n' '==> Starting Rust backend'
-        cargo run -p "$BACKEND_PACKAGE" --locked >"$backend_log" 2>&1 &
+        backend_env=()
+        if [[ -n "$GSTREAMER_SDK" ]]; then
+            mapfile -t backend_env < <(gstreamer_sdk_env "$GSTREAMER_SDK")
+        fi
+        env "${backend_env[@]}" cargo run -p "$BACKEND_PACKAGE" --locked >"$backend_log" 2>&1 &
         BACKEND_PID=$!
         trap cleanup_backend EXIT
         trap 'exit 130' INT

@@ -31,6 +31,7 @@ pub struct VideoFeed {
     /// Latest pipeline time pushed.
     last_ns: u64,
     discont: bool,
+    frames: Option<std::sync::Arc<std::sync::Mutex<super::frames::DecoderFrames>>>,
 }
 
 impl VideoFeed {
@@ -41,7 +42,16 @@ impl VideoFeed {
             origin: None,
             last_ns: 0,
             discont: false,
+            frames: None,
         }
+    }
+
+    pub fn with_frames(
+        mut self,
+        frames: std::sync::Arc<std::sync::Mutex<super::frames::DecoderFrames>>,
+    ) -> Self {
+        self.frames = Some(frames);
+        self
     }
 
     /// Bytes waiting in the `appsrc` (the decoder is behind when this grows).
@@ -107,6 +117,11 @@ impl VideoFeed {
                 writable.set_flags(gstreamer::BufferFlags::DISCONT);
             }
         }
+        if let (Some(frames), Some(identity), Some(pts)) = (&self.frames, unit.frame, out.pts()) {
+            if let Ok(mut frames) = frames.lock() {
+                frames.put(pts.nseconds(), identity);
+            }
+        }
         self.last_ns = self.last_ns.max(time - hub_origin + pipeline_origin);
         self.input.push_buffer(out)?;
         Ok(Pushed::Pushed)
@@ -132,6 +147,7 @@ mod tests {
             buffer,
             caps: caps.clone(),
             arrived_us: 0,
+            frame: None,
         }
     }
 

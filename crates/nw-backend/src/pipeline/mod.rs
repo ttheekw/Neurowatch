@@ -15,7 +15,7 @@ pub mod builder;
 pub mod encoded;
 pub mod hwaccel;
 pub mod ingest;
-mod preview_format;
+pub(crate) mod preview_format;
 mod preview_rate;
 pub mod reachability;
 pub mod supervisor;

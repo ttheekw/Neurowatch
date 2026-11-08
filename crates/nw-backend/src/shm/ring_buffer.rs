@@ -21,8 +21,9 @@
 
 use nw_core::camera::CameraId;
 use nw_core::frame::shm::{
-    HEADER_BYTES, MAX_FRAME_BYTES, NV12_CAPABILITY, NV12_SLOT_FLAG, PREVIEW_FORMAT_OFFSET,
-    PREVIEW_RATE_OFFSET, SLOT_COUNT, SLOT_HEADER_BYTES, SLOT_SIZE, TOTAL_BYTES,
+    FRAME_IDENTITIES_OFFSET, FRAME_IDENTITY_BYTES, FRAME_OBSERVED_OFFSET, HEADER_BYTES,
+    MAX_FRAME_BYTES, NV12_CAPABILITY, NV12_SLOT_FLAG, PREVIEW_FORMAT_OFFSET, PREVIEW_RATE_OFFSET,
+    SLOT_COUNT, SLOT_HEADER_BYTES, SLOT_SIZE, TOTAL_BYTES,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -36,6 +37,7 @@ pub fn windows_mapping_name(key: &str) -> String {
 pub struct ShmRingBufferWriter {
     mapping: platform::Mapping,
     cam_id: CameraId,
+    identity: Option<crate::streams::frames::Identity>,
 }
 
 impl ShmRingBufferWriter {
@@ -45,7 +47,12 @@ impl ShmRingBufferWriter {
         Ok(Self {
             mapping,
             cam_id: cam_id.clone(),
+            identity: None,
         })
+    }
+
+    pub fn set_identity(&mut self, identity: Option<crate::streams::frames::Identity>) {
+        self.identity = identity;
     }
 
     #[cfg(test)]
@@ -141,6 +148,7 @@ impl ShmRingBufferWriter {
                 }
             }
         }
+        write_identity(bytes, next, self.identity);
         unsafe { (*(bytes.as_mut_ptr() as *mut AtomicU32)).store(next as u32, Ordering::Release) };
         true
     }
@@ -198,11 +206,25 @@ impl ShmRingBufferWriter {
         }
 
         // Release ensures payload visibility before publishing the slot index.
+        write_identity(buf, next_slot, self.identity);
         unsafe {
             (*(buf.as_mut_ptr() as *mut AtomicU32)).store(next_slot as u32, Ordering::Release)
         };
         true
     }
+}
+
+fn write_identity(
+    bytes: &mut [u8],
+    slot: usize,
+    identity: Option<crate::streams::frames::Identity>,
+) {
+    let identity = identity.unwrap_or_default();
+    let at = FRAME_IDENTITIES_OFFSET + slot * FRAME_IDENTITY_BYTES;
+    bytes[at..at + 8].copy_from_slice(&identity.seq.to_le_bytes());
+    bytes[at + 8..at + 16].copy_from_slice(&identity.time_us.to_le_bytes());
+    let observed_at = FRAME_OBSERVED_OFFSET + slot * 8;
+    bytes[observed_at..observed_at + 8].copy_from_slice(&identity.observed_us.to_le_bytes());
 }
 
 #[cfg(unix)]
@@ -348,6 +370,48 @@ mod platform {
 mod tests {
     use super::*;
     use nw_core::frame::shm::SHM_PREFIX;
+
+    #[test]
+    fn rgb_and_nv12_publish_observation_with_the_same_picture_slot() {
+        let key = format!("test-identity-{}", uuid::Uuid::new_v4());
+        let mut writer = ShmRingBufferWriter::create(&key).unwrap();
+        let identity = crate::streams::frames::Identity {
+            seq: 1 << 40,
+            time_us: 90_000_000,
+            observed_us: 10_000_000,
+        };
+        writer.set_identity(Some(identity));
+        assert!(writer.write_frame(2, 2, 6, &[0; 12]));
+        assert!(writer.write_nv12_frame(2, 2, [2, 2], [&[16; 4], &[128; 2]], 2));
+        let bytes = writer.mapping.bytes_mut();
+        for slot in [1, 2] {
+            let at = FRAME_IDENTITIES_OFFSET + slot * FRAME_IDENTITY_BYTES;
+            assert_eq!(
+                u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()),
+                identity.seq
+            );
+            assert_eq!(
+                i64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()),
+                identity.time_us
+            );
+            let at = FRAME_OBSERVED_OFFSET + slot * 8;
+            assert_eq!(
+                i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()),
+                identity.observed_us
+            );
+        }
+        writer.set_identity(None);
+        for _ in 0..SLOT_COUNT {
+            assert!(writer.write_frame(2, 2, 6, &[0; 12]));
+        }
+        let bytes = writer.mapping.bytes_mut();
+        let at = FRAME_OBSERVED_OFFSET + 8;
+        assert_eq!(
+            &bytes[at..at + 8],
+            &[0; 8],
+            "legacy frames must not inherit an old live clock"
+        );
+    }
 
     #[test]
     fn nv12_packs_odd_padded_planes_and_preserves_rgb_compatibility() {

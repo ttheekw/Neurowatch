@@ -80,6 +80,7 @@ def test_menus_offer_only_what_the_account_may_do(qtbot):
     assert labels == ["Diagnostics", "Change Password…", "Sign Out (guard)", "About Neurowatch"]
     bar.apply_role()
     assert bar._tab_btns["settings"].isHidden()
+    assert bar._tab_btns["plugins"].isHidden(), "plugins are configured by administrators"
     cell = CellWidget()
     qtbot.addWidget(cell)
     cell.set_camera(CameraConfig(id="cam", name="Gate", url="rtsp://offline/fixture"))

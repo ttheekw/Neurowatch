@@ -67,7 +67,7 @@ QPushButton {
 QPushButton:hover, QPushButton:focus { background: #2a2a40; color: white; }
 """
 
-TABS = ("live", "playback", "events", "settings")
+TABS = ("live", "playback", "events", "plugins", "settings")
 #: Views opened from the ≡ menu rather than a tab of their own.
 MENU_VIEWS = ("diagnostics",)
 
@@ -77,7 +77,7 @@ class TitleBar(QWidget):
 
     tab_changed = Signal(
         str
-    )  # "live" | "playback" | "events" | "diagnostics" (≡ menu) | "settings"
+    )  # "live" | "playback" | "events" | "plugins" | "diagnostics" (≡ menu) | "settings"
     export_config_requested = Signal()
     export_video_requested = Signal()
     import_config_requested = Signal()
@@ -358,10 +358,12 @@ class TitleBar(QWidget):
         return menu
 
     def apply_role(self) -> None:
-        """Hide the Settings tab from accounts that may not change settings."""
+        """Settings and plugins are administrative; viewers still see plugin
+        drawings on their wall and plugin events in Events."""
         from neurowatch.ipc.auth import may
 
         self._tab_btns["settings"].setVisible(may("admin"))
+        self._tab_btns["plugins"].setVisible(may("admin"))
 
     def _update_tab_styles(self) -> None:
         for key, btn in self._tab_btns.items():

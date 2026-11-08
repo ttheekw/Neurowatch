@@ -137,17 +137,25 @@ def ensure_service(
     """
     service = controller or ServiceController(sleep=_qt_sleep)
     status = probe.backend_status(service.endpoint, timeout=1.0)
+    starting_message = ""
     if status is None:
-        progress(
+        starting_message = (
             "Building and starting the backend — the first build takes a few minutes"
             if dev_mode()
             else "Starting the NeuroWatch background service"
         )
     elif running_mode(status) != DESKTOP:
-        progress("Switching the NeuroWatch service from headless to desktop mode")
+        starting_message = "Switching the NeuroWatch service from headless to desktop mode"
+    if starting_message:
+        progress(starting_message)
+    last_message = starting_message
     worker = _ServiceStart(service, autostart)
     worker.start()
     while not worker.wait(30):
+        message = getattr(service, "startup_message", None) or starting_message
+        if message and message != last_message:
+            progress(message)
+            last_message = message
         QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 30)
     ok, error = worker.result
     if not ok and not error:

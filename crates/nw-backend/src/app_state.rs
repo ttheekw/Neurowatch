@@ -63,6 +63,11 @@ pub struct AppState {
     view_ended: HashMap<CameraId, Arc<AtomicBool>>,
     /// Desktop UIs' view leases: which cameras each shows, until when.
     view_demand: HashMap<String, (HashSet<CameraId>, Instant)>,
+    /// Streams kept decoding for plugins (`always_decode`), by camera and
+    /// stream selector, with the URL each decodes.
+    always_decoders: HashMap<(CameraId, String), (String, crate::streams::always::AlwaysDecoder)>,
+    /// Whether each running desktop view shows an always-on decoder's pictures.
+    view_borrows: HashMap<CameraId, bool>,
     /// Which camera each desktop UI listens to live, until when (its lease).
     audio_demand: HashMap<String, (CameraId, Instant)>,
     /// The camera played live on this computer's audio output, if any.
@@ -104,8 +109,12 @@ pub struct AppState {
     pub sessions: Arc<crate::accounts::Sessions>,
     /// Two-way audio: who talks through which camera (`crate::talk`).
     pub talk: Arc<crate::talk::TalkService>,
-    pub builtin_motion: Arc<crate::motion::runtime::BuiltinMotion>,
+    /// Analytics plugin sessions (`crate::plugin_host`).
+    pub plugins: Arc<crate::plugin_host::PluginHost>,
     pub snapshots: Arc<crate::snapshot::SnapshotService>,
+    /// Cloud Backup's latest status (set by `crate::cloud::backup`; "off"
+    /// without a cloud link or plan): health events, `system.status`.
+    pub backup: Arc<crate::cloud::backup::BackupStatus>,
 }
 
 impl AppState {
@@ -135,6 +144,9 @@ impl AppState {
         let events = Arc::new(crate::events::EventHub::new(Arc::clone(&db)));
         let streams = Arc::new(crate::streams::StreamHubs::default());
         let snapshots = Arc::new(crate::snapshot::SnapshotService::new(Arc::clone(&streams)));
+        let plugins = Arc::new(crate::plugin_host::PluginHost::with_database(Arc::clone(
+            &db,
+        )));
         Self {
             config,
             config_path,
@@ -155,6 +167,8 @@ impl AppState {
             views: HashSet::new(),
             view_ended: HashMap::new(),
             view_demand: HashMap::new(),
+            always_decoders: HashMap::new(),
+            view_borrows: HashMap::new(),
             audio_demand: HashMap::new(),
             live_audio: None,
             recording_unsupported: HashSet::new(),
@@ -167,15 +181,19 @@ impl AppState {
             frame_tap: None,
             keyframe_sink: None,
             reachability: HashMap::new(),
-            exports: Arc::new(crate::export::ExportService::new()),
+            exports: Arc::new(
+                crate::export::ExportService::new()
+                    .with_drawing_history(plugins.overlays.history.clone()),
+            ),
             events,
             onvif_events: Arc::new(crate::onvif_events::OnvifEvents::new()),
             ptz: Arc::new(crate::ptz::PtzService::default()),
             alerts: Arc::new(crate::alerts::AlertService::default()),
             sessions: Arc::new(crate::accounts::Sessions::default()),
             talk: Arc::new(crate::talk::TalkService::default()),
-            builtin_motion: Arc::new(crate::motion::runtime::BuiltinMotion::default()),
+            plugins,
             snapshots,
+            backup: Arc::default(),
         }
     }
 
@@ -318,6 +336,9 @@ impl AppState {
         let startup_stop_rx = stop_rx.clone();
         let startup_state_tx = state_tx.clone();
         let effective_cam = self.effective_camera_config(cam);
+        // Its stream decoded all the time: show those pictures, decode nothing.
+        let borrow = self.always_decodes(&cam.id, &effective_cam.url);
+        self.view_borrows.insert(cam.id.clone(), borrow);
         let health_counters = self.stream_health.counters_for(&cam.id);
         let mut supervisor = PipelineSupervisor::new(
             effective_cam,
@@ -330,7 +351,8 @@ impl AppState {
         .with_assignment(assignment.clone(), Arc::clone(&self.assignment_registry))
         .with_health_counters(Arc::clone(&health_counters))
         .with_headless(self.headless)
-        .with_stream_hubs(Arc::clone(&self.streams));
+        .with_stream_hubs(Arc::clone(&self.streams))
+        .with_borrowed_pictures(borrow);
         if let Some(tap) = self.frame_tap.clone() {
             supervisor = supervisor.with_frame_tap(tap);
         }
@@ -400,6 +422,7 @@ impl AppState {
     fn stop_view(&mut self, cam_id: &CameraId) {
         self.views.remove(cam_id);
         self.view_ended.remove(cam_id);
+        self.view_borrows.remove(cam_id);
         if let Some(tx) = self.stop_txs.get(cam_id) {
             let _ = tx.send(true);
             tracing::info!(cam_id = %cam_id, "Desktop view stop requested");
@@ -467,6 +490,7 @@ impl AppState {
         self.views.clear();
         self.view_ended.clear();
         self.view_demand.clear();
+        Self::drop_off_thread(self.always_decoders.drain().map(|(_, (_, d))| d).collect());
         self.audio_demand.clear();
         if let Some((cam_id, stop)) = self.live_audio.take() {
             let _ = stop.send(true);
@@ -487,6 +511,109 @@ impl AppState {
     /// Supervisor threads that may still be running, for shutdown to wait on.
     pub fn take_supervisor_tasks(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
         std::mem::take(&mut self.supervisor_tasks)
+    }
+
+    // -- streams decoded for plugins ------------------------------------------------
+
+    /// Keep decoding exactly the streams cameras ask for (`always_decode`):
+    /// start the missing, stop the unwanted, restart one whose URL changed.
+    /// Cheap when nothing changed (run every second).
+    pub fn reconcile_always_decoders(&mut self) {
+        let mut wanted: HashMap<(CameraId, String), CameraConfig> = HashMap::new();
+        let blocked = !crate::streams::enabled()
+            || crate::pipeline::hwaccel::live_view_block_reason().is_some();
+        if !blocked {
+            for camera in &self.config.cameras {
+                for selector in &camera.always_decode {
+                    let Some(url) = camera.stream_url(selector) else {
+                        continue;
+                    };
+                    // Sub without a URL of its own is Main: one decoder per stream.
+                    let duplicate = wanted
+                        .iter()
+                        .any(|((id, _), other)| id == &camera.id && other.url == url);
+                    let mut source = camera.clone();
+                    source.url = url;
+                    if !duplicate && crate::streams::shareable(&source) {
+                        wanted.insert((camera.id.clone(), selector.clone()), source);
+                    }
+                }
+            }
+        }
+        let stale: Vec<(CameraId, String)> = self
+            .always_decoders
+            .iter()
+            .filter(|(key, (url, _))| wanted.get(*key).map_or(true, |source| &source.url != url))
+            .map(|(key, _)| key.clone())
+            .collect();
+        // Views of a camera whose always-on decoding changes are rebuilt below:
+        // a view borrows those pictures, or decodes again, only when it starts.
+        let mut changed: HashSet<CameraId> = stale.iter().map(|(id, _)| id.clone()).collect();
+        let stopped: Vec<_> = stale
+            .iter()
+            .filter_map(|key| {
+                tracing::info!(cam_id = %key.0, stream = %key.1, "Always-on decoder stopping");
+                self.always_decoders.remove(key).map(|(_, decoder)| decoder)
+            })
+            .collect();
+        Self::drop_off_thread(stopped);
+        for (key, source) in wanted {
+            if self.always_decoders.contains_key(&key) {
+                continue;
+            }
+            let url = source.url.clone();
+            match crate::streams::always::AlwaysDecoder::start(
+                (*self.streams).clone(),
+                source,
+                key.1.clone(),
+            ) {
+                Ok(decoder) => {
+                    tracing::info!(cam_id = %key.0, stream = %key.1, "Always-on decoder started");
+                    changed.insert(key.0.clone());
+                    self.always_decoders.insert(key, (url, decoder));
+                }
+                Err(error) => {
+                    tracing::warn!(cam_id = %key.0, stream = %key.1, %error, "Could not start an always-on decoder");
+                }
+            }
+        }
+        for camera in self.config.cameras.clone() {
+            if !changed.contains(&camera.id) || !self.views.contains(&camera.id) {
+                continue;
+            }
+            let url = self.effective_camera_config(&camera).url;
+            let borrow = self.always_decodes(&camera.id, &url);
+            if self.view_borrows.get(&camera.id) != Some(&borrow) {
+                tracing::info!(cam_id = %camera.id, borrow, "Desktop view rebuilt for the camera's always-on decoding");
+                self.spawn_view(&camera);
+            }
+        }
+    }
+
+    /// Whether an always-on decoder runs on `url` of camera `cam_id`.
+    fn always_decodes(&self, cam_id: &str, url: &str) -> bool {
+        self.always_decoders
+            .iter()
+            .any(|((id, _), (decoded, _))| id == cam_id && decoded == url)
+    }
+
+    /// Streams being decoded for plugins right now, as `(camera, selector)`.
+    pub fn always_decoded(&self) -> Vec<(CameraId, String)> {
+        self.always_decoders.keys().cloned().collect()
+    }
+
+    /// Stopping a decoder waits for its thread: never on the caller's
+    /// (an async worker holding the state lock).
+    fn drop_off_thread(decoders: Vec<crate::streams::always::AlwaysDecoder>) {
+        if decoders.is_empty() {
+            return;
+        }
+        if let Err(error) = std::thread::Builder::new()
+            .name("always-decode-stop".into())
+            .spawn(move || drop(decoders))
+        {
+            tracing::warn!(%error, "Could not stop always-on decoders off thread");
+        }
     }
 
     // -- desktop view leases ---------------------------------------------------------
@@ -832,6 +959,25 @@ impl AppState {
             if let Some(fps) = ui.get("preview_fps").filter(|v| v.is_object()) {
                 self.config.ui.preview_fps = self.config.ui.preview_fps.updated(fps);
             }
+            if let Some(mode) = ui["wall_drawings"]
+                .as_str()
+                .and_then(crate::config::WallDrawings::parse)
+            {
+                self.config.ui.wall_drawings = mode;
+            }
+            if let Some(v) = ui["drawings_on_analysed"].as_bool() {
+                self.config.ui.drawings_on_analysed = v;
+            }
+            if let Some(v) = ui["show_counts"].as_bool() {
+                self.config.ui.show_counts = v;
+            }
+            if let Some(Ok(tiles)) = ui.get("tile_plugins").map(|v| {
+                serde_json::from_value::<
+                    std::collections::BTreeMap<String, crate::config::TilePluginView>,
+                >(v.clone())
+            }) {
+                self.config.ui.tile_plugins = tiles;
+            }
         }
         if let Some(desktop) = desktop {
             self.config.desktop = desktop;
@@ -1057,15 +1203,11 @@ impl AppState {
                 self.restart_ingest(&cam);
             }
             let source = cam.motion.effective_source();
-            let healthy = (source.uses_builtin()
-                && self
-                    .builtin_motion
-                    .status(&cam.id)
-                    .is_some_and(|status| status.state == "running"))
-                || (source.uses_onvif()
-                    && self.onvif_events.status(&cam.id).is_some_and(|status| {
-                        status.state == crate::onvif_events::SubscriptionState::Subscribed
-                    }));
+            let healthy = (source.uses_onvif()
+                && self.onvif_events.status(&cam.id).is_some_and(|status| {
+                    status.state == crate::onvif_events::SubscriptionState::Subscribed
+                }))
+                || self.plugins.detecting(&cam.id);
             let fingerprint = serde_json::to_string(&(
                 &cam.recording,
                 &cam.motion,
@@ -1102,15 +1244,11 @@ impl AppState {
             return None;
         }
         let source = camera.motion.effective_source();
-        let healthy = (source.uses_builtin()
-            && self
-                .builtin_motion
-                .status(camera_id)
-                .is_some_and(|status| status.state == "running"))
-            || (source.uses_onvif()
-                && self.onvif_events.status(camera_id).is_some_and(|status| {
-                    status.state == crate::onvif_events::SubscriptionState::Subscribed
-                }));
+        let healthy = (source.uses_onvif()
+            && self.onvif_events.status(camera_id).is_some_and(|status| {
+                status.state == crate::onvif_events::SubscriptionState::Subscribed
+            }))
+            || self.plugins.detecting(camera_id);
         if !healthy {
             return None;
         }
@@ -1503,6 +1641,64 @@ mod tests {
             "clamped to 100%"
         );
         assert!(st.config.ui.fullscreen, "other ui settings are unchanged");
+    }
+
+    #[tokio::test]
+    async fn each_tile_keeps_its_own_plugin_view() {
+        use crate::config::TilePluginView;
+        let older: crate::config::UiConfig =
+            serde_json::from_value(serde_json::json!({"theme": "dark", "fullscreen": true}))
+                .expect("a config without the setting still loads");
+        assert!(older.tile_plugins.is_empty());
+        let mut st = app_state(AppConfig::default());
+        st.update_config_settings(&serde_json::json!({"ui": {"tile_plugins": {
+            "door": {"drawings": false, "counts": true},
+            "gate": {"counts": true},
+        }}}))
+        .expect("settings should save");
+        assert_eq!(
+            st.config.ui.tile_plugins["door"],
+            TilePluginView {
+                drawings: false,
+                counts: true
+            }
+        );
+        assert!(
+            st.config.ui.tile_plugins["gate"].drawings,
+            "drawings stay on unless switched off"
+        );
+        st.update_config_settings(&serde_json::json!({"ui": {"tile_plugins": "nonsense"}}))
+            .expect("settings should save");
+        assert_eq!(st.config.ui.tile_plugins.len(), 2, "bad values are ignored");
+        let saved = std::fs::read_to_string(&st.config_path).expect("the config was written");
+        let _ = std::fs::remove_file(&st.config_path);
+        assert!(saved.contains("tile_plugins"), "survives a restart");
+    }
+
+    #[tokio::test]
+    async fn wall_drawings_default_to_each_cameras_choice_and_can_change() {
+        use crate::config::WallDrawings;
+        let older: crate::config::UiConfig =
+            serde_json::from_value(serde_json::json!({"theme": "dark", "fullscreen": true}))
+                .expect("a config without the setting still loads");
+        assert_eq!(older.wall_drawings, WallDrawings::Chosen);
+        assert!(!older.show_counts, "counts only when asked for");
+        assert!(older.drawings_on_analysed, "analysed pictures by default");
+        let mut st = app_state(AppConfig::default());
+        st.update_config_settings(&serde_json::json!({"ui": {"wall_drawings": "all"}}))
+            .expect("settings should save");
+        assert_eq!(st.config.ui.wall_drawings, WallDrawings::All);
+        st.update_config_settings(&serde_json::json!({"ui": {"drawings_on_analysed": false}}))
+            .expect("settings should save");
+        assert!(!st.config.ui.drawings_on_analysed);
+        st.update_config_settings(&serde_json::json!({"ui": {"wall_drawings": "nonsense"}}))
+            .expect("settings should save");
+        let _ = std::fs::remove_file(&st.config_path);
+        assert_eq!(
+            st.config.ui.wall_drawings,
+            WallDrawings::All,
+            "unknown values are ignored"
+        );
     }
 
     #[tokio::test]

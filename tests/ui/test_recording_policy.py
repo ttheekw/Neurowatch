@@ -322,9 +322,9 @@ def test_camera_save_uses_background_update_without_creating_manual_recording_ov
     monkeypatch.setattr(module, "_IpcCallWorker", Worker)
     fake = SimpleNamespace(
         _cameras=[camera],
-        _rec_states={},
         _edit_workers={},
         _ipc_endpoint=lambda: "unix:/isolated-test",
+        _records_all_cameras=lambda: False,
         _on_camera_updated=lambda result: None,
         _on_recording_policy_copied=lambda ids, policy: None,
     )
@@ -398,3 +398,43 @@ def test_recording_tab_opens_with_readable_background_and_visible_grid(
             # A short screen shows where the schedule starts; it scrolls into view.
             rect.setHeight(40)
         assert viewport.rect().contains(rect), f"{type(widget).__name__} hidden below initial view"
+
+
+def test_record_box_shows_the_saved_choice_not_live_recording(qtbot):
+    import neurowatch.dialogs.camera_dialog as module
+    from neurowatch.models.camera import CameraConfig
+
+    camera = CameraConfig.from_dict(
+        {
+            "id": "cam",
+            "name": "Gate",
+            "url": "rtsp://example.invalid/1",
+            "recording": {"local": {"enabled": False}},
+        }
+    )
+    dialog = module.AddEditCameraDialog(camera=camera)
+    qtbot.addWidget(dialog)
+    assert not dialog._local_enabled.isChecked()
+    assert dialog._local_enabled.isEnabled()
+    assert dialog.get_config().recording.local.enabled is False
+
+
+def test_record_all_cameras_locks_the_box_and_keeps_the_saved_choice(qtbot):
+    import neurowatch.dialogs.camera_dialog as module
+    from neurowatch.models.camera import CameraConfig
+
+    for saved in (False, True):
+        camera = CameraConfig.from_dict(
+            {
+                "id": "cam",
+                "name": "Gate",
+                "url": "rtsp://example.invalid/1",
+                "recording": {"local": {"enabled": saved}},
+            }
+        )
+        dialog = module.AddEditCameraDialog(camera=camera, records_all_cameras=True)
+        qtbot.addWidget(dialog)
+        assert dialog._local_enabled.isChecked()
+        assert not dialog._local_enabled.isEnabled()
+        assert not dialog._records_all_lbl.isHidden()
+        assert dialog.get_config().recording.local.enabled is saved

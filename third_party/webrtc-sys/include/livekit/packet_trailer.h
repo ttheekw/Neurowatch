@@ -161,7 +161,8 @@ class PacketTrailerTransformer : public webrtc::FrameTransformerInterface {
   /// Emit a sender-side publish timing event.
   void emit_publish_timing(VideoPublishTimingStage stage,
                            uint64_t user_timestamp,
-                           uint32_t frame_id) const;
+                           uint32_t frame_id,
+                           uint32_t rtp_timestamp = 0) const;
 
   /// Set the observer receiving receiver-side subscribe timing events.
   void set_subscribe_timing_observer(
