@@ -1077,7 +1077,7 @@ QWidget#settingsPage {{ background: transparent; }}
 QLabel#settingsPageTitle {{
     color: {c.text}; font-size: 18px; font-weight: 600; background: transparent;
 }}
-QWidget#cameraRecordingPage {{
+QWidget#cameraRecordingPage, QWidget#cameraMotionPage, QWidget#cameraDecodingPage {{
     background-color: {c.surface};
 }}
 """ + _scrollbar_rules(c)
@@ -1177,6 +1177,108 @@ def _tint(color: str, background: str, amount: float) -> str:
         round(fg.blue() * amount + bg.blue() * (1 - amount)),
     )
     return str(mixed.name())
+
+
+def plugins_stylesheet(theme_name: str | None = None) -> str:
+    """Plugins page: the plugin tree, cards, tabs and the camera settings form."""
+    c = active_colors(theme_name)
+    tones = {
+        "success": c.success,
+        "warning": c.warning,
+        "error": c.error,
+        "info": c.info,
+        "muted": c.text_muted,
+    }
+    tinted = "".join(
+        f"""
+QWidget#pluginsView QLabel#pluginNotice[tone="{tone}"] {{
+    background: {_tint(color, c.window, 0.10)}; border: 1px solid {_tint(color, c.window, 0.35)};
+}}
+QWidget#pluginsView QLabel#pluginState[tone="{tone}"] {{
+    background: {_tint(color, c.window, 0.12)}; border: 1px solid {_tint(color, c.window, 0.30)};
+}}
+QWidget#pluginsView QFrame#pluginCallout[tone="{tone}"] {{
+    background: {_tint(color, c.window, 0.08)}; border: 1px solid {_tint(color, c.window, 0.35)};
+}}
+"""
+        for tone, color in tones.items()
+    )
+    return (
+        scope_stylesheet(
+            _container_rules(c)
+            + _input_rules(c)
+            + _button_rules(c)
+            + _choice_rules(c)
+            + _table_rules(c),
+            "QWidget#pluginsView",
+        )
+        + f"""
+QWidget#pluginsView {{ background: {c.window}; }}
+QWidget#pluginsView QCheckBox, QWidget#pluginsView QRadioButton,
+QWidget#pluginsView QLabel, QWidget#pluginsView QWidget#shapePart {{ background: transparent; }}
+QWidget#pluginsView QLabel#pluginsTitle {{
+    color: {c.text}; font-size: 20px; font-weight: 700; background: transparent;
+}}
+QWidget#pluginsView QLabel#pluginsSideTitle {{
+    color: {c.text}; font-size: 18px; font-weight: 700; background: transparent;
+}}
+QWidget#pluginsView QLabel#pluginNotice {{
+    color: {c.text}; border-radius: 8px; padding: 8px 12px;
+}}
+QWidget#pluginsView QLabel#pluginState {{
+    border-radius: 6px; padding: 2px 8px; font-weight: 600;
+}}
+QWidget#pluginsView QLabel#pluginMono {{
+    color: {c.text_muted}; background: transparent;
+}}
+QWidget#pluginsView QFrame#pluginCallout {{ border-radius: 8px; }}
+QWidget#pluginsView QFrame#pluginCallout QLabel,
+QWidget#pluginsView QFrame#pluginCallout QCheckBox {{ background: transparent; }}
+QWidget#pluginsView QFrame#pluginRow {{
+    background: transparent; border: none; border-top: 1px solid {c.border};
+}}
+QWidget#pluginsView QFrame#pluginRow QLabel {{ background: transparent; }}
+QWidget#pluginsView QFrame#pluginStat {{
+    background-color: {c.surface_raised}; border: 1px solid {c.border}; border-radius: 10px;
+}}
+QWidget#pluginsView QFrame#pluginStat QLabel {{ background: transparent; }}
+QWidget#pluginsView QLabel#pluginStatValue {{
+    color: {c.text}; font-size: 26px; font-weight: 700;
+}}
+QWidget#pluginsView QFrame#pluginSaveBar {{
+    background: transparent; border: none; border-top: 1px solid {c.border};
+}}
+QWidget#pluginsView QTabWidget#pluginCameraTabs::pane {{
+    border: none; border-top: 1px solid {c.border}; border-radius: 0;
+    background: transparent; top: -1px;
+}}
+QWidget#pluginsView QFrame#pluginsEmpty {{
+    background-color: {c.surface}; border: 1px solid {c.border}; border-radius: 12px;
+}}
+QWidget#pluginsView QFrame#pluginsEmpty QLabel {{ background: transparent; }}
+QLabel#pluginsEmptyTitle {{ color: {c.text}; font-size: 18px; font-weight: 600; }}
+QTreeWidget#pluginsTree {{
+    background: {c.surface}; border: 1px solid {c.border}; border-radius: 10px;
+    padding: 6px; color: {c.text}; show-decoration-selected: 0; outline: 0;
+}}
+QTreeWidget#pluginsTree::item {{ padding: 6px 6px; border-radius: 6px; }}
+QTreeWidget#pluginsTree::item:selected {{ background: {c.accent_subtle}; color: {c.text}; }}
+QTreeWidget#pluginsTree::item:hover:!selected {{ background: {c.hover}; }}
+QTreeWidget#pluginsTree::branch,
+QTreeWidget#pluginsTree::branch:selected,
+QTreeWidget#pluginsTree::branch:hover {{ background: {c.surface}; border: none; }}
+QListWidget#pluginEvents {{
+    background: {c.surface}; border: 1px solid {c.border}; border-radius: 10px; padding: 4px;
+    outline: 0;
+}}
+QListWidget#pluginEvents::item {{
+    padding: 8px 10px; border-radius: 6px; color: {c.text};
+}}
+QListWidget#pluginEvents::item:hover:!selected {{ background: {c.hover}; }}
+QListWidget#pluginEvents::item:selected {{ background: {c.accent_subtle}; color: {c.text}; }}
+"""
+        + tinted
+    )
 
 
 def events_stylesheet(theme_name: str | None = None) -> str:

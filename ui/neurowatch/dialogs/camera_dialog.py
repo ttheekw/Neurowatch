@@ -14,7 +14,7 @@ from urllib.parse import quote as url_quote
 from urllib.parse import unquote as url_unquote
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPaintEvent, QPen, QPixmap, QShowEvent
+from PySide6.QtGui import QColor, QPainter, QPaintEvent, QPen, QPixmap, QShowEvent
 from PySide6.QtWidgets import (
     QBoxLayout,
     QButtonGroup,
@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -31,14 +30,10 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QPlainTextEdit,
-    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
-    QSlider,
     QSpinBox,
     QStackedWidget,
     QTableWidget,
@@ -72,9 +67,9 @@ from neurowatch.models.motion import (
     camera_events_status,
     source_of,
     uses_camera_events,
-    valid_motion_zones,
     with_camera_events,
 )
+from neurowatch.models.plugins import camera_plugins_text, without_builtin_motion
 from neurowatch.models.recording_policy import policy_problem
 from neurowatch.theme import (
     active_colors,
@@ -199,6 +194,21 @@ def _password_b64(password: str) -> str:
 # Background workers — every backend call runs off the main thread.
 # Network search and ONVIF run in the backend (camera.discovery.*).
 # ---------------------------------------------------------------------------
+
+
+#: The camera dialog's tabs that are named in code.
+DETECTION_TAB = "Detection"
+DECODING_TAB = "Decoding"
+
+
+def _page_scroll(page: QWidget) -> QScrollArea:
+    """A settings page in a scroll area of its own (the dialog stays on screen)."""
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    scroll.setWidget(page)
+    return scroll
 
 
 class _RpcWorker(Worker):
@@ -493,17 +503,20 @@ class AddEditCameraDialog(QDialog):
     def __init__(
         self,
         camera: CameraConfig | None = None,
-        is_recording: bool = False,
         parent: QWidget | None = None,
         ipc_endpoint: str | None = None,
         existing_names: Iterable[str] = (),
+        records_all_cameras: bool = False,
     ) -> None:
         super().__init__(parent)
         self._endpoint = ipc_endpoint or None
         #: Names in use, so cameras added from a search get distinct ones.
         self._camera_names: set[str] = set(existing_names)
         self._is_edit = camera is not None
-        self._is_recording = is_recording
+        #: Settings → Recording records every camera: this camera's own
+        #: choice is kept but has no effect, so the box cannot change it.
+        self._records_all = records_all_cameras
+        self._saved_local_enabled = False
         self.setWindowTitle("Edit Camera" if self._is_edit else "Add Camera")
         # One width for every tab: the motion and schedule editors need room.
         self.setMinimumWidth(840)
@@ -535,12 +548,14 @@ class AddEditCameraDialog(QDialog):
         self._keep_choice: tuple[str | None, str | None] = (None, None)
         # Settings this dialog does not show, kept as they were.
         self._motion: dict = dict(camera.motion) if camera else {}
+        #: Streams decoded all the time for plugins (``always_decode``).
+        self._always_decode: list[str] = list(camera.always_decode) if camera else []
         self._onvif: dict | None = camera.onvif if camera else None
         self._motion_worker: _RpcWorker | None = None
         self._policy_worker: _RpcWorker | None = None
         self._record_action_worker: _RpcWorker | None = None
         self._record_action = ""
-        self._snapshot_worker: _RpcWorker | None = None
+        self._plugins_worker: _RpcWorker | None = None
         self._recording_policy = {
             key: getattr(camera.recording, key) if camera else None
             for key in (
@@ -554,7 +569,8 @@ class AddEditCameraDialog(QDialog):
 
         layout = install_dialog_chrome(self, "Edit camera" if self._is_edit else "Add camera")
         subtitle = QLabel(
-            "Change how NeuroWatch connects to this camera, how it records, and its motion events."
+            "Change how NeuroWatch connects to this camera, how it records, what it detects, "
+            "and how it is decoded."
             if self._is_edit
             else "Search the network for cameras, look one up over ONVIF, or enter stream URLs."
         )
@@ -570,7 +586,10 @@ class AddEditCameraDialog(QDialog):
         self._camera_tab = self._build_camera_tab()
         self._tabs.addTab(self._camera_tab, "Camera")
         self._tabs.addTab(self._build_recording_tab(), "Recording")
-        self._tabs.addTab(self._build_motion_tab(), "Motion")
+        # What the camera detects itself (ONVIF events) and the analytics
+        # plugins that analyse it; decoding for plugins is a tab of its own.
+        self._tabs.addTab(self._build_motion_tab(), DETECTION_TAB)
+        self._tabs.addTab(self._build_decoding_tab(), DECODING_TAB)
 
         # ── Connection test: below the tabs, or beside them on a short screen ──
         self._test_panel = QWidget()
@@ -1114,16 +1133,15 @@ class AddEditCameraDialog(QDialog):
         on_search = self._search_tab is not None and self._tabs.currentWidget() is self._search_tab
         self._test_panel.setVisible(
             not on_search
-            and self._tabs.tabText(self._tabs.currentIndex()) not in ("Motion", "Recording")
+            and self._tabs.tabText(self._tabs.currentIndex())
+            not in (DETECTION_TAB, DECODING_TAB, "Recording")
         )
         tall = min(640, max(200, self._available_height() - 220))
-        for page in (self._recording_scroll, self._motion_scroll):
+        for page in (self._recording_scroll, self._motion_scroll, self._decoding_scroll):
             page.setMinimumHeight(tall if self._tabs.currentWidget() is page else 0)
         self._sync_add_button()
-        on_motion = self._tabs.tabText(self._tabs.currentIndex()) == "Motion"
+        on_motion = self._tabs.tabText(self._tabs.currentIndex()) == DETECTION_TAB
         if on_motion and self.isVisible():
-            if self._camera_id and not self._zone_canvas.has_snapshot():
-                self._load_zone_snapshot()
             self._load_motion_status()
         if self.isVisible():
             # Its size changes with the panel: fit the screen again, centred.
@@ -1634,6 +1652,17 @@ class AddEditCameraDialog(QDialog):
         self._local_enabled = QCheckBox("Record this camera")
         self._local_enabled.setToolTip("Save this camera's video on this computer")
         body.addWidget(self._local_enabled)
+        self._records_all_lbl = QLabel(
+            "Enabled globally: Settings → Recording → Enable local recording for all "
+            "cameras is on. Turn it off there to choose cameras one by one."
+        )
+        self._records_all_lbl.setWordWrap(True)
+        set_label_role(self._records_all_lbl, "hint")
+        body.addWidget(self._records_all_lbl)
+        self._records_all_lbl.setVisible(self._records_all)
+        if self._records_all:
+            self._local_enabled.setChecked(True)
+            self._local_enabled.setEnabled(False)
         self._policy_status_lbl = QLabel()
         self._policy_status_lbl.setWordWrap(True)
         set_label_role(self._policy_status_lbl, "hint")
@@ -1718,7 +1747,6 @@ class AddEditCameraDialog(QDialog):
 
     def _build_motion_tab(self) -> QWidget:
         from neurowatch.widgets.form_parts import OptionCard, settings_card
-        from neurowatch.widgets.motion_zones import ZoneCanvas
 
         w = QWidget()
         w.setObjectName("cameraMotionPage")
@@ -1726,14 +1754,14 @@ class AddEditCameraDialog(QDialog):
         vl.setContentsMargins(4, 4, 8, 4)
         vl.setSpacing(14)
 
-        # ── Who detects motion ──────────────────────────────────────────
+        # ── The camera's own detection ──────────────────────────────────
         card, body, _ = settings_card(
-            "Motion detection", "Choose who detects motion. Both can run together."
-        )
-        sources = QHBoxLayout()
-        sources.setSpacing(10)
-        camera_card = OptionCard(
             "Camera's own detection",
+            "Cameras that detect motion and other events themselves report them to "
+            "NeuroWatch over ONVIF.",
+        )
+        camera_card = OptionCard(
+            "Use the camera's events",
             "The camera reports motion over ONVIF, at no cost to this computer. Cameras "
             "with analytics also report intrusion, line crossing, tampering and alarm "
             "inputs. Set its areas and sensitivity in the camera's web settings.",
@@ -1741,304 +1769,99 @@ class AddEditCameraDialog(QDialog):
         self._camera_events = camera_card.checkbox
         self._camera_events.setChecked(uses_camera_events(self._motion))
         self._motion_status_lbl = camera_card.status
-        sources.addWidget(camera_card, 1)
-        builtin_card = OptionCard(
-            "NeuroWatch detection",
-            "This computer analyses a small video stream (the grid stream when there is "
-            "one) at 5 pictures a second, using the zones below. Recording is never "
-            "affected.",
-        )
-        self._builtin_events = builtin_card.checkbox
-        self._builtin_events.setChecked(source_of(self._motion) in ("builtin", "both"))
-        self._builtin_status_lbl = builtin_card.status
-        sources.addWidget(builtin_card, 1)
-        body.addLayout(sources)
+        body.addWidget(camera_card)
+
+        # The built-in detector is replaced by the motion plugin: a camera
+        # that still uses it can only turn it off here.
+        self._builtin_events: QCheckBox | None = None
+        if source_of(self._motion) in ("builtin", "both"):
+            builtin_card = OptionCard(
+                "NeuroWatch's built-in detection (being replaced)",
+                "Motion detection by NeuroWatch now runs as the Motion plugin: bind this "
+                "camera to it on the Plugins page, which copies its sensitivity and zones "
+                "and turns this off. Or untick this and save to turn it off now; it cannot "
+                "be turned back on here.",
+            )
+            self._builtin_events = builtin_card.checkbox
+            self._builtin_events.setChecked(True)
+            body.addWidget(builtin_card)
         vl.addWidget(card)
 
-        # ── Detection settings ──────────────────────────────────────────
-        self._builtin_controls = QWidget()
-        controls = QVBoxLayout(self._builtin_controls)
-        controls.setContentsMargins(0, 0, 0, 0)
-        controls.setSpacing(14)
+        # ── Analytics plugins ───────────────────────────────────────────
         card, body, _ = settings_card(
-            "Detection settings", "How NeuroWatch detection decides that something moved."
+            "Analytics plugins",
+            "Motion detection by NeuroWatch and other analytics (such as licence plates or "
+            "counting) run as plugins. Choose which cameras each one analyses on "
+            "the Plugins page.",
         )
-        form = QGridLayout()
-        form.setHorizontalSpacing(14)
-        form.setVerticalSpacing(10)
-        form.setColumnStretch(1, 1)
-        self._motion_sensitivity = QSlider(Qt.Orientation.Horizontal)
-        self._motion_sensitivity.setRange(1, 10)
-        self._motion_sensitivity.setPageStep(1)
-        self._motion_sensitivity.setAccessibleName("Motion sensitivity")
-        self._motion_sensitivity.setValue(int(self._motion.get("sensitivity", 5)))
-        sensitivity_value = QLabel()
-        sensitivity_value.setMinimumWidth(96)
-
-        def show_sensitivity(value: int) -> None:
-            word = "Low" if value <= 3 else "Medium" if value <= 7 else "High"
-            sensitivity_value.setText(f"{value} · {word}")
-
-        self._motion_sensitivity.valueChanged.connect(show_sensitivity)
-        show_sensitivity(self._motion_sensitivity.value())
-        form.addWidget(QLabel("Sensitivity"), 0, 0)
-        form.addWidget(self._motion_sensitivity, 0, 1)
-        form.addWidget(sensitivity_value, 0, 2)
-        self._motion_min_duration = QDoubleSpinBox()
-        self._motion_min_duration.setRange(0, 60)
-        self._motion_min_duration.setDecimals(1)
-        self._motion_min_duration.setSingleStep(0.5)
-        self._motion_min_duration.setSuffix(" s")
-        self._motion_min_duration.setValue(float(self._motion.get("min_duration_sec", 0.5)))
-        self._motion_min_duration.setToolTip(
-            "Movement shorter than this (a flicker, a passing shadow) starts no event"
+        self._plugins_lbl = QLabel(
+            "" if self._camera_id else "Save the camera first, then bind it to a plugin."
         )
-        form.addWidget(QLabel("Ignore movement shorter than"), 1, 0)
-        form.addWidget(self._motion_min_duration, 1, 1, 1, 2, Qt.AlignmentFlag.AlignLeft)
-        self._motion_cooldown = QDoubleSpinBox()
-        self._motion_cooldown.setRange(0, 600)
-        self._motion_cooldown.setDecimals(1)
-        self._motion_cooldown.setSingleStep(1)
-        self._motion_cooldown.setSuffix(" s")
-        self._motion_cooldown.setValue(float(self._motion.get("cooldown_sec", 10)))
-        self._motion_cooldown.setToolTip(
-            "An event ends once the picture has been still this long; movement before "
-            "then continues the same event"
-        )
-        form.addWidget(QLabel("End the event after stillness of"), 2, 0)
-        form.addWidget(self._motion_cooldown, 2, 1, 1, 2, Qt.AlignmentFlag.AlignLeft)
-        for spin in (self._motion_min_duration, self._motion_cooldown):
-            spin.setMinimumWidth(110)
-        body.addLayout(form)
-        self._motion_low_cpu = QCheckBox("Low CPU mode (keyframes only)")
-        self._motion_low_cpu.setChecked(bool(self._motion.get("low_cpu", False)))
-        self._motion_low_cpu.setToolTip(
-            "Decodes keyframes only. Pictures may be seconds apart, so short movements "
-            "can be missed. Uses software decoding; normal detection remains the default."
-        )
-        body.addWidget(self._motion_low_cpu)
-        low_cpu_hint = QLabel(
-            "Analyses only the stream's keyframes, often seconds apart: much less work, "
-            "but short movements can be missed."
-        )
-        low_cpu_hint.setWordWrap(True)
-        set_label_role(low_cpu_hint, "hint")
-        body.addWidget(low_cpu_hint)
-        controls.addWidget(card)
-
-        # ── Zones and live view ─────────────────────────────────────────
-        card, body, heading = settings_card(
-            "Zones and live view",
-            "Draw where movement counts. Without zones the whole picture is watched; "
-            "ignored areas always win. Blue blocks show what moves right now.",
-        )
-        self._zone_snapshot_btn = QPushButton("Refresh Picture")
-        self._zone_snapshot_btn.setToolTip("Take a new picture from the camera to draw on")
-        set_button_variant(self._zone_snapshot_btn, "secondary")
-        self._zone_snapshot_btn.clicked.connect(self._load_zone_snapshot)
-        self._zone_snapshot_btn.setEnabled(bool(self._camera_id))
-        heading.addWidget(self._zone_snapshot_btn, 0, Qt.AlignmentFlag.AlignTop)
-        editor = QHBoxLayout()
-        editor.setSpacing(12)
-        picture_column = QVBoxLayout()
-        picture_column.setSpacing(8)
-        self._zone_canvas = ZoneCanvas()
-        self._zone_canvas.set_zones(self._motion.get("zones", []))
-        self._zone_canvas.changed.connect(self._refresh_zone_picker)
-        self._analysis_preview = self._zone_canvas
-        picture_column.addWidget(self._zone_canvas)
-        meter = QHBoxLayout()
-        meter.setSpacing(8)
-        meter_label = QLabel("Movement now")
-        set_label_role(meter_label, "hint")
-        meter.addWidget(meter_label)
-        self._motion_score = QProgressBar()
-        self._motion_score.setObjectName("motionMeter")
-        self._motion_score.setRange(0, 100)
-        self._motion_score.setValue(0)
-        self._motion_score.setTextVisible(False)
-        self._motion_score.setFixedHeight(6)
-        self._motion_score.setAccessibleName("Live motion score")
-        meter.addWidget(self._motion_score, 1)
-        self._motion_score_text = QLabel("—")
-        self._motion_score_text.setMinimumWidth(36)
-        self._motion_score_text.setAlignment(Qt.AlignmentFlag.AlignRight)
-        set_label_role(self._motion_score_text, "hint")
-        meter.addWidget(self._motion_score_text)
-        picture_column.addLayout(meter)
-        self._zone_status = QLabel(
-            "" if self._camera_id else "Save the camera first to see its picture here."
-        )
-        self._zone_status.setWordWrap(True)
-        set_label_role(self._zone_status, "hint")
-        picture_column.addWidget(self._zone_status)
-        editor.addLayout(picture_column, 3)
-
-        zone_column = QVBoxLayout()
-        zone_column.setSpacing(8)
-        zones_label = QLabel("Zones")
-        set_label_role(zones_label, "sectionLabel")
-        zone_column.addWidget(zones_label)
-        self._zone_picker = QListWidget()
-        self._zone_picker.setObjectName("zoneList")
-        self._zone_picker.setAccessibleName("Motion zones")
-        self._zone_picker.setMinimumWidth(180)
-        self._zone_picker.currentRowChanged.connect(self._select_zone)
-        zone_column.addWidget(self._zone_picker, 1)
-        self._zone_name = QLineEdit()
-        self._zone_name.setMaxLength(64)
-        self._zone_name.setPlaceholderText("Zone name")
-        self._zone_name.setAccessibleName("Zone name")
-        self._zone_name.textEdited.connect(self._rename_zone)
-        zone_column.addWidget(self._zone_name)
-        add_row = QHBoxLayout()
-        add_row.setSpacing(6)
-        for label, kind, tip in (
-            ("+ Watch", "include", "Add an area where movement counts"),
-            ("+ Ignore", "exclude", "Add an area where movement never counts"),
-        ):
-            button = QPushButton(label)
-            button.setToolTip(tip)
-            set_button_variant(button, "secondary")
-            button.clicked.connect(lambda _checked=False, kind=kind: self._add_zone(kind))
-            add_row.addWidget(button)
-        zone_column.addLayout(add_row)
-        self._zone_remove = QPushButton("Remove Zone")
-        set_button_variant(self._zone_remove, "ghost")
-        self._zone_remove.clicked.connect(self._remove_zone)
-        zone_column.addWidget(self._zone_remove)
-        editor.addLayout(zone_column, 1)
-        body.addLayout(editor)
-        zone_hint = QLabel(
-            "Click the picture to add points (three or more make a zone), drag a point to "
-            "move it, right-click a point to remove it. Check the zones again after the "
-            "camera is moved or re-aimed."
-        )
-        zone_hint.setWordWrap(True)
-        set_label_role(zone_hint, "hint")
-        body.addWidget(zone_hint)
-        controls.addWidget(card)
-        self._refresh_zone_picker()
-        self._builtin_controls.setEnabled(self._builtin_events.isChecked())
-        self._builtin_events.toggled.connect(self._builtin_controls.setEnabled)
-        vl.addWidget(self._builtin_controls)
+        self._plugins_lbl.setWordWrap(True)
+        set_label_role(self._plugins_lbl, "hint")
+        body.addWidget(self._plugins_lbl)
+        vl.addWidget(card)
         vl.addStretch()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setWidget(w)
-        self._motion_scroll = scroll
-        return scroll
+        self._motion_scroll = _page_scroll(w)
+        return self._motion_scroll
 
-    def _refresh_zone_picker(self) -> None:
-        from neurowatch.widgets.motion_zones import zone_color
+    def _build_decoding_tab(self) -> QWidget:
+        """Decoding on this recorder all the time, for plugins (``always_decode``)."""
+        from neurowatch.widgets.form_parts import settings_card
 
-        zones = self._zone_canvas.zones()
-        selected = self._zone_canvas.selected
-        self._zone_picker.blockSignals(True)
-        self._zone_picker.clear()
-        for zone in zones:
-            points = len(zone.get("points", []))
-            kind = "Ignore" if zone.get("kind") == "exclude" else "Watch"
-            text = str(zone.get("name") or zone["id"])
-            item = QListWidgetItem(f"{text}\n{kind}" + ("" if points >= 3 else " · add points"))
-            swatch = QPixmap(12, 12)
-            swatch.fill(zone_color(zone))
-            item.setIcon(QIcon(swatch))
-            self._zone_picker.addItem(item)
-        if not zones:
-            item = QListWidgetItem("Whole picture\nNo zones yet")
-            item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self._zone_picker.addItem(item)
-        else:
-            self._zone_picker.setCurrentRow(selected)
-        self._zone_picker.blockSignals(False)
-        self._select_zone(selected)
-
-    def _select_zone(self, index: int) -> None:
-        zones = self._zone_canvas.zones()
-        if not 0 <= index < len(zones):
-            index = 0
-        self._zone_canvas.selected = index
-        name = str(zones[index].get("name", "")) if zones else ""
-        if self._zone_name.text() != name:
-            self._zone_name.setText(name)
-        self._zone_name.setEnabled(bool(zones))
-        self._zone_remove.setEnabled(bool(zones))
-        self._zone_canvas.update()
-
-    def _rename_zone(self, name: str) -> None:
-        zones = self._zone_canvas.zones()
-        if zones:
-            zones[self._zone_canvas.selected]["name"] = name
-            self._zone_canvas.set_zones(zones)
-            self._refresh_zone_picker()
-
-    def _add_zone(self, kind: str) -> None:
-        if self._zone_canvas.add_zone(kind):
-            self._zone_name.setFocus()
-            self._zone_name.selectAll()
-
-    def _remove_zone(self) -> None:
-        zones = self._zone_canvas.zones()
-        if zones:
-            zones.pop(self._zone_canvas.selected)
-            self._zone_canvas.set_zones(zones)
-            self._refresh_zone_picker()
-
-    def _load_zone_snapshot(self) -> None:
-        if not self._camera_id or self._snapshot_worker is not None:
-            return
-        self._zone_snapshot_btn.setEnabled(False)
-        self._zone_status.setText("Taking a picture from the camera…")
-        worker = _RpcWorker(self._endpoint, "snapshot.capture", {"camera_id": self._camera_id})
-        worker.done.connect(self._on_zone_snapshot)
-        worker.finished.connect(worker.deleteLater)
-        self._snapshot_worker = worker
-        worker.start()
-
-    def _on_zone_snapshot(self, result: object) -> None:
-        self._snapshot_worker = None
-        self._zone_snapshot_btn.setEnabled(True)
-        set_status_tone(self._zone_status, "muted")
-        if not isinstance(result, dict):
-            self._zone_status.setText(
-                "The camera's picture is unavailable; zones can still be drawn. "
-                "Check the camera connection, then Refresh Picture."
-            )
-            return
-        picture = QPixmap()
-        try:
-            data = base64.b64decode(result.get("jpeg_b64", ""), validate=True)
-        except (ValueError, TypeError):
-            data = b""
-        if picture.loadFromData(data):
-            self._zone_canvas.set_snapshot(picture)
-            self._zone_status.setText("")
-        else:
-            self._zone_status.setText("The camera did not return a usable picture.")
+        w = QWidget()
+        w.setObjectName("cameraDecodingPage")
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(4, 4, 8, 4)
+        vl.setSpacing(14)
+        card, body, _ = settings_card(
+            "Decode on this recorder all the time",
+            "Analytics plugins use NeuroWatch's decoded pictures instead of decoding the "
+            "camera again. Without this they get them only while a video wall shows the "
+            "camera. Each ticked stream is decoded all the time, which uses the processor "
+            "or graphics card even when nobody watches.",
+        )
+        self._always_main = QCheckBox("Main stream")
+        self._always_main.setChecked("main" in self._always_decode)
+        self._always_sub = QCheckBox("Sub stream")
+        self._always_sub.setChecked("sub" in self._always_decode)
+        decode_row = QHBoxLayout()
+        decode_row.addWidget(self._always_main)
+        decode_row.addWidget(self._always_sub)
+        decode_row.addStretch(1)
+        body.addLayout(decode_row)
+        hint = QLabel(
+            "Leave both off unless a plugin needs pictures while no wall shows the camera: "
+            "a plugin can also decode the camera itself (Plugins → the camera → Settings → "
+            "Decoding)."
+        )
+        hint.setWordWrap(True)
+        set_label_role(hint, "hint")
+        body.addWidget(hint)
+        vl.addWidget(card)
+        vl.addStretch()
+        self._decoding_scroll = _page_scroll(w)
+        return self._decoding_scroll
 
     def _load_motion_status(self) -> None:
-        """Show the camera's event subscription (edit mode, off the UI thread)."""
+        """Show the camera's event subscription and the plugins analysing it
+        (edit mode, off the UI thread)."""
         if not self._camera_id or self._motion_worker is not None:
             return
-        preview = self.isVisible() and self._tabs.tabText(self._tabs.currentIndex()) == "Motion"
-        worker = _RpcWorker(
-            self._endpoint,
-            "motion.status",
-            {
-                "camera_id": self._camera_id,
-                "include_preview": preview,
-            },
-        )
+        worker = _RpcWorker(self._endpoint, "motion.status", {"camera_id": self._camera_id})
         worker.done.connect(self._on_motion_status)
         worker.finished.connect(worker.deleteLater)
         self._motion_worker = worker
         worker.start()
+        if self._plugins_worker is None:
+            plugins = _RpcWorker(self._endpoint, "plugins.status")
+            plugins.done.connect(self._on_plugins_status)
+            plugins.finished.connect(plugins.deleteLater)
+            self._plugins_worker = plugins
+            plugins.start()
 
     def _poll_motion_if_visible(self) -> None:
-        if self.isVisible() and self._tabs.tabText(self._tabs.currentIndex()) == "Motion":
+        if self.isVisible() and self._tabs.tabText(self._tabs.currentIndex()) == DETECTION_TAB:
             self._load_motion_status()
         elif self.isVisible() and self._tabs.tabText(self._tabs.currentIndex()) == "Recording":
             self._load_policy_status()
@@ -2085,9 +1908,6 @@ class AddEditCameraDialog(QDialog):
         self._motion_worker = None
         if not isinstance(result, dict) or not self._camera_id:
             return
-        camera_status = result.get("cameras", {}).get(self._camera_id, {})
-        if not isinstance(camera_status, dict):
-            camera_status = {}
         if self._camera_events.isChecked() and uses_camera_events(self._motion):
             text, tone = camera_events_status(result, self._camera_id)
             self._camera_card_status(text, tone)
@@ -2099,50 +1919,21 @@ class AddEditCameraDialog(QDialog):
         self._motion_status_lbl.setToolTip(
             "The camera's names for them:\n" + "\n".join(topics) if topics else ""
         )
-        builtin = camera_status.get("builtin")
-        running = isinstance(builtin, dict) and builtin.get("state") == "running"
-        self._analysis_preview.set_analysis(
-            camera_status.get("preview") if running else None,
-            builtin.get("blocks") if isinstance(builtin, dict) else None,
-        )
-        score = (
-            round(float(builtin.get("score", 0)) * 100)
-            if running and isinstance(builtin, dict)
-            else 0
-        )
-        self._motion_score.setValue(score)
-        self._motion_score_text.setText(f"{score}%" if running else "—")
-        if not self._builtin_events.isChecked():
-            self._builtin_card_status("", "muted")
-        elif not isinstance(builtin, dict):
-            self._builtin_card_status("Starts when you save.", "info")
-        elif running:
-            text = f"Running · {float(builtin.get('analysis_fps', 0)):.1f} pictures a second"
-            if builtin.get("low_cpu"):
-                text += " · keyframes only"
-            if not builtin.get("using_substream"):
-                text += " · main stream (a grid stream would use less CPU)"
-            self._builtin_card_status(text, "success")
-        else:
-            state = str(builtin.get("state", "connecting"))
-            detail = str(builtin.get("detail") or "").strip()
-            tone = "error" if state in ("unsupported", "error", "failed") else "info"
-            self._builtin_card_status(
-                detail or {"backoff": "Reconnecting…"}.get(state, state.capitalize() + "…"),
-                tone,
-            )
+
+    def _on_plugins_status(self, result: object) -> None:
+        self._plugins_worker = None
+        if not self._camera_id:
+            return
+        if isinstance(result, Exception):
+            # Only administrators may read plugins; say nothing then.
+            self._plugins_lbl.setText("")
+            return
+        self._plugins_lbl.setText(camera_plugins_text(result, self._camera_id))
 
     def _camera_card_status(self, text: str, tone: str) -> None:
         from neurowatch.widgets.form_parts import OptionCard
 
         card = self._camera_events.parentWidget()
-        if isinstance(card, OptionCard):
-            card.set_status(text, tone)
-
-    def _builtin_card_status(self, text: str, tone: str) -> None:
-        from neurowatch.widgets.form_parts import OptionCard
-
-        card = self._builtin_events.parentWidget()
         if isinstance(card, OptionCard):
             card.set_status(text, tone)
 
@@ -2235,10 +2026,12 @@ class AddEditCameraDialog(QDialog):
         # Recording tab
         rec = cam.recording
         self._rec_schedule.setText(rec.schedule or "")
-        # Local destination — checkbox reflects live state OR persisted config.
-        # A camera may be recording via the global "all cameras" toggle even when
-        # rec.local.enabled is False in the stored config.
-        self._local_enabled.setChecked(rec.local.enabled or self._is_recording)
+        # The saved choice, not whether it records now: a camera recorded by
+        # the "all cameras" setting or started by hand would otherwise open
+        # ticked, and Save would store that.
+        self._saved_local_enabled = rec.local.enabled
+        if not self._records_all:
+            self._local_enabled.setChecked(rec.local.enabled)
         self._local_storage.setText(rec.local.storage_path or "")
         self._local_quota.setValue(rec.local.quota_gb or 0)
 
@@ -2397,14 +2190,14 @@ class AddEditCameraDialog(QDialog):
                     pass
                 retire(worker)
                 setattr(self, attribute, None)
-        snapshot = self._snapshot_worker
-        if snapshot is not None:
+        plugins = self._plugins_worker
+        if plugins is not None:
             try:
-                snapshot.done.disconnect(self._on_zone_snapshot)
+                plugins.done.disconnect(self._on_plugins_status)
             except Exception:
                 pass
-            retire(snapshot)
-            self._snapshot_worker = None
+            retire(plugins)
+            self._plugins_worker = None
         self._stop_streams_worker()
         batch = self._batch_worker
         if batch is not None:
@@ -2562,16 +2355,6 @@ class AddEditCameraDialog(QDialog):
                     self._tabs.setCurrentIndex(index)
                     break
             return
-        if not valid_motion_zones(self._zone_canvas.zones()):
-            set_status_tone(self._zone_status, "warning")
-            self._zone_status.setText(
-                "Complete each zone with 3–64 points, or remove it before saving."
-            )
-            for index in range(self._tabs.count()):
-                if self._tabs.tabText(index) == "Motion":
-                    self._tabs.setCurrentIndex(index)
-                    break
-            return
         if self._search_tab is not None and self._tabs.currentWidget() is self._search_tab:
             self._run_batch(add=True)
             return
@@ -2679,6 +2462,12 @@ class AddEditCameraDialog(QDialog):
         cam.password_b64 = _password_b64(password) if user else ""
         cam.notes = self._notes.text().strip()
         cam.onvif = self._onvif_endpoint(cam.url)
+        # Main and Sub from the boxes; any other stream already listed stays.
+        cam.always_decode = [
+            *(item for item in self._always_decode if item not in ("main", "sub")),
+            *(["main"] if self._always_main.isChecked() else []),
+            *(["sub"] if self._always_sub.isChecked() else []),
+        ]
 
         # Recording settings (from dedicated tab — applies regardless of which stream tab is active)
         local_quota = self._local_quota.value()
@@ -2686,7 +2475,11 @@ class AddEditCameraDialog(QDialog):
             **self._policy_editor.policy(),
             schedule=self._rec_schedule.text().strip() or None,
             local=LocalRecordingDest(
-                enabled=self._local_enabled.isChecked(),
+                enabled=(
+                    self._saved_local_enabled
+                    if self._records_all
+                    else self._local_enabled.isChecked()
+                ),
                 storage_path=self._local_storage.text().strip() or None,
                 quota_gb=local_quota if local_quota > 0 else None,
             ),
@@ -2698,30 +2491,8 @@ class AddEditCameraDialog(QDialog):
         else:
             cam.motion = dict(self._motion)
 
-        builtin = self._builtin_events.isChecked()
-        if builtin != (source_of(cam.motion) in ("builtin", "both")):
-            onvif = uses_camera_events(cam.motion)
-            cam.motion["source"] = (
-                "both"
-                if builtin and onvif
-                else "builtin"
-                if builtin
-                else "onvif"
-                if onvif
-                else "off"
-            )
-            cam.motion["enabled"] = False
-        for key, value, default in (
-            ("sensitivity", self._motion_sensitivity.value(), 5),
-            ("cooldown_sec", self._motion_cooldown.value(), 10.0),
-            ("min_duration_sec", self._motion_min_duration.value(), 0.5),
-            ("low_cpu", self._motion_low_cpu.isChecked(), False),
-        ):
-            if value != self._motion.get(key, default):
-                cam.motion[key] = value
-        zones = self._zone_canvas.zones()
-        if zones != self._motion.get("zones", []):
-            cam.motion["zones"] = zones
+        if self._builtin_events is not None and not self._builtin_events.isChecked():
+            cam.motion = without_builtin_motion(cam.motion)
 
         logger.info(
             "Camera config built: name='%s', protocol=%s, has_sub=%s, streams=%d, local_rec=%s",

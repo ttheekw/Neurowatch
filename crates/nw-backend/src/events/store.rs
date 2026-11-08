@@ -124,6 +124,10 @@ pub struct Filter {
     /// Literal, case-insensitive phrase across event text and current camera names.
     pub search: Option<String>,
     pub search_cameras: Vec<String>,
+    /// Only events from this source, and with this exact topic (an analytics
+    /// plugin's events: source `plugin`, topic its id).
+    pub source: Option<EventSource>,
+    pub topic: Option<String>,
     pub limit: u32,
 }
 
@@ -167,6 +171,14 @@ pub fn list(conn: &Connection, filter: &Filter) -> rusqlite::Result<Vec<EventRec
     if filter.unacknowledged_only {
         clauses.push("acknowledged = 0".into());
     }
+    if let Some(source) = filter.source {
+        let mark = bind(source.as_str().to_owned().into());
+        clauses.push(format!("source = {mark}"));
+    }
+    if let Some(topic) = &filter.topic {
+        let mark = bind(topic.clone().into());
+        clauses.push(format!("topic = {mark}"));
+    }
     if let Some(ongoing) = filter.ongoing {
         clauses.push(
             if ongoing {
@@ -191,6 +203,8 @@ pub fn list(conn: &Connection, filter: &Filter) -> rusqlite::Result<Vec<EventRec
              WHEN 'digital_input' THEN 'Alarm input' \
              WHEN 'disk_low' THEN 'Recording drive almost full' \
              WHEN 'storage_missing' THEN 'Recording storage missing' \
+             WHEN 'plugin_offline' THEN 'Plugin offline' \
+             WHEN 'backup_failed' THEN 'Cloud Backup failed' \
              WHEN 'backend_started' THEN 'NeuroWatch started' \
              WHEN 'tamper' THEN 'Tampering' ELSE replace(event_type, '_', ' ') END), {mark}) > 0"
         )];
@@ -426,6 +440,30 @@ mod tests {
         assert!(edit_bookmark(&conn, 1, None, Some(false))
             .unwrap()
             .is_some_and(|r| !r.kept));
+    }
+
+    #[test]
+    fn list_filters_by_source_and_exact_topic() {
+        let mut motion = record(1, Some("a"), EventKind::Motion, 100, Some(200));
+        motion.source = EventSource::Plugin;
+        motion.topic = Some("nw.motion".into());
+        let mut other = record(2, Some("a"), EventKind::Motion, 110, Some(210));
+        other.source = EventSource::Plugin;
+        other.topic = Some("nw.motion.extra".into());
+        let builtin = record(3, Some("a"), EventKind::Motion, 120, Some(220));
+        let conn = db_with(&[motion, other, builtin]);
+        let ids = |source: Option<EventSource>, topic: Option<&str>| -> Vec<i64> {
+            let filter = Filter {
+                source,
+                topic: topic.map(str::to_owned),
+                limit: 100,
+                ..Filter::default()
+            };
+            list(&conn, &filter).unwrap().iter().map(|e| e.id).collect()
+        };
+        assert_eq!(ids(Some(EventSource::Plugin), Some("nw.motion")), vec![1]);
+        assert_eq!(ids(Some(EventSource::Plugin), None), vec![2, 1]);
+        assert_eq!(ids(None, None), vec![3, 2, 1]);
     }
 
     #[test]

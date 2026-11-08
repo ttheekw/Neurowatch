@@ -58,6 +58,9 @@ $CargoArgs = @('build', '--manifest-path', $BackendManifest, '--release', '--loc
 if ($Edition -eq 'unlimited') { $CargoArgs += @('--features', 'nw-backend/unlimited') }
 Invoke-Native 'cargo' $CargoArgs | Set-Content -Encoding utf8 (Join-Path $WorkDir 'backend-build.jsonl')
 Copy-Item (Join-Path $BackendTarget 'release/nw-backend.exe') (Join-Path $BundleDir 'bin/nw-backend.exe') -Force
+Invoke-Native 'cargo' @('build', '--manifest-path', (Join-Path $Root 'Cargo.toml'), '--release', '--locked', '-p', 'nw-motion')
+$MotionTarget = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Root 'target' }
+Copy-Item (Join-Path $MotionTarget 'release/nw-motion.exe') (Join-Path $BundleDir 'bin/nw-motion.exe') -Force
 # The licence and notice ship with every artifact.
 Copy-Item (Join-Path $Root 'LICENSE') (Join-Path $BundleDir 'LICENSE') -Force
 Copy-Item (Join-Path $Root 'NOTICE') (Join-Path $BundleDir 'NOTICE') -Force
@@ -110,13 +113,11 @@ Copy-Item -Recurse -Force (Join-Path $GStreamerRoot 'lib/gio') (Join-Path $GstDi
 if (Test-Path (Join-Path $GStreamerRoot 'etc')) {
     Copy-Item -Recurse -Force (Join-Path $GStreamerRoot 'etc') (Join-Path $GstDir 'etc')
 }
-foreach ($license in @('share/licenses', 'share/gstreamer-1.0/licenses')) {
-    $src = Join-Path $GStreamerRoot $license
-    if (Test-Path $src) {
-        Copy-Item -Recurse -Force $src (Join-Path $GstDir 'licenses')
-        break
-    }
-}
+# The LGPL and other media licences must ship: a layout without them fails.
+$Licenses = @('share/licenses', 'share/gstreamer-1.0/licenses') |
+    ForEach-Object { Join-Path $GStreamerRoot $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $Licenses) { throw "GStreamer licences not found under $GStreamerRoot" }
+Copy-Item -Recurse -Force $Licenses (Join-Path $GstDir 'licenses')
 
 # App-local MSVC runtime: no system-wide installer or administrator rights.
 if (-not $env:VCToolsRedistDir) { throw 'Run from an MSVC developer shell (VCToolsRedistDir missing)' }

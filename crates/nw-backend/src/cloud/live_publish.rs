@@ -418,7 +418,14 @@ impl SharedSource {
         let main = main_has_sound
             .then(|| {
                 state
-                    .subscribe_stream(&self.camera_id, "main", SubscriberPolicy::live_sound())
+                    .subscribe_stream(
+                        &self.camera_id,
+                        "main",
+                        SubscriberPolicy {
+                            consumer: crate::streams::queue::ConsumerKind::Browser,
+                            ..SubscriberPolicy::live_sound()
+                        },
+                    )
                     .ok()
             })
             .flatten();
@@ -525,6 +532,7 @@ pub(crate) fn access_unit(converter: &AnnexB, unit: &SharedUnit) -> Option<Encod
     let map = unit.buffer.map_readable().ok()?;
     let payload = converter.convert(&map, keyframe)?;
     Some(EncodedAccessUnit {
+        frame: unit.frame,
         codec: converter.codec,
         payload,
         keyframe,

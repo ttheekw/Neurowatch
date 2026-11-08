@@ -44,6 +44,12 @@ pub fn required_role(method: &str) -> Role {
         "events.acknowledge",
         "snapshot.capture",
         "motion.status",
+        "plugins.cameras",
+        "plugins.overlays",
+        "plugins.history",
+        "plugins.pages",
+        "plugins.web.request",
+        "plugins.web.read",
         "recording.list_segments",
         "recording.policy_status",
         "alerts.desktop",
@@ -164,8 +170,26 @@ pub fn filter_result(session: &Session, method: &str, mut result: Value) -> Resu
                 map.retain(|id, _| session.sees(id));
             }
         }
-        "motion.status" => {
+        "motion.status" | "plugins.cameras" => {
             if let Some(map) = result.get_mut("cameras").and_then(Value::as_object_mut) {
+                map.retain(|id, _| session.sees(id));
+            }
+        }
+        "plugins.overlays" | "plugins.history" => {
+            let key = if method == "plugins.history" {
+                "drawings"
+            } else {
+                "overlays"
+            };
+            if let Some(list) = result.get_mut(key).and_then(Value::as_array_mut) {
+                list.retain(|overlay| {
+                    overlay
+                        .get("camera_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| session.sees(id))
+                });
+            }
+            if let Some(map) = result.get_mut("figures").and_then(Value::as_object_mut) {
                 map.retain(|id, _| session.sees(id));
             }
         }
@@ -240,6 +264,37 @@ mod tests {
             assert_eq!(required_role(admin), Role::Admin, "{admin}");
         }
         assert!(open("auth.login") && open("system.status") && !open("camera.list"));
+        // A live view's plugin marker and drawings; managing plugins is admin.
+        assert_eq!(required_role("plugins.cameras"), Role::Viewer);
+        assert_eq!(required_role("plugins.overlays"), Role::Viewer);
+        assert_eq!(required_role("plugins.history"), Role::Viewer);
+        for admin in ["plugins.get", "plugins.set", "plugins.status"] {
+            assert_eq!(required_role(admin), Role::Admin, "{admin}");
+        }
+    }
+
+    #[test]
+    fn plugin_markers_and_drawings_show_only_the_users_cameras() {
+        let session = limited();
+        let cameras = json!({"cameras": {"cam-1": [{"plugin": "m"}], "cam-2": [{"plugin": "m"}]}});
+        let shown = filter_result(&session, "plugins.cameras", cameras).unwrap();
+        assert_eq!(shown["cameras"].as_object().unwrap().len(), 1);
+        let overlays = json!({"seq": 4, "overlays": [{"camera_id": "cam-1"}, {"camera_id": "cam-2"}],
+            "figures": {"cam-1": [{"label": "Cars"}], "cam-2": [{"label": "Cars"}]}});
+        let shown = filter_result(&session, "plugins.overlays", overlays).unwrap();
+        assert_eq!(shown["overlays"], json!([{"camera_id": "cam-1"}]));
+        assert_eq!(shown["figures"], json!({"cam-1": [{"label": "Cars"}]}));
+        let history = json!({"drawings": [{"camera_id":"cam-1"},{"camera_id":"cam-2"}]});
+        assert_eq!(
+            filter_result(&session, "plugins.history", history).unwrap()["drawings"],
+            json!([{"camera_id":"cam-1"}])
+        );
+        assert!(check_cameras(
+            &session,
+            "plugins.history",
+            &mut json!({"camera_id":"cam-2"})
+        )
+        .is_err());
     }
 
     #[test]

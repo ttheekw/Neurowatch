@@ -17,11 +17,10 @@ APP_ID="io.github.ttheekw.neurowatch"
 PKG_MAINTAINER="Neurowatch Developers <dev@neurowatch.invalid>"
 INSTALL_PREFIX="/opt/neurowatch"
 
-# Python, Qt, GStreamer and FFmpeg are bundled. Host libraries provide graphics,
+# Python, Qt, GStreamer, Orc and FFmpeg are bundled. Host libraries provide graphics,
 # audio, TLS and GLib (including its system GIO modules).
 DEB_DEPENDS=(
     libglib2.0-0
-    liborc-0.4-0
     libopus0
     libpulse0
     # The real ALSA library first: on Ubuntu 24.04+ / Debian 13 "libasound2" is
@@ -55,7 +54,7 @@ DEB_DEPENDS=(
 )
 DEB_RECOMMENDS=(mesa-va-drivers)
 RPM_REQUIRES=(
-    glib2 orc opus pulseaudio-libs alsa-lib libva libdrm libgudev
+    glib2 opus pulseaudio-libs alsa-lib libva libdrm libgudev
     libsoup3 gnutls gmp libstdc++ glib-networking libXv libX11-xcb
     mesa-libEGL
     libglvnd-glx libglvnd-gles
@@ -67,7 +66,7 @@ RPM_REQUIRES=(
 )
 RPM_RECOMMENDS=(mesa-va-drivers)
 ARCH_DEPENDS=(
-    glib2 orc opus libpulse alsa-lib libva libdrm libgudev
+    glib2 opus libpulse alsa-lib libva libdrm libgudev
     libsoup3 gnutls gmp gcc-libs glib-networking libxv
     libglvnd
     fontconfig
@@ -240,6 +239,8 @@ BACKEND_TARGET="${CARGO_TARGET_DIR:-$(dirname "$BACKEND_MANIFEST")/target}"
 cargo build --manifest-path "$BACKEND_MANIFEST" --release --locked -p "${NW_BACKEND_PACKAGE:-nw-backend}" \
     --message-format=json-render-diagnostics "${BACKEND_FEATURES[@]}" > "$WORK_DIR/backend-build.jsonl"
 install -m 0755 "$BACKEND_TARGET/release/nw-backend" "$BUNDLE_DIR/bin/nw-backend"
+cargo build --manifest-path "$ROOT/Cargo.toml" --release --locked -p nw-motion
+install -m 0755 "${CARGO_TARGET_DIR:-$ROOT/target}/release/nw-motion" "$BUNDLE_DIR/bin/nw-motion"
 # The licence and notice ship with every artifact.
 install -m 0644 "$ROOT/LICENSE" "$BUNDLE_DIR/LICENSE"
 install -m 0644 "$ROOT/NOTICE" "$BUNDLE_DIR/NOTICE"

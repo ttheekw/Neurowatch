@@ -7,6 +7,7 @@ import math
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import cast
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -26,6 +27,14 @@ from PySide6.QtWidgets import QGridLayout, QLayout, QWidget
 
 from neurowatch.ipc.frame_reader import FrameReaderThread
 from neurowatch.ipc.viewer_client import NativeViewerClient
+from neurowatch.models.analytics import (
+    AnalysedPictures,
+    Drawing,
+    TileInfo,
+    analysed_target,
+    picture_gap_us,
+    picture_time,
+)
 from neurowatch.models.camera import MAIN_STREAM, SUB_STREAM, CameraConfig, connection_status
 from neurowatch.models.preview_fps import PreviewFps
 from neurowatch.models.wall_layout import (
@@ -56,6 +65,14 @@ _HIDDEN_PAGE_FPS = float(PreviewFps().hidden)
 # A cached frame younger than this came from a running decoder (a page warmed
 # before an automatic page change): shown as live, not "refreshing".
 _FRESH_FRAME_S = 1.5
+#: How long a tile plays live without drawings waiting for its first analysed picture.
+_ANALYSED_WAIT_S = 6.0
+#: How long a tile waits for a plugin that is still starting (loading its model,
+#: opening the stream) before it plays plain video.
+_PLUGIN_START_WAIT_S = 20.0
+# An analysed-pictures tile whose newest result is this much later than its
+# held picture (that result's picture was not held) shows live video again.
+_ANALYSED_BEHIND_US = 1_000_000
 # After an outage, pictures may come back a moment before the backend's
 # camera status does; for this long after they resume, fresh pictures win.
 _RECOVERY_GRACE_S = 10.0
@@ -85,6 +102,7 @@ class CameraHandover:
     readers: dict[str, FrameReaderThread] = field(default_factory=dict)
     frames: dict[str, tuple[bytes, int, int, str]] = field(default_factory=dict)
     statuses: dict[str, str] = field(default_factory=dict)
+    identities: dict[str, tuple[int, int, int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -276,6 +294,9 @@ class VideoWallWidget(QWidget):
     view_demand_changed = Signal(list)
     # A tile's speaker was clicked: hear this camera live, or stop (cam_id).
     listen_toggled = Signal(str)
+    # A tile's plugin buttons: its camera's drawings or counts, on or off.
+    plugin_drawings_toggled = Signal(str)
+    plugin_counts_toggled = Signal(str)
     motion_acknowledge_requested = Signal(str)
     cell_ptz_requested = Signal(str)
     cell_bookmark_requested = Signal(str)
@@ -313,6 +334,7 @@ class VideoWallWidget(QWidget):
         # Their decoders stop (see desktop_demand), so the cached frame is shown
         # marked "refreshing" until the camera's decoder delivers again.
         self._last_frame_by_id: dict[str, tuple[bytes, int, int, str]] = {}
+        self._frame_identities: dict[str, tuple[int, int, int]] = {}
         self._last_frame_at: dict[str, float] = {}  # cam_id -> monotonic time
         # Cameras shown as not streaming, and when their pictures came back.
         self._down_ids: set[str] = set()
@@ -334,6 +356,23 @@ class VideoWallWidget(QWidget):
         # Cameras whose tiles show the MOTION badge (motion going on).
         self._motion_ids: set[str] = set()
         self._pending_motion_ids: set[str] = set()
+        # Analytics plugins: each camera's marker (tooltip line, running) and
+        # the drawings shown over its picture.
+        self._analytics_by_id: dict[str, tuple[str, bool]] = {}
+        # Cloud Backup symbols: {camera_id: (state, tooltip line)}.
+        self._backup_by_id: dict[str, tuple[str, str]] = {}
+        self._drawings_by_id: dict[str, list[Drawing]] = {}
+        # What each analysed camera's tile shows over its picture.
+        self._plugin_info_by_id: dict[str, TileInfo] = {}
+        # Cameras whose tile shows no drawings: plain live video, nothing held.
+        self._plain_ids: set[str] = set()
+        # Cameras whose plugin will draw on them but is still starting.
+        self._awaited_ids: set[str] = set()
+        # ``ui.drawings_on_analysed``: a tile showing a plugin's drawings
+        # shows the pictures the plugin analysed, held here until its
+        # results arrive (cameras a plugin analyses only).
+        self._drawings_on_analysed = True
+        self._analysed: dict[str, AnalysedPictures] = {}
         self._listening: str | None = None
         self._auto_fit: bool = True
         self._no_sub_ids: set[str] = set()  # cameras in grid view with no sub stream
@@ -438,6 +477,7 @@ class VideoWallWidget(QWidget):
             k: v for k, v in self._last_frame_by_id.items() if k in current_ids
         }
         self._last_frame_at = {k: v for k, v in self._last_frame_at.items() if k in current_ids}
+        self._analysed = {k: v for k, v in self._analysed.items() if k in current_ids}
         self._resumed_at = {k: v for k, v in self._resumed_at.items() if k in current_ids}
         self._down_ids &= current_ids
         if self._solo_camera_id not in current_ids:
@@ -454,9 +494,11 @@ class VideoWallWidget(QWidget):
         for cam_id in set(cam_ids):
             reader = self._readers.pop(cam_id, None)
             if reader is not None:
-                reader.frame_ready.disconnect(self._on_frame_ready)
+                self._disconnect_reader(reader)
                 handover.readers[cam_id] = reader
             frame = self._last_frame_by_id.get(cam_id)
+            if cam_id in self._frame_identities:
+                handover.identities[cam_id] = self._frame_identities[cam_id]
             if frame is not None:
                 handover.frames[cam_id] = frame
             status = self._status_by_id.get(cam_id)
@@ -478,8 +520,9 @@ class VideoWallWidget(QWidget):
                 previous.stop()
             if hasattr(reader, "set_accept_nv12"):
                 reader.set_accept_nv12(self._gpu_enabled)
-            reader.frame_ready.connect(self._on_frame_ready)
+            self._connect_reader(reader)
             self._readers[cam_id] = reader
+        self._frame_identities.update(handover.identities)
         for cam_id, frame in handover.frames.items():
             if self._gpu_enabled or not frame[3].startswith("nv12:"):
                 self._last_frame_by_id[cam_id] = frame
@@ -698,6 +741,8 @@ class VideoWallWidget(QWidget):
             cell.remove_requested.connect(self.cell_remove_requested)
             cell.stream_requested.connect(self.set_view_stream)
             cell.audio_toggle_requested.connect(self.listen_toggled)
+            cell.plugin_drawings_toggle_requested.connect(self.plugin_drawings_toggled)
+            cell.plugin_counts_toggle_requested.connect(self.plugin_counts_toggled)
             cell.motion_acknowledge_requested.connect(self.motion_acknowledge_requested)
             cell.tile_size_requested.connect(self.set_tile_size)
             cell.move_drag_started.connect(
@@ -796,12 +841,22 @@ class VideoWallWidget(QWidget):
                 continue
             self._quality_by_id[quality_cam.id] = target
             logger.info("Stream switch for cam_id=%s: %s", quality_cam.id, target)
+            # Another stream: pictures held from this one are no use to its
+            # results, and a tile keeps what it shows until the new one matches.
+            held = self._analysed.get(quality_cam.id)
+            if held is not None:
+                held.clear()
             self.camera_quality_requested.emit(quality_cam.id, target)
 
         # Assign cameras to cells
         self._cell_by_cam_id.clear()
         for i, cell in enumerate(self._cells):
             cam = page_cams[i] if i < len(page_cams) else None
+            if cam is not None and (cell.camera is None or cell.camera.id != cam.id):
+                # Coming into view: what it held is old, and it opens afresh.
+                held = self._analysed.get(cam.id)
+                if held is not None:
+                    held.clear()
             cell.set_camera(cam)
             if cam is None:
                 cell.set_layout_state(False, (1, 1), grid)
@@ -814,6 +869,12 @@ class VideoWallWidget(QWidget):
             cell.set_status(self._status_by_id.get(cam.id, CellStatus.CONNECTING))
             cell.set_motion(cam.id in self._motion_ids)
             cell.set_motion_pending(cam.id in self._pending_motion_ids)
+            marker = self._analytics_by_id.get(cam.id)
+            cell.set_analytics(*(marker if marker is not None else (None, False)))
+            backup = self._backup_by_id.get(cam.id)
+            cell.set_backup(*(backup if backup is not None else (None, "")))
+            cell.set_drawings(self._drawings_by_id.get(cam.id, []))
+            cell.set_plugin_info(self._plugin_info_by_id.get(cam.id, TileInfo()))
 
             if cam.id in self._no_sub_ids:
                 # No sub stream configured — show error overlay, no reader
@@ -823,8 +884,14 @@ class VideoWallWidget(QWidget):
             cell.set_stream_info(self._encoding_by_id.get(cam.id, "AUTO"), None)
             cell.set_audio(self._audio_state(cam.id))
             cached = self._last_frame_by_id.get(cam.id)
+            if cached is not None and self._shows_analysed(cam.id):
+                # This tile shows only pictures with their results: a cached one
+                # would flash without its drawings.
+                cached = None
             if cached is not None:
                 data, width, height, pixel_format = cached
+                # The tile may have shown another camera: drawings match this one.
+                cell.set_frame_identity(*self._frame_identities.get(cam.id, (0, 0, 0)))
                 cell.update_frame(data, width, height, pixel_format)
                 cell.set_status(self._status_by_id.get(cam.id, CellStatus.STREAMING))
                 # An old picture until its decoder delivers, unless the page
@@ -871,7 +938,7 @@ class VideoWallWidget(QWidget):
                 reader = FrameReaderThread(cam.id, max_emit_fps=reader_fps)
                 if hasattr(reader, "set_accept_nv12"):
                     reader.set_accept_nv12(self._gpu_enabled)
-                reader.frame_ready.connect(self._on_frame_ready)
+                self._connect_reader(reader)
                 reader.start()
                 self._readers[cam.id] = reader
             else:
@@ -1322,6 +1389,34 @@ class VideoWallWidget(QWidget):
             return None
         return self._cells[idx]
 
+    def _connect_reader(self, reader: FrameReaderThread) -> None:
+        if hasattr(reader, "identified_frame_ready"):
+            reader.identified_frame_ready.connect(self._on_identified_frame_ready)
+        else:
+            reader.frame_ready.connect(self._on_frame_ready)
+
+    def _disconnect_reader(self, reader: FrameReaderThread) -> None:
+        if hasattr(reader, "identified_frame_ready"):
+            reader.identified_frame_ready.disconnect(self._on_identified_frame_ready)
+        else:
+            reader.frame_ready.disconnect(self._on_frame_ready)
+
+    def _on_identified_frame_ready(
+        self,
+        cam_id: str,
+        data: bytes,
+        width: int,
+        height: int,
+        pixel_format: str,
+        seq: int,
+        capture_us: int,
+        observed_us: int = 0,
+    ) -> None:
+        if cam_id not in self._encoding_by_id:
+            return
+        self._frame_identities[cam_id] = (seq, capture_us, observed_us)
+        self._on_frame_ready(cam_id, data, width, height, pixel_format)
+
     def _on_frame_ready(
         self, cam_id: str, data: bytes, width: int, height: int, pixel_format: str
     ) -> None:
@@ -1345,6 +1440,8 @@ class VideoWallWidget(QWidget):
         if cell_idx is None or cell_idx >= len(self._cells):
             return
         frame = (data, width, height, pixel_format)
+        if self._hold_for_analysis(cam_id, frame):
+            return
         if first_frame:
             # Do not leave a newly connected camera blank until the next tick.
             self._render_frame(cam_id, frame)
@@ -1369,6 +1466,7 @@ class VideoWallWidget(QWidget):
             for key, value in self._last_frame_by_id.items()
             if not value[3].startswith("nv12:")
         }
+        self._analysed.clear()
         for cell in self._cells:
             cell._gpu_disabled = True
             cell.release_gpu_surface()
@@ -1385,7 +1483,12 @@ class VideoWallWidget(QWidget):
             if frame is not None:
                 self._render_frame(cam_id, frame)
 
-    def _render_frame(self, cam_id: str, frame: tuple[bytes, int, int, str]) -> None:
+    def _render_frame(
+        self,
+        cam_id: str,
+        frame: tuple[bytes, int, int, str],
+        identity: tuple[int, int, int] | None = None,
+    ) -> None:
         """Upload one already-coalesced frame to its currently assigned cell."""
         cell_idx = self._cell_by_cam_id.get(cam_id)
         if cell_idx is None or cell_idx >= len(self._cells):
@@ -1393,6 +1496,9 @@ class VideoWallWidget(QWidget):
         data, width, height, pixel_format = frame
         fps = self._update_fps(cam_id)
         self._cells[cell_idx].set_stream_info(self._encoding_by_id.get(cam_id, "AUTO"), fps)
+        if identity is None:
+            identity = self._frame_identities.get(cam_id, (0, 0, 0))
+        self._cells[cell_idx].set_frame_identity(*identity)
         self._cells[cell_idx].update_frame(data, width, height, pixel_format)
         self._cells[cell_idx].set_refreshing(False)
 
@@ -1473,6 +1579,183 @@ class VideoWallWidget(QWidget):
             cell = self._cell_for_cam_id(cam_id)
             if cell is not None:
                 cell.set_motion(cam_id in camera_ids)
+
+    def set_analytics(self, markers: dict[str, tuple[str, bool]]) -> None:
+        """Cameras an analytics plugin analyses: ``{camera_id: (tooltip line,
+        running)}``. Their tiles show a marker beside the name."""
+        changed = set(self._analytics_by_id) | set(markers)
+        self._analytics_by_id = dict(markers)
+        for cam_id in changed:
+            cell = self._cell_for_cam_id(cam_id)
+            if cell is not None:
+                marker = markers.get(cam_id)
+                cell.set_analytics(*(marker if marker is not None else (None, False)))
+
+    def set_backup(self, marks: dict[str, tuple[str, str]]) -> None:
+        """Cameras with a Cloud Backup plan: ``{camera_id: (state, tooltip
+        line)}`` (``models.backup_status.backup_tile_marks``). Their tiles
+        show the backup symbol beside the name."""
+        if marks == self._backup_by_id:
+            return
+        changed = set(self._backup_by_id) | set(marks)
+        self._backup_by_id = dict(marks)
+        for cam_id in changed:
+            cell = self._cell_for_cam_id(cam_id)
+            if cell is not None:
+                mark = marks.get(cam_id)
+                cell.set_backup(*(mark if mark is not None else (None, "")))
+
+    def set_drawings(self, drawings: dict[str, list[Drawing]]) -> None:
+        """What analytics plugins draw over each camera's picture now."""
+        changed = set(self._drawings_by_id) | set(drawings)
+        self._drawings_by_id = {cam_id: list(d) for cam_id, d in drawings.items()}
+        for cam_id in changed:
+            cell = self._cell_for_cam_id(cam_id)
+            if cell is not None:
+                cell.set_drawings(self._drawings_by_id.get(cam_id, []))
+                self._show_analysed(cam_id)
+
+    def set_plugin_info(self, info: dict[str, TileInfo]) -> None:
+        """Each analysed camera's counts, key and buttons, on its own tile only."""
+        changed = set(self._plugin_info_by_id) | set(info)
+        self._plugin_info_by_id = dict(info)
+        for cam_id in changed:
+            cell = self._cell_for_cam_id(cam_id)
+            if cell is not None:
+                cell.set_plugin_info(info.get(cam_id, TileInfo()))
+
+    def set_awaited_cameras(self, camera_ids: set[str]) -> None:
+        """Cameras whose plugin is still starting and will draw on them: a tile
+        opening now waits for it instead of showing plain video first."""
+        self._awaited_ids = set(camera_ids)
+
+    def set_plain_cameras(self, camera_ids: set[str]) -> None:
+        """Cameras whose tile shows no drawings (its button): they play plain
+        live video, and no pictures are held for them."""
+        for cam_id in camera_ids - self._plain_ids:
+            self._analysed.pop(cam_id, None)
+        self._plain_ids = set(camera_ids)
+
+    def set_drawings_on_analysed(self, enabled: bool) -> None:
+        """``ui.drawings_on_analysed``: while a tile shows a plugin's
+        drawings, show only the pictures the plugin analysed, each with its
+        own drawings (the plugin's frame rate, behind live by its delay);
+        off: live video, each drawing until the next."""
+        if enabled == self._drawings_on_analysed:
+            return
+        self._drawings_on_analysed = enabled
+        self._analysed.clear()  # the next picture shows live again
+
+    def _shows_analysed(self, cam_id: str) -> bool:
+        """Results are current for this camera and its tile shows their pictures."""
+        return (
+            self._drawings_on_analysed
+            and cam_id not in self._plain_ids
+            and (
+                cam_id in self._awaited_ids
+                or analysed_target(self._drawings_by_id.get(cam_id, []), time.monotonic())
+                is not None
+            )
+        )
+
+    def _hold_for_analysis(self, cam_id: str, frame: tuple[bytes, int, int, str]) -> bool:
+        """Keep a picture of a camera a plugin analyses; True when the tile
+        shows analysed pictures and this one waits for its result."""
+        analysed = (
+            self._analytics_by_id.get(cam_id, ("", False))[1]
+            or bool(self._drawings_by_id.get(cam_id))
+            or cam_id in self._awaited_ids
+        )
+        if not self._drawings_on_analysed or not analysed or cam_id in self._plain_ids:
+            self._analysed.pop(cam_id, None)
+            self._pause_drawings(cam_id, False)
+            self._wait_for_analysis(cam_id, False)
+            return False
+        pictures = self._analysed.setdefault(cam_id, AnalysedPictures())
+        if pictures.size not in (None, frame[1:3]):
+            # The stream asked for has arrived, seconds later: results have moved
+            # on meanwhile, which must not read as their pictures being lost.
+            pictures.clear()
+        pictures.size = (frame[1], frame[2])
+        pictures.add(self._frame_identities.get(cam_id, (0, 0, 0)), frame, len(frame[0]))
+        target = analysed_target(self._drawings_by_id.get(cam_id, []), time.monotonic())
+        if target is not None:
+            pictures.note_result(target)
+        if target is None and cam_id in self._awaited_ids and not pictures.opened:
+            # The app has just started: results are coming, not absent.
+            now = time.monotonic()
+            if pictures.starting_since is None:
+                pictures.starting_since = now
+            if now - pictures.starting_since < _PLUGIN_START_WAIT_S:
+                self._wait_for_analysis(cam_id, True)
+                return True
+        if target is None:
+            pictures.shown = None  # no current result: live video
+            pictures.live_since = None
+            pictures.opened = True
+            self._pause_drawings(cam_id, False)
+            self._wait_for_analysis(cam_id, False)
+            return False
+        # A result may be ahead of this tile's pictures (another stream).
+        self._show_analysed(cam_id)
+        if pictures.shown is not None and picture_gap_us(picture_time(target), pictures.shown) > (
+            _ANALYSED_BEHIND_US
+        ):
+            # Results whose pictures are no longer held (too late, or too
+            # large to keep): live video rather than a frozen picture.
+            pictures.shown = None
+        # Live until the first analysed picture is found, then only those.
+        if pictures.shown is None:
+            # What results there are describe earlier pictures: over this one
+            # their boxes would miss the vehicles. None for now, unless their
+            # pictures never come (results too late to hold them for).
+            now = time.monotonic()
+            if pictures.live_since is None:
+                pictures.live_since = now
+            waiting = now - pictures.live_since < _ANALYSED_WAIT_S
+            if waiting and not pictures.opened:
+                # Opening a camera a plugin is drawing on: nothing yet rather than
+                # plain video that then gains its drawings a moment later.
+                self._wait_for_analysis(cam_id, True)
+                return True
+            self._pause_drawings(cam_id, waiting)
+            self._wait_for_analysis(cam_id, False)
+            pictures.opened = True
+            return False
+        pictures.live_since = None
+        self._pause_drawings(cam_id, False)
+        return True
+
+    def _wait_for_analysis(self, cam_id: str, waiting: bool) -> None:
+        cell = self._cell_for_cam_id(cam_id)
+        if cell is not None:
+            cell.set_waiting_for_analysis(waiting)
+
+    def _pause_drawings(self, cam_id: str, paused: bool) -> None:
+        cell = self._cell_for_cam_id(cam_id)
+        if cell is not None:
+            cell.set_drawings_paused(paused)
+
+    def _show_analysed(self, cam_id: str) -> None:
+        """Show the picture the newest result describes, once it is held."""
+        pictures = self._analysed.get(cam_id)
+        if pictures is None:
+            return
+        ready = pictures.next_result(
+            analysed_target(self._drawings_by_id.get(cam_id, []), time.monotonic())
+        )
+        if ready is None:
+            return
+        target, frame = ready
+        pictures.shown = picture_time(target)
+        pictures.live_since = None
+        pictures.opened = True
+        self._pause_drawings(cam_id, False)
+        self._wait_for_analysis(cam_id, False)
+        self._pending_frames.pop(cam_id, None)
+        # The result's own identity: every layer drawn for that picture matches.
+        identity = (target.frame or 0, target.time_us or 0, target.observed_us or 0)
+        self._render_frame(cam_id, cast("tuple[bytes, int, int, str]", frame), identity)
 
     def set_camera_audio(self, cam_id: str, audio: str | None) -> None:
         """The camera's audio track (``AAC``, …), or None: its tile shows a

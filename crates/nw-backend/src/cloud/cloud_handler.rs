@@ -70,6 +70,7 @@ use nw_core::ipc::RpcError;
 pub struct CloudHandler {
     node: Mutex<CloudNode>,
     publisher: Option<std::sync::Arc<PublisherSupervisor>>,
+    backup: Option<std::sync::Arc<super::backup::BackupStatus>>,
 }
 
 impl CloudHandler {
@@ -77,7 +78,16 @@ impl CloudHandler {
         Self {
             node: Mutex::new(node),
             publisher: None,
+            backup: None,
         }
+    }
+
+    pub fn with_backup_status(
+        mut self,
+        status: std::sync::Arc<super::backup::BackupStatus>,
+    ) -> Self {
+        self.backup = Some(status);
+        self
     }
 
     pub fn with_publisher(mut self, publisher: std::sync::Arc<PublisherSupervisor>) -> Self {
@@ -88,6 +98,15 @@ impl CloudHandler {
     pub async fn dispatch(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
         match method {
             "cloud.status" => self.report(&*self.node.lock().await),
+            // Cloud Backup: which cameras are copied live, how far behind, why not.
+            "cloud.backup_status" => {
+                let report = self
+                    .backup
+                    .as_ref()
+                    .map(|status| status.report())
+                    .unwrap_or_default();
+                serde_json::to_value(report).map_err(|e| RpcError::internal(e.to_string()))
+            }
             "cloud.begin" | "cloud.claim" => {
                 // Shape errors are decided before the node is touched, so a
                 // malformed request can never half-start a link.

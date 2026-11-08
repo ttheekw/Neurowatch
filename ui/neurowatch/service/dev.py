@@ -31,6 +31,7 @@ from typing import Any, Protocol
 
 from neurowatch.service import probe
 from neurowatch.service.lock import InstanceLock
+from neurowatch.service.manager import gstreamer_sdk_env, source_gstreamer_sdk
 from neurowatch.service.paths import (
     backend_package,
     backend_workspace,
@@ -50,7 +51,7 @@ STOP_TIMEOUT_S = 30.0
 LOCK_WAIT_S = 30.0
 CRASH_BACKOFF_S = (2.0, 5.0, 10.0, 30.0)
 MIN_CLANG_MAJOR = 21  # backends that link libwebrtc need clang >= 21
-_SOURCE_SUFFIXES = {".rs", ".toml", ".proto", ".sql", ".json"}
+_SOURCE_SUFFIXES = {".rs", ".toml", ".proto", ".sql", ".json", ".js", ".html", ".css"}
 _SKIP_DIRS = {"target", ".git", "node_modules", "__pycache__"}
 
 Snapshot = dict[str, tuple[int, int]]
@@ -95,7 +96,7 @@ def _source_files(root: Path) -> Iterator[Path]:
         path = root / name
         if path.is_file():
             yield path
-    stack = [root / "crates"]
+    stack = [root / "crates", root / "sdk" / "web"]
     while stack:
         directory = stack.pop()
         try:
@@ -157,6 +158,12 @@ class DevSupervisor:
     def __post_init__(self) -> None:
         # NW_HEADLESS comes from the service's mode (manager.service_command).
         self._env = {**os.environ, "NW_IPC_ENDPOINT": self.endpoint}
+        # NW_GSTREAMER_SDK: the backend runs on that GStreamer; cargo still
+        # builds against the system's development files.
+        sdk = source_gstreamer_sdk(self.root)
+        self._run_env = (
+            {**self._env, **gstreamer_sdk_env(sdk, self.root / ".cache")} if sdk else self._env
+        )
         self._backend: Process | None = None
         self._stopping = False
         self._crashes = 0
@@ -289,6 +296,8 @@ class DevSupervisor:
     def _run_cargo(self) -> bool:
         select_cxx(self._env)
         command = ["cargo", "build", "-p", backend_package()]
+        if backend_package() == "nw-backend":
+            command.extend(["-p", "nw-motion"])
         logger.info("$ %s (CXX=%s)", " ".join(command), self._env.get("CXX", "default"))
         try:
             result = subprocess.run(command, cwd=self._workspace, env=self._env, check=False)
@@ -300,7 +309,7 @@ class DevSupervisor:
     def _launch_backend(self) -> Process:
         binary = dev_backend(self._workspace)
         logger.info("Starting %s", binary)
-        return subprocess.Popen([str(binary)], cwd=self.root, env=self._env)
+        return subprocess.Popen([str(binary)], cwd=self.root, env=self._run_env)
 
 
 def _short(root: Path, paths: list[str]) -> list[str]:

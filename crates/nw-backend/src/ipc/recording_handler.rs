@@ -559,7 +559,10 @@ mod tests {
 
     #[tokio::test]
     async fn policy_copy_is_atomic_preserves_destinations_credentials_and_manual_override() {
-        let mut config = AppConfig::default();
+        let mut config = AppConfig {
+            plugins_initialized: true,
+            ..AppConfig::default()
+        };
         let source = camera("source");
         let mut target = camera("target");
         target.url = "rtsp://user:secret@example.invalid/private".into();
@@ -926,6 +929,52 @@ mod tests {
                 .is_some_and(|path| path.starts_with(&global_root)),
             "expected global storage path, got {storage:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_camera_records_on_its_own_after_record_all_is_turned_off() {
+        let mut config = AppConfig::default();
+        config.recording.local_all_cameras = true;
+        config.recording.storage_path = test_config_path("record-all-off")
+            .to_string_lossy()
+            .into_owned();
+        let cam = camera("cam-record-all-off");
+        config.cameras.push(cam.clone());
+        let state = state_with_config(config);
+        state.write().await.spawn_supervisor(&cam);
+        let handler = RpcHandler::new(Arc::clone(&state), test_viewer_manager(), test_aggregator());
+        let status = |state: Arc<RwLock<AppState>>, id: String| async move {
+            let st = state.read().await;
+            (
+                st.recording.status_all().get(&id).cloned(),
+                st.recording.has_manual_override(&id),
+            )
+        };
+        assert_eq!(
+            status(Arc::clone(&state), cam.id.clone())
+                .await
+                .0
+                .as_deref(),
+            Some("starting")
+        );
+
+        rpc(
+            &handler,
+            "config.set",
+            json!({ "recording": { "local_all_cameras": false } }),
+        )
+        .await;
+        let (after_off, manual) = status(Arc::clone(&state), cam.id.clone()).await;
+        assert_ne!(after_off.as_deref(), Some("starting"));
+        assert!(!manual, "turning record-all off is not a manual Stop");
+
+        let mut edited = serde_json::to_value(&cam).expect("camera json");
+        edited["recording"]["local"]["enabled"] = json!(true);
+        rpc(&handler, "camera.update", edited).await;
+        let (after_tick, _) = status(Arc::clone(&state), cam.id.clone()).await;
+        state.write().await.stop_all();
+
+        assert_eq!(after_tick.as_deref(), Some("starting"));
     }
 
     #[tokio::test]

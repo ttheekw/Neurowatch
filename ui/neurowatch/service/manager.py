@@ -220,6 +220,67 @@ def source_gstreamer_env(root: Path) -> dict[str, str]:
     }
 
 
+def release_gstreamer_version(root: Path) -> str | None:
+    """The GStreamer version release packages bundle (``build_release_gstreamer.sh``)."""
+    try:
+        text = (root / "scripts" / "build_release_gstreamer.sh").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("GST_VERSION="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def source_gstreamer_sdk(root: Path) -> Path | None:
+    """The release GStreamer a source checkout runs its backend on: what the
+    packages ship, so development meets what users get.
+
+    Unset: ``.cache/gstreamer-sdk-<version>`` (built by
+    ``scripts/install_gstreamer_dev_sdk.sh``) when it is there, else the system's.
+    ``0``: the system's. ``1``: that folder, and any other value a directory: asked
+    for but missing is an error, never a silent fallback to the system's.
+    """
+    value = os.environ.get("NW_GSTREAMER_SDK", "").strip()
+    if value == "0":
+        return None
+    if value == "":
+        version = release_gstreamer_version(root)
+        sdk = root / ".cache" / f"gstreamer-sdk-{version}"
+        return sdk if version and (sdk / "lib" / "gstreamer-1.0").is_dir() else None
+    if value == "1":
+        version = release_gstreamer_version(root)
+        if version is None:
+            raise ServiceError(
+                "NW_GSTREAMER_SDK: no GST_VERSION in scripts/build_release_gstreamer.sh"
+            )
+        sdk = root / ".cache" / f"gstreamer-sdk-{version}"
+    else:
+        sdk = Path(value).expanduser()
+    if not (sdk / "lib" / "gstreamer-1.0").is_dir():
+        raise ServiceError(
+            f"NW_GSTREAMER_SDK: no GStreamer runtime at {sdk}; "
+            "build it with scripts/install_gstreamer_dev_sdk.sh"
+        )
+    return sdk
+
+
+def gstreamer_sdk_env(sdk: Path, cache: Path) -> dict[str, str]:
+    """Run on a release GStreamer SDK alone (its plugins only, as a bundle does).
+
+    For the backend process only: the build links the system's development files.
+    """
+    plugins = str(sdk / "lib" / "gstreamer-1.0")
+    return {
+        "PATH": os.pathsep.join([str(sdk / "bin"), os.environ.get("PATH", "")]),
+        "LD_LIBRARY_PATH": bundled_library_path(sdk),
+        "GST_PLUGIN_PATH_1_0": plugins,
+        "GST_PLUGIN_SYSTEM_PATH_1_0": plugins,
+        "GST_PLUGIN_SCANNER_1_0": str(sdk / "libexec" / "gstreamer-1.0" / "gst-plugin-scanner"),
+        "GST_REGISTRY_1_0": str(cache / f"gstreamer-registry-{sdk.name}.bin"),
+    }
+
+
 def service_command(endpoint: str | None = None, mode: str = DESKTOP) -> ServiceCommand:
     """What the service runs, with the settings it gets when (re)started."""
     headless = mode == HEADLESS
@@ -235,7 +296,11 @@ def service_command(endpoint: str | None = None, mode: str = DESKTOP) -> Service
             value = os.environ.get(name)
             if value:
                 env[name] = value
-        env.update(source_gstreamer_env(root))
+        # A release GStreamer (NW_GSTREAMER_SDK, forwarded with the other NW_*
+        # settings) replaces the system's in the dev supervisor's backend;
+        # checked here so a missing one fails the start.
+        if source_gstreamer_sdk(root) is None:
+            env.update(source_gstreamer_env(root))
         argv = python_command("neurowatch.service", "supervise", windowless=True)
         return ServiceCommand(argv, cwd=root, env=env, dev=True, headless=headless)
     backend = packaged_backend()
@@ -605,6 +670,8 @@ class ServiceController:
         self._systemd_ok: bool | None = None
         self._process: Any = None  # a detached service started here
         self._started_at = 0.0
+        #: A startup delay the welcome screen can explain while this worker waits.
+        self.startup_message: str | None = None
 
     # -- queries -------------------------------------------------------
 
@@ -736,14 +803,23 @@ class ServiceController:
         opening together never start two backends.
         """
         lock = InstanceLock(lock_path("service-start"))
+        self.startup_message = None
         deadline = time.monotonic() + (timeout if timeout is not None else self._start_timeout())
         while not lock.acquire():
+            if self.startup_message is None:
+                self.startup_message = (
+                    "Waiting for another NeuroWatch launch to finish starting the recorder."
+                )
+                logger.info("%s", self.startup_message)
             status = self.status()
             if status is not None and mode in (None, running_mode(status)):
+                self.startup_message = None
                 return True
             if time.monotonic() > deadline:
+                self.startup_message = None
                 return False
             self._sleep(0.25)
+        self.startup_message = None
         try:
             if mode is not None:
                 save_mode(mode)
@@ -851,7 +927,13 @@ class ServiceController:
 
         state = read_state()
         at = state.get("at")
-        if state.get("phase") in FAILED_PHASES and isinstance(at, float) and at >= self._started_at:
+        if (
+            state.get("phase") in (*FAILED_PHASES, "stopped")
+            and isinstance(at, float)
+            and at >= self._started_at
+        ):
+            if state["phase"] == "stopped":
+                return "The development service stopped before the backend became ready."
             if state["phase"] == "build-failed":
                 return "The backend did not build."
             return f"The backend exited (status {state.get('code')})."

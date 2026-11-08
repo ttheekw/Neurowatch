@@ -4,10 +4,15 @@ members  = [
     "crates/nw-core",
     "crates/nw-backend",
     "crates/nw-cloud-protocol",
+    "crates/nw-analytics-protocol",
+    "crates/nw-analytics-sdk",
+    "crates/nw-backup-protocol",
+    "crates/nw-backup-client",
+    "crates/nw-motion",
     "crates/nw-api",
 ]
 # Vendored, patched LiveKit crate (see [patch] below): not a member.
-exclude = ["third_party/webrtc-sys"]
+exclude = ["third_party/webrtc-sys", "third_party/libwebrtc"]
 
 [workspace.package]
 version      = "0.1.6"
@@ -23,6 +28,10 @@ publish      = false
 nw-core             = { path = "crates/nw-core" }
 nw-backend          = { path = "crates/nw-backend" }
 nw-cloud-protocol   = { path = "crates/nw-cloud-protocol" }
+nw-analytics-protocol = { path = "crates/nw-analytics-protocol" }
+nw-analytics-sdk = { path = "crates/nw-analytics-sdk" }
+nw-backup-protocol = { path = "crates/nw-backup-protocol" }
+nw-backup-client = { path = "crates/nw-backup-client" }
 # Async
 tokio               = { version = "1",    features = ["full"] }
 # Serialization
@@ -63,3 +72,4 @@ opt-level = 1
 # always offered (third_party/webrtc-sys/README.md).
 [patch."https://github.com/livekit/rust-sdks"]
 webrtc-sys = { path = "third_party/webrtc-sys" }
+libwebrtc = { path = "third_party/libwebrtc" }

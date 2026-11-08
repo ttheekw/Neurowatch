@@ -46,6 +46,7 @@
 - **Connect your existing cameras.** Add RTSP streams or use **Search Network** to discover ONVIF cameras. Compatibility depends on the camera's streams and ONVIF support.
 - **Keep recording in the background.** Recording carries on after you close the window, can start automatically, and reconnects cameras when they drop.
 - **Watch from anywhere, if you want to.** Optional NeuroWatch Cloud access shows your cameras in a browser. Cloud plans are separate from the desktop editions.
+- **Light by design, in Rust.** Recording, browser viewing and clip export never decode video, every reader of a camera stream shares one connection and one buffer, and a picture is decoded at most once however many walls and plugins use it. [How it works](#how-it-works).
 
 > **Beta:** the release workflow checks installation and generated video on Windows, Ubuntu 22.04 and 24.04, Debian 12 and 13, Fedora 43 and Arch Linux before publishing. These checks do not qualify physical cameras, GPUs or displays. Found a problem? [Tell us](https://github.com/ttheekw/Neurowatch/issues), it makes the next release better.
 
@@ -54,6 +55,7 @@ NeuroWatch is **free and open source** ([Apache-2.0](LICENSE)), including its Ne
 ## Contents
 
 - [Features](#features)
+- [How it works](#how-it-works)
 - [Installing](#installing)
 - [Getting started](#getting-started)
 - [Everyday use](#everyday-use)
@@ -89,9 +91,23 @@ NeuroWatch is **free and open source** ([Apache-2.0](LICENSE)), including its Ne
 - **Two-way audio:** right-click a live camera → **Talk…**, then hold **Hold to Talk** or the Space bar to speak through its speaker. Requires a microphone and a camera with a supported ONVIF G.711 audio backchannel; a test tone is available to check the speaker.
 - NeuroWatch won't add the same camera twice, and reconnects by itself when a camera drops out.
 
+### Motion detection
+
+Motion detection is a plugin, **[NeuroWatch Motion](https://github.com/ttheekw/Neurowatch-Motion)**. Every NeuroWatch download includes it and starts it for you, so there is nothing extra to install.
+
+- **How it works:** NeuroWatch sends the plugin each chosen camera's video as the camera sent it (H.264 or H.265), and the plugin sends back motion events and drawings. The events are kept like any other (the **Events** tab, alerts, recording only when something happens); the drawings appear as boxes on the live wall, on the picture they describe. The plugin runs in its own process, so recording goes on even if it stops; the status bar and tray then show **Plugin offline**. Analysis runs whether or not the window is open.
+- **Who decodes:** by default (**Automatic**) the plugin reuses pictures NeuroWatch already decodes, for a video wall or for a stream you set to **Decode on this recorder all the time** (Edit Camera → **Motion**), at the rate it asks for, and decodes the camera itself only when there are none. **Always decode in the plugin** (the camera's plugin **Settings**) makes it decode by itself. Diagnostics shows which is happening.
+- **Its dashboard:** in NeuroWatch Cloud, a recorder's **Plugin dashboards** and a camera's **Plugin** tab open the motion dashboard: each camera's motion today, counts for the last hour, day and week, an hourly chart and recent motion to play.
+
+  <img src="docs/images/portal-motion-dashboard.webp" width="640" alt="The NeuroWatch Motion dashboard in the web portal: two cameras with today's motion, one camera's counts for the last hour, today and 7 days, an hourly chart and recent motion events with Play buttons. The camera pictures are drawn mock scenes.">
+
+- **Set it up:** open **Plugins** (administrators only), choose NeuroWatch Motion, **Bind Camera…**, then set sensitivity, minimum duration, cooldown, low CPU mode, the video decoder and watched/ignored zones in the camera's **Settings** (on the desktop or in the portal; every setting explains itself). **Live** shows its drawings and **Output** lists its events. Motion settings from earlier versions move to the plugin automatically.
+- **On another computer:** to take the work off the recorder, [download NeuroWatch Motion](https://github.com/ttheekw/Neurowatch-Motion#download) for that computer (Windows, or Linux on a 64-bit PC or ARM), start it with `nw-motion --listen quic:0.0.0.0:7690`, then in **Plugins → Add Plugin → URL** enter `quic://that-computer:7690`, check that the key fingerprint matches the one the plugin prints, and approve it. Its [instructions](https://github.com/ttheekw/Neurowatch-Motion#connect-it-to-neurowatch) also cover running a newer version beside the included one, and [access codes](https://github.com/ttheekw/Neurowatch-Motion#access-codes) that limit which recorders may use it (enter the code under **Vendor Credential…**).
+- **Your camera's own detection** is separate and needs no plugin: see Camera motion events below.
+
 ### Events
 
-- **Computer motion detection:** enable **NeuroWatch detection** in Edit Camera → Motion to analyze a separate stream, preferably the lower-resolution substream. Set sensitivity, minimum duration, cooldown, and watched/ignored zones using a camera snapshot. Watch the live analysis picture, highlighted changed blocks and score in the Motion tab while checking saved settings. **Low CPU mode (keyframes only)** decodes fewer pictures but can miss short movements; it uses software decoding and is off by default. Main-stream fallback is explained when no grid stream is available. Detection also works without the desktop window, adds decoding work, and does not share the recording pipeline. Diagnostics reports motion decoders, analysis FPS, detector time and queue drops.
+- **Motion detection:** by the included NeuroWatch Motion plugin; see [Motion detection](#motion-detection).
 - **Camera motion events:** compatible ONVIF cameras can report their own motion detection. Turn on **Camera's own detection** in a camera's **Motion** tab (Edit Camera), and NeuroWatch records each motion event without continuously decoding video for detection. Event pictures use a short, one-frame snapshot. Supported camera analytics also report intrusion, line crossing, tampering and alarm inputs. The Motion tab shows whether the camera is sending its events. Set where and how sensitively the camera looks for motion in the camera's own web settings.
 - Cameras send their events straight to NeuroWatch when they can reach your computer (TCP port 7681; allow it in your firewall if one blocks cameras). Otherwise NeuroWatch asks each camera for its events every few seconds, automatically; the Motion tab says which.
 - **See events in the app:** the **Events** tab lists activity and alerts as they happen. Search your event history by camera, event or details; filter by camera, event type, ongoing/finished status and date range. Click a column heading to sort the loaded rows, and **Show Older** to go further back. Double-click an event to watch that moment in Playback. The tab counts new events while you're elsewhere; a camera's tile shows an orange **MOTION** badge while the camera sees motion.
@@ -148,10 +164,46 @@ NeuroWatch Cloud is an optional online service for browser access. Its plans are
 ### Status and diagnostics
 - A status bar shows disk space, CPU, memory, network speed, whether video is decoded by the graphics card, and the recorder and cloud connections.
 - Open **≡ → Diagnostics** to see how hard the computer is working, per-camera frame rates and dropped frames, and graphics card usage where the driver reports it.
+- Each camera stream is drawn as a tree: its codec and incoming rate, its shared frame buffer, then everything reading it (Recording, Video wall, Web, plugins), with a box wherever a picture is decoded. The same view is in the portal. See [How it works](#how-it-works).
 - Light and dark themes.
 
 ### Coming later
 Email alerts, dedicated Home Assistant and MQTT integrations, a local web interface, AI object detection, a multi-site desktop dashboard and native mobile apps remain planned. Generic webhook alerts can already send events to automation services.
+
+---
+
+## How it works
+
+For the technically curious: NeuroWatch is built so that the expensive part of a video recorder, decoding video, happens as rarely as possible.
+
+```mermaid
+flowchart LR
+  cam([Camera]) -->|"RTSP · H.264 / H.265"| conn["One connection per stream<br/>parsed, never decoded"]
+  conn --> buf[("Frame buffer<br/>latest GOP, compressed")]
+  buf -->|reference| rec["Recording<br/>MKV segments, as sent"]
+  buf -->|reference| web["Browser<br/>WebRTC, forwarded as-is"]
+  buf -->|reference| plug["Plugin<br/>local socket · TLS · QUIC"]
+  buf -->|reference| dec{{"Decoder<br/>only for a wall on screen<br/>or a stream you choose"}}
+  dec --> wall["Desktop wall"]
+  dec -.->|"shared pictures"| plug
+```
+
+- **One connection, one buffer.** Each camera stream is opened once. Its compressed units go into a buffer that keeps the latest group of pictures (from the last keyframe), and recording, the desktop wall, browsers and plugins all read references to the same units, not copies. A new viewer or plugin starts from that keyframe straight away.
+- **Bounded, independent readers.** Every reader has its own bounded queue that skips ahead to the next keyframe or drops its oldest units when it falls behind. A slow browser or a busy plugin never holds up the camera or recording.
+- **Recording and viewing without decoding.** Video goes to disk as the camera compressed it (segmented Matroska), browsers receive it forwarded unchanged over WebRTC, and exports copy it into MP4. None of these decodes or re-encodes video.
+- **Decode once, share the pictures.** The desktop decodes only the cameras on screen, on the graphics card where it can (VA-API, NVDEC, Direct3D 11/12, Quick Sync, V4L2), with smaller substreams in grids. Plugins on the same computer reuse those pictures, or the pictures of a stream you choose to decode all the time, instead of decoding the camera again; a wall showing that stream borrows them too. Pictures are copied into each plugin's private read-only buffer, and graphics memory never leaves its pool.
+- **Pictures never reopen a camera.** Event pictures and portal thumbnails come from a recorded keyframe or a stream that is already open; only when there is neither does NeuroWatch ask the camera.
+- **Streams close when unused.** A stream nobody needs lingers a few seconds, then disconnects, and opens again on demand.
+
+**Why Rust.** A recorder runs for months, so the engine (`nw-backend`) is compiled Rust on the Tokio async runtime: no garbage collector to pause it while video arrives, memory safety checked at build time for a program that parses video from devices on your network, and ownership rules that let one compressed unit be shared by many threads without copies or data races. GStreamer parses the media; the code in its streaming callbacks only wraps each unit and hands it on. The desktop window (Qt, Python) and every analytics plugin run as separate processes, so closing the window or a crashing plugin never stops recording, and a supervisor restarts the recorder if it ever exits unexpectedly.
+
+**See it for yourself.** Diagnostics draws this path live for every camera, on the desktop and in the portal. Below, the Car park's sub stream is decoded all the time and shared by its wall and the motion plugin; the Front entrance's plugin reuses the wall's pictures; the Loading bay's plugin decodes by itself.
+
+<img src="docs/images/desktop-diagnostics-flow.webp" alt="Desktop Diagnostics: three camera cards, each stream with its codec and incoming rate, its frame buffer, and its consumers; decoder boxes for an always-on stream, a video wall and a plugin that decodes by itself, and dashed boxes where the motion plugin reuses decoded pictures.">
+
+<img src="docs/images/portal-diagnostics-flow.webp" alt="The same three cameras in the NeuroWatch Cloud portal's Diagnostics page, drawn as trees in the portal's light theme.">
+
+There are no benchmark figures here on purpose: the load depends on your cameras, codecs, graphics hardware and how many are on screen. Diagnostics shows the real numbers for your own recorder. The full design is in [docs/architecture.md](docs/architecture.md), and [docs/analytics-plugins.md](docs/analytics-plugins.md) describes the plugin protocol and SDKs.
 
 ---
 
@@ -179,7 +231,7 @@ On Ubuntu, Debian, Linux Mint and Fedora you can **double-click** the downloaded
 | Arch Linux (64-bit PC) | [.pkg.tar.zst](https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=arch) | `sudo pacman -U ./neurowatch*-x86_64.pkg.tar.zst` |
 | Other Linux (portable) | [x86_64](https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=portable) or [ARM](https://neurowatch.app/downloads?version=latest&platform=linux&arch=arm64&kind=portable) .tar.gz | `tar xzf neurowatch*-linux-*.tar.gz && ./neurowatch/neurowatch` (needs the system's desktop and audio libraries) |
 
-Double-clicking opens the package in your software centre (App Center on Ubuntu 24.04 and later, Software on Fedora), which asks for your password and installs the system libraries NeuroWatch needs as well; then open **NeuroWatch** from your applications. If double-clicking opens another program (for example on Ubuntu 22.04), use the terminal command instead, with the `./` so the required libraries are installed too. Downloads include the video components NeuroWatch needs; you don't have to install any yourself.
+Double-clicking opens the package in your software centre (App Center on Ubuntu 24.04 and later, Software on Fedora), which asks for your password and installs the system libraries NeuroWatch needs as well; then open **NeuroWatch** from your applications. If double-clicking opens another program (for example on Ubuntu 22.04), use the terminal command instead, with the `./` so the required libraries are installed too. Downloads include the video components NeuroWatch needs; you don't have to install any yourself. Motion detection is included too: the [NeuroWatch Motion](https://github.com/ttheekw/Neurowatch-Motion) plugin is installed and started with NeuroWatch. Its own downloads, for running it on another computer, are on [its GitHub page](https://github.com/ttheekw/Neurowatch-Motion#download).
 
 On Linux the packages also add regular user accounts to the `render` and `video` groups where those groups exist, so recording can access the graphics card, hardware video decoder and USB cameras before sign-in. Sign out and in again, or restart, for group changes to take effect. With the portable download, add your account to the device groups your distribution uses; if both exist, run `sudo usermod -aG render,video "$USER"`. Windows starts NeuroWatch when you sign in.
 
@@ -343,6 +395,7 @@ From a copy of this repository, `scripts/docker.sh headless` or `scripts/docker.
 ## Privacy and responsible use
 
 - Recordings are stored on your own drives. Linking NeuroWatch Cloud sends camera names and status, recording availability and requested thumbnails, and supports remote video, diagnostics and clip exports. Exported clips are uploaded for download through the portal.
+- **Cloud Backup** (optional, per camera, paid in the portal) is the one feature that stores your video in the cloud. It sends only cameras with a plan, as they record. Footage stays on the backup server for the package's instant-playback time, then in archive storage for its archive days. Clips you keep, and footage held after a recorder goes offline without warning, are kept 7 days. Video is encrypted in transit and at rest by the storage provider, but not end to end.
 - External alerts do not require a cloud link. ntfy, Telegram and webhook channels send event details and, if enabled, pictures to their configured destinations.
 - Camera addresses can contain passwords. NeuroWatch stores them in its settings file (`~/.config/neurowatch/config.json` on Linux), so keep your computer account secure and don't share that file.
 - **Use NeuroWatch lawfully.** Video surveillance is regulated in many places. You are responsible for following the rules that apply to you, for example privacy and data-protection law, notices and signage, consent, and how long you keep footage. Don't record people where they expect privacy, and don't use NeuroWatch for anything unlawful. The NeuroWatch authors don't operate your local installation; optional cloud access and external alerts transmit data as described above.

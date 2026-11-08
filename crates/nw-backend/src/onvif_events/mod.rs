@@ -10,6 +10,8 @@
 //! camera ([`OnvifEndpoint`]), so the search runs once.
 
 pub mod parse;
+mod settings;
+pub use settings::validate_settings;
 pub mod push;
 mod subscriber;
 pub mod tracker;

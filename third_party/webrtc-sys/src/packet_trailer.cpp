@@ -235,7 +235,7 @@ void PacketTrailerTransformer::TransformSend(
   PacketTrailerMetadata meta_to_embed =
       LookupSendMetadata(*frame, ssrc, rtp_timestamp);
   emit_publish_timing(VideoPublishTimingStage::EncoderOutput,
-                      meta_to_embed.user_timestamp, meta_to_embed.frame_id);
+                      meta_to_embed.user_timestamp, meta_to_embed.frame_id, rtp_timestamp);
 
   // Append a trailer only when at least one metadata field is set;
   // AppendTrailer returns the data unchanged when there is nothing to
@@ -262,7 +262,7 @@ void PacketTrailerTransformer::TransformSend(
 
   if (cb) {
     emit_publish_timing(VideoPublishTimingStage::WebrtcPacketize,
-                        meta_to_embed.user_timestamp, meta_to_embed.frame_id);
+                        meta_to_embed.user_timestamp, meta_to_embed.frame_id, rtp_timestamp);
     cb->OnTransformedFrame(std::move(frame));
   } else {
     RTC_LOG(LS_WARNING)
@@ -552,7 +552,8 @@ void PacketTrailerTransformer::clear_publish_timing_observer() {
 void PacketTrailerTransformer::emit_publish_timing(
     VideoPublishTimingStage stage,
     uint64_t user_timestamp,
-    uint32_t frame_id) const {
+    uint32_t frame_id,
+    uint32_t rtp_timestamp) const {
   if (!publish_timing_enabled()) {
     return;
   }
@@ -567,7 +568,7 @@ void PacketTrailerTransformer::emit_publish_timing(
   }
 
   (*observer)->on_publish_timing(VideoPublishTimingEvent{
-      stage, CurrentUnixTimeMicros(), user_timestamp, frame_id});
+      stage, CurrentUnixTimeMicros(), user_timestamp, frame_id, rtp_timestamp});
 }
 
 void PacketTrailerTransformer::set_subscribe_timing_observer(

@@ -113,41 +113,40 @@ def test_motion_tab_on_a_new_camera(qtbot):
     assert dlg.get_config().to_dict()["motion"] == {"source": "onvif", "enabled": False}
 
 
-def test_builtin_controls_keep_camera_detection_zones_and_saved_credentials(qtbot):
+def test_the_builtin_detector_can_only_be_turned_off_keeping_everything_else(qtbot):
+    """Built-in detection moved to the motion plugin: a camera that still
+    uses it gets one switch, to turn it off."""
     from neurowatch.dialogs.camera_dialog import AddEditCameraDialog
 
-    camera = _camera(motion=MOTION, username="admin", password_b64="c2VjcmV0")
+    both = {**MOTION, "source": "both", "low_cpu": True}
+    camera = _camera(motion=both, username="admin", password_b64="c2VjcmV0")
     dialog = AddEditCameraDialog(camera=camera)
     qtbot.addWidget(dialog)
-    dialog._builtin_events.setChecked(True)
-    dialog._motion_sensitivity.setValue(8)
-    dialog._motion_cooldown.setValue(5.0)
+    assert dialog._builtin_events is not None and dialog._builtin_events.isChecked()
+    assert dialog.get_config().motion == both, "kept as it was unless switched off"
+    dialog._builtin_events.setChecked(False)
     updated = dialog.get_config()
-    assert updated.motion["source"] == "both"
-    assert updated.motion["sensitivity"] == 8
-    assert updated.motion["cooldown_sec"] == 5.0
+    assert updated.motion["source"] == "onvif"
     assert updated.motion["zones"] == MOTION["zones"]
+    assert updated.motion["low_cpu"] is True
     assert updated.password_b64 == "c2VjcmV0"
 
+    legacy = AddEditCameraDialog(camera=_camera(motion={"enabled": True}))
+    qtbot.addWidget(legacy)
+    legacy._builtin_events.setChecked(False)
+    assert legacy.get_config().motion["source"] == "off"
+    assert legacy.get_config().motion["enabled"] is False
 
-def test_zone_editor_changes_round_trip_in_camera_settings(qtbot):
-    from PySide6.QtCore import QPointF
-    from PySide6.QtGui import QPixmap
 
+def test_cameras_without_the_builtin_detector_never_offer_it(qtbot):
     from neurowatch.dialogs.camera_dialog import AddEditCameraDialog
 
-    dialog = AddEditCameraDialog(camera=_camera(motion={"source": "builtin", "zones": []}))
-    qtbot.addWidget(dialog)
-    picture = QPixmap(640, 360)
-    picture.fill()
-    dialog._zone_canvas.set_snapshot(picture)
-    dialog._add_zone("include")
-    for point in (QPointF(10, 10), QPointF(200, 10), QPointF(200, 150)):
-        dialog._zone_canvas.append_point(point)
-    zones = dialog.get_config().motion["zones"]
-    assert len(zones) == 1
-    assert zones[0]["kind"] == "include"
-    assert len(zones[0]["points"]) == 3
+    for motion in (MOTION, {"source": "off"}, None):
+        extra = {"motion": motion} if motion is not None else {}
+        dialog = AddEditCameraDialog(camera=_camera(**extra))
+        qtbot.addWidget(dialog)
+        assert dialog._builtin_events is None
+        assert not hasattr(dialog, "_zone_canvas"), "zones belong to the motion plugin now"
 
 
 def test_camera_edits_preserve_new_recording_policy_fields(qtbot):
@@ -169,67 +168,52 @@ def test_camera_edits_preserve_new_recording_policy_fields(qtbot):
         assert updated[key] == recording[key]
 
 
-def test_low_cpu_mode_round_trips_and_explains_detection_tradeoff(qtbot):
-    from neurowatch.dialogs.camera_dialog import AddEditCameraDialog
-
-    dialog = AddEditCameraDialog(camera=_camera(motion={**MOTION, "low_cpu": True}))
-    qtbot.addWidget(dialog)
-    assert dialog._motion_low_cpu.isChecked()
-    assert "miss" in dialog._motion_low_cpu.toolTip().lower()
-    assert dialog.get_config().motion["low_cpu"] is True
-    dialog._motion_low_cpu.setChecked(False)
-    assert dialog.get_config().motion["low_cpu"] is False
-
-
-def test_live_analysis_uses_bounded_actual_frames_and_clears_stale_overlay(qtbot):
-    import base64
-
-    from neurowatch.dialogs.camera_dialog import AddEditCameraDialog
-
-    dialog = AddEditCameraDialog(camera=_camera(motion={"source": "builtin"}))
-    qtbot.addWidget(dialog)
-    preview = {
-        "width": 320,
-        "height": 180,
-        "gray_b64": base64.b64encode(bytes([40]) * 57600).decode(),
-    }
-    builtin = {"state": "running", "analysis_fps": 5, "score": 0.1, "blocks": [0, 143]}
-    dialog._on_motion_status({"cameras": {"c1": {"builtin": builtin, "preview": preview}}})
-    assert dialog._analysis_preview.has_frame()
-    assert dialog._analysis_preview.active_blocks() == [0, 143]
-    assert dialog._motion_score.value() == 10
-    dialog._on_motion_status({"cameras": {"c1": {"builtin": {"state": "backoff"}}}})
-    assert not dialog._analysis_preview.has_frame()
-    assert dialog._analysis_preview.active_blocks() == []
-    assert dialog._motion_score.value() == 0
-    preview["gray_b64"] = "too short"
-    dialog._on_motion_status({"cameras": {"c1": {"builtin": builtin, "preview": preview}}})
-    assert not dialog._analysis_preview.has_frame()
-
-
-def test_analysis_preview_polling_is_visible_single_camera_and_coalesced(qtbot, monkeypatch):
+def test_motion_tab_reads_camera_events_and_plugins_once_at_a_time(qtbot, monkeypatch):
     from neurowatch.dialogs import camera_dialog
 
     calls = []
     monkeypatch.setattr(camera_dialog._RpcWorker, "start", lambda worker: calls.append(worker))
     dialog = camera_dialog.AddEditCameraDialog(
-        camera=_camera(motion={"source": "builtin"}),
+        camera=_camera(motion={"source": "onvif"}),
         ipc_endpoint="unix:/tmp/motion-test-unused.sock",
     )
     qtbot.addWidget(dialog)
     dialog._load_motion_status()
-    assert len(calls) == 1
+    assert [(w._method, w._params) for w in calls] == [
+        ("motion.status", {"camera_id": "c1"}),
+        ("plugins.status", {}),
+    ]
     assert calls[0]._endpoint == "unix:/tmp/motion-test-unused.sock"
-    assert calls[0]._params == {"camera_id": "c1", "include_preview": False}
     dialog._load_motion_status()
-    assert len(calls) == 1
-    dialog._on_motion_status({"cameras": {}})
+    assert len(calls) == 2, "one request of each kind at a time"
     for i in range(dialog._tabs.count()):
-        if dialog._tabs.tabText(i) == "Motion":
+        if dialog._tabs.tabText(i) == "Detection":
             dialog._tabs.setCurrentIndex(i)
-    assert dialog._test_panel.isHidden(), "connection testing must not crowd motion controls"
-    monkeypatch.setattr(dialog, "isVisible", lambda: True)
-    dialog._load_motion_status()
-    assert calls[-1]._params == {"camera_id": "c1", "include_preview": True}
+    assert dialog._test_panel.isHidden(), "connection testing must not crowd motion settings"
+
+    dialog._on_plugins_status(
+        {
+            "plugins": [
+                {
+                    "id": "motion",
+                    "state": "connected",
+                    "manifest": {"id": "nw.motion", "name": "Motion detection"},
+                    "bindings": {
+                        "c1": {
+                            "state": "active",
+                            "plugin": {"state": "running", "fps": 5.0, "decoder": "avdec_h264"},
+                        }
+                    },
+                }
+            ]
+        }
+    )
+    assert dialog._plugins_lbl.text() == (
+        "Analysed by Motion detection (running · 5 pictures a second · avdec_h264)."
+    )
+    dialog._on_plugins_status({"plugins": []})
+    assert dialog._plugins_lbl.text() == "No plugin analyses this camera."
+    dialog._on_plugins_status(RuntimeError("not allowed"))
+    assert dialog._plugins_lbl.text() == ""
     dialog._stop_background_work()
-    assert dialog._motion_worker is None
+    assert dialog._motion_worker is None and dialog._plugins_worker is None

@@ -1,0 +1,907 @@
+//! Cloud Backup on the recorder: the cameras the portal says have a plan are
+//! copied in real time to a backup ingest (`docs/plans/2026-11-07-cloud-backup.md`).
+//!
+//! Every [`CHECK_INTERVAL`] the portal is asked which cameras have a plan
+//! (`link::backup`). For each, a capture thread subscribes to the camera's
+//! shared connection ([`SubscriberPolicy::cloud_backup`]: no new camera
+//! connection, nothing decoded) and pushes its video, Annex-B, into a
+//! `nw_backup_client` track; the client sends it, keeps what is unconfirmed
+//! (the outage folder), reconnects and renews. Main is used when it fits the
+//! plan, else the sub stream. With sound in the plan, the camera's sound
+//! goes too: AAC as it is, other sound converted to AAC (`backup_sound`).
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use nw_backup_client::{AssignFuture, Assigner, Assignment, Backup, Config as ClientConfig, Track};
+use nw_backup_protocol::{
+    frame::{flags, MediaKind, MediaUnit},
+    limits::Limits,
+    messages::{Codec, TrackFormat, TrackKind},
+    ticket,
+};
+use nw_core::encoded::VideoCodec;
+use serde::Serialize;
+use tokio::sync::{watch, RwLock};
+
+use super::backup_sound::SoundPath;
+use super::link::backup::{parse_backup_reply, BackupAssignment};
+use super::link::{CloudError, CloudNode, LinkPhase};
+use crate::app_state::AppState;
+use crate::streams::{annexb::AnnexB, Delivery, Media, Phase, SubscriberPolicy, Unit};
+
+/// How often the portal is asked which cameras have a plan.
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// After the portal says it offers no backup (an older portal).
+const UNSUPPORTED_PAUSE: Duration = Duration::from_secs(300);
+/// Status is refreshed this often.
+const STATUS_INTERVAL: Duration = Duration::from_secs(2);
+/// An assignment fetched for the plan check is handed to the client if it
+/// asks within this long, instead of asking the portal again.
+const FRESH: Duration = Duration::from_secs(15);
+/// Per backed-up camera: units held in memory, then in the outage folder.
+const MEMORY_PER_TRACK: usize = 32 * 1024 * 1024;
+const DISK_PER_TRACK: u64 = 2 * 1024 * 1024 * 1024;
+
+/// `<data_local_dir>/neurowatch/backup-outage` (a temporary folder in tests).
+pub fn default_outage_dir() -> PathBuf {
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("nw-backup-outage-{}", std::process::id()));
+    }
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("neurowatch")
+        .join("backup-outage")
+}
+
+/// What the backup loop needs from the backend.
+#[derive(Clone)]
+pub struct BackupSource {
+    pub state: Arc<RwLock<AppState>>,
+    /// Unconfirmed units during an outage.
+    pub outage_dir: PathBuf,
+    pub status: Arc<BackupStatus>,
+}
+
+/// A camera not backed up for this long is failing (an event, a red symbol);
+/// shorter troubles (a reconnect, a brief backlog) are not.
+pub const FAIL_AFTER: Duration = Duration::from_secs(90);
+/// Footage waiting to be confirmed longer than this is a backup not keeping up.
+const BEHIND_FAILS_MS: i64 = 120_000;
+
+/// The latest status, for `cloud.backup_status`, `system.status` and the
+/// recorder's health events.
+#[derive(Default)]
+pub struct BackupStatus {
+    report: Mutex<StatusReport>,
+    /// When each camera's current trouble began.
+    troubled: Mutex<HashMap<String, std::time::Instant>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct StatusReport {
+    /// "off", "connecting", "connected" or "retrying".
+    pub state: String,
+    /// Why it is off or not connected, in plain words.
+    pub problem: Option<String>,
+    pub ingest: Option<String>,
+    pub transport: Option<String>,
+    pub cameras: Vec<CameraReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct CameraReport {
+    pub camera_id: String,
+    /// "main" or "sub".
+    pub stream: String,
+    /// Why it is not being backed up, if it is not.
+    pub problem: Option<String>,
+    pub unconfirmed_units: usize,
+    pub disk_bytes: u64,
+    /// How far the confirmed footage is behind now.
+    pub behind_ms: i64,
+    /// Not backed up for [`FAIL_AFTER`] or longer, and why.
+    pub failing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trouble: Option<String>,
+}
+
+/// What is wrong with a camera's backup now, if anything.
+fn trouble(report: &StatusReport, camera: &CameraReport) -> Option<String> {
+    if let Some(problem) = &camera.problem {
+        return Some(problem.clone());
+    }
+    if report.state != "connected" {
+        return Some(match &report.problem {
+            Some(problem) => format!("Not connected to the backup server: {problem}"),
+            None => "Not connected to the backup server.".to_owned(),
+        });
+    }
+    (camera.behind_ms > BEHIND_FAILS_MS).then(|| {
+        format!(
+            "Footage is {} min behind: it is not being sent fast enough.",
+            camera.behind_ms / 60_000
+        )
+    })
+}
+
+impl BackupStatus {
+    pub fn report(&self) -> StatusReport {
+        let report = self.report.lock().map(|r| r.clone()).unwrap_or_default();
+        if report.state.is_empty() {
+            return StatusReport {
+                state: "off".into(),
+                problem: Some("Cloud Backup has not started.".into()),
+                ..StatusReport::default()
+            };
+        }
+        report
+    }
+
+    fn set(&self, report: StatusReport) {
+        self.set_at(report, std::time::Instant::now());
+    }
+
+    /// Record `report`, marking each camera troubled since [`FAIL_AFTER`]
+    /// or longer as failing.
+    fn set_at(&self, mut report: StatusReport, now: std::time::Instant) {
+        if let Ok(mut troubled) = self.troubled.lock() {
+            let mut seen = HashMap::new();
+            for index in 0..report.cameras.len() {
+                let why = trouble(&report, &report.cameras[index]);
+                let camera = &mut report.cameras[index];
+                if let Some(why) = why {
+                    let since = troubled.get(&camera.camera_id).copied().unwrap_or(now);
+                    seen.insert(camera.camera_id.clone(), since);
+                    camera.failing = now.saturating_duration_since(since) >= FAIL_AFTER;
+                    camera.trouble = Some(why);
+                }
+            }
+            *troubled = seen;
+        }
+        if let Ok(mut current) = self.report.lock() {
+            *current = report;
+        }
+    }
+}
+
+/// The portal, for the client: assignments, the plan check's if recent.
+struct PortalAssigner {
+    node: CloudNode,
+    cached: Mutex<Option<(Instant, BackupAssignment)>>,
+}
+
+impl PortalAssigner {
+    fn remember(&self, assignment: BackupAssignment) {
+        if let Ok(mut cached) = self.cached.lock() {
+            *cached = Some((Instant::now(), assignment));
+        }
+    }
+}
+
+impl Assigner for PortalAssigner {
+    fn assign(&self) -> AssignFuture<'_> {
+        Box::pin(async move {
+            let recent = self
+                .cached
+                .lock()
+                .ok()
+                .and_then(|mut cached| cached.take())
+                .filter(|(at, _)| at.elapsed() < FRESH)
+                .map(|(_, assignment)| assignment);
+            let assignment = match recent {
+                Some(assignment) => assignment,
+                None => fetch(&self.node)
+                    .await?
+                    .ok_or_else(|| "No camera has a backup plan.".to_owned())?,
+            };
+            Ok(Assignment {
+                ticket: assignment.ticket,
+                server_name: assignment.ingest.name,
+                quic: assignment.ingest.quic,
+                tcp: assignment.ingest.tcp,
+            })
+        })
+    }
+}
+
+/// The assignment: from the portal, or (debug builds) from the file
+/// `NW_BACKUP_DEV_ASSIGNMENT` names, in the portal's reply format.
+async fn fetch(node: &CloudNode) -> Result<Option<BackupAssignment>, String> {
+    if let Some(path) = dev_assignment_file() {
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let reply: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        return parse_backup_reply(&reply).map_err(|e| e.to_string());
+    }
+    node.backup_assignment().await.map_err(|error| match error {
+        CloudError::Network(message) if message == "HTTP 404 Not Found" => UNSUPPORTED.to_owned(),
+        other => other.to_string(),
+    })
+}
+
+const UNSUPPORTED: &str = "This cloud does not offer backup yet.";
+
+fn dev_assignment_file() -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var_os("NW_BACKUP_DEV_ASSIGNMENT")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+struct Running {
+    backup: Arc<Backup>,
+    assigner: Arc<PortalAssigner>,
+    captures: HashMap<String, Capture>,
+}
+
+pub(crate) async fn run_loop(
+    node: CloudNode,
+    source: BackupSource,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut running: Option<Running> = None;
+    let mut next_check = tokio::time::Instant::now();
+    let mut off: Option<String> = None;
+    loop {
+        if tokio::time::Instant::now() >= next_check {
+            next_check = tokio::time::Instant::now() + CHECK_INTERVAL;
+            let linked =
+                node.status().phase == LinkPhase::Linked || dev_assignment_file().is_some();
+            let checked = if linked {
+                fetch(&node).await
+            } else {
+                Err("Not linked to NeuroWatch Cloud.".into())
+            };
+            match checked {
+                Ok(Some(assignment)) => {
+                    off = None;
+                    if let Err(problem) = apply(&node, &source, &mut running, assignment) {
+                        off = Some(problem);
+                    }
+                }
+                Ok(None) => {
+                    off = Some("No camera has a backup plan.".into());
+                    stop_running(&mut running).await;
+                }
+                Err(problem) => {
+                    if problem == UNSUPPORTED {
+                        next_check = tokio::time::Instant::now() + UNSUPPORTED_PAUSE;
+                    }
+                    if !linked || problem == UNSUPPORTED {
+                        stop_running(&mut running).await;
+                        off = Some(problem);
+                    } else {
+                        // A failed check keeps what runs: the client
+                        // reconnects and renews on its own.
+                        tracing::warn!(%problem, "Cloud Backup: the plan check failed");
+                    }
+                }
+            }
+        }
+        source.status.set(report(&running, off.as_deref()));
+        tokio::select! {
+            _ = tokio::time::sleep(STATUS_INTERVAL) => {}
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+    stop_running(&mut running).await;
+}
+
+/// Start or update backing up for an assignment's cameras.
+fn apply(
+    node: &CloudNode,
+    source: &BackupSource,
+    running: &mut Option<Running>,
+    assignment: BackupAssignment,
+) -> Result<(), String> {
+    let claims =
+        ticket::read_claims(&assignment.ticket).ok_or("The backup ticket could not be read.")?;
+    if running.is_none() {
+        let key = node
+            .identity_key()
+            .ok_or("This recorder has no cloud identity yet.")?;
+        let ca = match assignment.ingest.ca_pem.as_deref() {
+            Some(pem) => {
+                Some(pem_der(pem).ok_or("The backup server's development CA is not PEM.")?)
+            }
+            None => None,
+        };
+        let tls = nw_backup_client::tls_config(ca.as_deref())?;
+        let assigner = Arc::new(PortalAssigner {
+            node: node.shared(),
+            cached: Mutex::new(None),
+        });
+        let backup = Arc::new(Backup::start(
+            ClientConfig {
+                node_key: key,
+                recorder: env!("CARGO_PKG_VERSION").into(),
+                tls,
+                outage_dir: Some(source.outage_dir.clone()),
+                memory_bytes_per_track: MEMORY_PER_TRACK,
+                disk_bytes_per_track: DISK_PER_TRACK,
+            },
+            assigner.clone() as Arc<dyn Assigner>,
+        ));
+        tracing::info!(cameras = claims.cameras.len(), ingest = %assignment.ingest.name, "Cloud Backup: starting");
+        *running = Some(Running {
+            backup,
+            assigner,
+            captures: HashMap::new(),
+        });
+    }
+    let Some(running) = running.as_mut() else {
+        return Ok(());
+    };
+    running.assigner.remember(assignment);
+    // Cameras with a plan get a capture (limits follow plan changes);
+    // cameras that lost theirs stop.
+    for grant in &claims.cameras {
+        match running.captures.get(&grant.camera_id) {
+            Some(capture) if capture.sound == grant.sound && capture.named == named(grant) => {
+                capture.set_limits(grant.limits)
+            }
+            existing => {
+                // New, sound switched on or off, or another stream: (re)start its capture.
+                if existing.is_some() {
+                    if let Some(old) = running.captures.remove(&grant.camera_id) {
+                        tokio::task::spawn_blocking(move || drop(old));
+                    }
+                }
+                let capture = Capture::start(
+                    source.state.clone(),
+                    running.backup.clone(),
+                    grant.camera_id.clone(),
+                    grant.limits,
+                    grant.sound,
+                    named(grant),
+                );
+                running.captures.insert(grant.camera_id.clone(), capture);
+            }
+        }
+    }
+    let gone: Vec<String> = running
+        .captures
+        .keys()
+        .filter(|id| claims.camera(id).is_none())
+        .cloned()
+        .collect();
+    for id in gone {
+        if let Some(capture) = running.captures.remove(&id) {
+            tokio::task::spawn_blocking(move || drop(capture));
+        }
+    }
+    Ok(())
+}
+
+async fn stop_running(running: &mut Option<Running>) {
+    let Some(stopped) = running.take() else {
+        return;
+    };
+    // The client first: it keeps what is unconfirmed in the outage folder
+    // for the next start, before the captures' tracks go.
+    stopped.backup.stop().await;
+    let captures: Vec<Capture> = stopped.captures.into_values().collect();
+    let _ = tokio::task::spawn_blocking(move || drop(captures)).await;
+    tracing::info!("Cloud Backup: stopped");
+}
+
+fn report(running: &Option<Running>, off: Option<&str>) -> StatusReport {
+    let Some(running) = running else {
+        return StatusReport {
+            state: "off".into(),
+            problem: off.map(str::to_owned),
+            ..StatusReport::default()
+        };
+    };
+    let status = running.backup.status();
+    let mut cameras: Vec<CameraReport> = running
+        .captures
+        .iter()
+        .map(|(id, capture)| {
+            let info = capture.info();
+            let track = status
+                .tracks
+                .iter()
+                .find(|t| &t.camera_id == id && t.kind == TrackKind::Video);
+            CameraReport {
+                camera_id: id.clone(),
+                stream: info.stream.into(),
+                problem: info
+                    .problem
+                    .or_else(|| track.and_then(|t| t.refused.clone())),
+                unconfirmed_units: track.map_or(0, |t| t.unconfirmed_units),
+                disk_bytes: track.map_or(0, |t| t.disk_bytes),
+                behind_ms: track.map_or(0, |t| t.behind_ms),
+                failing: false,
+                trouble: None,
+            }
+        })
+        .collect();
+    cameras.sort_by(|a, b| a.camera_id.cmp(&b.camera_id));
+    StatusReport {
+        state: status.state.into(),
+        problem: off.map(str::to_owned).or(status.problem),
+        ingest: status.ingest,
+        transport: status.transport.map(str::to_owned),
+        cameras,
+    }
+}
+
+/// The DER of the first certificate in `pem`.
+fn pem_der(pem: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let body: String = pem
+        .lines()
+        .skip_while(|l| !l.starts_with("-----BEGIN CERTIFICATE-----"))
+        .skip(1)
+        .take_while(|l| !l.starts_with("-----END"))
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .ok()
+        .filter(|d| !d.is_empty())
+}
+
+#[derive(Debug, Clone, Default)]
+struct CaptureInfo {
+    stream: &'static str,
+    problem: Option<String>,
+}
+
+/// The stream a plan is for, as the capture names it (`None`: an older
+/// ticket; the main stream while it fits the limits, else the sub).
+fn named(grant: &nw_backup_protocol::ticket::CameraGrant) -> Option<&'static str> {
+    match grant.named_stream() {
+        Some("main") => Some("main"),
+        Some("sub") => Some("sub"),
+        _ => None,
+    }
+}
+
+/// One camera's capture thread.
+struct Capture {
+    /// Whether this capture copies the camera's sound.
+    sound: bool,
+    /// The stream the plan is for, if it names one.
+    named: Option<&'static str>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    info: Arc<Mutex<CaptureInfo>>,
+    limits: Arc<Mutex<Limits>>,
+}
+
+impl Capture {
+    fn start(
+        state: Arc<RwLock<AppState>>,
+        backup: Arc<Backup>,
+        camera_id: String,
+        limits: Limits,
+        sound: bool,
+        named: Option<&'static str>,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let info = Arc::new(Mutex::new(CaptureInfo {
+            stream: named.unwrap_or("main"),
+            problem: None,
+        }));
+        let limits = Arc::new(Mutex::new(limits));
+        let thread = std::thread::Builder::new()
+            .name(format!("backup-{camera_id}"))
+            .spawn({
+                let (stop, info, limits) = (stop.clone(), info.clone(), limits.clone());
+                move || {
+                    capture(
+                        &state, &backup, &camera_id, &limits, sound, named, &info, &stop,
+                    )
+                }
+            })
+            .map_err(|error| tracing::error!(%error, "Cloud Backup: no capture thread"))
+            .ok();
+        Self {
+            sound,
+            named,
+            stop,
+            thread,
+            info,
+            limits,
+        }
+    }
+
+    fn info(&self) -> CaptureInfo {
+        self.info.lock().map(|i| i.clone()).unwrap_or_default()
+    }
+
+    fn set_limits(&self, limits: Limits) {
+        if let Ok(mut current) = self.limits.lock() {
+            *current = limits;
+        }
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn set_info(info: &Mutex<CaptureInfo>, stream: &'static str, problem: Option<String>) {
+    if let Ok(mut info) = info.lock() {
+        info.stream = stream;
+        info.problem = problem;
+    }
+}
+
+/// Copy a camera's video into a backup track until stopped: the stream the
+/// plan names, as the camera sends it (a larger one than bought is still
+/// backed up; the portal warns); for older tickets, main while it fits the
+/// plan, else sub.
+#[allow(clippy::too_many_arguments)]
+fn capture(
+    state: &RwLock<AppState>,
+    backup: &Backup,
+    camera_id: &str,
+    limits: &Mutex<Limits>,
+    sound: bool,
+    named: Option<&'static str>,
+    info: &Mutex<CaptureInfo>,
+    stop: &AtomicBool,
+) {
+    let mut stream: &'static str = named.unwrap_or("main");
+    // A named stream is never swapped for the other one.
+    let switchable = named.is_none();
+    'connection: while !stop.load(Ordering::Acquire) {
+        let subscribed = {
+            let state = state.blocking_read();
+            let has_sub = state
+                .config
+                .cameras
+                .iter()
+                .find(|c| c.id == camera_id)
+                .map(|c| c.sub_url.as_deref().is_some_and(|u| !u.trim().is_empty()));
+            match has_sub {
+                None => Err("This camera is not on this recorder.".to_owned()),
+                Some(false) if stream == "sub" => Err(
+                    "The plan is for this camera's substream, and the camera has none on this recorder."
+                        .to_owned(),
+                ),
+                Some(has_sub) => state
+                    .subscribe_stream(camera_id, stream, SubscriberPolicy::cloud_backup(sound))
+                    .map(|subscription| (has_sub, subscription)),
+            }
+        };
+        let (has_sub, subscription) = match subscribed {
+            Ok(subscribed) => subscribed,
+            Err(problem) => {
+                set_info(info, stream, Some(problem));
+                if wait(stop, Duration::from_secs(10)) {
+                    return;
+                }
+                continue;
+            }
+        };
+        set_info(info, stream, None);
+        let mut track: Option<Track> = None;
+        let mut converter: Option<(gstreamer::Caps, Option<AnnexB>)> = None;
+        let mut restart = true;
+        let mut sound_state = SoundState::None;
+        let mut sound_track: Option<(TrackFormat, Track)> = None;
+        while !stop.load(Ordering::Acquire) {
+            if switchable
+                && stream == "main"
+                && has_sub
+                && track.as_ref().is_some_and(Track::over_plan)
+            {
+                tracing::info!(
+                    camera = camera_id,
+                    "Cloud Backup: main stream is over the plan; using the sub stream"
+                );
+                stream = "sub";
+                continue 'connection;
+            }
+            let Some(delivery) = subscription.recv(Duration::from_millis(100)) else {
+                if subscription.state().phase == Phase::Closed {
+                    if wait(stop, Duration::from_secs(2)) {
+                        return;
+                    }
+                    continue 'connection;
+                }
+                continue;
+            };
+            let (unit, after_gap) = match delivery {
+                Delivery::Discontinuity { .. } => {
+                    restart = true;
+                    // A new connection's sound: a new converter.
+                    sound_state = SoundState::None;
+                    continue;
+                }
+                Delivery::Unit { unit, after_gap } => (unit, after_gap),
+            };
+            if unit.media == Media::Audio {
+                if sound {
+                    back_up_sound(&mut sound_state, &mut sound_track, backup, camera_id, &unit);
+                }
+                continue;
+            }
+            restart |= after_gap;
+            let keyframe = unit.keyframe();
+            if restart && !keyframe {
+                continue;
+            }
+            // Caps that differ in nothing the units depend on (the GOP
+            // cache's and the live units' can) change nothing: a
+            // discontinuity would start a new file on the ingest.
+            if let Some((caps, Some(old))) = converter.as_mut() {
+                if *caps != unit.caps && AnnexB::from_caps(&unit.caps).as_ref() == Ok(&*old) {
+                    *caps = unit.caps.clone();
+                }
+            }
+            if converter
+                .as_ref()
+                .map_or(true, |(caps, _)| *caps != unit.caps)
+            {
+                let next = match AnnexB::from_caps(&unit.caps) {
+                    Ok(next) => next,
+                    Err(name) => {
+                        set_info(
+                            info,
+                            stream,
+                            Some(format!(
+                                "The camera sends {name}; backup takes H.264 or H.265."
+                            )),
+                        );
+                        converter = Some((unit.caps.clone(), None));
+                        continue;
+                    }
+                };
+                let plan = limits.lock().map(|l| *l).unwrap_or(Limits::P1080_10);
+                if let Err(breach) = plan.check_size(next.width, next.height) {
+                    if switchable && stream == "main" && has_sub {
+                        stream = "sub";
+                        continue 'connection;
+                    }
+                    let why = plan.explain(&breach);
+                    set_info(
+                        info,
+                        stream,
+                        Some(format!("{why} Give the camera a smaller stream.")),
+                    );
+                    track = None;
+                    converter = Some((unit.caps.clone(), None));
+                    continue;
+                }
+                set_info(info, stream, None);
+                let format = TrackFormat {
+                    codec: match next.codec {
+                        VideoCodec::H264 => Codec::H264,
+                        VideoCodec::H265 => Codec::H265,
+                    },
+                    width: Some(next.width),
+                    height: Some(next.height),
+                    sample_rate: None,
+                    channels: None,
+                    codec_data: None,
+                };
+                // A new codec is a new track; a new size is told to the one there.
+                let same_codec = converter
+                    .as_ref()
+                    .and_then(|(_, old)| old.as_ref())
+                    .is_some_and(|old| old.codec == next.codec);
+                match &track {
+                    Some(existing) if same_codec => existing.set_format(format),
+                    _ => track = Some(backup.track(camera_id, TrackKind::Video, format)),
+                }
+                converter = Some((unit.caps.clone(), Some(next)));
+                restart = true;
+            }
+            let (Some(track), Some((_, Some(annexb)))) = (&track, &converter) else {
+                continue;
+            };
+            let data = match unit.buffer.map_readable() {
+                Ok(map) => annexb.convert(&map, keyframe),
+                Err(_) => None,
+            };
+            let Some(data) = data else { continue };
+            let mut unit_flags = 0;
+            if keyframe {
+                unit_flags |= flags::KEYFRAME;
+            }
+            if restart {
+                unit_flags |= flags::DISCONTINUITY;
+            }
+            track.push(MediaUnit {
+                media: MediaKind::Video,
+                flags: unit_flags,
+                track: 0,
+                seq: 0,
+                time_us: unit.arrived_us,
+                pts_ns: unit.buffer.pts().map(gstreamer::ClockTime::nseconds),
+                dts_ns: unit.buffer.dts().map(gstreamer::ClockTime::nseconds),
+                data,
+            });
+            restart = false;
+        }
+    }
+}
+
+/// Where a capture's sound is.
+enum SoundState {
+    None,
+    Ready(gstreamer::Caps, SoundPath),
+    /// Sound with these caps cannot be backed up (said once).
+    Failed(gstreamer::Caps),
+}
+
+/// One sound unit into the camera's sound track (made once its AAC format
+/// is known; a new format is a new track).
+fn back_up_sound(
+    state: &mut SoundState,
+    track: &mut Option<(TrackFormat, Track)>,
+    backup: &Backup,
+    camera_id: &str,
+    unit: &crate::streams::SharedUnit,
+) {
+    let same = match &*state {
+        SoundState::Ready(caps, _) | SoundState::Failed(caps) => *caps == unit.caps,
+        SoundState::None => false,
+    };
+    if !same {
+        *state = match SoundPath::for_caps(&unit.caps) {
+            Ok(path) => SoundState::Ready(unit.caps.clone(), path),
+            Err(error) => {
+                tracing::warn!(camera = camera_id, %error, "Cloud Backup: this camera's sound cannot be backed up");
+                SoundState::Failed(unit.caps.clone())
+            }
+        };
+    }
+    let SoundState::Ready(_, path) = state else {
+        return;
+    };
+    let frames = path.push(unit);
+    if frames.is_empty() {
+        return;
+    }
+    let Some(format) = path.format() else { return };
+    if track.as_ref().map_or(true, |(known, _)| *known != format) {
+        *track = Some((
+            format.clone(),
+            backup.track(camera_id, TrackKind::Audio, format),
+        ));
+    }
+    let Some((_, track)) = track.as_ref() else {
+        return;
+    };
+    for frame in frames {
+        track.push(MediaUnit {
+            media: MediaKind::Audio,
+            flags: flags::KEYFRAME,
+            track: 0,
+            seq: 0,
+            time_us: frame.time_us,
+            pts_ns: None,
+            dts_ns: None,
+            data: frame.data,
+        });
+    }
+}
+
+/// Sleep up to `time`; true when asked to stop meanwhile.
+fn wait(stop: &AtomicBool, time: Duration) -> bool {
+    let until = Instant::now() + time;
+    while Instant::now() < until {
+        if stop.load(Ordering::Acquire) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    stop.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn report(state: &str, camera: CameraReport) -> StatusReport {
+        StatusReport {
+            state: state.into(),
+            cameras: vec![camera],
+            ..StatusReport::default()
+        }
+    }
+    fn camera(problem: Option<&str>, behind_ms: i64) -> CameraReport {
+        CameraReport {
+            camera_id: "cam-1".into(),
+            stream: "main".into(),
+            problem: problem.map(str::to_owned),
+            behind_ms,
+            ..CameraReport::default()
+        }
+    }
+
+    #[test]
+    fn trouble_fails_only_once_it_lasts() {
+        let status = BackupStatus::default();
+        let start = Instant::now();
+        status.set_at(report("connected", camera(None, 1000)), start);
+        let ok = status.report();
+        assert!(!ok.cameras[0].failing && ok.cameras[0].trouble.is_none());
+        // Disconnected: troubled at once, failing only after FAIL_AFTER.
+        status.set_at(report("retrying", camera(None, 1000)), start);
+        assert!(!status.report().cameras[0].failing);
+        assert!(status.report().cameras[0]
+            .trouble
+            .as_deref()
+            .unwrap()
+            .starts_with("Not connected"));
+        status.set_at(report("retrying", camera(None, 1000)), start + FAIL_AFTER);
+        assert!(status.report().cameras[0].failing);
+        // Back: the trouble clock starts over.
+        status.set_at(
+            report("connected", camera(None, 1000)),
+            start + FAIL_AFTER * 2,
+        );
+        assert!(!status.report().cameras[0].failing);
+        status.set_at(report("connected", camera(Some("The plan is for this camera's substream, and the camera has none on this recorder."), 0)), start + FAIL_AFTER * 2);
+        status.set_at(
+            report("connected", camera(Some("x"), 0)),
+            start + FAIL_AFTER * 3,
+        );
+        assert_eq!(status.report().cameras[0].trouble.as_deref(), Some("x"));
+        assert!(
+            status.report().cameras[0].failing,
+            "a camera problem that lasts"
+        );
+        // Footage piling up unsent.
+        let behind = BackupStatus::default();
+        behind.set_at(
+            report("connected", camera(None, BEHIND_FAILS_MS + 60_000)),
+            start,
+        );
+        behind.set_at(
+            report("connected", camera(None, BEHIND_FAILS_MS + 60_000)),
+            start + FAIL_AFTER,
+        );
+        assert!(behind.report().cameras[0].failing);
+        assert!(behind.report().cameras[0]
+            .trouble
+            .as_deref()
+            .unwrap()
+            .contains("3 min behind"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_development_ca_is_read_from_pem() {
+        let pem = "junk\n-----BEGIN CERTIFICATE-----\nAAEC\nAwQ=\n-----END CERTIFICATE-----\n";
+        assert_eq!(pem_der(pem), Some(vec![0, 1, 2, 3, 4]));
+        assert_eq!(pem_der("nothing"), None);
+    }
+
+    #[test]
+    fn status_before_starting_says_so() {
+        let status = BackupStatus::default();
+        assert_eq!(status.report().state, "off");
+        let report = report(&None, Some("No camera has a backup plan."));
+        assert_eq!(
+            (report.state.as_str(), report.problem.as_deref()),
+            ("off", Some("No camera has a backup plan."))
+        );
+    }
+}

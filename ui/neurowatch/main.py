@@ -55,14 +55,28 @@ from neurowatch.dialogs.message import ask, show_message
 from neurowatch.dialogs.new_window_dialog import NewWindowDialog, PageSummary, WindowSummary
 from neurowatch.dialogs.settings_dialog import SettingsDialog
 from neurowatch.ipc.alert_feed import AlertFeedWorker
+from neurowatch.ipc.analytics_feed import AnalyticsFeedWorker
 from neurowatch.ipc.event_feed import EventFeedWorker
 from neurowatch.ipc.quality_dispatcher import CameraQualityDispatcher
 from neurowatch.ipc.sync_client import BackendOfflineError, IpcError, SyncIpcClient
 from neurowatch.ipc.view_lease import ViewLeaseWorker
 from neurowatch.ipc.viewer_client import NativeViewerClient
+from neurowatch.models.analytics import (
+    CameraPlugin,
+    Drawing,
+    Marking,
+    MarkingHold,
+    TileInfo,
+    marker_text,
+    markings_reported,
+    on_wall,
+    tile_choice,
+)
+from neurowatch.models.backup_status import backup_tile_marks
 from neurowatch.models.camera import CameraConfig, WallPosition
 from neurowatch.models.edition import CAMERA_LIMIT_REACHED, Edition, limit_message
 from neurowatch.models.events import ACTIVITY_KINDS, SYSTEM_KINDS, ActivityTracker, Event
+from neurowatch.models.plugins import offline_plugin_names
 from neurowatch.models.preview_fps import PreviewFps
 from neurowatch.models.video_decoder import restart_reply
 from neurowatch.models.wall_layout import Placement
@@ -74,6 +88,7 @@ from neurowatch.service.startup import StartupPrefs, load_prefs
 from neurowatch.theme import app_icon, apply_app_theme, icon_path
 from neurowatch.utils.threads import Worker, retire, wait_for_retired
 from neurowatch.widgets.alert_toasts import AlertToasts
+from neurowatch.widgets.backup_notice import BackupIndicator
 from neurowatch.widgets.camera_panel import CameraPanel
 from neurowatch.widgets.compact_bar import CompactTitleBar
 from neurowatch.widgets.detached_wall import DEFAULT_CYCLE_INTERVAL, DetachedWallWindow
@@ -82,6 +97,8 @@ from neurowatch.widgets.events_view import EventsView
 from neurowatch.widgets.page_strip import PageStripWidget
 from neurowatch.widgets.performance_page import PerformancePage
 from neurowatch.widgets.playback_view import PlaybackView
+from neurowatch.widgets.plugin_notice import PluginOfflineNotice
+from neurowatch.widgets.plugins_view import PluginsView
 from neurowatch.widgets.status_bar_widget import StatusBarWidget
 from neurowatch.widgets.status_overlay import DEFAULT_OPACITY, StatusOverlay
 from neurowatch.widgets.title_bar import TitleBar
@@ -91,6 +108,9 @@ from neurowatch.widgets.welcome_screen import StartupStage, WelcomeScreen
 from neurowatch.widgets.window_chrome import guard_window_size, guard_windows_on_focus
 
 logger = logging.getLogger(__name__)
+
+#: A plugin not connected this soon after the app opens is on its way.
+_PLUGIN_CONNECT_GRACE_S = 20.0
 
 _DEFAULT_ROWS, _DEFAULT_COLS = 4, 8  # 8 cols × 4 rows (matches "8×4 Grid" label)
 # The page an automatic page change shows next is decoded this long before
@@ -233,6 +253,8 @@ class _PollWorker(Worker):
     #: ``stats.get_performance`` (CPU, memory, network for the status bar),
     #: or None when the backend is unreachable.
     performance = Signal(object)
+    #: ``system.status``, or None when the backend is unreachable.
+    system = Signal(object)
 
     def __init__(self, endpoint: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -262,9 +284,14 @@ class _PollWorker(Worker):
                     self.performance.emit(client.call("stats.get_performance"))
                 except Exception:
                     self.performance.emit(None)
+                try:
+                    self.system.emit(client.call("system.status"))
+                except Exception:
+                    self.system.emit(None)
             except Exception:
                 self.poll_done.emit({}, {}, {}, False)
                 self.performance.emit(None)
+                self.system.emit(None)
             # Sleep in 200 ms increments so interruption is responsive
             for _ in range(10):
                 if self.isInterruptionRequested():
@@ -478,6 +505,12 @@ class MainWindow(QMainWindow):
 
         self._events_view = EventsView(endpoint or None, self._cameras)
         self._events_view.play_requested.connect(self._play_event)
+        self._plugins_view = PluginsView(endpoint or None)
+        self._plugins_view.counts_choice = lambda cam_id: self._tile_choice(cam_id)[1]
+        self._plugins_view.figures_choice_changed.connect(self._set_selected_camera_counts)
+        self._plugins_view.play_requested.connect(
+            lambda event: self._play_event(event.camera_id or "", event.start_ms)
+        )
         self._events_view.export_requested.connect(self._export_event)
 
         self._content_stack = QStackedWidget()
@@ -485,6 +518,7 @@ class MainWindow(QMainWindow):
         self._content_stack.addWidget(self._playback_view)  # index 1 — playback
         self._content_stack.addWidget(self._performance_page)  # index 2 — diagnostics
         self._content_stack.addWidget(self._events_view)  # index 3 — events
+        self._content_stack.addWidget(self._plugins_view)  # index 4 — plugins
 
         layout.addWidget(self._content_stack, stretch=1)
 
@@ -515,6 +549,8 @@ class MainWindow(QMainWindow):
         # The camera heard live (one for the whole app), or None.
         self._listening: str | None = None
         self._wall.listen_toggled.connect(self._toggle_listen)
+        self._wall.plugin_drawings_toggled.connect(self._toggle_tile_drawings)
+        self._wall.plugin_counts_toggled.connect(self._toggle_tile_counts)
         # Cameras of the pages the page clock shows next (main wall / windows).
         self._prewarm_main: frozenset[str] = frozenset()
         self._prewarm_windows: frozenset[str] = frozenset()
@@ -532,12 +568,21 @@ class MainWindow(QMainWindow):
         self._browse_warm_timer.setSingleShot(True)
         self._browse_warm_timer.timeout.connect(lambda: self._set_browse_warm(frozenset()))
         self._wall.view_demand_changed.connect(self._sync_view_demand)
+        self._plugins_view.view_demand_changed.connect(self._sync_view_demand)
         self._content_stack.currentChanged.connect(self._sync_view_demand)
         self._sync_view_demand()
 
         self._poll_worker = _PollWorker(endpoint, self)
         self._poll_worker.poll_done.connect(self._on_poll_done)
         self._poll_worker.performance.connect(self._status_bar.set_performance)
+        # Plugins that stopped answering: amber in the status bar, by name.
+        # Cloud Backup: green while backing up, red while a camera's backup fails.
+        self._backup_indicator = BackupIndicator()
+        self.add_status_indicator(self._backup_indicator)
+        self._plugin_notice = PluginOfflineNotice()
+        self._plugin_notice.clicked.connect(lambda: self._title_bar.select_tab("plugins"))
+        self.add_status_indicator(self._plugin_notice)
+        self._poll_worker.system.connect(self._on_system_status)
         self._poll_worker.start()
 
         # Events as they happen: tiles show MOTION while a camera reports it,
@@ -560,6 +605,17 @@ class MainWindow(QMainWindow):
         self._alert_feed = AlertFeedWorker(endpoint or None)
         self._alert_feed.alert.connect(self._on_desktop_alert)
         self._alert_feed.start()
+        # Analytics plugins: a marker on the tiles of cameras they analyse,
+        # and their drawings over the picture (the wall layers on the walls,
+        # every layer on the Plugins tab's live picture).
+        self._analytics_cameras: dict[str, list[CameraPlugin]] = {}
+        self._analytics_drawings: dict[str, list[Drawing]] = {}
+        self._marking_hold = MarkingHold()
+        self._analytics_since = time.monotonic()
+        self._analytics_feed = AnalyticsFeedWorker(endpoint or None)
+        self._analytics_feed.cameras.connect(self._on_analytics_cameras)
+        self._analytics_feed.drawings.connect(self._on_analytics_drawings)
+        self._analytics_feed.start()
         # Events without duration (a line crossed) show for a few seconds.
         self._activity_timer = QTimer(self)
         self._activity_timer.setInterval(1000)
@@ -663,6 +719,7 @@ class MainWindow(QMainWindow):
         self._camera_panel.set_cameras(self._cameras)
         self._playback_view.refresh_camera_list(self._cameras)
         self._events_view.set_cameras(self._cameras)
+        self._plugins_view.set_cameras(self._cameras)
         self._performance_page.set_camera_names({c.id: c.name or c.id for c in self._cameras})
 
     def _refresh_walls(self, page: int | None = None) -> None:
@@ -687,6 +744,7 @@ class MainWindow(QMainWindow):
             parent=self,
             ipc_endpoint=self._ipc_endpoint() or None,
             existing_names=[c.name for c in self._cameras],
+            records_all_cameras=self._records_all_cameras(),
         )
         _delete_after_use(dlg)
         accepted = dlg.exec() == AddEditCameraDialog.DialogCode.Accepted
@@ -772,6 +830,9 @@ class MainWindow(QMainWindow):
         retire(self._event_feed)
         self._alert_feed.requestInterruption()
         retire(self._alert_feed)
+        self._analytics_feed.requestInterruption()
+        retire(self._analytics_feed)
+        self._plugins_view.stop()
         self._events_view.shutdown()
         for dialog in list(self._ptz_dialogs.values()):
             dialog.close()
@@ -925,6 +986,9 @@ class MainWindow(QMainWindow):
         dialog.exec()
         dialog.deleteLater()
 
+    def _records_all_cameras(self) -> bool:
+        return (self._config.get("recording") or {}).get("local_all_cameras") is True
+
     def _on_edit_camera_selected(self) -> None:
         if self._selected_cam_id:
             self._on_edit_camera(self._selected_cam_id)
@@ -936,12 +1000,11 @@ class MainWindow(QMainWindow):
         cam = next((c for c in self._cameras if c.id == cam_id), None)
         if cam is None:
             return
-        was_recording = self._rec_states.get(cam_id) == "recording"
         dlg = AddEditCameraDialog(
             camera=cam,
-            is_recording=was_recording,
             parent=self,
             ipc_endpoint=self._ipc_endpoint() or None,
+            records_all_cameras=self._records_all_cameras(),
         )
         dlg.recording_policy_copied.connect(self._on_recording_policy_copied)
         _delete_after_use(dlg)
@@ -1141,6 +1204,142 @@ class MainWindow(QMainWindow):
     # Extra windows: a page of cameras in its own window
     # ------------------------------------------------------------------
 
+    def _on_analytics_cameras(self, cameras: dict[str, list[CameraPlugin]]) -> None:
+        """Which plugins analyse each camera: the tiles' markers."""
+        self._analytics_cameras = cameras
+        markers = {
+            cam_id: (text, any(p.running for p in plugins))
+            for cam_id, plugins in cameras.items()
+            if (text := marker_text(plugins)) is not None
+        }
+        for wall in self._walls():
+            wall.set_analytics(markers)
+        self._plugins_view.set_analytics(cameras)
+        self._apply_tile_choices()
+
+    def _tile_choice(self, cam_id: str) -> tuple[bool, bool]:
+        """A camera's ``(drawings, counts)``, its tile's two buttons."""
+        return tile_choice(self._config.get("ui", {}), cam_id)
+
+    def _toggle_tile_drawings(self, cam_id: str) -> None:
+        drawings, counts = self._tile_choice(cam_id)
+        self._set_tile_choice(cam_id, not drawings, counts)
+
+    def _toggle_tile_counts(self, cam_id: str) -> None:
+        drawings, counts = self._tile_choice(cam_id)
+        self._set_tile_choice(cam_id, drawings, not counts)
+
+    def _set_selected_camera_counts(self, shown: bool) -> None:
+        """The Plugins page's Show counts: the same choice as the tile's."""
+        cam_id = self._plugins_view.selected_camera()
+        if cam_id is not None:
+            self._set_tile_choice(cam_id, self._tile_choice(cam_id)[0], shown)
+
+    def _set_tile_choice(self, cam_id: str, drawings: bool, counts: bool) -> None:
+        tiles = self._config.setdefault("ui", {}).setdefault("tile_plugins", {})
+        tiles[cam_id] = {"drawings": drawings, "counts": counts}
+        self._apply_tile_choices()
+        self._save_ui_choice({"tile_plugins": tiles})
+
+    def _save_ui_choice(self, ui: dict[str, object]) -> None:
+        """Keep a tile's choice, off the UI thread; it took effect already."""
+        self._ignore_config_changes_until = time.monotonic() + 2.0
+        worker = _IpcCallWorker("config.set", {"ui": ui}, self._ipc_endpoint())
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _wall_drawings_mode(self) -> str:
+        """``ui.wall_drawings``: ``off``, ``chosen`` or ``all`` (Settings)."""
+        return str(self._config.get("ui", {}).get("wall_drawings", "chosen"))
+
+    def _apply_tile_choices(self) -> None:
+        """Settings or a tile's button changed what the walls show."""
+        on_analysed = self._wall_on_analysed()
+        plain = {cam_id for cam_id in self._analytics_cameras if not self._tile_choice(cam_id)[0]}
+        awaited = self._awaited_cameras()
+        for wall in self._walls():
+            wall.set_drawings_on_analysed(on_analysed)
+            wall.set_plain_cameras(plain)
+            wall.set_awaited_cameras(awaited)
+        self._plugins_view.refresh_counts_choice()
+        self._on_analytics_drawings(self._analytics_drawings)
+
+    def _awaited_cameras(self) -> set[str]:
+        """Cameras whose plugin will draw on their tile but is still starting. A
+        plugin not connected counts only just after the app opens: it is usually
+        on its way then, and later it is simply off."""
+        mode = self._wall_drawings_mode()
+        if mode == "off":
+            return set()
+        just_opened = time.monotonic() - self._analytics_since < _PLUGIN_CONNECT_GRACE_S
+        return {
+            cam_id
+            for cam_id, plugins in self._analytics_cameras.items()
+            if self._tile_choice(cam_id)[0]
+            and any(
+                # No layers listed yet: not connected, so it cannot say what it draws.
+                (plugin.wall_layers or mode == "all" or not plugin.layers)
+                and (
+                    plugin.state in ("starting", "waiting")
+                    or (plugin.state == "offline" and just_opened)
+                )
+                for plugin in plugins
+            )
+        }
+
+    def _show_counts(self) -> None:
+        """On each analysed camera's own tile, in every wall: its two buttons,
+        its counts and the key to what is drawn on it, as chosen for it."""
+        mode = self._wall_drawings_mode()
+        info = {}
+        for cam_id, plugins in self._analytics_cameras.items():
+            drawings, counts = self._tile_choice(cam_id)
+            figures = tuple(f for plugin in plugins for f in plugin.figures)
+            info[cam_id] = TileInfo(
+                figures if counts else (),
+                self._picture_key(cam_id, plugins, counts) if drawings else (),
+                # Settings can turn drawings off for the whole wall.
+                drawings=drawings if mode != "off" else None,
+                counts=counts if figures else None,
+            )
+        for wall in self._walls():
+            wall.set_plugin_info(info)
+
+    def _picture_key(
+        self, cam_id: str, plugins: list[CameraPlugin], counts: bool
+    ) -> tuple[Marking, ...]:
+        """What the colours drawn on a camera stand for: the plugins' counted
+        types, then the areas they name."""
+        mode = self._wall_drawings_mode()
+        if mode == "off":
+            return ()
+        reported = (
+            marking
+            for plugin in plugins
+            if plugin.wall_layers or mode == "all"
+            for marking in markings_reported(plugin.figures, counts)
+        )
+        drawn = self._marking_hold.shown([cam_id], time.monotonic())
+        return tuple(dict.fromkeys((*reported, *drawn)))
+
+    def _on_analytics_drawings(self, drawings: dict[str, list[Drawing]]) -> None:
+        """The plugins' drawings: each binding's wall layers on the walls."""
+        self._analytics_drawings = drawings
+        mode = self._wall_drawings_mode()
+        shown = {
+            cam_id: layers
+            for cam_id, layers in on_wall(drawings, self._analytics_cameras, mode).items()
+            if self._tile_choice(cam_id)[0]
+        }
+        for wall in self._walls():
+            wall.set_drawings(shown)
+        self._plugins_view.set_drawings(drawings)
+        if mode == "off":
+            self._marking_hold.clear()
+        else:
+            self._marking_hold.update(shown, time.monotonic())
+        self._show_counts()
+
     def _walls(self) -> list[VideoWallWidget]:
         return [self._wall, *(window.wall for window in self._detached)]
 
@@ -1260,8 +1459,22 @@ class MainWindow(QMainWindow):
     def _preview_fps(self) -> PreviewFps:
         return PreviewFps.from_config(self._config.get("ui", {}))
 
+    def _drawings_on_analysed(self) -> bool:
+        """``ui.drawings_on_analysed`` (default on)."""
+        return self._config.get("ui", {}).get("drawings_on_analysed", True) is not False
+
+    def _wall_on_analysed(self) -> bool:
+        """With drawings off there is nothing to match pictures to: the walls
+        show plain live video and hold no pictures for it."""
+        return self._drawings_on_analysed() and self._wall_drawings_mode() != "off"
+
     def _connect_window(self, window: DetachedWallWindow) -> None:
         window.wall.set_preview_fps(self._preview_fps())
+        window.wall.set_drawings_on_analysed(self._wall_on_analysed())
+        window.wall.set_plain_cameras(
+            {cam_id for cam_id in self._analytics_cameras if not self._tile_choice(cam_id)[0]}
+        )
+        window.wall.set_awaited_cameras(self._awaited_cameras())
         window.wall.set_motion_cameras(self._motion_cameras)
         window.wall.set_pending_motion_cameras(self._pending_motion_cameras)
         window.wall.motion_acknowledge_requested.connect(self._acknowledge_motion)
@@ -1275,6 +1488,8 @@ class MainWindow(QMainWindow):
         window.interval_chosen.connect(self._set_page_interval)
         window.view_demand_changed.connect(self._sync_view_demand)
         window.wall.listen_toggled.connect(self._toggle_listen)
+        window.wall.plugin_drawings_toggled.connect(self._toggle_tile_drawings)
+        window.wall.plugin_counts_toggled.connect(self._toggle_tile_counts)
         window.wall.set_listening(self._listening)
         window.layout_changed.connect(self._schedule_windows_save)
         window.wall.camera_quality_requested.connect(self._on_camera_quality_requested)
@@ -1284,6 +1499,9 @@ class MainWindow(QMainWindow):
         window.wall.cell_talk_requested.connect(self._on_talk)
         window.wall.cell_remove_requested.connect(self._on_remove_camera)
         self._detached.append(window)
+        if hasattr(self, "_analytics_feed"):
+            # The new window's tiles show the plugins' markers and drawings too.
+            self._on_analytics_cameras(self._analytics_cameras)
 
     # ------------------------------------------------------------------
     # Open windows are saved in the config and reopen at the next start
@@ -1587,6 +1805,8 @@ class MainWindow(QMainWindow):
         if tab != "playback":
             # Nobody watches it now: stop the video (the position stays).
             self._playback_view.pause()
+        if tab != "plugins":
+            self._plugins_view.stop()
         if tab == "live":
             self._content_stack.setCurrentIndex(0)
             self._toolbar.show()
@@ -1601,6 +1821,11 @@ class MainWindow(QMainWindow):
             self._toolbar.hide()
             self._page_strip.hide()
             self._performance_page.start_refresh()
+        elif tab == "plugins":
+            self._content_stack.setCurrentIndex(4)
+            self._toolbar.hide()
+            self._page_strip.hide()
+            self._plugins_view.activate()
         elif tab == "events":
             self._content_stack.setCurrentIndex(3)
             self._toolbar.hide()
@@ -1713,6 +1938,8 @@ class MainWindow(QMainWindow):
         for window in self._detached:
             demand.update(window.desktop_demand())
         demand.update(self._prewarm_windows)
+        if self._content_stack.currentIndex() == 4 and not self.isMinimized():
+            demand.update(self._plugins_view.desktop_demand())
         self._view_lease.set_cameras(demand)
         # Live audio follows the camera on screen: a page change, another
         # tab, a minimized window or a closed one ends it.
@@ -1754,6 +1981,7 @@ class MainWindow(QMainWindow):
         self, states: dict, stream_infos: dict, rec_states: dict, backend_ok: bool
     ) -> None:
         """Called on the main thread with poll results from the background worker."""
+        self._show_counts()  # a plugin that stopped sends nothing that would clear its key
         for cam_id, state in states.items():
             if isinstance(state, str):
                 # Only log when status actually changes
@@ -1875,6 +2103,8 @@ class MainWindow(QMainWindow):
         if isinstance(app, QApplication):
             apply_app_theme(app, theme)
         self._events_view.apply_theme(theme)
+        self._plugins_view.apply_theme(theme)
+        self._playback_view.apply_key_theme(theme)
         root = self.centralWidget()
         if root is not None:
             root.setStyleSheet(
@@ -1892,6 +2122,10 @@ class MainWindow(QMainWindow):
         for wall in self._walls():
             wall.set_preview_fps(self._preview_fps())
         self._playback_view.set_preview_fps(self._preview_fps())
+        self._plugins_view.set_preview_fps(self._preview_fps())
+        # The Plugins tab shows its own drawings, whatever the walls do.
+        self._plugins_view.live_wall.set_drawings_on_analysed(self._drawings_on_analysed())
+        self._apply_tile_choices()
         self._apply_autoscroll()
         self._sync_status_overlay()
         interval = int(grid.get("page_interval_sec", 0))
@@ -2089,6 +2323,18 @@ class MainWindow(QMainWindow):
             self._edition_notice = EditionNotice()
             self.add_status_indicator(self._edition_notice)
         self._edition_notice.set_edition(edition)
+
+    def _on_system_status(self, status: object) -> None:
+        """Each poll's ``system.status``: the plugins offline (none while the
+        backend is unreachable: the backend dot says that)."""
+        from neurowatch.ipc.auth import may
+
+        self._plugin_notice.set_offline(offline_plugin_names(status), can_open=may("admin"))
+        self._backup_indicator.set_status(status)
+        # Each wall tile of a camera with a plan shows its backup symbol too.
+        marks = backup_tile_marks(status)
+        for wall in self._walls():
+            wall.set_backup(marks)
 
     def add_status_indicator(self, widget: QWidget) -> None:
         """Show a widget in the bottom status bar, before the version."""

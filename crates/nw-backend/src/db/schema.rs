@@ -177,6 +177,7 @@ pub fn apply_migrations(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_segments_tier ON segments(tier, start_ts, id) WHERE local_deleted=0;
          INSERT OR IGNORE INTO schema_version VALUES (10);",
     )?;
+    conn.execute_batch("INSERT OR IGNORE INTO schema_version VALUES (11);")?;
     Ok(())
 }
 

@@ -20,17 +20,6 @@ impl CameraFile {
     }
 
     /// Native-resolution detail and motion make decoder CPU worth measuring.
-    pub fn detailed(frames: u32, width: u32, height: u32, bitrate: u32) -> Self {
-        Self::encoded(
-            &format!(
-                "videotestsrc num-buffers={frames} pattern=zone-plate kx2=20 ky2=20 kt=1 \
-             ! video/x-raw,format=I420,width={width},height={height},framerate=25/1 \
-             ! x264enc speed-preset=faster bitrate={bitrate} key-int-max=50"
-            ),
-            120,
-        )
-    }
-
     fn encoded(source: &str, timeout_sec: u64) -> Self {
         gstreamer::init().unwrap();
         let path =

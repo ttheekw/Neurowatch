@@ -107,3 +107,37 @@ def test_posix_reader_still_uses_shm_prefix_path(qtbot, monkeypatch, tmp_path) -
 
     assert opened == [module.TOTAL_BYTES]
     assert emitted == [("cam", bytes(range(12)), 2, 2, "rgb")]
+
+
+def test_windows_older_backend_keeps_its_existing_frame_identity(qtbot, monkeypatch) -> None:
+    ring = _one_frame_ring()
+    identities_at = len(ring)
+    ring.extend(bytes(module.SLOT_COUNT * 16))
+    struct.pack_into("<Qq", ring, identities_at + 3 * 16, 2**40, 1_700_000_000_123_456)
+    monkeypatch.setattr(module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(module, "_windows_mapping_exists", lambda _name: True)
+    monkeypatch.setattr(module, "SLOT_SIZE", 24)
+    monkeypatch.setattr(module, "FRAME_IDENTITIES_OFFSET", identities_at)
+    monkeypatch.setattr(module, "FRAME_OBSERVED_OFFSET", len(ring))
+    monkeypatch.setattr(module, "IDENTIFIED_TOTAL_BYTES", len(ring))
+    monkeypatch.setattr(module, "TOTAL_BYTES", len(ring) + module.SLOT_COUNT * 8)
+    opened = []
+
+    def legacy_mapping(_fd, length, **_kwargs):
+        opened.append(length)
+        if length > len(ring):
+            raise OSError("old backend's section has no observation trailer")
+        return ring
+
+    monkeypatch.setattr(module.mmap, "mmap", legacy_mapping)
+    reader = module.FrameReaderThread("legacy")
+    frames = []
+
+    def received(*args):
+        frames.append(args)
+        reader._stop_event.set()
+
+    reader.identified_frame_ready.connect(received)
+    reader.run()
+    assert opened == [module.TOTAL_BYTES, module.IDENTIFIED_TOTAL_BYTES]
+    assert frames == [("legacy", bytes(range(12)), 2, 2, "rgb", 2**40, 1_700_000_000_123_456, 0)]

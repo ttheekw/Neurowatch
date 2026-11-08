@@ -203,10 +203,97 @@ def test_source_checkout_prefers_installed_va_bugfix_runtime(tmp_path, monkeypat
     assert env["GST_REGISTRY_1_0"].endswith("gstreamer-registry-1.24.13.bin")
 
 
+def _release_sdk(base: Path) -> Path:
+    """A release GStreamer SDK's layout, as install_gstreamer_dev_sdk.sh builds it."""
+    (base / "lib" / "gstreamer-1.0").mkdir(parents=True)
+    (base / "libexec" / "gstreamer-1.0").mkdir(parents=True)
+    return base
+
+
+def test_a_checkout_runs_on_the_release_gstreamer_when_it_has_one(tmp_path, monkeypatch) -> None:
+    from neurowatch.service.manager import ServiceError, source_gstreamer_sdk
+
+    root = tmp_path / "checkout"
+    (root / "scripts").mkdir(parents=True)
+    (root / "scripts/build_release_gstreamer.sh").write_text("GST_VERSION=1.28.8\n")
+    for unset in ("", "0"):
+        monkeypatch.setenv("NW_GSTREAMER_SDK", unset)
+        assert source_gstreamer_sdk(root) is None, "not built yet: the system's"
+    monkeypatch.setenv("NW_GSTREAMER_SDK", "1")
+    with pytest.raises(ServiceError, match=r"install_gstreamer_dev_sdk\.sh"):
+        source_gstreamer_sdk(root)  # asked for: never a silent fallback
+    default = _release_sdk(root / ".cache/gstreamer-sdk-1.28.8")
+    assert source_gstreamer_sdk(root) == default
+    monkeypatch.setenv("NW_GSTREAMER_SDK", "")
+    assert source_gstreamer_sdk(root) == default, "what the packages ship, without asking"
+    monkeypatch.delenv("NW_GSTREAMER_SDK")
+    assert source_gstreamer_sdk(root) == default
+    monkeypatch.setenv("NW_GSTREAMER_SDK", "0")
+    assert source_gstreamer_sdk(root) is None, "the way out"
+    other = _release_sdk(tmp_path / "elsewhere")
+    monkeypatch.setenv("NW_GSTREAMER_SDK", str(other))
+    assert source_gstreamer_sdk(root) == other
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux runtime overlay")
+def test_a_release_sdk_replaces_the_va_runtime_in_the_dev_service(tmp_path, monkeypatch) -> None:
+    from neurowatch.service.manager import ServiceError
+
+    monkeypatch.delenv("NW_SOURCE_ROOT", raising=False)
+    sdk = _release_sdk(tmp_path / "sdk")
+    monkeypatch.setenv("NW_GSTREAMER_SDK", str(sdk))
+    env = service_command().env
+    # Forwarded with the backend's settings; the supervisor applies it to the backend.
+    assert env["NW_GSTREAMER_SDK"] == str(sdk)
+    assert "GST_REGISTRY_1_0" not in env and "GST_PLUGIN_PATH_1_0" not in env
+    monkeypatch.setenv("NW_GSTREAMER_SDK", str(tmp_path / "missing"))
+    with pytest.raises(ServiceError):
+        service_command()
+
+
+def test_the_dev_supervisor_runs_the_backend_on_the_release_sdk_but_builds_as_usual(
+    tmp_path, monkeypatch
+) -> None:
+    from neurowatch.service import dev
+
+    sdk = _release_sdk(tmp_path / "sdk")
+    monkeypatch.setenv("NW_GSTREAMER_SDK", str(sdk))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/from/the/session")
+    seen: dict[str, dict[str, str]] = {}
+
+    def run(command, **kwargs):
+        if command[0] == "cargo":  # not select_cxx's compiler probe
+            seen["build"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    def popen(command, **kwargs):
+        seen["backend"] = kwargs["env"]
+        return object()
+
+    monkeypatch.setattr(dev.subprocess, "run", run)
+    monkeypatch.setattr(dev.subprocess, "Popen", popen)
+    monkeypatch.setattr(dev, "dev_backend", lambda _workspace: tmp_path / "nw-backend")
+    supervisor = DevSupervisor(tmp_path, endpoint="unix:/tmp/test.sock")
+    assert supervisor._run_cargo()
+    supervisor._launch_backend()
+
+    backend, build = seen["backend"], seen["build"]
+    plugins = str(sdk / "lib" / "gstreamer-1.0")
+    assert backend["GST_PLUGIN_SYSTEM_PATH_1_0"] == plugins == backend["GST_PLUGIN_PATH_1_0"]
+    assert backend["LD_LIBRARY_PATH"].split(os.pathsep)[0] == str(sdk / "lib")
+    assert backend["GST_REGISTRY_1_0"] == str(tmp_path / ".cache/gstreamer-registry-sdk.bin")
+    assert backend["NW_IPC_ENDPOINT"] == "unix:/tmp/test.sock"
+    # The build links the system's development files: none of the SDK's settings.
+    assert "GST_PLUGIN_SYSTEM_PATH_1_0" not in build
+    assert build["LD_LIBRARY_PATH"] == "/from/the/session"
+
+
 def test_the_service_gets_the_backend_settings_of_its_session(packaged, monkeypatch) -> None:
     # A development script sets backend settings, then (re)starts the service.
     monkeypatch.setenv("NW_EXAMPLE_ENDPOINT", "http://127.0.0.1:8000")
-    monkeypatch.setenv("LIVEKIT_URL", "ws://127.0.0.1:7880")  # not the backend's: the cloud sends it
+    monkeypatch.setenv(
+        "LIVEKIT_URL", "ws://127.0.0.1:7880"
+    )  # not the backend's: the cloud sends it
     monkeypatch.setenv("RUST_LOG", "debug")
     monkeypatch.setenv("NW_HEADLESS", "1")
     monkeypatch.setenv("NW_SERVICE", "external")
@@ -398,6 +485,53 @@ def test_the_mode_reaches_the_backend(packaged, monkeypatch) -> None:
     assert "Description=NeuroWatch backend (camera capture and recording), headless" in (
         systemd_unit(headless)
     )
+
+
+def test_a_dev_service_stopped_during_start_fails_fast_and_releases_its_lock(
+    tmp_path, monkeypatch
+) -> None:
+    from neurowatch.service import dev
+    from neurowatch.service.manager import ServiceError
+    from neurowatch.service.paths import lock_path
+
+    monkeypatch.delenv("NW_SOURCE_ROOT", raising=False)
+
+    def unexpected_wait(_seconds):
+        pytest.fail("A stopped development service must not keep the startup lock for 15 minutes")
+
+    controller = ServiceController(
+        systemd=SystemdUser(runner=FakeSystemctl(available=False), unit_dir=tmp_path / "u"),
+        login_items=LoginItems(autostart_dir=tmp_path / "a"),
+        spawn=lambda _command, _log: dev.write_state("stopped"),
+        status=lambda _endpoint: None,
+        sleep=unexpected_wait,
+    )
+    with pytest.raises(ServiceError, match="stopped before the backend became ready"):
+        controller.ensure_running(autostart=False, timeout=600)
+    lock = InstanceLock(lock_path("service-start"))
+    assert lock.acquire(), "the next launch must be able to start the backend"
+    lock.release()
+    controller._started_at += 10
+    assert controller._start_failure() is None, "an earlier stopped state is harmless"
+
+
+def test_waiting_for_another_start_reports_why(tmp_path, packaged) -> None:
+    from neurowatch.service.paths import lock_path
+
+    lock = InstanceLock(lock_path("service-start"))
+    assert lock.acquire()
+    controller, _ = _controller(tmp_path, FakeSystemctl(available=False), FakeBackend())
+
+    def release_other_start(_seconds):
+        assert "another NeuroWatch" in controller.startup_message
+        lock.release()
+
+    controller._sleep = release_other_start
+    try:
+        assert controller.ensure_running(autostart=False)
+        assert controller.startup_message is None
+    finally:
+        lock.release()
 
 
 def test_headless_service_starts_at_boot_without_a_tray(tmp_path, packaged) -> None:

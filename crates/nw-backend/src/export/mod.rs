@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::playback::session::PlaybackSegment;
+pub(crate) use remux::aac_encoder_description;
 use remux::RemuxSummary;
 
 /// Longest range one export covers.
@@ -330,6 +331,8 @@ struct Job {
     cancel: AtomicBool,
     progress: AtomicU32,
     state: Mutex<JobState>,
+    history: Option<Arc<crate::plugin_host::history::History>>,
+    drawing_result: Mutex<Option<Result<(PathBuf, bool), String>>>,
 }
 
 impl Job {
@@ -372,6 +375,9 @@ impl Job {
             skipped_files: None,
             truncated: None,
             error: None,
+            analytics_path: None,
+            analytics_error: None,
+            analytics_truncated: None,
         };
         match state {
             JobState::Running => {}
@@ -398,6 +404,16 @@ impl Job {
             }
             JobState::Cancelled => status.state = "cancelled",
         }
+        if let Ok(result) = self.drawing_result.lock() {
+            match result.as_ref() {
+                Some(Ok((path, truncated))) => {
+                    status.analytics_path = Some(path.to_string_lossy().into_owned());
+                    status.analytics_truncated = Some(*truncated);
+                }
+                Some(Err(error)) => status.analytics_error = Some(error.clone()),
+                None => {}
+            }
+        }
         status
     }
 }
@@ -405,6 +421,12 @@ impl Job {
 /// A job's state as clients see it (`export.status`).
 #[derive(Debug, Clone, Serialize)]
 pub struct ExportStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analytics_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analytics_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analytics_truncated: Option<bool>,
     pub job_id: String,
     pub camera_id: String,
     /// `running`, `done`, `failed` or `cancelled`.
@@ -458,11 +480,20 @@ struct Jobs {
 #[derive(Default)]
 pub struct ExportService {
     jobs: Mutex<Jobs>,
+    history: Option<Arc<crate::plugin_host::history::History>>,
 }
 
 impl ExportService {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_drawing_history(
+        mut self,
+        history: Option<Arc<crate::plugin_host::history::History>>,
+    ) -> Self {
+        self.history = history;
+        self
     }
 
     /// Start exporting `segments` (the camera's recordings overlapping the
@@ -534,6 +565,8 @@ impl ExportService {
                 cancel: AtomicBool::new(false),
                 progress: AtomicU32::new(0),
                 state: Mutex::new(JobState::Running),
+                history: self.history.clone(),
+                drawing_result: Mutex::new(None),
             });
             jobs.by_id.insert(job.id.clone(), Arc::clone(&job));
             jobs.order.push_back(job.id.clone());
@@ -656,6 +689,24 @@ fn run(job: &Job, segments: &[PlaybackSegment]) {
     }
     .and_then(|summary| {
         std::fs::rename(&part, &job.path)?;
+        if let Some(history) = &job.history {
+            let path = job.path.with_extension("analytics.jsonl");
+            let result = history
+                .write_sidecar(
+                    &path,
+                    &job.camera_id,
+                    summary.first_ms,
+                    summary.last_ms,
+                    &job.cancel,
+                )
+                .map(|truncated| (path, truncated))
+                .map_err(|error| error.to_string());
+            if result.is_err() || result.as_ref().is_ok_and(|(path, _)| path.is_file()) {
+                if let Ok(mut saved) = job.drawing_result.lock() {
+                    *saved = Some(result);
+                }
+            }
+        }
         let size_bytes = std::fs::metadata(&job.path).map_or(0, |m| m.len());
         Ok(JobState::Done {
             summary,
@@ -868,6 +919,8 @@ mod tests {
                 timelapse: None,
                 cancel: AtomicBool::new(false),
                 progress: AtomicU32::new(0),
+                history: None,
+                drawing_result: Mutex::new(None),
                 state: Mutex::new(if n == 0 {
                     JobState::Running
                 } else {

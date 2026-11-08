@@ -112,6 +112,9 @@ class CameraConfig:
     # left out of updates, so the backend keeps what it has.
     motion: dict[str, Any] = field(default_factory=dict)
     onvif: dict[str, Any] | None = None
+    # Streams the recorder keeps decoding for analytics plugins whether or not
+    # a desktop shows them: "main", "sub" or a stream id.
+    always_decode: list[str] = field(default_factory=list)
 
     def stream_options(self) -> list[CameraStream]:
         """Streams a viewer may pick; main and sub for a camera without a list."""
@@ -168,6 +171,10 @@ class CameraConfig:
             obj.motion = copy.deepcopy(motion)
         if isinstance(onvif, dict):
             obj.onvif = dict(onvif)
+        always = d.get("always_decode")
+        obj.always_decode = (
+            [item for item in always if isinstance(item, str)] if isinstance(always, list) else []
+        )
         if isinstance(wp, dict):
             fields = WallPosition.__dataclass_fields__
             obj.wall_position = WallPosition(**{k: v for k, v in wp.items() if k in fields})

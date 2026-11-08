@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QContextMenuEvent,
@@ -25,6 +25,7 @@ from PySide6.QtGui import (
     QDropEvent,
     QFont,
     QFontMetrics,
+    QHelpEvent,
     QImage,
     QMouseEvent,
     QPainter,
@@ -36,10 +37,13 @@ from PySide6.QtGui import (
     QResizeEvent,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QApplication, QMenu, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QToolTip, QWidget
 
+from neurowatch.models.analytics import Drawing, DrawingHistory, TileInfo
 from neurowatch.models.camera import CameraConfig
 from neurowatch.theme import mono_font, themed_menu, ui_font
+from neurowatch.widgets.analytics_paint import backup_marker_pixmap, marker_pixmap, paint_drawings
+from neurowatch.widgets.figures_legend import FiguresLegend
 from neurowatch.widgets.native_viewer_surface import NativeViewerSurface
 
 if TYPE_CHECKING:
@@ -99,6 +103,16 @@ _MOTION_LABEL = "MOTION"
 _REC_DOT_RED = QColor(239, 68, 68)  # #ef4444 — recording
 _REC_DOT_AMBER = QColor(245, 158, 11)  # #f59e0b — scheduled
 
+#: A plugin button while it is on: the violet of the plugin's marker.
+_PLUGIN_BUTTON_ON = QColor(109, 40, 217, 235)
+_DRAWINGS_TIP = {
+    True: "Plugin drawings are on for this camera. Click to hide them and play plain live video.",
+    False: "Plugin drawings are off for this camera. Click to show them.",
+}
+_COUNTS_TIP = {
+    True: "Plugin counts are on for this camera. Click to hide them.",
+    False: "Plugin counts are off for this camera. Click to show them.",
+}
 _TOP_MARGIN = 4
 _TOP_HEIGHT = 24
 _TOP_GAP = 4
@@ -133,6 +147,9 @@ class CellWidget(QWidget):
     stream_requested = Signal(str, object)  # cam_id, stream id or None for Auto
     # The speaker (or its menu item) was clicked: hear this camera, or stop.
     audio_toggle_requested = Signal(str)  # cam_id
+    # The plugin buttons (or their menu items): this camera's drawings or counts.
+    plugin_drawings_toggle_requested = Signal(str)  # cam_id
+    plugin_counts_toggle_requested = Signal(str)  # cam_id
     motion_acknowledge_requested = Signal(str)  # cam_id
     # Wall layout editing. Positions are global so the wall can follow a
     # drag that leaves this tile (the tile keeps the mouse grab meanwhile).
@@ -196,6 +213,34 @@ class CellWidget(QWidget):
         # The camera's audio: "none", "available" (muted) or "on" (heard).
         self._audio = AUDIO_NONE
         self._audio_rect = QRect()
+        # Analytics plugins: the marker's tooltip line (None: no marker),
+        # whether one runs, and their drawings over the picture.
+        self._analytics: str | None = None
+        self._analytics_running = False
+        # Cloud Backup: the symbol's state ("ok", "starting", "failing"; None:
+        # no plan, no symbol) and its tooltip line.
+        self._backup: str | None = None
+        self._backup_text = ""
+        self._drawings: list[Drawing] = []
+        self._drawings_paused = False
+        self._drawing_history = DrawingHistory()
+        # Repaints when the soonest drawing runs out: a drawing must leave the
+        # picture on time even when no new frame comes to repaint it (a paused
+        # or stalled stream, a GPU tile that only repaints on frames).
+        self._drawings_expiry = QTimer(self)
+        self._drawings_expiry.setSingleShot(True)
+        self._drawings_expiry.timeout.connect(self._drop_expired_drawings)
+        self._frame_identity = (0, 0, 0)
+        # The picture's size, for drawing on GPU and pixmap frames alike.
+        self._frame_size: tuple[int, int] = (0, 0)
+        # Counts and key of a camera a plugin analyses, over its picture;
+        # made when first needed, as most tiles never show one.
+        self._plugin_info: FiguresLegend | None = None
+        # Opening on a camera a plugin draws on: no picture yet, on purpose.
+        self._waiting_for_analysis = False
+        # The plugin buttons: on or off, or None without that button.
+        self._plugin_drawings: bool | None = None
+        self._plugin_counts: bool | None = None
 
     def set_mode(self, mode: str) -> None:
         """Set display mode: 'live' (default) or 'playback' (changes badge label/color)."""
@@ -241,8 +286,124 @@ class CellWidget(QWidget):
         self._motion = False
         self._motion_pending = False
         self._motion_alert_click_rect = QRect()
+        self._analytics = None
+        self._analytics_running = False
+        self._backup = None
+        self._backup_text = ""
+        self._drawings = []
+        self._drawing_history.clear()
+        self._drawings_expiry.stop()
+        self._frame_identity = (0, 0, 0)
+        self._frame_size = (0, 0)
+        self.set_plugin_info(TileInfo())
+        self._waiting_for_analysis = False
         self._refresh_tooltip()
         self.update()
+
+    @property
+    def camera(self) -> CameraConfig | None:
+        return self._camera
+
+    def set_waiting_for_analysis(self, waiting: bool) -> None:
+        """Says so on an empty tile while its first analysed picture is on its way."""
+        if waiting != self._waiting_for_analysis:
+            self._waiting_for_analysis = waiting
+            self.update()
+
+    def set_plugin_info(self, info: TileInfo) -> None:
+        """What the plugins analysing this camera show on this tile."""
+        if (info.drawings, info.counts) != (self._plugin_drawings, self._plugin_counts):
+            self._plugin_drawings, self._plugin_counts = info.drawings, info.counts
+            self.update()
+            if self._gpu_surface is not None and self._gpu_surface.isVisible():
+                self._gpu_surface.update()
+        if self._plugin_info is None:
+            if not info.figures and not info.markings:
+                return
+            self._plugin_info = FiguresLegend(self, floating=True)
+        self._plugin_info.set_figures(info.figures)
+        self._plugin_info.set_markings(info.markings)
+        self._place_plugin_info()
+
+    def _place_plugin_info(self) -> None:
+        if self._plugin_info is not None:
+            picture = self._frame_rect(*self._frame_size) if self._frame_size[0] else self.rect()
+            self._plugin_info.place_in(picture.intersected(self.rect()))
+
+    def set_analytics(self, text: str | None, running: bool = False) -> None:
+        """Show the analytics marker beside the camera's name: ``text`` says
+        which plugins analyse it (tooltip); None hides it."""
+        if (text, running) == (self._analytics, self._analytics_running):
+            return
+        self._analytics = text
+        self._analytics_running = running
+        self._refresh_tooltip()
+        self.update()
+
+    @property
+    def analytics(self) -> str | None:
+        return self._analytics
+
+    def set_backup(self, state: str | None, text: str = "") -> None:
+        """Show the Cloud Backup symbol after the name (and any analytics
+        marker): green ``ok``, grey ``starting``, red ``failing``; None hides it."""
+        if (state, text) == (self._backup, self._backup_text):
+            return
+        self._backup = state
+        self._backup_text = text
+        self._refresh_tooltip()
+        self.update()
+
+    @property
+    def backup(self) -> str | None:
+        return self._backup
+
+    def set_drawings_paused(self, paused: bool) -> None:
+        """Paint no drawings for now: the picture is newer than any result's."""
+        if paused != self._drawings_paused:
+            self._drawings_paused = paused
+            self._repaint_picture()
+
+    def set_drawings(self, drawings: list[Drawing]) -> None:
+        """What analytics plugins draw over this camera's picture now."""
+        if not drawings and not self._drawings:
+            return
+        self._drawings = list(drawings)
+        self._drawing_history.update(self._drawings)
+        self._expire_drawings_later()
+        self._repaint_picture()
+
+    def _expire_drawings_later(self) -> None:
+        now = time.monotonic()
+        pending = [until for until in self._drawing_history.until() if until > now]
+        if not pending:
+            self._drawings_expiry.stop()
+            return
+        # A few milliseconds late, so the paint finds the drawing expired; at
+        # most a minute ahead (QTimer takes 32-bit milliseconds), then again.
+        delay = round((min(pending) - now) * 1000) + 15
+        self._drawings_expiry.start(max(1, min(delay, 60_000)))
+
+    def _drop_expired_drawings(self) -> None:
+        now = time.monotonic()
+        self._drawing_history.prune(now)
+        live = [d for d in self._drawings if d.until > now]
+        if len(live) != len(self._drawings):
+            self._drawings = live
+        # An older drawing kept for a picture still on its way may lapse too.
+        self._repaint_picture()
+        self._expire_drawings_later()
+
+    def _repaint_picture(self) -> None:
+        """Repaint the tile and, on a GPU tile, the surface that draws the
+        drawings over the picture (it otherwise repaints only on a frame)."""
+        self.update()
+        if self._gpu_surface is not None and self._gpu_surface.isVisible():
+            self._gpu_surface.update()
+
+    @property
+    def drawings(self) -> list[Drawing]:
+        return self._drawings
 
     def set_motion(self, active: bool) -> None:
         """Show the MOTION badge beside the camera's name while the camera
@@ -278,6 +439,8 @@ class CellWidget(QWidget):
             self.width(),
             self._audio,
             self._motion_pending,
+            self._plugin_drawings is not None,
+            self._plugin_counts is not None,
             self.zoom_supported,
             self._zoom,
             self.devicePixelRatioF(),
@@ -289,6 +452,10 @@ class CellWidget(QWidget):
             controls.append(("audio", _TOP_HEIGHT))
         if self._motion_pending:
             controls.append(("motion", _TOP_HEIGHT))
+        if self._plugin_counts is not None:
+            controls.append(("counts", _TOP_HEIGHT))
+        if self._plugin_drawings is not None:
+            controls.append(("drawings", _TOP_HEIGHT))
         if self.zoom_supported and self._zoom > 1.0:
             text = f"{self._zoom:.1f}× ↺"
             available = self.width() - 2 * _TOP_MARGIN - _TOP_HEIGHT
@@ -326,10 +493,17 @@ class CellWidget(QWidget):
     def audio_state(self) -> str:
         return self._audio
 
+    def set_frame_identity(self, seq: int, capture_us: int, observed_us: int = 0) -> None:
+        """Identity delivered in the same reader message as this picture."""
+        self._frame_identity = (seq, capture_us, observed_us)
+
     def update_frame(self, data: bytes, width: int, height: int, pixel_format: str = "rgb") -> None:
         """Upload a paced frame to GPU YUV textures or the RGB pixmap fallback."""
         if not data or width == 0 or height == 0:
             return
+        if (width, height) != self._frame_size:
+            self._frame_size = (width, height)
+            self._place_plugin_info()
         if pixel_format.startswith("nv12:"):
             if self._gpu_disabled:
                 return
@@ -344,8 +518,11 @@ class CellWidget(QWidget):
                     self._gpu_surface.setGeometry(self.rect())
                 self._gpu_surface.set_frame(data, width, height, int(pixel_format.split(":")[1]))
                 self._status = CellStatus.STREAMING
-                self._gpu_surface.show()
-                self._gpu_surface.raise_()
+                if self._gpu_surface.isHidden():
+                    self._gpu_surface.show()
+                    self._gpu_surface.raise_()
+                    if self._plugin_info is not None:
+                        self._plugin_info.raise_()  # over the picture
                 self.update()
             except Exception:
                 self._on_gpu_failed()
@@ -501,6 +678,10 @@ class CellWidget(QWidget):
             hint = f"{hint}\nSpeaker (top right): hear this camera"
         if self._motion_pending:
             hint = f"{hint}\nOrange motion alert (top right): click to acknowledge motion"
+        if getattr(self, "_analytics", None):
+            hint = f"{hint}\n{self._analytics}"
+        if getattr(self, "_backup", None):
+            hint = f"{hint}\n{self._backup_text}"
         self.setToolTip(hint)
 
     def _layout_native_surface(self) -> None:
@@ -556,6 +737,24 @@ class CellWidget(QWidget):
                 self._draw_frame(painter, rect)
             else:
                 self._draw_grid_placeholder(painter, rect)
+                if self._waiting_for_analysis:
+                    painter.setPen(_EMPTY_TEXT)
+                    painter.setFont(ui_font(10))
+                    painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "Starting analysis…")
+            # Over the picture, under the tile's own strips. A native overlay
+            # draws its pixels itself, out of reach of Qt painting.
+            if (
+                self._drawings
+                and not self._drawings_paused
+                and self._native_surface is None
+                and self._frame_size[0]
+            ):
+                paint_drawings(
+                    painter,
+                    self._frame_rect(*self._frame_size),
+                    self._drawing_history.shown(self._frame_identity, time.monotonic()),
+                    frame_identity=self._frame_identity,
+                )
 
             # Dim overlay for OFFLINE / RECONNECTING / NO_SUB states
             if self._status in (CellStatus.OFFLINE, CellStatus.ERROR, CellStatus.UNAUTHORIZED):
@@ -585,6 +784,7 @@ class CellWidget(QWidget):
 
             self._draw_name_label(painter, rect)
             self._draw_speaker(painter, rect)
+            self._draw_plugin_buttons(painter)
             self._draw_motion_alert(painter)
             self._draw_bottom_info(painter, rect)
             if self.zoom_supported and self._zoom > 1.0:
@@ -604,6 +804,7 @@ class CellWidget(QWidget):
         self._layout_native_surface()
         if self._gpu_surface is not None:
             self._gpu_surface.setGeometry(self.rect())
+        self._place_plugin_info()
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         delta = event.angleDelta().y()
@@ -635,6 +836,11 @@ class CellWidget(QWidget):
             and self._top_control_rects().get("audio", QRect()).contains(event.position().toPoint())
         ):
             self.audio_toggle_requested.emit(self._camera.id)
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._press_plugin_button(
+            event.position().toPoint()
+        ):
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
@@ -775,7 +981,38 @@ class CellWidget(QWidget):
                 return
         super().mouseReleaseEvent(event)
 
+    def _press_plugin_button(self, pos: QPoint) -> bool:
+        """A plugin button under ``pos``: switch it, and nothing else happens."""
+        if self._camera is None:
+            return False
+        rects = self._top_control_rects()
+        if rects.get("drawings", QRect()).contains(pos):
+            self.plugin_drawings_toggle_requested.emit(self._camera.id)
+            return True
+        if rects.get("counts", QRect()).contains(pos):
+            self.plugin_counts_toggle_requested.emit(self._camera.id)
+            return True
+        return False
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.ToolTip and isinstance(event, QHelpEvent):
+            rects = self._top_control_rects()
+            for name, text in (
+                ("drawings", _DRAWINGS_TIP[bool(self._plugin_drawings)]),
+                ("counts", _COUNTS_TIP[bool(self._plugin_counts)]),
+            ):
+                if rects.get(name, QRect()).contains(event.pos()):
+                    QToolTip.showText(event.globalPos(), text, self, rects[name])
+                    return True
+        return super().event(event)
+
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._press_plugin_button(
+            event.position().toPoint()
+        ):
+            # The second click of two quick ones, not "open this tile".
+            event.accept()
+            return
         if self.motion_alert_rect().contains(event.position().toPoint()) or (
             time.monotonic() - self._motion_alert_click_at
             <= QApplication.doubleClickInterval() / 1000
@@ -808,6 +1045,20 @@ class CellWidget(QWidget):
             else:
                 text = "Listen" if live else "Play Audio"
             menu.addAction(text, lambda: self.audio_toggle_requested.emit(cam_id))
+            menu.addSeparator()
+        if self._plugin_drawings is not None:
+            action = menu.addAction(
+                "Show Plugin Drawings", lambda: self.plugin_drawings_toggle_requested.emit(cam_id)
+            )
+            action.setCheckable(True)
+            action.setChecked(self._plugin_drawings)
+        if self._plugin_counts is not None:
+            action = menu.addAction(
+                "Show Plugin Counts", lambda: self.plugin_counts_toggle_requested.emit(cam_id)
+            )
+            action.setCheckable(True)
+            action.setChecked(self._plugin_counts)
+        if self._plugin_drawings is not None or self._plugin_counts is not None:
             menu.addSeparator()
         from neurowatch.ipc.auth import may
 
@@ -1008,7 +1259,10 @@ class CellWidget(QWidget):
             (box.left() - _TOP_GAP for box in controls.values()),
             default=rect.right() - _TOP_MARGIN + 1,
         )
-        max_width = max(1, right - _TOP_MARGIN)
+        marker = self._analytics is not None
+        backup = self._backup is not None
+        markers = int(marker) + int(backup)
+        max_width = max(1, right - _TOP_MARGIN - (_TOP_HEIGHT + 3) * markers)
         key = (name, self._recording_state, badge_label, badge_bg.rgba(), motion, dpr, max_width)
         strip = self._cached_strip(
             "label",
@@ -1018,6 +1272,68 @@ class CellWidget(QWidget):
             ),
         )
         painter.drawPixmap(rect.left() + _TOP_MARGIN, rect.top() + _TOP_MARGIN, strip)
+        left = rect.left() + _TOP_MARGIN + round(strip.width() / dpr) + 3
+        if marker:
+            self._draw_analytics_marker(
+                painter, QRect(left, rect.top() + _TOP_MARGIN, _TOP_HEIGHT, _TOP_HEIGHT)
+            )
+            left += _TOP_HEIGHT + 3
+        if backup:
+            self._draw_backup_marker(
+                painter, QRect(left, rect.top() + _TOP_MARGIN, _TOP_HEIGHT, _TOP_HEIGHT)
+            )
+
+    def analytics_marker_rect(self) -> QRect:
+        """Where the analytics marker is drawn (empty without one), for tests."""
+        if self._analytics is None or self._camera is None:
+            return QRect()
+        strip = self._overlay_cache.get("label")
+        if strip is None:
+            return QRect()
+        dpr = self.devicePixelRatioF()
+        left = _TOP_MARGIN + round(strip[1].width() / dpr) + 3
+        return QRect(left, _TOP_MARGIN, _TOP_HEIGHT, _TOP_HEIGHT)
+
+    def backup_marker_rect(self) -> QRect:
+        """Where the Cloud Backup symbol is drawn (empty without one), for tests."""
+        if self._backup is None or self._camera is None:
+            return QRect()
+        strip = self._overlay_cache.get("label")
+        if strip is None:
+            return QRect()
+        dpr = self.devicePixelRatioF()
+        left = _TOP_MARGIN + round(strip[1].width() / dpr) + 3
+        if self._analytics is not None:
+            left += _TOP_HEIGHT + 3
+        return QRect(left, _TOP_MARGIN, _TOP_HEIGHT, _TOP_HEIGHT)
+
+    def _draw_backup_marker(self, painter: QPainter, box: QRect) -> None:
+        dpr = self.devicePixelRatioF()
+        state = self._backup or "starting"
+        marker = self._cached_strip(
+            "backup",
+            (state, box.width(), dpr),
+            lambda: backup_marker_pixmap(box.width(), dpr, state),
+        )
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(box, marker)
+        painter.restore()
+
+    def _draw_analytics_marker(self, painter: QPainter, box: QRect) -> None:
+        """The analytics marker: violet while a plugin runs on the camera,
+        grey while none does. Rendered once at high resolution, then cached."""
+        dpr = self.devicePixelRatioF()
+        running = self._analytics_running
+        marker = self._cached_strip(
+            "analytics",
+            (running, box.width(), dpr),
+            lambda: marker_pixmap(box.width(), dpr, running),
+        )
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(box, marker)
+        painter.restore()
 
     def _render_label_strip(
         self,
@@ -1125,6 +1441,15 @@ class CellWidget(QWidget):
             return
         self._draw_top_button(painter, "audio", f"audio:{self._audio}", self._audio_rect)
 
+    def _draw_plugin_buttons(self, painter: QPainter) -> None:
+        """This camera's plugin drawings and counts: violet (as the plugin's
+        marker) while shown, dark and struck through while not."""
+        rects = self._top_control_rects()
+        for name, on in (("drawings", self._plugin_drawings), ("counts", self._plugin_counts)):
+            box = rects.get(name)
+            if box is not None:
+                self._draw_top_button(painter, name, f"{name}:{'on' if on else 'off'}", box)
+
     def _draw_top_button(self, painter: QPainter, slot: str, kind: str, box: QRect) -> None:
         dpr = self.devicePixelRatioF()
         strip = self._cached_strip(
@@ -1142,9 +1467,12 @@ class CellWidget(QWidget):
         painter = QPainter(strip)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         on = kind == f"audio:{AUDIO_ON}"
+        plugin_on = kind in ("drawings:on", "counts:on")
         background = (
             _MOTION_BG
             if kind == "motion"
+            else _PLUGIN_BUTTON_ON
+            if plugin_on
             else (QColor(22, 128, 61, 235) if on else QColor(0, 0, 0, 170))
         )
         painter.setPen(Qt.PenStyle.NoPen)
@@ -1185,6 +1513,26 @@ class CellWidget(QWidget):
             else:
                 painter.drawLine(QPointF(15.5, 9.5), QPointF(19.5, 14.5))
                 painter.drawLine(QPointF(19.5, 9.5), QPointF(15.5, 14.5))
+        elif kind.startswith(("drawings:", "counts:")):
+            if kind.startswith("drawings:"):
+                # A detection box: its corners, and a small object inside.
+                painter.drawRoundedRect(QRectF(5.5, 7, 13, 10), 1.5, 1.5)
+                painter.drawLine(QPointF(5.5, 4.5), QPointF(9, 4.5))
+                painter.drawLine(QPointF(15, 19.5), QPointF(18.5, 19.5))
+            else:
+                # Sigma, as the total's own icon.
+                sigma = QPainterPath()
+                sigma.moveTo(16.5, 6.5)
+                sigma.lineTo(7.5, 6.5)
+                sigma.lineTo(12.5, 12)
+                sigma.lineTo(7.5, 17.5)
+                sigma.lineTo(16.5, 17.5)
+                painter.drawPath(sigma)
+            if not plugin_on:
+                painter.setPen(QPen(QColor(0, 0, 0, 200), 3.6))
+                painter.drawLine(QPointF(5, 19), QPointF(19, 5))
+                painter.setPen(pen)
+                painter.drawLine(QPointF(5, 19), QPointF(19, 5))
         else:
             painter.setFont(_overlay_fonts()["info"])
             painter.setPen(_ZOOM_TEXT)

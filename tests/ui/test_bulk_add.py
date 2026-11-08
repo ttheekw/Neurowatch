@@ -205,6 +205,7 @@ def test_the_main_window_takes_the_cameras_the_dialog_added(monkeypatch) -> None
     fake = SimpleNamespace(
         _cameras=[SimpleNamespace(name="Gate")],
         _ipc_endpoint=lambda: ENDPOINT,
+        _records_all_cameras=lambda: False,
         _on_add_camera_result=lambda result, submitted: results.append(submitted.id),
     )
     main_mod.MainWindow._on_add_camera(fake)  # type: ignore[arg-type]

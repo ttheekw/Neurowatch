@@ -29,7 +29,7 @@ discovery and on export setup failures. It shipped in
 3. Check `gst-inspect-1.0 va` in the service's runtime environment. Its plugin
    version matters; `gst-inspect-1.0 --version` only identifies the core. Confirm
    the backend startup log and Diagnostics after a planned restart. Release
-   packages now bundle matched GStreamer 1.24.13; source checkouts still need
+   packages now bundle matched GStreamer 1.28.8; source checkouts still need
    their own fixed runtime (see below and [release packaging](releasing.md)). Vendor backports
    retaining a 1.24.0–1.24.5 plugin version remain conservatively excluded.
 4. Qualify the actual runtime before advertising hardware acceleration for that
@@ -49,7 +49,19 @@ plugin plus the support libraries from the same `gst-plugins-bad` release, and
 installs them under the ignored `.cache/gstreamer-1.24.13` directory. The
 supported launcher and dev service select that component while retaining the
 distribution's other plugins. Run the script independently on each source
-checkout. Release packages should use a qualified distribution runtime of
+checkout.
+
+To run a checkout on the same GStreamer the release packages bundle instead
+(all of it, not only the VA plugin), build it once and opt in:
+
+```bash
+scripts/install_gstreamer_dev_sdk.sh      # Docker; --native builds on this machine
+./neurowatch.sh                       # on it once built; NW_GSTREAMER_SDK=0 for the system's
+```
+
+The backend (and the motion plugin it starts) then uses only that build's
+plugins and libraries; `cargo build` still uses the system's development files,
+and the private VA component above is not used. Release packages should use a qualified distribution runtime of
 1.24.6 or later; this checkout-local install is not copied into Linux packages.
 
 On Linux, startup raises only the backend's open-file soft limit to its existing

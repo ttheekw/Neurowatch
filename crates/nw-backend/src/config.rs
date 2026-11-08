@@ -40,6 +40,15 @@ pub struct AppConfig {
     /// The desktop UI's extra windows, reopened when the app starts again.
     #[serde(default)]
     pub desktop: DesktopConfig,
+    /// Analytics plugin daemons and the cameras bound to them (`crate::plugin_host`).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::plugin_host::PluginsConfig::is_empty"
+    )]
+    pub plugins: crate::plugin_host::PluginsConfig,
+    /// One-time bundled-plugin installation; removing it remains a user choice.
+    #[serde(default)]
+    pub plugins_initialized: bool,
 }
 
 #[cfg(test)]
@@ -141,6 +150,56 @@ pub struct UiConfig {
     /// Desktop live-preview frame-rate limits.
     #[serde(default)]
     pub preview_fps: PreviewFpsConfig,
+    /// Analytics plugins' drawings on the desktop video wall.
+    #[serde(default)]
+    pub wall_drawings: WallDrawings,
+    /// While a tile shows a plugin's drawings, show only the pictures the
+    /// plugin analysed, each with its own drawing (the video then runs at
+    /// the plugin's frame rate, a little behind live).
+    #[serde(default = "default_true")]
+    pub drawings_on_analysed: bool,
+    /// Plugins' counts over a tile whose camera has no choice of its own in
+    /// `tile_plugins`; off until asked for.
+    #[serde(default)]
+    pub show_counts: bool,
+    /// What each camera's tile shows of its plugins (the tile's own buttons).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tile_plugins: std::collections::BTreeMap<String, TilePluginView>,
+}
+
+/// One camera's choice on the desktop's video wall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TilePluginView {
+    #[serde(default = "default_true")]
+    pub drawings: bool,
+    #[serde(default)]
+    pub counts: bool,
+}
+
+/// Which analytics plugin drawings the desktop video wall shows (the
+/// Plugins tab always shows every layer of the camera it shows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WallDrawings {
+    /// None.
+    Off,
+    /// Each camera's chosen layers (`plugins.bindings[].wall_layers`, else
+    /// the plugin's defaults: motion boxes).
+    #[default]
+    Chosen,
+    /// Every layer, debug drawings included.
+    All,
+}
+
+impl WallDrawings {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "off" => Some(Self::Off),
+            "chosen" => Some(Self::Chosen),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
 }
 
 /// Frames per second the desktop wall paints, by what is on screen. Only the
@@ -731,6 +790,10 @@ impl Default for AppConfig {
                 fullscreen_status: true,
                 fullscreen_status_opacity: DEFAULT_STATUS_OPACITY,
                 preview_fps: PreviewFpsConfig::default(),
+                wall_drawings: WallDrawings::default(),
+                drawings_on_analysed: true,
+                show_counts: false,
+                tile_plugins: std::collections::BTreeMap::new(),
             },
             debug: DebugConfig::default(),
             video: VideoConfig::default(),
@@ -741,6 +804,8 @@ impl Default for AppConfig {
             accounts: crate::accounts::AccountsConfig::default(),
             monitors: MonitorsConfig::default(),
             desktop: DesktopConfig::default(),
+            plugins: crate::plugin_host::PluginsConfig::default(),
+            plugins_initialized: false,
         }
     }
 }
@@ -750,11 +815,17 @@ impl AppConfig {
     pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
             tracing::info!(path = %path.display(), "Config not found — using defaults");
-            return Ok(Self::default());
+            let mut config = Self::default();
+            crate::plugin_host::bundled::migrate(&mut config, path).map_err(anyhow::Error::msg)?;
+            return Ok(config);
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Cannot read config: {}", path.display()))?;
-        let mut config: Self = serde_json::from_str(&text)
+        let mut document: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("Invalid JSON in config: {}", path.display()))?;
+        let motion_migrated = crate::plugin_host::bundled::migrate_document(&mut document)
+            .map_err(anyhow::Error::msg)?;
+        let mut config: Self = serde_json::from_value(document)
             .with_context(|| format!("Invalid JSON in config: {}", path.display()))?;
         // Fullscreen was previously persisted but ignored by the UI. Since it
         // could not represent a real user choice, enable the new working
@@ -791,7 +862,9 @@ impl AppConfig {
                 "Camera limit of this free version reached; the other cameras are kept but not run"
             );
         }
-        if old_version < 4 {
+        let plugins_changed =
+            crate::plugin_host::bundled::migrate(&mut config, path).map_err(anyhow::Error::msg)?;
+        if old_version < 4 || plugins_changed || motion_migrated {
             config.version = 4;
             if let Err(e) = config.save(path) {
                 tracing::warn!(error = %e, "Failed to write migrated v4 config");

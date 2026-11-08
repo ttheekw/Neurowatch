@@ -24,6 +24,15 @@ pub trait Unit: Clone + Send + 'static {
     fn bytes(&self) -> usize;
     /// Presentation time in nanoseconds, if the unit has one.
     fn time_ns(&self) -> Option<u64>;
+    /// The video codec (`h264`, `h265`), for diagnostics; read on keyframes only.
+    fn video_codec(&self) -> Option<&'static str> {
+        None
+    }
+    /// The picture size (width, height) as the parser reported it; read on
+    /// keyframes only.
+    fn video_size(&self) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 /// What a full queue drops.
@@ -36,9 +45,32 @@ pub enum Overflow {
     DropOldest,
 }
 
+/// Fixed roles only: never subscriber identities, account data or credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerKind {
+    Recording,
+    Desktop,
+    Browser,
+    Plugin,
+    Snapshot,
+    Audio,
+    /// A stream the recorder keeps decoding for plugins (`always_decode`).
+    /// Diagnostics reports it as a flag, not a role, so portals that know
+    /// only the six roles above keep accepting the report.
+    AlwaysDecode,
+    /// A desktop view showing an always-on decoder's pictures (it decodes
+    /// nothing itself). Diagnostics reports a count, not a role (as above).
+    SharedView,
+    /// Cloud Backup's real-time copy (`cloud::backup`). Diagnostics reports
+    /// it as a flag, not a role (as above).
+    CloudBackup,
+}
+
 /// How much a subscriber may fall behind, and what happens then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriberPolicy {
+    pub consumer: ConsumerKind,
     pub max_bytes: usize,
     pub max_units: usize,
     /// Longest span of queued time (newest minus oldest unit).
@@ -55,11 +87,21 @@ pub struct SubscriberPolicy {
 }
 
 impl SubscriberPolicy {
+    /// A plugin that needs continuity may retain a bounded backlog before it
+    /// skips to a keyframe. Its queue never blocks another subscriber.
+    pub fn plugin_reliable(max_buffer_ms: u32) -> Self {
+        let mut policy = Self::plugin();
+        policy.max_span = Duration::from_millis(u64::from(max_buffer_ms.clamp(100, 10_000)));
+        policy.max_units = 1200;
+        policy.max_bytes = 32 * 1024 * 1024;
+        policy
+    }
     /// A recording: up to ~10 s behind (as long as the segment writer may
     /// stall today, `builder::RECORDING_STALL_NS`), then skip to the next
     /// keyframe. It closes the connection as soon as it leaves.
     pub fn recorder() -> Self {
         Self {
+            consumer: ConsumerKind::Recording,
             max_bytes: 64 * 1024 * 1024,
             max_units: 4096,
             max_span: Duration::from_secs(10),
@@ -76,6 +118,7 @@ impl SubscriberPolicy {
     /// paging and grid changes do not reconnect.
     pub fn live_video() -> Self {
         Self {
+            consumer: ConsumerKind::Browser,
             max_bytes: 16 * 1024 * 1024,
             max_units: 256,
             max_span: Duration::from_secs(2),
@@ -91,6 +134,7 @@ impl SubscriberPolicy {
     /// keyframe, so a slow decoder shows the present rather than a backlog.
     pub fn desktop_view() -> Self {
         Self {
+            consumer: ConsumerKind::Desktop,
             max_bytes: 16 * 1024 * 1024,
             max_units: 64,
             max_span: Duration::from_secs(1),
@@ -101,11 +145,41 @@ impl SubscriberPolicy {
         }
     }
 
-    /// Opt-in analysis: only a few compressed pictures may wait for its
-    /// decoder; a slow detector never holds back the camera.
-    pub fn analysis() -> Self {
+    /// A desktop view of a stream the recorder decodes all the time: it only
+    /// follows the connection's state (its units are discarded, not decoded).
+    pub fn shared_view() -> Self {
         Self {
-            max_units: 8,
+            consumer: ConsumerKind::SharedView,
+            ..Self::desktop_view()
+        }
+    }
+
+    /// Cloud Backup's copy of a camera stream: as a recording's (a backup
+    /// skips to a keyframe only when ~10 s behind, and tells the ingest);
+    /// sound too when the camera's plan includes it.
+    pub fn cloud_backup(sound: bool) -> Self {
+        Self {
+            consumer: ConsumerKind::CloudBackup,
+            media: if sound { None } else { Some(Media::Video) },
+            ..Self::recorder()
+        }
+    }
+
+    /// A camera stream the recorder keeps decoding (`CameraConfig::always_decode`):
+    /// as a desktop decoder's, under its own role.
+    pub fn always_decode() -> Self {
+        Self {
+            consumer: ConsumerKind::AlwaysDecode,
+            ..Self::desktop_view()
+        }
+    }
+
+    /// An analytics plugin's compressed pictures (`crate::plugin_host`): as a
+    /// desktop decoder's, so a plugin that falls behind skips to the next
+    /// keyframe (the plugin is told: a `gap`).
+    pub fn plugin() -> Self {
+        Self {
+            consumer: ConsumerKind::Plugin,
             ..Self::desktop_view()
         }
     }
@@ -113,6 +187,7 @@ impl SubscriberPolicy {
     /// One picture, with no connection left running after the request.
     pub fn snapshot() -> Self {
         Self {
+            consumer: ConsumerKind::Snapshot,
             max_units: 1,
             linger: Duration::ZERO,
             ..Self::desktop_view()
@@ -122,6 +197,7 @@ impl SubscriberPolicy {
     /// Sound to listen to: what is late is dropped first.
     pub fn live_sound() -> Self {
         Self {
+            consumer: ConsumerKind::Audio,
             max_bytes: 1024 * 1024,
             max_units: 256,
             max_span: Duration::from_secs(1),
@@ -369,6 +445,7 @@ pub(crate) mod tests {
 
     fn small(overflow: Overflow) -> SubscriberPolicy {
         SubscriberPolicy {
+            consumer: ConsumerKind::Desktop,
             max_bytes: 1_000_000,
             max_units: 3,
             max_span: Duration::from_secs(10),

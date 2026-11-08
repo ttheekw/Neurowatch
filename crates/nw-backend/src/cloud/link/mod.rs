@@ -31,6 +31,7 @@ pub const CONFIG_PULL_OPERATION: &str = "config_pull";
 pub const CONFIG_RESULT_OPERATION: &str = "config_result";
 pub const DIAGNOSTICS_REPORT_OPERATION: &str = "diagnostics_report";
 
+pub mod backup;
 mod clock;
 mod diagnostics;
 #[cfg(windows)]
@@ -46,7 +47,7 @@ pub use exports::{ExportSource, SegmentLookup, EXPORT_PULL_OPERATION, EXPORT_REP
 pub use inventory::camera_inventory;
 pub use inventory::{
     camera_coverage, camera_inventory_with_live, reported_camera_ids, CameraCoverage,
-    CameraSnapshot, MAX_COVERAGE_RANGES,
+    CameraSnapshot, StreamVideo, MAX_COVERAGE_RANGES,
 };
 
 /// Supplies the current allowlisted camera inventory to the scheduler.
@@ -81,6 +82,9 @@ pub struct RemoteConfigRequest {
     pub method: String,
     #[serde(default)]
     pub params: Value,
+    /// Supplied by the authenticated relay, outside the browser's sealed input.
+    #[serde(default)]
+    pub requester: Option<Value>,
 }
 
 /// Longest the cloud holds a configuration pull open; below the cloud
@@ -1798,6 +1802,7 @@ impl CloudNode {
                     "diagnostics-reports" => DIAGNOSTICS_REPORT_OPERATION,
                     "export-pulls" => EXPORT_PULL_OPERATION,
                     "export-reports" => EXPORT_REPORT_OPERATION,
+                    "backup-tickets" => backup::BACKUP_TICKET_OPERATION,
                     "departures" => DEPARTURE_OPERATION,
                     "unlink-indications" => UNLINK_OPERATION,
                     _ => return Err(CloudError::Invalid("unsupported control operation".into())),
@@ -3315,7 +3320,16 @@ async fn run_remote_request(
     let (outcome, opened) = match request.params.get("sealed") {
         Some(envelope) => match node.open_sealed(&method, envelope) {
             Ok(opened) => {
-                let outcome = handler(method.clone(), opened.params.clone(), true).await;
+                let mut params = opened.params.clone();
+                if method == "plugins.pages" || method.starts_with("plugins.web.") {
+                    if let Some(params) = params.as_object_mut() {
+                        params.insert(
+                            "_portal_viewer".into(),
+                            request.requester.clone().unwrap_or(Value::Null),
+                        );
+                    }
+                }
+                let outcome = handler(method.clone(), params, true).await;
                 (outcome, Some(opened))
             }
             Err(error) => (Err(error.to_string()), None),

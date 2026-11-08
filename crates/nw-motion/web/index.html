@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Motion</title>
+<style>
+:root{--text:var(--nw-text,#0f172a);--muted:var(--nw-muted,#64748b);--surface:var(--nw-surface,#ffffff);--line:var(--nw-line,#e2e8f0);--accent:var(--nw-accent,#7c3aed);--motion:#f59e0b;color-scheme:var(--nw-scheme,light)}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0;background:var(--surface);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+body{padding:20px}
+h1{font-size:20px;line-height:1.3;margin:0;letter-spacing:-.01em}
+h2{font-size:16px;margin:0;letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+h3{font-size:14px;margin:0}
+p{margin:0}
+.muted{color:var(--muted)}
+.small{font-size:12px}
+button{font:inherit;color:inherit;cursor:pointer;min-height:44px;border-radius:8px;border:1px solid var(--line);background:var(--surface);padding:8px 14px;display:inline-flex;align-items:center;gap:6px;transition:border-color .15s,background-color .15s}
+button:hover{border-color:color-mix(in srgb,var(--text) 25%,var(--line))}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+button.primary:hover{filter:brightness(1.08)}
+svg.icon{width:16px;height:16px;flex:none;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.top{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}
+.cameras{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin:16px 0 0;padding:0;list-style:none}
+.camera{width:100%;padding:0;flex-direction:column;align-items:stretch;gap:0;overflow:hidden;text-align:left;border-radius:12px}
+.camera[aria-pressed=true]{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.shot{position:relative;aspect-ratio:16/9;background:#0b1220;display:grid;place-items:center;color:#94a3b8}
+.shot img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.now{position:absolute;top:8px;left:8px;display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;background:#000b;color:#fff;font-size:12px;font-weight:600}
+.now::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--motion)}
+.camera .label{display:flex;justify-content:space-between;gap:8px;padding:9px 12px}
+.camera .label b{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.camera .label span{flex:none}
+.detail{margin-top:20px;border:1px solid var(--line);border-radius:12px;padding:18px}
+.detail-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px}
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin:16px 0 0;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.stats div{padding:10px 14px;min-width:0}
+.stats div+div{border-left:1px solid var(--line)}
+.stats dt{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stats dd{margin:2px 0 0;font-size:22px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stats dd.time{font-size:15px;line-height:33px}
+.day{margin-top:18px}
+.day-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.bars{display:flex;align-items:flex-end;gap:2px;height:64px;margin-top:8px;padding-bottom:1px;border-bottom:1px solid var(--line)}
+.bars span{flex:1;min-width:0;border-radius:3px 3px 0 0;background:color-mix(in srgb,var(--motion) 85%,transparent)}
+.bars span.empty{background:var(--line);height:2px!important}
+.axis{display:flex;justify-content:space-between;margin-top:4px;font-size:11px;color:var(--muted)}
+.events{list-style:none;margin:10px 0 0;padding:0;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.events li{display:flex;align-items:center;gap:12px;padding:8px 8px 8px 14px}
+.events li+li{border-top:1px solid var(--line)}
+.events .when{flex:1;min-width:0}
+.events .when b{font-weight:600;font-variant-numeric:tabular-nums}
+.events .when p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.events .when p:first-child{white-space:normal}
+.badge{display:inline-flex;align-items:center;padding:1px 8px;margin-left:6px;border-radius:999px;font-size:12px;font-weight:600;background:color-mix(in srgb,var(--motion) 18%,transparent);color:color-mix(in srgb,var(--motion) 60%,var(--text))}
+.empty-note{margin-top:10px;padding:18px;border:1px dashed var(--line);border-radius:10px;text-align:center;color:var(--muted)}
+.note{margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+.alert{margin-top:12px;padding:10px 12px;border-radius:8px;background:color-mix(in srgb,#ef4444 12%,transparent);color:color-mix(in srgb,#ef4444 75%,var(--text))}
+.more{margin-top:10px}
+@media (max-width:560px){body{padding:14px}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.stats div:nth-child(3){border-left:0}.stats div:nth-child(n+3){border-top:1px solid var(--line)}.cameras{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4"/></symbol>
+  <symbol id="i-live" viewBox="0 0 24 24"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="m16 10 6-3v10l-6-3"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z"/><circle cx="12" cy="13" r="3"/></symbol>
+</svg>
+<div class="top">
+  <div><h1>Motion</h1><p class="muted">Movement noticed on each camera over the last 7 days.</p></div>
+  <button type="button" id="refresh"><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+</div>
+<p id="error" class="alert" role="alert" hidden></p>
+<ul id="cameras" class="cameras" aria-label="Cameras"></ul>
+<section id="detail" class="detail" aria-labelledby="camera-name" hidden>
+  <div class="detail-head">
+    <div style="min-width:0"><h2 id="camera-name"></h2><p id="camera-state" class="muted small"></p></div>
+    <button type="button" id="live" class="primary"><svg class="icon" aria-hidden="true"><use href="#i-live"/></svg>Open live view</button>
+  </div>
+  <p id="live-note" class="muted small" role="status" style="margin-top:6px"></p>
+  <dl class="stats">
+    <div><dt>Last hour</dt><dd id="hour">–</dd></div>
+    <div><dt>Today</dt><dd id="today">–</dd></div>
+    <div><dt>Last 7 days</dt><dd id="week">–</dd></div>
+    <div><dt>Last motion</dt><dd id="last" class="time">–</dd></div>
+  </dl>
+  <div class="day">
+    <div class="day-head"><h3>Last 24 hours</h3><span class="muted small">Motion events per hour</span></div>
+    <div id="bars" class="bars" role="img"></div>
+    <div class="axis" aria-hidden="true"><span>24 h ago</span><span>18 h</span><span>12 h</span><span>6 h</span><span>Now</span></div>
+  </div>
+  <div class="day">
+    <h3>Recent motion</h3>
+    <ul id="events" class="events" aria-label="Recent motion" hidden></ul>
+    <p id="no-events" class="empty-note" hidden>No motion in the last 7 days.</p>
+    <button type="button" id="more" class="more" hidden></button>
+    <p id="capped" class="muted small" style="margin-top:8px" hidden>Showing the newest 50 events; the counts may be higher.</p>
+  </div>
+  <p id="admin-note" class="note muted small" hidden>Watched areas, sensitivity and the video decoder are set on the Plugins page, in this camera's Settings.</p>
+</section>
+<p id="loading" class="muted" role="status" style="margin-top:16px">Loading…</p>
+<script>
+(()=>{
+  'use strict';
+  const nw=window.NeuroWatch,$=id=>document.getElementById(id);
+  const HOUR=3600e3,DAY=24*HOUR,LIMIT=50,FIRST=10;
+  let context=null,selected=null,all=[],mine=[],expanded=false,zoneNames={},zonesOf=null,epoch=0;
+  const shots=new Map();
+  const fmt=n=>Number(n).toLocaleString();
+  const svg=name=>{const ns='http://www.w3.org/2000/svg',node=document.createElementNS(ns,'svg'),use=document.createElementNS(ns,'use');node.setAttribute('class','icon');node.setAttribute('aria-hidden','true');use.setAttribute('href',`#i-${name}`);node.append(use);return node;};
+  const el=(tag,cls,text)=>{const node=document.createElement(tag);if(cls)node.className=cls;if(text!=null)node.textContent=text;return node;};
+  const startOfToday=()=>{const d=new Date();d.setHours(0,0,0,0);return d.getTime();};
+  function when(ms){
+    const d=new Date(ms),today=startOfToday(),time=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+    if(ms>=today)return `Today ${time}`;
+    if(ms>=today-DAY)return `Yesterday ${time}`;
+    return `${d.toLocaleDateString([],{weekday:'short',day:'numeric',month:'short'})} ${time}`;
+  }
+  function ago(ms){
+    const s=Math.max(0,Math.round((Date.now()-ms)/1000));
+    return s<60?'Just now':s<3600?`${Math.round(s/60)} min ago`:s<86400?`${Math.round(s/3600)} h ago`:`${Math.round(s/86400)} d ago`;
+  }
+  function length(event){
+    if(event.end_ms==null)return null;
+    const s=Math.max(0,Math.round((event.end_ms-event.start_ms)/1000));
+    return s<60?`${s} s`:`${Math.floor(s/60)} min ${s%60} s`;
+  }
+  // The recorder returns the newest 50 events of the last 7 days: a full list may hold back older ones.
+  const since=(events,from)=>events.filter(event=>(event.end_ms??Date.now())>=from).length;
+  const cut=(events,from)=>events.length>=LIMIT&&events[events.length-1].start_ms>from;
+  const count=(events,from)=>`${fmt(since(events,from))}${cut(events,from)?'+':''}`;
+  const newest=events=>[...events].sort((a,b)=>b.start_ms-a.start_ms);
+  function showError(message){const box=$('error');box.textContent=message??'';box.hidden=!message;}
+
+  function renderCameras(){
+    const list=$('cameras');list.replaceChildren();
+    for(const camera of context.cameras){
+      const events=all.filter(event=>event.camera_id===camera.id),ongoing=events.some(event=>event.end_ms==null),today=count(events,startOfToday());
+      const item=el('li'),button=el('button','camera');button.type='button';button.setAttribute('aria-pressed',String(camera.id===selected));
+      const shot=el('div','shot'),src=shots.get(camera.id);
+      if(src){const img=el('img');img.alt='';img.src=src;shot.append(img);}else shot.append(svg('camera'));
+      if(ongoing)shot.append(el('span','now','Motion now'));
+      const label=el('span','label');label.append(el('b',null,camera.name),el('span','muted small',`${today} today`));
+      button.append(shot,label);
+      button.setAttribute('aria-label',`${camera.name}: ${ongoing?'motion now, ':''}${today} motion events today`);
+      button.onclick=()=>select(camera.id);
+      item.append(button);list.append(item);
+    }
+  }
+  function renderDetail(){
+    const camera=context.cameras.find(c=>c.id===selected);$('detail').hidden=!camera;if(!camera)return;
+    const now=Date.now(),ongoing=mine.find(event=>event.end_ms==null),latest=mine[0];
+    $('camera-name').textContent=camera.name;
+    $('camera-state').textContent=ongoing?'Motion now':latest?`Quiet since ${when(latest.end_ms??latest.start_ms)}`:'No motion in the last 7 days';
+    $('hour').textContent=count(mine,now-HOUR);$('today').textContent=count(mine,startOfToday());$('week').textContent=count(mine,now-7*DAY);
+    $('last').textContent=ongoing?'Now':latest?ago(latest.end_ms??latest.start_ms):'–';
+    // Events per hour over the last day, oldest on the left.
+    const buckets=Array(24).fill(0);
+    for(const event of mine){const at=Math.floor((now-event.start_ms)/HOUR);if(at>=0&&at<24)buckets[23-at]++;}
+    const peak=Math.max(1,...buckets),bars=$('bars');bars.replaceChildren();
+    buckets.forEach((value,index)=>{const hoursAgo=23-index,bar=el('span',value?null:'empty');bar.style.height=`${Math.max(6,value/peak*100)}%`;bar.title=`${hoursAgo?`${hoursAgo} h ago`:'This hour'}: ${value} ${value===1?'event':'events'}`;bars.append(bar);});
+    const total=buckets.reduce((a,b)=>a+b,0);
+    bars.setAttribute('aria-label',`${total} motion ${total===1?'event':'events'} in the last 24 hours${total?`, at most ${peak} in one hour`:''}`);
+    const list=$('events');list.replaceChildren();
+    for(const event of expanded?mine:mine.slice(0,FIRST)){
+      const row=el('li'),text=el('div','when'),top=el('p'),span=length(event);
+      top.append(el('b',null,when(event.start_ms)),span?el('span','muted',` · ${span}`):el('span','badge','Ongoing'));
+      text.append(top);
+      const zones=(event.zones??[]).map(id=>zoneNames[id]??id);
+      if(zones.length)text.append(el('p','muted small',zones.join(', ')));
+      const play=el('button');play.type='button';play.append(svg('play'),el('span',null,'Play'));
+      play.setAttribute('aria-label',`Play the recording of motion at ${when(event.start_ms)}`);
+      play.onclick=()=>nw.call('playback.open',{event_id:event.id}).catch(error=>showError(error.message));
+      row.append(text,play);list.append(row);
+    }
+    list.hidden=!mine.length;$('no-events').hidden=!!mine.length;
+    const more=$('more');more.hidden=mine.length<=FIRST;more.textContent=expanded?'Show fewer':`Show all ${mine.length}`;
+    $('capped').hidden=mine.length<LIMIT;
+  }
+  async function loadSelected(){
+    const op=++epoch,camera=selected;if(!camera)return;
+    try{
+      const response=await nw.call('events.list',{camera_id:camera});
+      if(op!==epoch)return;
+      mine=newest(response.events??[]);showError(null);renderDetail();
+    }catch(error){if(op===epoch)showError(error.message);}
+    // Managers may read the zones' names; everyone else sees the event without them.
+    if(context.user.role==='admin'&&zonesOf!==camera){
+      try{
+        const saved=await nw.call('binding.get',{camera_id:camera});if(op!==epoch)return;
+        zoneNames={};for(const zone of saved.config?.zones??[])if(zone?.id)zoneNames[zone.id]=zone.name||zone.id;
+        zonesOf=camera;renderDetail();
+      }catch{/* ids stay */}
+    }
+  }
+  async function loadAll(){
+    try{const response=await nw.call('events.list',{});all=newest(response.events??[]);renderCameras();}
+    catch(error){showError(error.message);}
+  }
+  async function loadShots(){
+    for(const camera of context.cameras.slice(0,24)){
+      try{const picture=await nw.call('snapshot',{camera_id:camera.id});if(picture?.jpeg_b64){shots.set(camera.id,`data:image/jpeg;base64,${picture.jpeg_b64}`);renderCameras();}}
+      catch{/* the placeholder stays */}
+    }
+  }
+  function select(id){
+    if(selected===id)return;
+    selected=id;expanded=false;mine=[];zoneNames={};zonesOf=null;$('live-note').textContent='';
+    try{nw.selectCamera(id);}catch{/* not one of this page's cameras */}
+    renderCameras();renderDetail();void loadSelected();
+  }
+  const refresh=()=>Promise.all([loadAll(),loadSelected()]);
+  $('refresh').onclick=()=>{void refresh();void loadShots();};
+  $('more').onclick=()=>{expanded=!expanded;renderDetail();};
+  $('live').onclick=async()=>{
+    try{await nw.call('live.open',{camera_id:selected});$('live-note').textContent='The live view is open beside this page.';}
+    catch(error){$('live-note').textContent=error.message;}
+  };
+  nw.ready.then(value=>{
+    context=value;$('loading').remove();
+    $('admin-note').hidden=value.user.role!=='admin';
+    if(!value.cameras.length){$('cameras').replaceWith(el('p','empty-note','No cameras are analysed by the motion plugin yet.'));return;}
+    selected=value.cameras[0].id;
+    renderCameras();renderDetail();void refresh();void loadShots();
+    setInterval(()=>{if(!document.hidden)void refresh();},15000);
+  }).catch(error=>{$('loading').textContent=error.message;});
+})();
+</script>
+</body>
+</html>

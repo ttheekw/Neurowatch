@@ -490,7 +490,7 @@ fn prepare_unit(
     // The frame held when first paused is the file's start; with a seek to
     // come it is not shown, so the view never flashes the wrong moment.
     let show_preroll = Arc::new(AtomicBool::new(visible && seek_ms <= 0));
-    if !wire_appsink(&pipeline, shm_key, writer, &show_preroll) {
+    if !wire_appsink(&pipeline, shm_key, writer, &show_preroll, unit.start_ts) {
         let _ = pipeline.set_state(gstreamer::State::Null);
         return None;
     }
@@ -871,6 +871,7 @@ fn wire_appsink(
     shm_key: &str,
     sink: &SegmentSink,
     show_preroll: &Arc<AtomicBool>,
+    origin_ms: i64,
 ) -> bool {
     let SegmentSink::Shm(writer) = sink;
     let Some(appsink) = pipeline
@@ -906,6 +907,15 @@ fn wire_appsink(
                 .map_err(|_| gstreamer::FlowError::Error)?;
 
             if let Ok(mut w) = writer_cb.lock() {
+                w.set_identity(buffer.pts().map(|pts| {
+                    crate::streams::frames::Identity {
+                        observed_us: 0,
+                        seq: 0,
+                        time_us: origin_ms
+                            .saturating_mul(1000)
+                            .saturating_add(i64::try_from(pts.useconds()).unwrap_or(i64::MAX)),
+                    }
+                }));
                 w.write_frame(width, height, stride, pixels);
             }
 
@@ -1056,7 +1066,8 @@ mod tests {
             &pipeline,
             &key,
             &sink,
-            &Arc::new(std::sync::atomic::AtomicBool::new(true))
+            &Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            1_700_000_000_000,
         ));
         pipeline.set_state(gstreamer::State::Playing).expect("play");
         let message = pipeline.bus().expect("bus").timed_pop_filtered(

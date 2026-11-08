@@ -1,5 +1,6 @@
 //! System-health events: a camera offline, a recording that failed, a
-//! recording drive running out of space or missing, the backend starting.
+//! recording drive running out of space or missing, an analytics plugin that
+//! stopped answering, the backend starting.
 //!
 //! The tray used to be the only place that noticed these, and only while a
 //! desktop session ran it; as events they reach the event list, alerts and
@@ -41,6 +42,20 @@ pub struct HealthSnapshot {
     /// Recording locations in use that are missing, with why
     /// (`crate::storage_guard`).
     pub missing_storage: Vec<(PathBuf, String)>,
+    /// Enabled analytics plugins and their connection.
+    pub plugins: Vec<PluginHealth>,
+    /// Cameras whose Cloud Backup is failing (`cloud::backup::FAIL_AFTER`),
+    /// with why.
+    pub backup_failing: Vec<(CameraId, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginHealth {
+    pub id: String,
+    pub name: String,
+    /// Unreachable for [`crate::plugin_host::OFFLINE_AFTER`] or longer.
+    pub offline: bool,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +76,8 @@ enum Key {
     RecordingFailed(CameraId),
     Disk(PathBuf),
     Storage(PathBuf),
+    Plugin(String),
+    Backup(CameraId),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -160,9 +177,42 @@ impl HealthTracker {
                 spec(key, None, EventKind::StorageMissing, Some(reason.clone())),
             );
         }
+        // A stopped plugin is one event until it answers again (or is switched
+        // off or removed); nothing else about the recorder changes. Offline
+        // means unreachable for a while, so a plugin still starting with the
+        // recorder is not reported (the tray and status bar use the same rule).
+        for plugin in &snapshot.plugins {
+            let key = Key::Plugin(plugin.id.clone());
+            known.insert(key.clone());
+            if plugin.offline {
+                let detail = match &plugin.detail {
+                    Some(reason) => format!("{}: {reason}", plugin.name),
+                    None => plugin.name.clone(),
+                };
+                wanted.insert(
+                    key.clone(),
+                    spec(key, None, EventKind::PluginOffline, Some(detail)),
+                );
+            }
+        }
+        // A camera's backup failing is one event until it is backed up again
+        // (or its plan ends).
+        for (camera, why) in &snapshot.backup_failing {
+            let key = Key::Backup(camera.clone());
+            known.insert(key.clone());
+            wanted.insert(
+                key.clone(),
+                spec(
+                    key,
+                    Some(camera),
+                    EventKind::BackupFailed,
+                    Some(why.clone()),
+                ),
+            );
+        }
         // A location that is back (or no longer used) ends its event.
         for key in self.open.keys() {
-            if matches!(key, Key::Storage(_)) {
+            if matches!(key, Key::Storage(_) | Key::Plugin(_) | Key::Backup(_)) {
                 known.insert(key.clone());
             }
         }
@@ -214,8 +264,35 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 async fn snapshot(state: &Arc<RwLock<AppState>>) -> HealthSnapshot {
-    let (cameras, roots, missing_storage) = {
+    let (cameras, roots, missing_storage, plugins, backup_failing) = {
         let st = state.read().await;
+        let backup_failing = st
+            .backup
+            .report()
+            .cameras
+            .into_iter()
+            .filter(|camera| camera.failing)
+            .map(|camera| {
+                let why = camera
+                    .trouble
+                    .unwrap_or_else(|| "Not backed up.".to_owned());
+                (camera.camera_id, why)
+            })
+            .collect::<Vec<_>>();
+        let plugins = st
+            .plugins
+            .offline(
+                &st.config.plugins.servers,
+                crate::plugin_host::OFFLINE_AFTER,
+            )
+            .into_iter()
+            .map(|plugin| PluginHealth {
+                id: plugin.id,
+                name: plugin.name,
+                offline: true,
+                detail: plugin.detail,
+            })
+            .collect::<Vec<_>>();
         let states = st.supervisor_states();
         let recording = st.recording.status_all_with_pipeline_states(&states);
         let cameras = st
@@ -262,7 +339,7 @@ async fn snapshot(state: &Arc<RwLock<AppState>>) -> HealthSnapshot {
             .filter(|(root, _)| in_use.contains(root))
             .collect();
         roots.retain(|root| st.storage.is_ready(root));
-        (cameras, roots, missing_storage)
+        (cameras, roots, missing_storage, plugins, backup_failing)
     };
     let drives = tokio::task::spawn_blocking(move || {
         roots
@@ -279,6 +356,8 @@ async fn snapshot(state: &Arc<RwLock<AppState>>) -> HealthSnapshot {
         cameras,
         drives,
         missing_storage,
+        plugins,
+        backup_failing,
     }
 }
 
@@ -372,6 +451,8 @@ mod tests {
             cameras,
             drives: vec![],
             missing_storage: vec![],
+            plugins: vec![],
+            backup_failing: vec![],
         }
     }
 
@@ -444,6 +525,8 @@ mod tests {
             } else {
                 vec![]
             },
+            plugins: vec![],
+            backup_failing: vec![],
         };
         let blocked = || {
             let mut cam = camera("a", "streaming", Some("failed"));
@@ -480,6 +563,8 @@ mod tests {
             cameras: vec![],
             drives: vec![(PathBuf::from("/rec"), Some((50 * GB, available)))],
             missing_storage: vec![],
+            plugins: vec![],
+            backup_failing: vec![],
         };
         let mut t = HealthTracker::default();
         assert!(observe(&mut t, drive(40 * GB)).is_empty());
@@ -490,5 +575,71 @@ mod tests {
         // 2.5 GB free: no longer below the line, not yet clearly above it.
         assert!(observe(&mut t, drive(5 * GB / 2)).is_empty());
         assert_eq!(observe(&mut t, drive(40 * GB)).len(), 1);
+    }
+
+    #[test]
+    fn a_stopped_plugin_is_one_event_until_it_answers_again() {
+        let mut tracker = HealthTracker::default();
+        let offline = |offline: bool| HealthSnapshot {
+            plugins: offline
+                .then(|| PluginHealth {
+                    id: "motion".into(),
+                    name: "Motion detection".into(),
+                    offline: true,
+                    detail: Some("Could not connect".into()),
+                })
+                .into_iter()
+                .collect(),
+            ..HealthSnapshot::default()
+        };
+        assert!(observe(&mut tracker, offline(false)).is_empty());
+        let started = tracker.observe(&offline(true));
+        let [HealthChange::Start(spec)] = started.as_slice() else {
+            panic!("one start: {started:?}");
+        };
+        assert_eq!(spec.kind, EventKind::PluginOffline);
+        assert_eq!(spec.camera_id, None);
+        assert_eq!(
+            spec.detail.as_deref(),
+            Some("Motion detection: Could not connect")
+        );
+        tracker.started(spec, 7);
+        assert!(observe(&mut tracker, offline(true)).is_empty(), "one event");
+        // Answering again, switched off or removed: no longer offline.
+        assert_eq!(tracker.observe(&offline(false)), vec![HealthChange::End(7)]);
+    }
+
+    #[test]
+    fn a_failing_backup_is_one_event_per_camera_until_it_is_backed_up_again() {
+        let mut tracker = HealthTracker::default();
+        let failing = |cameras: &[&str]| HealthSnapshot {
+            backup_failing: cameras
+                .iter()
+                .map(|id| {
+                    (
+                        id.to_string(),
+                        "Not connected to the backup server.".to_owned(),
+                    )
+                })
+                .collect(),
+            ..HealthSnapshot::default()
+        };
+        assert!(observe(&mut tracker, failing(&[])).is_empty());
+        let started = tracker.observe(&failing(&["cam-1"]));
+        let [HealthChange::Start(spec)] = started.as_slice() else {
+            panic!("one start: {started:?}");
+        };
+        assert_eq!(spec.kind, EventKind::BackupFailed);
+        assert_eq!(spec.camera_id.as_deref(), Some("cam-1"));
+        assert_eq!(
+            spec.detail.as_deref(),
+            Some("Not connected to the backup server.")
+        );
+        tracker.started(spec, 9);
+        assert!(
+            observe(&mut tracker, failing(&["cam-1"])).is_empty(),
+            "one event"
+        );
+        assert_eq!(tracker.observe(&failing(&[])), vec![HealthChange::End(9)]);
     }
 }

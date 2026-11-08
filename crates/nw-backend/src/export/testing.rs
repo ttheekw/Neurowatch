@@ -15,6 +15,8 @@ pub(crate) fn running_job(service: &ExportService, camera_id: &str) -> String {
         cancel: AtomicBool::new(false),
         progress: AtomicU32::new(0),
         state: Mutex::new(JobState::Running),
+        history: None,
+        drawing_result: Mutex::new(None),
     });
     let mut jobs = service.jobs.lock().unwrap();
     jobs.by_id.insert(id.clone(), job);

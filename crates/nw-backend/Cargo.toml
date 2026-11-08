@@ -20,6 +20,10 @@ unlimited = []
 [dependencies]
 nw-core            = { workspace = true }
 nw-cloud-protocol  = { workspace = true }
+nw-analytics-protocol = { workspace = true }
+nw-analytics-sdk = { workspace = true }
+nw-backup-protocol = { workspace = true }
+nw-backup-client = { workspace = true }
 
 tokio              = { workspace = true }
 serde              = { workspace = true }

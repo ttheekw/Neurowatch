@@ -26,12 +26,33 @@ PREVIEW_RATE_OFFSET = 4  # optional u32 milli-FPS; 0 = unlimited
 PREVIEW_FORMAT_OFFSET = 8
 NV12_CAPABILITY = 0x31565559  # YUV1: explicitly negotiated, older backends ignore
 NV12_SLOT_FLAG = 1 << 31
-TOTAL_BYTES = HEADER_BYTES + SLOT_COUNT * SLOT_SIZE
+FRAME_IDENTITIES_OFFSET = HEADER_BYTES + SLOT_COUNT * SLOT_SIZE
+FRAME_IDENTITY_BYTES = 16
+LEGACY_TOTAL_BYTES = FRAME_IDENTITIES_OFFSET
+IDENTIFIED_TOTAL_BYTES = FRAME_IDENTITIES_OFFSET + SLOT_COUNT * FRAME_IDENTITY_BYTES
+FRAME_OBSERVED_OFFSET = IDENTIFIED_TOTAL_BYTES
+TOTAL_BYTES = FRAME_OBSERVED_OFFSET + SLOT_COUNT * 8
 SHM_PREFIX = "/dev/shm/neurowatch_"
 # Windows has no /dev/shm: the backend creates a named, pagefile-backed section.
 WINDOWS_MAPPING_PREFIX = "Local\\neurowatch_"
 _IS_WINDOWS = sys.platform == "win32"
 logger = logging.getLogger(__name__)
+
+
+def frame_identity(ring: mmap.mmap | bytes | bytearray, slot: int) -> tuple[int, int]:
+    """Read an optional per-slot identity; older rings have no trailer."""
+    at = FRAME_IDENTITIES_OFFSET + slot * FRAME_IDENTITY_BYTES
+    if slot < 0 or slot >= SLOT_COUNT or len(ring) < at + FRAME_IDENTITY_BYTES:
+        return (0, 0)
+    return struct.unpack_from("<Qq", ring, at)
+
+
+def frame_observed_us(ring: mmap.mmap | bytes | bytearray, slot: int) -> int:
+    """Optional node receipt clock; legacy and playback rings use zero."""
+    at = FRAME_OBSERVED_OFFSET + slot * 8
+    if slot < 0 or slot >= SLOT_COUNT or len(ring) < at + 8:
+        return 0
+    return int(struct.unpack_from("<q", ring, at)[0])
 
 
 def windows_mapping_name(key: str) -> str:
@@ -69,6 +90,8 @@ class FrameReaderThread(Worker):
 
     # cam_id, pixel_data, width, height, format ("rgb" or "nv12:<descriptor>")
     frame_ready = Signal(str, bytes, int, int, str)
+    # Same atomic delivery, plus the shared stream sequence and UTC capture time.
+    identified_frame_ready = Signal(str, bytes, int, int, str, object, object, object)
 
     def __init__(self, cam_id: str, max_emit_fps: float | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -210,6 +233,17 @@ class FrameReaderThread(Worker):
                                     self.frame_ready.emit(
                                         self._cam_id, raw, width, height, pixel_format
                                     )
+                                    seq, capture_us = frame_identity(mm, write_idx)
+                                    self.identified_frame_ready.emit(
+                                        self._cam_id,
+                                        raw,
+                                        width,
+                                        height,
+                                        pixel_format,
+                                        seq,
+                                        capture_us,
+                                        frame_observed_us(mm, write_idx),
+                                    )
                             self._stop_event.wait(self._poll_interval_ms / 1000)
                     finally:
                         # Release the request if the reader stops or changes rings.
@@ -249,10 +283,23 @@ class FrameReaderThread(Worker):
             if not _windows_mapping_exists(path):
                 raise FileNotFoundError(path)
             # ``tagname`` exists only in the Windows stubs.
-            yield mmap.mmap(-1, TOTAL_BYTES, tagname=path), None  # type: ignore[call-arg,unused-ignore]
+            try:
+                ring = mmap.mmap(-1, TOTAL_BYTES, tagname=path)  # type: ignore[call-arg,unused-ignore]
+            except OSError:
+                try:
+                    ring = mmap.mmap(-1, IDENTIFIED_TOTAL_BYTES, tagname=path)  # type: ignore[call-arg,unused-ignore]
+                except OSError:
+                    ring = mmap.mmap(-1, LEGACY_TOTAL_BYTES, tagname=path)  # type: ignore[call-arg,unused-ignore]
+            yield ring, None
             return
         with open(path, "r+b") as f:
-            yield mmap.mmap(f.fileno(), TOTAL_BYTES), os.fstat(f.fileno()).st_ino
+            stat = os.fstat(f.fileno())
+            length = (
+                min(stat.st_size, TOTAL_BYTES)
+                if stat.st_size >= LEGACY_TOTAL_BYTES
+                else TOTAL_BYTES
+            )
+            yield mmap.mmap(f.fileno(), length), stat.st_ino
 
     def stop(self) -> None:
         # A stop immediately after start() must not be undone by run() starting.

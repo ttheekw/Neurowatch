@@ -1,22 +1,29 @@
-//! Latest system-memory picture from a desktop decoder. Motion borrows it
+//! Latest system-memory picture from a desktop decoder. Plugins borrow it
 //! instead of decoding again; a slow reader never holds up the desktop.
-use gstreamer::prelude::*;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 
-const INTERVAL: Duration = Duration::from_millis(200);
+/// Fastest a desktop decoder's pictures are shared: each shared picture is a
+/// full-frame copy into a plugin's ring, made by the recorder. A plugin asks
+/// for its own rate (`DecodedRequest::max_fps`) up to this.
+pub(crate) const MAX_SHARED_FPS: u32 = 30;
+/// Publishing keeps a reference only; the forwarder paces the copies. A little
+/// under a 30 fps frame time, so camera jitter never drops a frame here.
+const INTERVAL: Duration = Duration::from_millis(25);
 pub(crate) const SWITCH_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) struct Frame {
     pub sample: gstreamer::Sample,
-    pub decoder: Arc<str>,
+    pub identity: Option<super::frames::Identity>,
     published: Instant,
     since: Instant,
     sequence: u64,
+    /// Who published it: an always-on decoder (1) wins over a desktop view (0).
+    priority: u8,
 }
 
 #[derive(Default)]
@@ -26,6 +33,18 @@ pub(crate) struct Channel {
 }
 
 impl Channel {
+    #[cfg(test)]
+    pub(crate) fn stable_picture(&self, sample: &gstreamer::Sample) {
+        let now = Instant::now();
+        *self.latest.lock().unwrap() = Some(Frame {
+            sample: sample.clone(),
+            identity: None,
+            published: now,
+            since: now - SWITCH_DELAY,
+            sequence: 1,
+            priority: 0,
+        });
+    }
     pub fn subscribe(self: &Arc<Self>) -> Receiver {
         self.readers.fetch_add(1, Ordering::Relaxed);
         Receiver {
@@ -34,7 +53,21 @@ impl Channel {
         }
     }
 
-    fn publish(&self, sample: &gstreamer::Sample, decoder: &Arc<str>, now: Instant) {
+    #[cfg(test)]
+    fn publish(&self, sample: &gstreamer::Sample, _decoder: &Arc<str>, now: Instant) {
+        self.publish_identified(sample, now, None, 0);
+    }
+
+    /// A stream may have two decoders: a desktop view's and an always-on one.
+    /// The always-on one's pictures win while it publishes, so plugins keep
+    /// one source when a desktop opens or closes the camera.
+    fn publish_identified(
+        &self,
+        sample: &gstreamer::Sample,
+        now: Instant,
+        identity: Option<super::frames::Identity>,
+        priority: u8,
+    ) {
         // The common case does not even read the clock, lock or clone a sample.
         // The caller supplies the time only after checking demand.
         if self.readers.load(Ordering::Relaxed) == 0 {
@@ -43,23 +76,26 @@ impl Channel {
         let Ok(mut latest) = self.latest.try_lock() else {
             return;
         };
-        if latest
-            .as_ref()
-            .is_some_and(|f| now.duration_since(f.published) < INTERVAL)
-        {
+        if latest.as_ref().is_some_and(|f| {
+            let age = now.duration_since(f.published);
+            (f.priority > priority && age < SWITCH_DELAY)
+                || (f.priority == priority && age < INTERVAL)
+        }) {
             return;
         }
+        // Another publisher, or a gap: warming up again.
         let since = latest
             .as_ref()
-            .filter(|f| now.duration_since(f.published) < SWITCH_DELAY)
+            .filter(|f| f.priority == priority && now.duration_since(f.published) < SWITCH_DELAY)
             .map_or(now, |f| f.since);
         let sequence = latest.as_ref().map_or(1, |f| f.sequence + 1);
         *latest = Some(Frame {
             sample: sample.clone(),
-            decoder: Arc::clone(decoder),
+            identity,
             published: now,
             since,
             sequence,
+            priority,
         });
     }
 }
@@ -98,31 +134,37 @@ impl Drop for Receiver {
 
 pub(crate) struct Publisher {
     channel: Arc<Channel>,
-    decoder: Arc<Mutex<Arc<str>>>,
     /// Retaining a GPU pool buffer could starve the desktop decoder. Check
     /// memory features only when caps change; usual frames compare pointers.
     caps: Mutex<Option<(gstreamer::Caps, bool)>>,
+    frames: Option<Arc<Mutex<super::frames::DecoderFrames>>>,
+    priority: u8,
 }
 
 impl Publisher {
-    pub fn new(channel: Arc<Channel>, pipeline: &gstreamer::Pipeline) -> Self {
-        let decoder = Arc::new(Mutex::new(Arc::from("desktop")));
-        let name = Arc::clone(&decoder);
-        pipeline.connect_deep_element_added(move |_, _, element| {
-            if let Some(factory) = element.factory() {
-                let class = factory.metadata("klass").unwrap_or_default();
-                if class.contains("Decoder") && class.contains("Video") {
-                    if let Ok(mut name) = name.lock() {
-                        *name = Arc::from(factory.name().as_str());
-                    }
-                }
-            }
-        });
+    pub fn new(channel: Arc<Channel>, _pipeline: &gstreamer::Pipeline) -> Self {
         Self {
             channel,
-            decoder,
             caps: Mutex::new(None),
+            frames: None,
+            priority: 0,
         }
+    }
+
+    pub fn with_frames(
+        channel: Arc<Channel>,
+        pipeline: &gstreamer::Pipeline,
+        frames: Arc<Mutex<super::frames::DecoderFrames>>,
+    ) -> Self {
+        let mut publisher = Self::new(channel, pipeline);
+        publisher.frames = Some(frames);
+        publisher
+    }
+
+    /// An always-on decoder's: its pictures win over a desktop view's.
+    pub fn always_on(mut self) -> Self {
+        self.priority = 1;
+        self
     }
 
     /// Called beside existing SHM/tap delivery. No waiting, media copies or
@@ -156,9 +198,12 @@ impl Publisher {
         if !system_memory {
             return;
         }
-        if let Ok(decoder) = self.decoder.try_lock() {
-            self.channel.publish(sample, &decoder, Instant::now());
-        }
+        let identity = sample
+            .buffer()
+            .and_then(|buffer| buffer.pts())
+            .and_then(|pts| self.frames.as_ref()?.try_lock().ok()?.get(pts.nseconds()));
+        self.channel
+            .publish_identified(sample, Instant::now(), identity, self.priority);
     }
 }
 
@@ -240,6 +285,36 @@ mod tests {
     }
 
     #[test]
+    fn an_always_on_decoder_keeps_the_channel_while_a_desktop_comes_and_goes() {
+        let channel = Arc::new(Channel::default());
+        let mut receiver = channel.subscribe();
+        let sample = picture();
+        let start = Instant::now() - Duration::from_secs(5);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        channel.publish_identified(&sample, at(0), None, 0);
+        // The always-on decoder takes over at once, warming up again.
+        channel.publish_identified(&sample, at(30), None, 1);
+        // A desktop view publishing meanwhile is ignored.
+        for ms in [40, 70, 100, 900] {
+            channel.publish_identified(&sample, at(ms), None, 0);
+            assert_eq!(
+                channel.latest.lock().unwrap().as_ref().unwrap().priority,
+                1,
+                "{ms}"
+            );
+        }
+        for ms in (60..1100).step_by(30) {
+            channel.publish_identified(&sample, at(ms), None, 1);
+        }
+        let latest = channel.latest.lock().unwrap().clone().unwrap();
+        assert_eq!(latest.since, at(30), "the switch restarted the warm-up");
+        drop(receiver.take());
+        // Once it stops for SWITCH_DELAY, the desktop's pictures are used again.
+        channel.publish_identified(&sample, at(1100) + SWITCH_DELAY, None, 0);
+        assert_eq!(channel.latest.lock().unwrap().as_ref().unwrap().priority, 0);
+    }
+
+    #[test]
     fn decoded_frames_are_rate_limited_before_queuing() {
         let channel = Arc::new(Channel::default());
         let mut receiver = channel.subscribe();
@@ -249,10 +324,17 @@ mod tests {
         for ms in 0..1000 {
             channel.publish(&sample, &decoder, now + Duration::from_millis(ms));
         }
+        // One a millisecond is kept once per INTERVAL (25 ms): 40 a second.
         let frame = receiver.take().unwrap().0;
-        assert_eq!(frame.sequence, 5);
-        assert_eq!(frame.published, now + Duration::from_millis(800));
+        let kept = 1000 / INTERVAL.as_millis() as u64;
+        assert_eq!(frame.sequence, kept);
+        assert_eq!(
+            frame.published,
+            now + Duration::from_millis((kept - 1) * INTERVAL.as_millis() as u64)
+        );
         assert!(receiver.take().is_none());
+        // Enough for the fastest a plugin may ask for.
+        assert!(kept >= u64::from(MAX_SHARED_FPS));
     }
 
     #[test]
@@ -311,9 +393,13 @@ mod tests {
         channel.publish(&sample, &decoder, Instant::now());
         assert!(!receiver.take().unwrap().1, "the gap resets the warm-up");
         let start = Instant::now();
-        for i in 1..=5 {
+        // Stable once it has published for SWITCH_DELAY without a gap.
+        let steps = (SWITCH_DELAY.as_millis() / INTERVAL.as_millis()) as u32;
+        for i in 1..steps {
             channel.publish(&sample, &decoder, start + INTERVAL * i);
         }
+        assert!(!receiver.take().unwrap().1, "still warming up");
+        channel.publish(&sample, &decoder, start + INTERVAL * steps);
         assert!(receiver.take().unwrap().1);
     }
 }

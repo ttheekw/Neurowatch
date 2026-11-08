@@ -102,6 +102,17 @@ pub fn shared_view_pipeline_str(hwaccel: HwAccelKind) -> String {
     )
 }
 
+/// A desktop view of a stream the recorder decodes all the time: the same
+/// tail as [`shared_view_pipeline_str`], fed decoded pictures instead of
+/// compressed video (no decoder of its own).
+pub fn borrowed_view_pipeline_str(hwaccel: HwAccelKind) -> String {
+    shared_view_pipeline_str(hwaccel).replacen(
+        "decodebin",
+        "queue max-size-buffers=2 leaky=downstream",
+        1,
+    )
+}
+
 pub fn mjpeg_pipeline_str(config: &CameraConfig, _hwaccel: HwAccelKind) -> String {
     let effective = url_with_credentials_str(
         &config.url,

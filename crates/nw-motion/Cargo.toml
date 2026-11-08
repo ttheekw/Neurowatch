@@ -1,0 +1,29 @@
+[package]
+name         = "nw-motion"
+version      = "0.2.0"
+edition      = "2021"
+license      = "Apache-2.0"
+rust-version = "1.75"
+publish      = false
+description  = "NeuroWatch motion detection analytics plugin daemon"
+
+[dependencies]
+# The protocol lives in the NeuroWatch repository (a sibling checkout).
+nw-analytics-protocol = { path = "../nw-analytics-protocol" }
+nw-analytics-sdk = { path = "../nw-analytics-sdk" }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+anyhow             = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# GStreamer 0.24 targets GStreamer >= 1.24, as NeuroWatch does.
+gstreamer          = "0.24"
+gstreamer-app      = "0.24"
+gstreamer-video    = "0.24"
+libc = "0.2"
+# PBKDF2 for the access-code file (as NeuroWatch hashes account passwords).
+ring = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_Threading"] }
+

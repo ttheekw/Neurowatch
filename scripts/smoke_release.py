@@ -222,8 +222,12 @@ def smoke(bundle: Path) -> None:
                 "matroskamux",
                 "matroskademux",
                 "mp4mux",
+                "appsrc",
                 "appsink",
                 "decodebin",
+                # The motion plugin's pipelines (nw-motion src/worker.rs).
+                "videoscale",
+                "videoconvert",
                 "avdec_h264",
                 "avdec_h265",
                 "avenc_aac",
@@ -236,7 +240,7 @@ def smoke(bundle: Path) -> None:
                 subprocess.run([inspect, "--exists", plugin], env=media_env, check=True, timeout=30)
             if os.name != "nt":
                 va = subprocess.check_output([inspect, "va"], env=media_env, text=True, timeout=30)
-                assert "1.24.13" in va, va
+                assert release_gstreamer_version() in va, va
             subprocess.run(
                 [
                     str(gst / f"bin/gst-launch-1.0{suffix}"),
@@ -273,6 +277,13 @@ def smoke(bundle: Path) -> None:
                     check=True,
                     timeout=30,
                 )
+            # The bundled motion plugin finds every element its analysis uses.
+            subprocess.run(
+                [str(bundle / f"bin/nw-motion{suffix}"), "--check"],
+                env=media_env,
+                check=True,
+                timeout=60,
+            )
         finally:
             try:
                 ui_command("service", "stop")
@@ -289,6 +300,15 @@ def smoke(bundle: Path) -> None:
                     print(log.name, log.read_text(errors="replace")[-12000:])
         ui_command("service", "status", "--json", expected=3)
         print("Release smoke check passed", flush=True)
+
+
+def release_gstreamer_version() -> str:
+    """The GStreamer version the Linux release builds (build_release_gstreamer.sh)."""
+    script = Path(__file__).resolve().parent / "build_release_gstreamer.sh"
+    for line in script.read_text(encoding="utf-8").splitlines():
+        if line.startswith("GST_VERSION="):
+            return line.split("=", 1)[1].strip()
+    raise RuntimeError(f"no GST_VERSION in {script}")
 
 
 if __name__ == "__main__":

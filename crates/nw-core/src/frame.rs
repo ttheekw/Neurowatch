@@ -2,6 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Identity assigned once by a shared camera stream, before fan-out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameIdentity {
+    pub seq: u64,
+    pub time_us: i64,
+    /// Node receipt clock for live alignment across independently clocked streams.
+    /// Zero for playback/legacy frames, whose presentation timeline remains authoritative.
+    #[serde(default)]
+    pub observed_us: i64,
+}
+
 /// Pixel format of a VideoFrame.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -49,8 +60,17 @@ pub mod shm {
     /// Global ring buffer header size (aligned to 64 bytes).
     pub const HEADER_BYTES: usize = 64;
 
-    /// Total shared memory size per camera.
-    pub const TOTAL_BYTES: usize = HEADER_BYTES + SLOT_COUNT * SLOT_SIZE;
+    /// Optional picture identity trailer. Slot/payload offsets stay compatible
+    /// with older desktop readers; each slot adds seq(u64) + UTC time(i64).
+    pub const FRAME_IDENTITIES_OFFSET: usize = HEADER_BYTES + SLOT_COUNT * SLOT_SIZE;
+    pub const FRAME_IDENTITY_BYTES: usize = 16;
+
+    /// Separate optional observation trailer preserves existing identity offsets.
+    pub const FRAME_OBSERVED_OFFSET: usize =
+        FRAME_IDENTITIES_OFFSET + SLOT_COUNT * FRAME_IDENTITY_BYTES;
+
+    /// Total shared memory size per camera, including both trailers.
+    pub const TOTAL_BYTES: usize = FRAME_OBSERVED_OFFSET + SLOT_COUNT * 8;
 
     /// Shared memory name prefix.
     pub const SHM_PREFIX: &str = "/neurowatch_";

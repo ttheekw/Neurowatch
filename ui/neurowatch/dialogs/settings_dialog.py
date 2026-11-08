@@ -66,8 +66,11 @@ from neurowatch.theme import (
     style_button_box,
 )
 from neurowatch.utils.threads import Worker, retire
-from neurowatch.widgets.form_parts import settings_card
+from neurowatch.widgets.form_parts import Segmented, settings_card
 from neurowatch.widgets.window_chrome import install_dialog_chrome, resize_window
+
+#: ``ui.wall_drawings`` values (``models.analytics.on_wall``).
+WALL_DRAWINGS = ("off", "chosen", "all")
 
 #: Disk threshold shown when it is off or not set (the backend's default).
 DEFAULT_DISK_THRESHOLD_PERCENT = 90
@@ -376,6 +379,7 @@ class SettingsDialog(QDialog):
         set_label_role(preview_hint, "hint")
         preview_form.addRow(preview_hint)
         self._pages["wall"].addWidget(preview_box)
+        self._pages["wall"].addWidget(self._build_wall_drawings())
         self._pages["wall"].addWidget(self._build_decoder())
 
         # ------------------------------------------------------------------
@@ -536,6 +540,49 @@ class SettingsDialog(QDialog):
         self._scan_drives()
         self._read_archive_status()
         self._read_decoder_status()
+
+    def _build_wall_drawings(self) -> QFrame:
+        """Which analytics plugin drawings the video wall shows: none, each
+        camera's choice (motion boxes), or everything, debug included."""
+        card, form = self._card(
+            "Analytics drawings",
+            "What analytics plugins draw over the video wall's cameras. The Plugins tab"
+            " always shows every drawing of the camera it shows.",
+        )
+        self._wall_drawings = Segmented(
+            [("Off", "off"), ("Chosen per camera", "chosen"), ("All, with debug", "all")]
+        )
+        self._wall_drawings.setAccessibleName("Analytics drawings on the video wall")
+        mode = self._config.get("ui", {}).get("wall_drawings", "chosen")
+        self._wall_drawings.set_value(mode if mode in WALL_DRAWINGS else "chosen")
+        form.addRow("On the video wall:", self._wall_drawings)
+        hint = QLabel(
+            "Chosen per camera: what each camera's plugin settings pick (for motion: a box"
+            " around the moving area). All, with debug: also what the plugin sees, such as"
+            " the changed blocks, the zones and the score. Each camera's tile also has its"
+            " own buttons to turn its drawings and counts off and on."
+        )
+        hint.setWordWrap(True)
+        set_label_role(hint, "hint")
+        form.addRow(hint)
+        self._drawings_on_analysed = QCheckBox("Show the pictures the plugin analysed")
+        self._drawings_on_analysed.setChecked(
+            self._config.get("ui", {}).get("drawings_on_analysed", True) is not False
+        )
+        form.addRow(self._drawings_on_analysed)
+        self._show_counts = QCheckBox("Show what plugins count under the video wall")
+        self._show_counts.setChecked(self._config.get("ui", {}).get("show_counts", False) is True)
+        form.addRow(self._show_counts)
+        analysed_hint = QLabel(
+            "While a camera shows a plugin's drawings, its tile shows only the pictures the"
+            " plugin analysed, each with its own boxes: the video runs at the plugin's frame"
+            " rate, slightly behind live, and the boxes sit exactly on what they mark. Off:"
+            " live video, each drawing shown until the next one arrives."
+        )
+        analysed_hint.setWordWrap(True)
+        set_label_role(analysed_hint, "hint")
+        form.addRow(analysed_hint)
+        return card
 
     @staticmethod
     def _card(title: str, subtitle: str = "") -> tuple[QFrame, QFormLayout]:
@@ -1153,6 +1200,9 @@ class SettingsDialog(QDialog):
         cfg["ui"]["fullscreen"] = self._start_fullscreen.isChecked()
         cfg["ui"]["fullscreen_status"] = self._fullscreen_status.isChecked()
         cfg["ui"]["fullscreen_status_opacity"] = int(self._status_opacity.value())
+        cfg["ui"]["wall_drawings"] = str(self._wall_drawings.value() or "chosen")
+        cfg["ui"]["drawings_on_analysed"] = self._drawings_on_analysed.isChecked()
+        cfg["ui"]["show_counts"] = self._show_counts.isChecked()
         cfg["ui"]["preview_fps"] = PreviewFps(
             single=int(self._fps_single.value()),
             wall=int(self._fps_wall.value()),

@@ -1,0 +1,30 @@
+[package]
+name = "nw-analytics-sdk"
+description = "Transport and local picture sharing for NeuroWatch analytics daemons"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nw-analytics-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+memmap2 = { workspace = true }
+getrandom = { version = "0.2", features = ["std"] }
+libc = "0.2"
+subtle = "2.6"
+tokio = { workspace = true }
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["std"] }
+sha2 = "0.10"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "crypto"] }
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading", "Win32_Security", "Win32_Security_Cryptography"] }

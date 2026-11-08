@@ -111,15 +111,16 @@ impl RecordingSupervisor {
         }
     }
 
-    /// Stop recording only when it was started by the global all-cameras setting.
+    /// Stop recording only when it was started by the global all-cameras
+    /// setting. The camera is forgotten, not marked stopped by hand: a manual
+    /// Stop would win over the camera's own Record this camera afterwards.
     pub fn stop_global_all_local(&mut self, cam_id: &CameraId) {
-        if let Some(rec) = self.cameras.get_mut(cam_id) {
-            if rec.state == RecordingState::Starting
-                && rec.source == RecordingSource::GlobalAllLocal
-            {
-                rec.state = RecordingState::Idle;
-                rec.source = RecordingSource::Manual;
-            }
+        if self
+            .cameras
+            .get(cam_id)
+            .is_some_and(|rec| rec.source == RecordingSource::GlobalAllLocal)
+        {
+            self.cameras.remove(cam_id);
         }
     }
 
@@ -235,6 +236,27 @@ mod tests {
         s.start_configured_local(id.clone(), PathBuf::from("/unused"));
         assert!(!s.wants_recording(&id));
         assert!(s.has_manual_override(&id));
+    }
+
+    #[test]
+    fn turning_record_all_off_leaves_cameras_free_to_record_on_their_own() {
+        let id = "camera".to_owned();
+        let mut s = RecordingSupervisor::new();
+        s.start_global_all_local(id.clone(), PathBuf::from("/all"));
+        s.stop_global_all_local(&id);
+        assert!(!s.wants_recording(&id));
+        assert!(!s.has_manual_override(&id));
+        // Record this camera ticked afterwards starts it.
+        s.start_configured_local(id.clone(), PathBuf::from("/own"));
+        assert!(s.wants_recording(&id));
+
+        // Cameras recording for another reason are left alone.
+        let manual = "manual".to_owned();
+        s.start(manual.clone(), PathBuf::from("/manual"));
+        s.stop_global_all_local(&manual);
+        assert!(s.wants_recording(&manual));
+        s.stop_global_all_local(&id);
+        assert!(s.wants_recording(&id));
     }
 
     #[test]

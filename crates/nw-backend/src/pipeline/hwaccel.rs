@@ -635,26 +635,6 @@ fn exclude_plugin_features(registry: &gstreamer::Registry, name: &str) -> usize 
     count
 }
 
-/// Remove every hardware decoder plugin from this process's registry, so
-/// `decodebin` decodes in software (measurements that must not depend on the
-/// machine's GPU). Irreversible for the process: only for a test run alone.
-#[cfg(test)]
-pub(crate) fn remove_hardware_decoders() -> usize {
-    let registry = gstreamer::Registry::get();
-    [
-        "va",
-        "vaapi",
-        "nvcodec",
-        "v4l2codecs",
-        "qsv",
-        "d3d11",
-        "d3d12",
-    ]
-    .into_iter()
-    .map(|plugin| exclude_plugin_features(&registry, plugin))
-    .sum()
-}
-
 /// Rank `factories` above the software decoders (`avdec_*`, primary), so the
 /// `decodebin` of live view and playback picks them too, not only the explicit
 /// `h264_decoder` choice.

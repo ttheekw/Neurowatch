@@ -474,6 +474,9 @@ async fn run_job(node: &CloudNode, source: &ExportSource, job: ExportJob) {
     let path = PathBuf::from(&done.path);
     deliver(node, &export_id, &job, &done, &path).await;
     let _ = tokio::fs::remove_file(&path).await;
+    if let Some(sidecar) = done.analytics_path {
+        let _ = tokio::fs::remove_file(sidecar).await;
+    }
 }
 
 /// Report the local job's progress until it ends; `Some` with its status

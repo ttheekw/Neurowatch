@@ -1,8 +1,10 @@
 //! Allowlisted camera inventory reported to NeuroWatch Cloud.
 //!
 //! Only an opaque camera id, a display name, a coarse status, whether local
-//! recording is on and which of its streams browser live view can forward
-//! (with their codecs once seen) ever leave the node. Stream URLs, credentials,
+//! recording is on, which of its streams browser live view can forward
+//! (with their codecs once seen) and each stream's picture size and measured
+//! frame rate and bitrate (which Cloud Backup qualities fit it) ever leave
+//! the node. Stream URLs, credentials,
 //! network addresses and storage paths are never read into this type; unsafe
 //! display names are replaced rather than sent.
 
@@ -20,7 +22,38 @@ const MAX_NAME_CHARS: usize = 64;
 /// cannot be watched in a browser.
 pub type LiveStreams = BTreeMap<&'static str, Option<&'static str>>;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// A stream's picture size and measured rates, as last seen (`"main"`,
+/// `"sub"`); a stream not seen yet is left out.
+pub type StreamVideos = BTreeMap<&'static str, StreamVideo>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct StreamVideo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Pictures a second, to a tenth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate_bps: Option<u64>,
+}
+
+impl From<crate::streams::VideoFormat> for StreamVideo {
+    fn from(format: crate::streams::VideoFormat) -> Self {
+        Self {
+            width: format.width.filter(|w| (1..=16_384).contains(w)),
+            height: format.height.filter(|h| (1..=16_384).contains(h)),
+            fps: format
+                .fps
+                .filter(|fps| fps.is_finite() && *fps > 0.0 && *fps <= 1000.0)
+                .map(|fps| (fps * 10.0).round() / 10.0),
+            bitrate_bps: format.video_bps.filter(|bps| *bps <= 10_000_000_000),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CameraSnapshot {
     pub camera_id: String,
     pub name: String,
@@ -29,6 +62,10 @@ pub struct CameraSnapshot {
     /// Left out when not known, so the cloud keeps its earlier assumption.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live: Option<LiveStreams>,
+    /// Left out when no stream has been seen yet. (Not `video`: the cloud
+    /// refuses that key anywhere, as a guard against media in reports.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formats: Option<StreamVideos>,
 }
 
 /// Build the cloud snapshot from local config and supervisor states.
@@ -37,7 +74,7 @@ pub fn camera_inventory(
     cameras: &[CameraConfig],
     states: &HashMap<String, String>,
 ) -> Vec<CameraSnapshot> {
-    camera_inventory_with_live(cameras, states, |_| None)
+    camera_inventory_with_live(cameras, states, |_| None, |_| None)
 }
 
 /// [`camera_inventory`], also reporting each camera's live streams.
@@ -45,6 +82,7 @@ pub fn camera_inventory_with_live(
     cameras: &[CameraConfig],
     states: &HashMap<String, String>,
     live: impl Fn(&CameraConfig) -> Option<LiveStreams>,
+    formats: impl Fn(&CameraConfig) -> Option<StreamVideos>,
 ) -> Vec<CameraSnapshot> {
     let cameras = &cameras[..cameras.len().min(MAX_REPORTED_CAMERAS)];
     cameras
@@ -60,6 +98,7 @@ pub fn camera_inventory_with_live(
             // and an offline camera records nothing.
             recording: states.get(&camera.id).map(String::as_str) == Some("recording_ready"),
             live: live(camera),
+            formats: formats(camera).filter(|streams| !streams.is_empty()),
         })
         .collect()
 }

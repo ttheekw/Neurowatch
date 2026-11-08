@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from neurowatch.utils.network import format_bitrate
 from neurowatch.utils.threads import Worker
+from neurowatch.widgets.camera_diagnostics import CameraDiagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -254,11 +255,12 @@ class PerformancePage(QWidget):
             self._gpu_container,
             self._ipc_grid_container,
             self._cameras_container,
-            self._motion_container,
+            self._analytics_container,
             self._bottleneck_container,
         ):
             for child in widget.findChildren(QLabel):
-                text = child.text()
+                # A label shortened with "…" keeps its whole text in `full`.
+                text = getattr(child, "full", None) or child.text()
                 if text:
                     parts.append(text)
         if self._last_error is not None:
@@ -419,32 +421,41 @@ class PerformancePage(QWidget):
         gpu_layout.addLayout(telemetry_layout)
         body_layout.addWidget(self._gpu_container)
 
-        self._cameras_container = self._labeled_section("Per-camera health")
-        self._cameras_body_layout = QVBoxLayout()
-        cameras_wrapper = QWidget()
-        cameras_wrapper.setLayout(self._cameras_body_layout)
-        self._cameras_empty_label = QLabel("No cameras configured.")
-        self._cameras_empty_label.setStyleSheet("color: #7878a0; font-size: 11px;")
-        self._cameras_body_layout.addWidget(self._cameras_empty_label)
-        cameras_section_layout = self._cameras_container.layout()
-        assert cameras_section_layout is not None  # installed by _labeled_section
-        cameras_section_layout.addWidget(cameras_wrapper)
+        self._cameras_container = self._labeled_section("Camera health & connections")
+        cameras_layout = self._cameras_container.layout()
+        assert cameras_layout is not None
+        legend = QLabel(
+            "Connected (green)  ·  Waiting / reconnecting (yellow)  ·  "
+            "Not in use: opens when something needs it (grey)"
+        )
+        legend.setWordWrap(True)
+        legend.setStyleSheet("color: #a5b4c9; font-size: 11px;")
+        cameras_layout.addWidget(legend)
+        self._camera_diagnostics = CameraDiagnostics()
+        cameras_layout.addWidget(self._camera_diagnostics)
+        note = QLabel(
+            "Rates measure incoming compressed payload, excluding network overhead. "
+            "Consumers are backend subscriptions, not people; Web can serve multiple viewers. "
+            "Idle connections close after a short wait. The frame buffer is compressed video "
+            "shared by every consumer; a decoder box marks each place a picture is decoded, and "
+            "a dashed line a plugin using the video wall's pictures instead of decoding again. "
+            "Missing measurements show —."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #a5b4c9; font-size: 11px;")
+        cameras_layout.addWidget(note)
         body_layout.addWidget(self._cameras_container)
 
-        self._motion_container = self._labeled_section("Motion detection")
-        self._motion_label = QLabel("Motion diagnostics unavailable")
-        self._motion_label.setWordWrap(True)
-        self._motion_label.setStyleSheet("color: #a0a0c0; font-size: 11px;")
-        motion_layout = self._motion_container.layout()
-        assert motion_layout is not None  # installed by _labeled_section
-        motion_layout.addWidget(self._motion_label)
-        self._motion_grid_widget = QWidget()
-        self._motion_grid = QGridLayout(self._motion_grid_widget)
-        self._motion_grid.setContentsMargins(0, 0, 0, 0)
-        self._motion_grid.setHorizontalSpacing(18)
-        self._motion_grid.setVerticalSpacing(5)
-        motion_layout.addWidget(self._motion_grid_widget)
-        body_layout.addWidget(self._motion_container)
+        self._analytics_container = self._labeled_section("Analytics plugins")
+        self._analytics_label = QLabel(
+            "Analytics run in separate processes. "
+            "Open Plugins to see their status and camera bindings."
+        )
+        self._analytics_label.setWordWrap(True)
+        analytics_layout = self._analytics_container.layout()
+        assert analytics_layout is not None
+        analytics_layout.addWidget(self._analytics_label)
+        body_layout.addWidget(self._analytics_container)
 
         # Footer with capture timestamp.
         self._captured_label = QLabel("Last capture: —")
@@ -537,7 +548,6 @@ class PerformancePage(QWidget):
         self._gpu_decoder_label.setText("—")
         self._gpu_reason_label.setText(f"error: {reason}")
         self._captured_label.setText("Last capture: never (backend error)")
-        self._motion_label.setText("Motion diagnostics unavailable")
 
     def _render_snapshot(self, snap: dict[str, Any]) -> None:
         # Process
@@ -621,8 +631,11 @@ class PerformancePage(QWidget):
             self._gpu_reason_label.setStyleSheet("font-size: 10px; color: #e0a020;")
 
         # Cameras
-        self._render_cameras(snap.get("cameras") or [])
-        self._render_motion(snap)
+        self._camera_diagnostics.update_snapshot(
+            snap.get("cameras") or [], snap.get("stream_connections"), self._names,
+            plugin_consumers=snap.get("plugin_stream_consumers"),
+            decoder=(snap.get("video_acceleration") or {}).get("label"),
+        )
 
         # Bottleneck
         b = snap.get("bottleneck", {}) or {}
@@ -675,94 +688,6 @@ class PerformancePage(QWidget):
 
     def _name(self, camera_id: object) -> str:
         return self._names.get(str(camera_id), str(camera_id or "?"))
-
-    def _render_motion(self, snap: dict[str, Any]) -> None:
-        while self._motion_grid.count():
-            item = self._motion_grid.takeAt(0)
-            widget = item.widget() if item else None
-            if widget is not None:
-                widget.deleteLater()
-        if "motion_decoders" not in snap:
-            self._motion_label.setText("Motion diagnostics unavailable")
-            return
-        motion = [m for m in snap.get("motion") or [] if isinstance(m, dict)]
-        decoders = snap.get("motion_decoders", 0)
-        self._motion_label.setText(
-            f"{decoders} analysis decoder{'s' if decoders != 1 else ''} running"
-            if motion
-            else "No camera uses NeuroWatch motion detection."
-        )
-        if not motion:
-            return
-        headings = ("Camera", "State", "Mode", "Decoder", "Analysis", "Detector", "Dropped")
-        for column, text in enumerate(headings):
-            label = QLabel(text)
-            label.setStyleSheet("color: #7878a0; font-size: 10px; font-weight: bold;")
-            self._motion_grid.addWidget(label, 0, column)
-        state_colors = {"running": "#4ade80", "connecting": "#60a5fa", "backoff": "#fbbf24"}
-        for row, entry in enumerate(motion, start=1):
-            state = str(entry.get("state", "?"))
-            cells = (
-                self._name(entry.get("camera_id")),
-                state,
-                ("Keyframes only" if entry.get("low_cpu") else "Normal")
-                + (" · substream" if entry.get("using_substream") else " · main stream"),
-                str(entry.get("decoder") or "—"),
-                f"{_fmt_number(entry.get('analysis_fps'))} fps",
-                f"{_fmt_number(entry.get('analysis_ms'))} ms / picture",
-                f"{entry.get('dropped_frames', 0)} ({_fmt_number(entry.get('dropped_fps'))}/s)",
-            )
-            for column, text in enumerate(cells):
-                label = QLabel(text)
-                color = state_colors.get(state, "#f87171") if column == 1 else "#c8c8dc"
-                weight = " font-weight: bold;" if column == 0 else ""
-                label.setStyleSheet(f"color: {color}; font-size: 11px;{weight}")
-                self._motion_grid.addWidget(label, row, column)
-        self._motion_grid.setColumnStretch(len(headings), 1)
-
-    def _render_cameras(self, cams: list[dict[str, Any]]) -> None:
-        # Clear existing rows.
-        while self._cameras_body_layout.count() > 0:
-            item = self._cameras_body_layout.takeAt(0)
-            w = item.widget() if item else None
-            if w is not None:
-                w.deleteLater()
-        if not cams:
-            self._cameras_empty_label = QLabel("No cameras configured.")
-            self._cameras_empty_label.setStyleSheet("color: #7878a0; font-size: 11px;")
-            self._cameras_body_layout.addWidget(self._cameras_empty_label)
-            return
-        for cam in cams:
-            row = QWidget()
-            layout = QGridLayout(row)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.setHorizontalSpacing(12)
-            id_label = QLabel(self._name(cam.get("camera_id")))
-            id_label.setStyleSheet("color: #c8c8dc; font-size: 12px; font-weight: bold;")
-            state_label = QLabel(str(cam.get("state", "?")))
-            state_label.setStyleSheet("color: #a0a0c0; font-size: 11px;")
-            dec = cam.get("decoder_fps")
-            ren = cam.get("renderer_fps")
-            rates_label = QLabel(
-                f"decoder: {_fmt_number(dec)} fps • renderer: {_fmt_number(ren)} fps"
-            )
-            rates_label.setStyleSheet("color: #c8c8dc; font-size: 11px;")
-            drops_label = QLabel(
-                f"drops: decoder {cam.get('decoder_drops', 0)} / "
-                f"renderer {cam.get('renderer_drops', 0)}"
-            )
-            drops_label.setStyleSheet("color: #a0a0c0; font-size: 11px;")
-            e2e = cam.get("end_to_end_latency_ms")
-            latency_label = QLabel(
-                f"end-to-end: {_fmt_number(e2e)} ms" if e2e is not None else "end-to-end: —"
-            )
-            latency_label.setStyleSheet("color: #a0a0c0; font-size: 11px;")
-            layout.addWidget(id_label, 0, 0)
-            layout.addWidget(state_label, 0, 1)
-            layout.addWidget(rates_label, 1, 0, 1, 2)
-            layout.addWidget(drops_label, 2, 0, 1, 2)
-            layout.addWidget(latency_label, 3, 0, 1, 2)
-            self._cameras_body_layout.addWidget(row)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.stop_refresh()

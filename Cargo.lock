@@ -1790,7 +1790,6 @@ dependencies = [
 [[package]]
 name = "libwebrtc"
 version = "0.3.49"
-source = "git+https://github.com/livekit/rust-sdks?rev=5a656c4bc4bc5c4f7fad17ab69044db3b487dfeb#5a656c4bc4bc5c4f7fad17ab69044db3b487dfeb"
 dependencies = [
  "cxx",
  "jni",
@@ -2230,6 +2229,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "nw-analytics-protocol"
+version = "0.1.6"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nw-analytics-sdk"
+version = "0.1.6"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "libc",
+ "memmap2",
+ "nw-analytics-protocol",
+ "quinn",
+ "rcgen",
+ "rustls 0.23.45",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "nw-api"
 version = "0.1.6"
 dependencies = [
@@ -2279,6 +2309,10 @@ dependencies = [
  "livekit-api",
  "md-5",
  "memmap2",
+ "nw-analytics-protocol",
+ "nw-analytics-sdk",
+ "nw-backup-client",
+ "nw-backup-protocol",
  "nw-cloud-protocol",
  "nw-core",
  "rcgen",
@@ -2306,6 +2340,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "nw-backup-client"
+version = "0.1.6"
+dependencies = [
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "nw-backup-protocol",
+ "quinn",
+ "rustls 0.23.45",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tracing",
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "nw-backup-protocol"
+version = "0.1.6"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "nw-cloud-protocol"
 version = "0.1.6"
 dependencies = [
@@ -2325,6 +2389,25 @@ dependencies = [
  "time",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "nw-motion"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "gstreamer",
+ "gstreamer-app",
+ "gstreamer-video",
+ "libc",
+ "nw-analytics-protocol",
+ "nw-analytics-sdk",
+ "ring",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3611,6 +3694,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,7 +28,9 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from neurowatch.cloud.tray import tray_status as cloud_tray_status
 from neurowatch.ipc.alert_feed import AlertFeedWorker
+from neurowatch.models.backup_status import backup_problems, backup_summary
 from neurowatch.models.camera import connection_status
+from neurowatch.models.plugins import offline_plugin_names
 from neurowatch.service import probe
 from neurowatch.service.lock import InstanceLock
 from neurowatch.service.manager import ServiceController
@@ -171,13 +173,17 @@ def find_problems(
     online: int,
     recording: Mapping[str, Any],
     performance: Any,
+    plugins_offline: Sequence[str] = (),
 ) -> tuple[Problem, ...]:
-    """What needs attention: cameras offline, recordings that failed, and
-    diagnostics warnings. Extensions add their own (see ``read_status``)."""
+    """What needs attention: cameras offline, recordings that failed,
+    analytics plugins that stopped answering (by name), and diagnostics
+    warnings. The cloud adds its own (see ``read_status``)."""
     problems: list[Problem] = []
     offline = cameras - online
     if offline > 0:
         problems.append(Problem(f"{_plural(offline, 'camera')} offline"))
+    for name in plugins_offline:
+        problems.append(Problem(f"Plugin offline: {name}"))
     failed = sum(1 for state in recording.values() if state == "failed")
     if failed:
         problems.append(Problem(f"Recording failed on {_plural(failed, 'camera')}"))
@@ -209,8 +215,14 @@ def read_status(
     cameras = int(system.get("cameras") or len(states))
     online = sum(1 for state in states.values() if connection_status(str(state)) == "streaming")
     cloud = cloud_tray_status(request, target)
+    plugins_offline = offline_plugin_names(system)
     details = [cloud.detail] if cloud.detail else []
     extra_problems = [Problem(label, explanation) for label, explanation in cloud.problems]
+    # Cloud Backup failing on a camera (the recorder keeps trying).
+    extra_problems += [
+        Problem(label, explanation)
+        for label, explanation in backup_problems(backup_summary(system))
+    ]
     return ServiceStatus(
         running=True,
         site=str(system.get("site_name") or ""),
@@ -226,6 +238,7 @@ def read_status(
             online=online,
             recording=recording,
             performance=performance,
+            plugins_offline=plugins_offline,
         )
         + tuple(extra_problems),
     )

@@ -17,7 +17,7 @@ use super::CameraHealthSource;
 
 /// Lock-free per-camera counters. Written from the GStreamer callback and
 /// from the SHM writer, read from the aggregator.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct HealthCounters {
     /// Compressed access units received by the camera's ingest (recording),
     /// whether or not anything decodes them.
@@ -31,6 +31,20 @@ pub struct HealthCounters {
     /// State string is small and rarely written; separate mutex avoids
     /// dragging an atomic pointer dance into the hot path.
     state: Mutex<String>,
+}
+
+impl Default for HealthCounters {
+    fn default() -> Self {
+        Self {
+            ingested_units: AtomicU64::new(0),
+            decoded_frames: AtomicU64::new(0),
+            rendered_frames: AtomicU64::new(0),
+            decoder_drops: AtomicU64::new(0),
+            renderer_drops: AtomicU64::new(0),
+            last_end_to_end_us: AtomicI64::new(-1),
+            state: Mutex::new(String::new()),
+        }
+    }
 }
 
 impl HealthCounters {

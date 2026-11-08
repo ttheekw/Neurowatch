@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neurowatch.models.events import EVENT_LABELS, Event
+from neurowatch.models.events import EVENT_LABELS, PLAYBACK_KINDS, Event
 from neurowatch.theme import active_colors, set_button_variant, set_label_role
 from neurowatch.widgets.event_list import EventImageLoader, EventListView
 from neurowatch.widgets.event_preview import EventPreview
@@ -73,7 +73,7 @@ class PlaybackEventsPane(QWidget):
         self._kind = QComboBox()
         self._kind.addItem("All types", "")
         for kind, name in EVENT_LABELS.items():
-            if kind not in ("disk_low", "storage_missing", "backend_started"):
+            if kind in PLAYBACK_KINDS:
                 self._kind.addItem(name, kind)
         self._kind.setAccessibleName("Playback event type")
         for field in (self._camera, self._kind):

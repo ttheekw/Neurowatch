@@ -111,6 +111,30 @@ def test_selected_preview_shows_metadata_as_plain_text(qtbot, monkeypatch):
     assert workers.made[0].endpoint == "unix:/tmp/selected.sock"
 
 
+def test_plugin_events_name_their_plugin(qtbot, monkeypatch):
+    from neurowatch.models.events import Event
+    from neurowatch.widgets.event_list import EventImageLoader
+    from neurowatch.widgets.event_preview import EventPreview
+
+    _FakeWorkers(monkeypatch)
+    preview = EventPreview(EventImageLoader(None))
+    qtbot.addWidget(preview)
+    preview.show()
+    event = Event.from_dict(
+        {
+            "id": 2,
+            "kind": "motion",
+            "camera_id": "c",
+            "start_ms": 1000,
+            "end_ms": 4000,
+            "source": "plugin",
+            "topic": "nw.motion",
+        }
+    )
+    preview.set_event(event, "Gate")
+    assert "Source: Analytics plugin (nw.motion)" in preview.details_text()
+
+
 def test_events_without_saved_pictures_ask_nothing(qtbot, monkeypatch):
     from neurowatch.models.events import Event
     from neurowatch.widgets.event_list import EventImageLoader

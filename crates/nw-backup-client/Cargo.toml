@@ -1,0 +1,29 @@
+[package]
+name        = "nw-backup-client"
+description = "The recorder's side of NeuroWatch Cloud Backup: unconfirmed units, outage folder, QUIC and TLS-over-TCP sessions"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+rust-version.workspace = true
+
+# Used by nw-backend and by the ingest's end-to-end tests: no GStreamer and
+# no NeuroWatch crates beyond the protocol.
+[dependencies]
+nw-backup-protocol = { workspace = true }
+tokio         = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+quinn         = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls        = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls  = { version = "0.26", default-features = false, features = ["ring"] }
+webpki-roots  = "1"
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["std"] }
+getrandom     = { version = "0.2", features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -104,7 +104,7 @@ class StatusIndicator(QLabel):
     lack them. The mark takes the text's colour (``color:`` in a style
     sheet). Extensions use it for their indicators too."""
 
-    MARKS = ("dot", "square", "diamond", "ring", "alert")
+    MARKS = ("dot", "square", "diamond", "ring", "alert", "cloud")
     _MARK_WIDTH = 8
     _GAP = 5
 
@@ -177,8 +177,31 @@ class StatusIndicator(QLabel):
                 QPointF(center.x(), center.y() - r + 2), QPointF(center.x(), center.y() + 0.5)
             )
             painter.drawPoint(QPointF(center.x(), center.y() + r - 1.8))
+        elif self._mark == "cloud":
+            _paint_cloud(painter, center, r)
         else:
             painter.drawEllipse(center, r - 1, r - 1)
+
+
+def _paint_cloud(painter: QPainter, center: QPointF, r: float) -> None:
+    """A filled cloud with an upward arrow cut out of it (Cloud Backup), in
+    the pen's brush; ``r`` is half the mark's width."""
+    from PySide6.QtGui import QPainterPath
+
+    h = r * 0.62  # the cloud is wider than tall
+    cloud = QPainterPath()
+    cloud.addRoundedRect(
+        QRectF(center.x() - r, center.y() - h * 0.1, 2 * r, h * 1.1), h * 0.55, h * 0.55
+    )
+    cloud.addEllipse(QPointF(center.x() - r * 0.3, center.y() - h * 0.05), r * 0.45, r * 0.45)
+    cloud.addEllipse(QPointF(center.x() + r * 0.25, center.y() - h * 0.3), r * 0.55, r * 0.55)
+    painter.drawPath(cloud.simplified())
+    painter.setPen(QPen(QColor(_BG), max(1.2, r * 0.22)))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    tip = QPointF(center.x(), center.y() - h * 0.55)
+    painter.drawLine(QPointF(center.x(), center.y() + h * 0.85), tip)
+    painter.drawLine(tip, QPointF(center.x() - r * 0.32, tip.y() + r * 0.32))
+    painter.drawLine(tip, QPointF(center.x() + r * 0.32, tip.y() + r * 0.32))
 
 
 class StatusBarWidget(QWidget):

@@ -243,6 +243,18 @@ impl EventsHandler {
             ongoing,
             search,
             search_cameras,
+            source: match &params["source"] {
+                Value::Null => None,
+                Value::String(name) => Some(EventSource::parse(name).ok_or_else(|| {
+                    RpcError::invalid_params(format!("Unknown event source '{name}'"))
+                })?),
+                _ => return Err(RpcError::invalid_params("'source' must be text")),
+            },
+            topic: match &params["topic"] {
+                Value::Null => None,
+                Value::String(topic) if topic.len() <= 256 => Some(topic.clone()),
+                _ => return Err(RpcError::invalid_params("'topic' must be text")),
+            },
             limit: params["limit"]
                 .as_u64()
                 .map_or(100, |limit| limit.min(u64::from(store::MAX_LIST)) as u32),
@@ -525,7 +537,7 @@ impl EventsHandler {
                 "Choose one camera for an analysis preview",
             ));
         }
-        let (cameras, hub, onvif, builtin) = {
+        let (cameras, hub, onvif) = {
             let st = self.state.read().await;
             let cameras: Vec<(String, MotionSource)> = st
                 .config
@@ -538,7 +550,6 @@ impl EventsHandler {
                 cameras,
                 Arc::clone(&st.events),
                 Arc::clone(&st.onvif_events),
-                Arc::clone(&st.builtin_motion),
             )
         };
         let mut active: HashMap<String, Vec<&'static str>> = HashMap::new();
@@ -558,23 +569,12 @@ impl EventsHandler {
                     .filter_map(|topic| onvif_events::tracker::classify(topic))
                     .map(EventKind::as_str)
                     .collect();
-                if source.uses_builtin() {
-                    kinds.push("motion");
-                }
                 kinds.sort_unstable();
                 kinds.dedup();
-                let (builtin_status, preview) =
-                    builtin.snapshot(&id, include_preview && source.uses_builtin());
-                let mut status = json!({
-                    "source": source,
-                    "onvif": camera_status,
-                    "builtin": builtin_status,
-                    "kinds": kinds,
-                    "active": active.remove(&id).unwrap_or_default(),
+                let status = json!({
+                    "source":source,"onvif":camera_status,"kinds":kinds,
+                    "active":active.remove(&id).unwrap_or_default(),
                 });
-                if include_preview && source.uses_builtin() {
-                    status["preview"] = preview.unwrap_or(Value::Null);
-                }
                 (id, status)
             })
             .collect();
@@ -648,7 +648,7 @@ fn apply_motion_params(motion: &mut CameraMotionConfig, params: &Value) -> Resul
     if !params["source"].is_null() {
         merged["enabled"] = Value::Bool(false);
     }
-    *motion = crate::motion::validate_settings(&merged).map_err(RpcError::invalid_params)?;
+    *motion = crate::onvif_events::validate_settings(&merged).map_err(RpcError::invalid_params)?;
     Ok(())
 }
 
@@ -674,12 +674,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn motion_preview_requires_one_camera_and_low_cpu_updates_preserve_other_fields() {
+    async fn camera_status_has_no_builtin_preview_and_rejects_removed_sources() {
         let (handler, state, _dir) = handler();
         let first = handler
             .dispatch(
                 "motion.configure",
-                &json!({"camera_id":"cam-1", "source":"builtin", "sensitivity":8, "low_cpu":true}),
+                &json!({"camera_id":"cam-1", "source":"onvif", "sensitivity":8, "low_cpu":true}),
             )
             .await
             .unwrap();

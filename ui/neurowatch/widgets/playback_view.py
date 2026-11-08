@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable
 
 from PySide6.QtCore import QDateTime, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut, QShowEvent
+from PySide6.QtGui import QActionGroup, QCloseEvent, QKeySequence, QShortcut, QShowEvent
 from PySide6.QtWidgets import (
     QDateTimeEdit,
     QGridLayout,
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -39,7 +40,9 @@ from PySide6.QtWidgets import (
 
 from neurowatch.ipc.event_feed import read_events
 from neurowatch.ipc.frame_reader import FrameReaderThread
+from neurowatch.ipc.playback_analytics import PlaybackAnalytics
 from neurowatch.ipc.sync_client import SyncIpcClient
+from neurowatch.models.analytics import MarkingHold
 from neurowatch.models.camera import CameraConfig
 from neurowatch.models.events import PLAYBACK_KINDS, Event, zone_names
 from neurowatch.models.playback_controls import enqueue_controls
@@ -53,6 +56,7 @@ from neurowatch.theme import (
 )
 from neurowatch.utils.threads import Worker, retire
 from neurowatch.widgets.cell_widget import AUDIO_AVAILABLE, AUDIO_NONE, AUDIO_ON, CellWidget
+from neurowatch.widgets.figures_legend import FiguresLegend
 from neurowatch.widgets.playback_events import PlaybackEventsPane
 from neurowatch.widgets.playback_timeline import PlaybackTimeline
 from neurowatch.widgets.wheel_guard import guard_wheel
@@ -202,6 +206,13 @@ class PlaybackView(QWidget):
 
         self._worker: _IpcWorker | None = None
         self._bg_workers: set[_IpcWorker] = set()
+        self._analytics = PlaybackAnalytics(self._ipc_endpoint(), self)
+        self._marking_hold = MarkingHold()
+        self._analytics.ready.connect(self._redraw_history)
+        self._frame_times: dict[str, int] = {}
+        self._camera_by_session: dict[str, str] = {}
+        # Recordings play as recorded; plugin drawings are opt-in (Drawings menu).
+        self._drawing_mode = "off"
         self._motion_worker: _MotionEventsWorker | None = None
         self._motion_load_id = 0
         self._motion_recent_updates: dict[int, Event] = {}
@@ -379,8 +390,16 @@ class PlaybackView(QWidget):
         self._grid_layout = QGridLayout(self._grid_container)
         self._grid_layout.setSpacing(2)
         self._grid_layout.setContentsMargins(2, 2, 2, 2)
+        # The pictures, with the key to their drawings under them.
+        self._picture_column = QWidget()
+        picture_layout = QVBoxLayout(self._picture_column)
+        picture_layout.setContentsMargins(0, 0, 0, 0)
+        picture_layout.setSpacing(0)
+        picture_layout.addWidget(self._grid_container, 1)
+        self._drawings_key = FiguresLegend()
+        picture_layout.addWidget(self._drawings_key)
         self._media_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._media_splitter.addWidget(self._grid_container)
+        self._media_splitter.addWidget(self._picture_column)
         self._events_pane = PlaybackEventsPane(self._ipc_endpoint())
         self._events_pane.seek_requested.connect(self._review_event)
         self._events_pane.export_requested.connect(self.export_requested)
@@ -424,6 +443,26 @@ class PlaybackView(QWidget):
         set_label_role(timeline_title, "sectionTitle")
         timeline_heading.addWidget(timeline_title)
         timeline_heading.addSpacing(10)
+        drawing_button = QPushButton("Drawings")
+        drawing_button.setAccessibleName("Analytics drawings in playback")
+        set_button_variant(drawing_button, "secondary")
+        drawing_menu = QMenu(drawing_button)
+        drawing_choices = QActionGroup(drawing_menu)
+        drawing_choices.setExclusive(True)
+        for label, mode in [
+            ("Off", "off"),
+            ("Chosen per camera", "chosen"),
+            ("All, with debug", "all"),
+        ]:
+            action = drawing_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(mode == self._drawing_mode)
+            drawing_choices.addAction(action)
+            action.triggered.connect(
+                lambda _checked=False, value=mode: self._set_drawing_mode(value)
+            )
+        drawing_button.setMenu(drawing_menu)
+        timeline_heading.addWidget(drawing_button)
         self._events_toggle = QPushButton("Event List")
         self._events_toggle.setCheckable(True)
         self._events_toggle.setFocusPolicy(Qt.FocusPolicy.TabFocus)
@@ -874,10 +913,14 @@ class PlaybackView(QWidget):
             if self._active_playhead_ms is not None:
                 cell.set_overlay_timestamp(self._active_playhead_ms)
             self._cells[session_id] = cell
+            self._camera_by_session[session_id] = cam_id
 
             # Start frame reader using shm_key (neurowatch_{shm_key} ring; see frame_reader)
             reader = FrameReaderThread(shm_key, max_emit_fps=target_fps)
-            reader.frame_ready.connect(self._on_frame)
+            if hasattr(reader, "identified_frame_ready"):
+                reader.identified_frame_ready.connect(self._on_identified_frame)
+            else:
+                reader.frame_ready.connect(self._on_frame)
             reader.start()
             self._readers[session_id] = reader
 
@@ -929,6 +972,51 @@ class PlaybackView(QWidget):
     # Frame routing
     # ------------------------------------------------------------------
 
+    def _set_drawing_mode(self, mode: str) -> None:
+        self._drawing_mode = mode
+        if mode == "off":
+            self._marking_hold.clear()
+        self._redraw_history()
+        if mode != "off" and self._active_playhead_ms is not None:
+            self._analytics.request(list(self._sessions), self._active_playhead_ms)
+
+    def apply_key_theme(self, theme_name: str | None = None) -> None:
+        self._drawings_key.apply_theme(theme_name)
+
+    def _redraw_history(self) -> None:
+        now = time.monotonic()
+        for session_id, cell in self._cells.items():
+            camera = self._camera_by_session.get(session_id)
+            at = self._frame_times.get(session_id, self._active_playhead_ms)
+            window = self._analytics.window
+            drawings = (
+                window.at(camera, at, self._drawing_mode)
+                if window and camera and at is not None
+                else []
+            )
+            cell.set_drawings(drawings)
+            self._marking_hold.update({session_id: drawings}, now)
+        self._drawings_key.set_markings(self._marking_hold.shown(self._cells, now))
+
+    def _on_identified_frame(
+        self,
+        shm_id: str,
+        data: bytes,
+        width: int,
+        height: int,
+        fmt: str,
+        seq: int,
+        capture_us: int,
+        observed_us: int = 0,
+    ) -> None:
+        session = shm_id.removeprefix("pb_")
+        if capture_us:
+            self._frame_times[session] = capture_us // 1000
+        cell = self._cells.get(session)
+        if cell:
+            cell.set_frame_identity(seq, capture_us, observed_us)
+        self._on_frame(shm_id, data, width, height, fmt)
+
     def _on_frame(self, shm_id: str, data: bytes, width: int, height: int, fmt: str) -> None:
         # shm_id == shm_key == "pb_{session_id}"
         # Derive session_id from shm_key
@@ -938,6 +1026,7 @@ class PlaybackView(QWidget):
             fps = self._measure_fps(session_id)
             cell.set_stream_info(f"{width}×{height}", fps)
             cell.update_frame(data, width, height, fmt)
+            self._redraw_history()
 
     def _measure_fps(self, session_id: str) -> float | None:
         """Frames shown per second, over windows of about a second."""
@@ -968,6 +1057,8 @@ class PlaybackView(QWidget):
 
     def _on_playhead_changed(self, ts_ms: int) -> None:
         self._active_playhead_ms = ts_ms
+        if self._drawing_mode != "off":
+            self._analytics.request(list(self._sessions), ts_ms)
         for cell in self._cells.values():
             cell.set_overlay_timestamp(ts_ms)
 
@@ -1149,11 +1240,16 @@ class PlaybackView(QWidget):
                 except Exception:
                     pass
         self._sessions.clear()
+        self._analytics.reset()
+        self._frame_times.clear()
+        self._camera_by_session.clear()
         self._frame_counts.clear()
         self._active_playhead_ms = None
 
         # Clean up cells
         self._cells.clear()
+        self._marking_hold.clear()
+        self._drawings_key.set_markings(())
         self._clear_grid()
         self._show_placeholder("Select cameras and a time range, then click  ▶ Load Recordings")
 

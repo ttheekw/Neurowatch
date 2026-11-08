@@ -34,8 +34,9 @@ server, monitor count/scaling and installed artifact for each machine.
 
 For every row, confirm **Diagnostics → Active decoder** names the intended
 hardware decoder. A software-decoder pass is not evidence for VA-API or NVDEC.
-The Linux bundle's `va` plugin must report 1.24.13; versions 1.24.0–1.24.5 are
-release blockers.
+The Linux bundle's `va` plugin must report the bundled version (1.28.8,
+`GST_VERSION` in `scripts/build_release_gstreamer.sh`; the smoke check asserts
+it); versions 1.24.0–1.24.5 are release blockers.
 
 ## Install, upgrade and removal
 
