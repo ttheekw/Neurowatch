@@ -292,7 +292,9 @@ mod tests {
     #[tokio::test]
     async fn a_portal_thumbnail_comes_from_a_stream_already_open() {
         use crate::streams::{Delivery, StreamHubs, SubscriberPolicy};
-        let fixture = crate::streams::testing::CameraFile::new(150);
+        // 30 s of video: a shorter one could end before the picture is asked for
+        // on a loaded machine (coverage builds), leaving no open stream.
+        let fixture = crate::streams::testing::CameraFile::new(750);
         let hubs = StreamHubs::default();
         let mut camera = fixture.camera.clone();
         let open = camera.url.clone();
@@ -314,6 +316,12 @@ mod tests {
         })
         .await
         .unwrap();
+        // The stream is marked streaming by its poll after its first unit:
+        // wait for that, not only for a unit, or this races it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while hubs.streaming_source(&camera).is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let thumbnails = Thumbnails::new(std::sync::Arc::new(KeyframeStore::default()));
         let started = Instant::now();
         let jpeg = thumbnails.fetch(&camera, &hubs).await;

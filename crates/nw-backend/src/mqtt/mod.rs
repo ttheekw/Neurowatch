@@ -530,6 +530,9 @@ fn describe(error: &ConnectionError) -> String {
 }
 
 #[cfg(test)]
+mod test_broker;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -556,6 +559,30 @@ mod tests {
             return;
         };
         let (host, port) = broker.rsplit_once(':').unwrap();
+        discovery_states_events_and_goodbye(host, port).await;
+    }
+
+    /// The same, against the tests' own small broker (`test_broker.rs`), so
+    /// it always runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_broker_receives_discovery_states_events_and_goodbye() {
+        let port = super::test_broker::start().await;
+        discovery_states_events_and_goodbye("127.0.0.1", &port.to_string()).await;
+    }
+
+    #[tokio::test]
+    async fn testing_the_settings_against_a_broker_succeeds() {
+        let port = super::test_broker::start().await;
+        let config = MqttConfig {
+            enabled: true,
+            host: "127.0.0.1".into(),
+            port,
+            ..MqttConfig::default()
+        };
+        MqttService::test(&config).await.unwrap();
+    }
+
+    async fn discovery_states_events_and_goodbye(host: &str, port: &str) {
         let prefix = format!("nwtest{}", std::process::id());
         let mut config = crate::config::AppConfig::default();
         let mut camera =

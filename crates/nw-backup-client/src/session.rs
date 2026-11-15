@@ -392,11 +392,17 @@ async fn connected_session(
     }
 }
 
-/// Renew at two thirds of the ticket's life.
+/// Renew at two thirds of the ticket's life, and within a day whatever its
+/// times say: a ticket with absurd times must not overflow (a panic in debug
+/// builds, a wrapped deadline in release ones).
 fn renewal_instant(claims: &Ticket) -> Instant {
-    let life = (claims.expires_at_ms - claims.issued_at_ms).max(0);
-    let at = claims.issued_at_ms + life * 2 / 3;
-    let left = (at - now_us() / 1000).max(1_000);
+    const MOST_MS: i64 = 24 * 60 * 60 * 1000;
+    let life = claims
+        .expires_at_ms
+        .saturating_sub(claims.issued_at_ms)
+        .clamp(0, i64::MAX / 2);
+    let at = claims.issued_at_ms.saturating_add(life / 3 * 2);
+    let left = at.saturating_sub(now_us() / 1000).clamp(1_000, MOST_MS);
     Instant::now() + Duration::from_millis(left as u64)
 }
 
@@ -547,4 +553,48 @@ fn proves_instance(assignment: &crate::Assignment, binding: &[u8], proof: Option
         &nw_service_protocol::instance_proof_payload(&assignment.ticket, binding),
         proof,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ticket(issued_at_ms: i64, expires_at_ms: i64) -> Ticket {
+        Ticket {
+            v: 1,
+            id: "t".into(),
+            org_id: "o".into(),
+            node_id: "n".into(),
+            node_key: "00".repeat(32),
+            audience: "a".into(),
+            issued_at_ms,
+            expires_at_ms,
+            cameras: vec![],
+        }
+    }
+
+    #[test]
+    fn renewal_comes_at_two_thirds_of_a_tickets_life_and_never_overflows() {
+        let now = now_us() / 1000;
+        let soon = renewal_instant(&ticket(now, now + 15 * 60 * 1000));
+        let left = soon.saturating_duration_since(Instant::now());
+        assert!(
+            left > Duration::from_secs(9 * 60) && left <= Duration::from_secs(10 * 60),
+            "{left:?}"
+        );
+        // Absurd times: a day at most, at least a second, and no panic.
+        for (issued, expires) in [
+            (0, i64::MAX),
+            (i64::MIN, i64::MAX),
+            (i64::MAX, i64::MIN),
+            (now, now - 1),
+        ] {
+            let at = renewal_instant(&ticket(issued, expires));
+            let left = at.saturating_duration_since(Instant::now());
+            assert!(
+                left <= Duration::from_secs(24 * 60 * 60),
+                "{issued} {expires}: {left:?}"
+            );
+        }
+    }
 }
