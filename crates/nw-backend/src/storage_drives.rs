@@ -1,8 +1,13 @@
 //! Drives a recording location can be chosen from, for remote configuration.
 //!
 //! The web portal never names a path: it picks one of the mounted drives this
-//! scan reports, and recordings go to `<drive>/nw-storage`. Only real disk
-//! partitions are listed (no pseudo, network, loop or boot filesystems).
+//! scan reports, and recordings go to `<drive>/nw-storage`. On the drive that
+//! holds the user's home folder, when its top cannot be written (`/` on Linux),
+//! they go to `~/Videos/neurowatch` instead (2026-11-15: choosing the system
+//! drive failed with "cannot create /nw-storage: permission denied"). Each
+//! listed drive says where it would record (`folder`) and whether NeuroWatch
+//! can write there (`writable`). Only real disk partitions are listed (no
+//! pseudo, network, loop or boot filesystems).
 
 use std::path::{Path, PathBuf};
 
@@ -41,6 +46,10 @@ pub struct Drive {
     pub recommended: bool,
     /// The current recording location is on this drive.
     pub selected: bool,
+    /// Where recordings go if this drive is chosen.
+    pub folder: String,
+    /// NeuroWatch can create and write that folder.
+    pub writable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,6 +368,11 @@ fn drives_on(
             let (total_bytes, available_bytes) = space(&mount.mount_point)?;
             Some(Drive {
                 recommended: total_bytes >= RECOMMENDED_MIN_BYTES,
+                folder: Path::new(&mount.mount_point)
+                    .join(STORAGE_FOLDER)
+                    .to_string_lossy()
+                    .into_owned(),
+                writable: true,
                 mount_point: mount.mount_point,
                 device: mount.device,
                 filesystem: mount.filesystem,
@@ -376,10 +390,69 @@ fn drives_on(
     drives
 }
 
+/// Where recordings go on `drive`, and whether NeuroWatch can write there:
+/// `<drive>/nw-storage` when it exists writable or the drive's top can be
+/// written; else, on the drive holding `home`, `home/Videos/neurowatch` (the
+/// default location). A drive whose top only an administrator can write has
+/// no usable folder otherwise.
+pub(crate) fn folder_on(
+    drives: &[Drive],
+    drive: &Drive,
+    home: Option<&Path>,
+    can_write: &dyn Fn(&Path) -> bool,
+) -> (PathBuf, bool) {
+    let top = Path::new(&drive.mount_point).join(STORAGE_FOLDER);
+    if if top.is_dir() {
+        can_write(&top)
+    } else {
+        can_write(Path::new(&drive.mount_point))
+    } {
+        return (top, true);
+    }
+    if let Some(home) = home {
+        if drive_of(drives, home).is_some_and(|d| d.mount_point == drive.mount_point) {
+            let folder = home.join("Videos").join("neurowatch");
+            let nearest = folder.ancestors().find(|p| p.exists()).unwrap_or(home);
+            return (folder.clone(), can_write(nearest));
+        }
+    }
+    (top, false)
+}
+
+/// Fill each drive's `folder` and `writable` (see [`folder_on`]).
+fn with_folders(mut drives: Vec<Drive>) -> Vec<Drive> {
+    let home = dirs::home_dir();
+    let snapshot = drives.clone();
+    for drive in &mut drives {
+        let (folder, writable) = folder_on(&snapshot, drive, home.as_deref(), &writable_by_us);
+        drive.folder = folder.to_string_lossy().into_owned();
+        drive.writable = writable;
+    }
+    drives
+}
+
+/// Whether this process may create entries in `path`.
+#[cfg(not(windows))]
+fn writable_by_us(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a valid NUL-terminated string; access() only reads it.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
+/// Windows lets ordinary users create folders at a fixed drive's top; the
+/// write test in [`prepare_on`] reports the rare drive that refuses.
+#[cfg(windows)]
+fn writable_by_us(_path: &Path) -> bool {
+    true
+}
+
 /// Mounted drives a recording location can be put on. Unless `all`, only
 /// drives of at least [`RECOMMENDED_MIN_BYTES`] (and the current one).
 pub fn list(all: bool, current_storage: &Path) -> Result<Vec<Drive>, String> {
-    let drives = drives_on(mounted_disks()?, space, current_storage);
+    let drives = with_folders(drives_on(mounted_disks()?, space, current_storage));
     Ok(drives
         .into_iter()
         .filter(|drive| all || drive.recommended || drive.selected)
@@ -389,15 +462,15 @@ pub fn list(all: bool, current_storage: &Path) -> Result<Vec<Drive>, String> {
 /// Create `<mount_point>/nw-storage` on a drive the scan reports and check it
 /// can be written. Any other path is refused.
 pub fn prepare(mount_point: &str) -> Result<PathBuf, String> {
-    let drives = drives_on(mounted_disks()?, space, Path::new(""));
+    let drives = with_folders(drives_on(mounted_disks()?, space, Path::new("")));
     prepare_on(&drives, mount_point)
 }
 
 pub(crate) fn prepare_on(drives: &[Drive], mount_point: &str) -> Result<PathBuf, String> {
-    if !drives.iter().any(|drive| drive.mount_point == mount_point) {
+    let Some(drive) = drives.iter().find(|drive| drive.mount_point == mount_point) else {
         return Err("that drive is not available on this recorder".to_owned());
-    }
-    let folder = Path::new(mount_point).join(STORAGE_FOLDER);
+    };
+    let folder = PathBuf::from(&drive.folder);
     let denied = |error: std::io::Error| {
         if error.kind() == std::io::ErrorKind::PermissionDenied {
             format!(
@@ -484,6 +557,8 @@ server:/share /mnt/nas nfs4 rw 0 0
             available_bytes: 1,
             recommended: false,
             selected: false,
+            folder: dir.join(STORAGE_FOLDER).to_string_lossy().into_owned(),
+            writable: true,
         }];
 
         assert!(prepare_on(&drives, "/etc").is_err());
@@ -493,6 +568,42 @@ server:/share /mnt/nas nfs4 rw 0 0
         assert!(folder.is_dir());
         assert!(!folder.join(".nw-write-test").exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn drive(mount: &str) -> Drive {
+        Drive {
+            mount_point: mount.into(),
+            device: "/dev/sdz1".into(),
+            filesystem: "ext4".into(),
+            total_bytes: 1,
+            available_bytes: 1,
+            recommended: true,
+            selected: false,
+            folder: String::new(),
+            writable: false,
+        }
+    }
+
+    #[test]
+    fn the_system_drive_records_under_home_when_its_top_is_not_writable() {
+        let drives = vec![drive("/"), drive("/media/big")];
+        let home = Path::new("/home/ubuntu");
+        let only_home = |p: &Path| p.starts_with("/home") || p.starts_with("/media/big");
+        let (folder, writable) = folder_on(&drives, &drives[0], Some(home), &only_home);
+        assert_eq!(folder, Path::new("/home/ubuntu/Videos/neurowatch"));
+        assert!(writable);
+        let (folder, writable) = folder_on(&drives, &drives[1], Some(home), &only_home);
+        assert_eq!(folder, Path::new("/media/big/nw-storage"));
+        assert!(writable);
+    }
+
+    #[test]
+    fn a_drive_only_root_can_write_is_marked_not_writable() {
+        let drives = vec![drive("/"), drive("/mnt/locked")];
+        let home = Path::new("/home/ubuntu");
+        let (folder, writable) = folder_on(&drives, &drives[1], Some(home), &|_: &Path| false);
+        assert_eq!(folder, Path::new("/mnt/locked/nw-storage"));
+        assert!(!writable);
     }
 
     #[test]

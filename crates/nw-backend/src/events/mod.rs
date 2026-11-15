@@ -211,11 +211,7 @@ impl EventHub {
             );
         }
         for event in self.open_events().into_iter().filter(|event| {
-            event.camera_id.as_deref() == Some(camera_id)
-                && matches!(
-                    event.kind,
-                    EventKind::Motion | EventKind::Intrusion | EventKind::LineCrossing
-                )
+            event.camera_id.as_deref() == Some(camera_id) && event.kind.is_activity()
         }) {
             self.end(event.id);
         }

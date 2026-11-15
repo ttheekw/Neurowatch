@@ -52,6 +52,10 @@ class Drive:
     recommended: bool
     #: The backend records to this drive now.
     selected: bool
+    #: Where choosing it records to (empty from older backends: ``<drive>/<folder>``).
+    folder: str = ""
+    #: NeuroWatch can write that folder (older backends: assumed).
+    writable: bool = True
 
     @classmethod
     def from_json(cls, value: dict) -> Drive:
@@ -63,6 +67,8 @@ class Drive:
             available_bytes=int(value.get("available_bytes", 0)),
             recommended=bool(value.get("recommended", False)),
             selected=bool(value.get("selected", False)),
+            folder=str(value.get("folder") or ""),
+            writable=bool(value.get("writable", True)),
         )
 
 
@@ -89,6 +95,8 @@ class StorageScan:
 
     def folder_on(self, drive: Drive) -> str:
         """The recording folder a drive gets when chosen."""
+        if drive.folder:
+            return drive.folder
         if ntpath.splitdrive(drive.mount_point)[0]:
             return ntpath.join(drive.mount_point, self.folder)
         return f"{drive.mount_point.rstrip('/')}/{self.folder}"
@@ -156,7 +164,7 @@ class _DriveRow(QFrame):
 
     chosen = Signal(object)  # Drive
 
-    def __init__(self, drive: Drive, *, in_use: bool, pending: bool) -> None:
+    def __init__(self, drive: Drive, *, in_use: bool, pending: bool, folder: str = "") -> None:
         super().__init__()
         self.drive = drive
         self.setObjectName("driveRow")
@@ -174,6 +182,19 @@ class _DriveRow(QFrame):
         detail = QLabel(f"{describe_space(drive)} · {drive.filesystem} · {drive.device}")
         set_label_role(detail, "hint")
         text.addWidget(detail)
+        if folder:
+            target = QLabel(f"Records to {folder}")
+            target.setWordWrap(True)
+            set_label_role(target, "hint")
+            text.addWidget(target)
+        if not drive.writable:
+            refused = QLabel(
+                "NeuroWatch can't write to this drive. Give the user running NeuroWatch "
+                "write access to it, then open this list again."
+            )
+            refused.setWordWrap(True)
+            set_status_tone(refused, "warning")
+            text.addWidget(refused)
         layout.addLayout(text, stretch=1)
 
         if in_use:
@@ -181,7 +202,7 @@ class _DriveRow(QFrame):
             set_status_tone(badge, "success")
             layout.addWidget(badge)
         self.button = QPushButton("Chosen" if pending else "Use this drive")
-        self.button.setEnabled(not pending)
+        self.button.setEnabled(not pending and drive.writable)
         self.button.setAccessibleName(f"Record to {drive.mount_point}")
         set_button_variant(self.button, "secondary")
         self.button.clicked.connect(lambda: self.chosen.emit(self.drive))
@@ -202,8 +223,8 @@ class DrivePickerDialog(QDialog):
 
         layout = install_dialog_chrome(self, "Recording drive")
         intro = QLabel(
-            f"Now recording to {scan.storage_path}. Choosing a drive records to a "
-            f"{scan.folder} folder on it when you save Settings; recordings made "
+            f"Now recording to {scan.storage_path}. Each drive shows the folder it "
+            "records to; a choice applies when you save Settings, and recordings made "
             "so far stay where they are."
         )
         intro.setObjectName("dialogSubtitle")
@@ -257,6 +278,7 @@ class DrivePickerDialog(QDialog):
                 drive,
                 in_use=drive.selected,
                 pending=_normalized_path(self._scan.folder_on(drive)) == pending,
+                folder=self._scan.folder_on(drive),
             )
             row.chosen.connect(self._choose)
             self._rows.addWidget(row)

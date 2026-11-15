@@ -32,6 +32,9 @@ pub struct AppConfig {
     /// Alert notifications: channels and rules (`crate::alerts`).
     #[serde(default, skip_serializing_if = "is_default_alerts")]
     pub alerts: crate::alerts::AlertsConfig,
+    /// MQTT and Home Assistant (`crate::mqtt`).
+    #[serde(default, skip_serializing_if = "crate::mqtt::MqttConfig::is_default")]
+    pub mqtt: crate::mqtt::MqttConfig,
     /// Local accounts and the sign-in requirement (`crate::accounts`).
     #[serde(default, skip_serializing_if = "is_default_accounts")]
     pub accounts: crate::accounts::AccountsConfig,
@@ -801,6 +804,7 @@ impl Default for AppConfig {
             motion: MotionGlobalConfig::default(),
             events: EventsConfig::default(),
             alerts: crate::alerts::AlertsConfig::default(),
+            mqtt: crate::mqtt::MqttConfig::default(),
             accounts: crate::accounts::AccountsConfig::default(),
             monitors: MonitorsConfig::default(),
             desktop: DesktopConfig::default(),

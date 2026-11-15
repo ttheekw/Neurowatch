@@ -33,6 +33,34 @@ pub struct PluginServer {
     /// Verified manifest id, learned when the daemon is inspected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_id: Option<String>,
+    /// Provided by NeuroWatch: set from the portal's signed reply alone, and
+    /// not editable here (`cloud::services`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<Managed>,
+}
+
+/// Which hosted service a managed plugin server is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Managed {
+    pub service: String,
+    pub instance: String,
+    /// The name customers know it by, from the portal's catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl PluginServer {
+    /// The name people see: a hosted plugin's catalog name, else the
+    /// plugin's own (`manifest_name`, when it has connected), else the id.
+    pub fn shown_name(&self, manifest_name: Option<&str>) -> String {
+        self.managed
+            .as_ref()
+            .and_then(|managed| managed.label.as_deref())
+            .or(manifest_name)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&self.id)
+            .to_owned()
+    }
 }
 
 /// A camera bound to a plugin, with that binding's configuration document
@@ -57,6 +85,10 @@ pub struct PluginBinding {
     /// Off: automatic, it uses the recorder's pictures whenever there are any.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub own_decoder: bool,
+    /// A hosted plugin no longer covers this camera: off until it does again,
+    /// its settings kept. Set only by `cloud::services`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub withdrawn: bool,
 }
 
 fn enabled() -> bool {
@@ -102,6 +134,11 @@ impl PluginsConfig {
                 .map_err(|error| format!("Plugin {:?}: {error}", server.id))?;
             if !addresses.insert(super::discovery::address_key(&address.to_string())?) {
                 return Err("This plugin address has already been added".into());
+            }
+            if server.managed.is_some()
+                && !matches!(address, Address::Quic { .. } | Address::Tls { .. })
+            {
+                return Err("A hosted service must use an encrypted address".into());
             }
             if let Some(id) = &server.plugin_id {
                 if !valid_id(id) {

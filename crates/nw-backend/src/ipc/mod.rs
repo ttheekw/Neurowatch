@@ -5,6 +5,7 @@ pub mod alerts_handler;
 pub mod events_handler;
 pub mod export_handler;
 pub mod handler;
+pub mod mqtt_handler;
 pub mod plugins_handler;
 pub mod recording_handler;
 pub mod server;

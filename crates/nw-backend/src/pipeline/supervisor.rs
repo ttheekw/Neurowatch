@@ -175,6 +175,9 @@ pub struct PipelineSupervisor {
     borrowed: Option<crate::streams::decoded::Receiver>,
     /// When a borrowed picture last arrived (or the run began).
     borrow_seen: Instant,
+    /// A hardware decoder failed on this view's stream before showing a
+    /// picture: later runs decode it on the CPU (`hwaccel::software_only`).
+    software_decode: bool,
     /// The run's time origin for borrowed pictures' timestamps.
     raw_start: Instant,
 }
@@ -220,6 +223,7 @@ impl PipelineSupervisor {
             reachability: None,
             reconnect_attempt: 0,
             frame_counter: Arc::new(AtomicU64::new(0)),
+            software_decode: false,
             hubs: None,
             shared_any: false,
             subscription: None,
@@ -462,6 +466,11 @@ impl PipelineSupervisor {
             }
         };
 
+        if shared && !borrowing && self.software_decode {
+            if let Some(decodebin) = pipeline.by_name(builder::VIEW_DECODE) {
+                super::hwaccel::software_only(&decodebin);
+            }
+        }
         self.frame_ids = Arc::default();
         // Wire appsink → SHM ring buffer before going to PLAYING
         let (shm_writer, frames_counted) = self.wire_appsink(&pipeline);
@@ -841,6 +850,7 @@ impl PipelineSupervisor {
                         e.debug().unwrap_or_default()
                     ));
                     tracing::error!(cam_id = %self.cam_id, %reason, "Pipeline error");
+                    self.note_decoder_failure(pipeline);
                     return Some(State::Error { reason });
                 }
                 MessageView::Eos(_) => {
@@ -860,6 +870,28 @@ impl PipelineSupervisor {
             }
         }
         None
+    }
+
+    /// A failed run of a shared view that never showed a picture, with a
+    /// hardware decoder in it: decode this stream on the CPU from now on (a
+    /// stream the hardware cannot take, e.g. above a Raspberry Pi 4's 1080p).
+    fn note_decoder_failure(&mut self, pipeline: &gstreamer::Pipeline) {
+        if self.software_decode
+            || self.feed.is_none()
+            || self.frame_counter.load(AtomicOrdering::Relaxed) > 0
+        {
+            return;
+        }
+        let Some(decodebin) = pipeline
+            .by_name(builder::VIEW_DECODE)
+            .and_then(|element| element.downcast::<gstreamer::Bin>().ok())
+        else {
+            return;
+        };
+        if let Some(decoder) = super::hwaccel::hardware_decoder_in(&decodebin) {
+            tracing::warn!(cam_id = %self.cam_id, %decoder, "The hardware decoder failed on this stream before showing a picture; decoding it on the CPU");
+            self.software_decode = true;
+        }
     }
 
     /// Mirror the shared connection's state into the view's; whether the

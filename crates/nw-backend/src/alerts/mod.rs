@@ -124,6 +124,9 @@ pub fn label(kind: EventKind) -> &'static str {
         EventKind::Motion => "Motion",
         EventKind::Intrusion => "Intrusion",
         EventKind::LineCrossing => "Line crossed",
+        EventKind::Person => "Person detected",
+        EventKind::Vehicle => "Vehicle detected",
+        EventKind::Animal => "Animal detected",
         EventKind::Tamper => "Camera tampering",
         EventKind::DigitalInput => "Alarm input",
         EventKind::CameraEvent => "Camera event",
@@ -500,7 +503,7 @@ impl AlertService {
 }
 
 /// The event's saved picture, waiting a little for it to be written.
-async fn picture(state: &Arc<RwLock<AppState>>, event_id: i64) -> Option<Vec<u8>> {
+pub(crate) async fn picture(state: &Arc<RwLock<AppState>>, event_id: i64) -> Option<Vec<u8>> {
     let deadline = Instant::now() + PICTURE_WAIT;
     loop {
         let (db, hub) = {

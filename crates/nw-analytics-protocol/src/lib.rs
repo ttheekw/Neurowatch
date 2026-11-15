@@ -33,6 +33,8 @@ pub mod method {
     pub const DETACH: &str = "detach";
     pub const PING: &str = "ping";
     pub const AUTHENTICATE: &str = "authenticate";
+    /// A NeuroWatch-hosted plugin: the recorder's ticket, again on renewal.
+    pub const ENTITLEMENT: &str = "entitlement";
     // Node → plugin notifications.
     pub const STREAM_FORMAT: &str = "stream_format";
     pub const GAP: &str = "gap";
@@ -60,4 +62,6 @@ pub mod error_code {
     pub const INVALID_CONFIG: i64 = -33003;
     /// A binding the plugin does not know.
     pub const UNKNOWN_BINDING: i64 = -33004;
+    /// A ticket that is not valid for this service and connection.
+    pub const NOT_ENTITLED: i64 = -33005;
 }

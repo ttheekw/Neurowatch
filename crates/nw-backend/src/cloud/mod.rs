@@ -18,6 +18,7 @@ pub mod media_publish;
 pub mod playback_publish;
 pub mod previews;
 pub mod remote_config;
+pub mod services;
 pub mod snapshots;
 pub mod thumbnails;
 
@@ -492,6 +493,12 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
 
     // Cloud Backup: the cameras the portal says have a plan, copied live.
     let (backup_stop, backup_stopped) = tokio::sync::watch::channel(false);
+    // Hosted plugin services follow the portal, and stop with the backup.
+    tokio::spawn(services::run_loop(
+        node.shared(),
+        Arc::clone(&state),
+        backup_stopped.clone(),
+    ));
     let backup_task = tokio::spawn(backup::run_loop(
         node.shared(),
         backup::BackupSource {

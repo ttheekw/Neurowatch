@@ -76,6 +76,8 @@ class PluginServer:
     approval: dict[str, Any] | None = None
     credential_revision: int = 0
     plugin_id: str | None = None
+    #: Provided by NeuroWatch: the portal decides, nothing is editable here.
+    managed: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"id": self.id, "address": self.address, "enabled": self.enabled}
@@ -86,6 +88,14 @@ class PluginServer:
         if self.plugin_id:
             out["plugin_id"] = self.plugin_id
         return out
+
+    def shown_name(self, manifest_name: str | None = None) -> str:
+        """A hosted plugin's catalog name, else the plugin's own, else the id."""
+        label = self.managed.get("label") if self.managed else None
+        for name in (label, manifest_name):
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        return self.id
 
 
 #: Which of the camera's streams a plugin gets: None is the plugin's choice.
@@ -105,6 +115,8 @@ class PluginBinding:
     #: The plugin always decodes the camera itself; off: it uses NeuroWatch's
     #: decoded pictures whenever there are any (automatic).
     own_decoder: bool = False
+    #: A hosted plugin no longer covers this camera (read only: set by the backend).
+    withdrawn: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -143,6 +155,7 @@ class PluginsConfig:
                 s.get("approval") if isinstance(s.get("approval"), dict) else None,
                 int(s.get("credential_revision") or 0),
                 str(s["plugin_id"]) if s.get("plugin_id") else None,
+                s["managed"] if isinstance(s.get("managed"), dict) else None,
             )
             for s in items("servers")
             if isinstance(s, dict) and "id" in s and "address" in s
@@ -158,6 +171,7 @@ class PluginsConfig:
                 if isinstance(b.get("wall_layers"), list)
                 else None,
                 b.get("own_decoder") is True,
+                b.get("withdrawn") is True,
             )
             for b in items("bindings")
             if isinstance(b, dict) and "server" in b and "camera_id" in b
@@ -172,6 +186,15 @@ class PluginsConfig:
 
     def bindings_of(self, server: str) -> list[PluginBinding]:
         return [b for b in self.bindings if b.server == server]
+
+    def shown_servers(self) -> list[PluginServer]:
+        """Plugins to list: not a hosted one NeuroWatch no longer provides
+        (kept switched off only so its camera settings return with it)."""
+        return [s for s in self.servers if s.managed is None or s.enabled]
+
+    def shown_bindings_of(self, server: str) -> list[PluginBinding]:
+        """A plugin's cameras to list: not those a hosted plugin no longer covers."""
+        return [b for b in self.bindings_of(server) if not b.withdrawn]
 
     def binding(self, server: str, camera_id: str) -> PluginBinding | None:
         return next(
@@ -235,6 +258,7 @@ class Manifest:
     def uses_recorder_pictures(self) -> bool:
         """Whether the plugin can use NeuroWatch's decoded pictures."""
         return "decoded_frames" in self.permissions
+
     web_ui: dict[str, Any] | None = None
 
     @classmethod
@@ -321,29 +345,30 @@ def connection_notices(
         if not server.enabled or status is None or status.state in ("disabled", "pending_approval"):
             continue
         old = before.get(server.id)
+        name = server.shown_name(status.manifest.name if status.manifest is not None else None)
         if status.state == "connected":
             if old is not None and old.tone == "success":
                 notices.append(old)
             else:
                 verb = "reconnected" if old else "connected"
-                notices.append(PluginConnectionNotice(server.id, f"{server.id} {verb}.", "success"))
+                notices.append(PluginConnectionNotice(server.id, f"{name} {verb}.", "success"))
         elif status.state in ("connecting", "authorizing"):
             if old is not None:
                 notices.append(
                     old
                     if old.tone == "error"
                     else PluginConnectionNotice(
-                        server.id, f"{server.id} disconnected. The recorder keeps trying.", "error"
+                        server.id, f"{name} disconnected. The recorder keeps trying.", "error"
                     )
                 )
         else:
             verb = "disconnected" if old else "unavailable"
-            if old is not None and old.text.startswith(f"{server.id} unavailable"):
+            if old is not None and old.text.startswith(f"{name} unavailable"):
                 verb = "unavailable"
             detail = f": {status.detail}" if status.detail else ""
             notices.append(
                 PluginConnectionNotice(
-                    server.id, f"{server.id} {verb}{detail}. The recorder keeps trying.", "error"
+                    server.id, f"{name} {verb}{detail}. The recorder keeps trying.", "error"
                 )
             )
     return notices
@@ -409,6 +434,8 @@ def binding_text(
     binding: PluginBinding, status: BindingStatus | None, connected: bool
 ) -> tuple[str, str]:
     """(text, tone) for one bound camera."""
+    if binding.withdrawn:
+        return ("Not covered any more · add it under Subscription in NeuroWatch Cloud", "muted")
     if not binding.enabled:
         return ("Off", "muted")
     if not connected:

@@ -40,6 +40,7 @@ pub struct RpcHandler {
     playback: PlaybackHandler,
     export: ExportHandler,
     alerts: super::alerts_handler::AlertsHandler,
+    mqtt: super::mqtt_handler::MqttHandler,
     plugins: super::plugins_handler::PluginsHandler,
     accounts: super::accounts_handler::AccountsHandler,
     events: EventsHandler,
@@ -131,6 +132,7 @@ impl RpcHandler {
         let playback = PlaybackHandler::new(Arc::clone(&state));
         let export = ExportHandler::new(Arc::clone(&state));
         let alerts = super::alerts_handler::AlertsHandler::new(Arc::clone(&state));
+        let mqtt = super::mqtt_handler::MqttHandler::new(Arc::clone(&state));
         let plugins = super::plugins_handler::PluginsHandler::new(Arc::clone(&state));
         let accounts = super::accounts_handler::AccountsHandler::new(Arc::clone(&state));
         let events = EventsHandler::new(Arc::clone(&state));
@@ -142,6 +144,7 @@ impl RpcHandler {
             playback,
             export,
             alerts,
+            mqtt,
             plugins,
             accounts,
             events,
@@ -235,6 +238,7 @@ impl RpcHandler {
             m if m.starts_with("playback.") => self.playback.dispatch(m, params).await,
             m if m.starts_with("export.") => self.export.dispatch(m, params).await,
             m if m.starts_with("alerts.") => self.alerts.dispatch(m, params).await,
+            m if m.starts_with("mqtt.") => self.mqtt.dispatch(m, params).await,
             m if m.starts_with("plugins.") => self.plugins.dispatch(m, params).await,
             m if m.starts_with("talk.") => self.talk_dispatch(m, params).await,
             m if m.starts_with("auth.") || m.starts_with("accounts.") => {

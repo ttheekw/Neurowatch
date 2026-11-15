@@ -682,7 +682,7 @@ class PluginsView(QWidget):
         chosen: QTreeWidgetItem | None = None
         # By name: no plugin comes first for any other reason.
         for server in sorted(
-            snapshot.config.servers, key=lambda s: (self._title(s).casefold(), s.id)
+            snapshot.config.shown_servers(), key=lambda s: (self._title(s).casefold(), s.id)
         ):
             item = QTreeWidgetItem([self._title(server)])
             item.setData(0, Qt.ItemDataRole.UserRole, (server.id, None))
@@ -692,7 +692,7 @@ class PluginsView(QWidget):
             self.tree.addTopLevelItem(item)
             if keep == (server.id, None):
                 chosen = item
-            for binding in snapshot.config.bindings_of(server.id):
+            for binding in snapshot.config.shown_bindings_of(server.id):
                 child = QTreeWidgetItem([self._camera_name(binding.camera_id)])
                 child.setData(0, Qt.ItemDataRole.UserRole, (server.id, binding.camera_id))
                 item.addChild(child)
@@ -702,7 +702,7 @@ class PluginsView(QWidget):
         self.tree.blockSignals(False)
         if chosen is None and self.tree.topLevelItemCount():
             chosen = self.tree.topLevelItem(0)
-        has_plugins = bool(snapshot.config.servers)
+        has_plugins = bool(snapshot.config.shown_servers())
         self.side.setVisible(has_plugins)
         self.empty_add.setVisible(not has_plugins)
         if chosen is not None:
@@ -810,20 +810,34 @@ class PluginsView(QWidget):
         header.addLayout(titles, 1)
         actions = QHBoxLayout()
         actions.setSpacing(8)
-        enabled = QCheckBox("On")
-        enabled.setToolTip("Connect to this plugin and send it its cameras")
-        enabled.setChecked(server.enabled)
-        enabled.toggled.connect(lambda on, s=server: self._on_enabled(s, on))
-        actions.addWidget(enabled)
-        remove = QPushButton("Remove…")
-        set_button_variant(remove, "ghost")
-        remove.clicked.connect(lambda _c=False, s=server: self._on_remove(s))
-        actions.addWidget(remove)
+        if server.managed is None:
+            enabled = QCheckBox("On")
+            enabled.setToolTip("Connect to this plugin and send it its cameras")
+            enabled.setChecked(server.enabled)
+            enabled.toggled.connect(lambda on, s=server: self._on_enabled(s, on))
+            actions.addWidget(enabled)
+            remove = QPushButton("Remove…")
+            set_button_variant(remove, "ghost")
+            remove.clicked.connect(lambda _c=False, s=server: self._on_remove(s))
+            actions.addWidget(remove)
+        else:
+            # In words, not a tooltip: this is why the usual controls are absent.
+            provided = QLabel(
+                "Provided by NeuroWatch. Your organization's owners and admins choose its "
+                "cameras in NeuroWatch Cloud, under Subscription."
+                if server.enabled
+                else "Provided by NeuroWatch, but not available to this recorder now. "
+                "Its camera settings are kept in case it returns."
+            )
+            provided.setObjectName("pluginProvided")
+            provided.setWordWrap(True)
+            set_label_role(provided, "hint")
+            titles.addWidget(provided)
         header.addLayout(actions)
         header.setAlignment(actions, Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
 
-        if manifest is not None and manifest.public_key:
+        if manifest is not None and manifest.public_key and server.managed is None:
             current = snapshot.status.get(plugin)
             pending = current is not None and current.state == "pending_approval"
             approved = (
@@ -896,6 +910,9 @@ class PluginsView(QWidget):
         set_label_role(self.plugin_today, "hint")
         heading.addWidget(self.plugin_today, 0, Qt.AlignmentFlag.AlignTop)
         bind = QPushButton("Bind Camera…")
+        # A hosted plugin's cameras are chosen in NeuroWatch Cloud.
+        hosted = server.managed is not None
+        bind.setVisible(not hosted)
         set_button_variant(bind, "secondary")
         bound = {b.camera_id for b in snapshot.config.bindings_of(plugin)}
         bind.setEnabled(any(c.id not in bound for c in snapshot.cameras))
@@ -904,9 +921,13 @@ class PluginsView(QWidget):
         bind.clicked.connect(lambda _c=False, s=server: self._on_bind(s))
         self.bind_button = bind
         heading.addWidget(bind, 0, Qt.AlignmentFlag.AlignTop)
-        bindings = snapshot.config.bindings_of(plugin)
+        bindings = snapshot.config.shown_bindings_of(plugin)
         if not bindings:
-            none = QLabel("No cameras yet. Bind Camera… chooses which ones it analyses.")
+            none = QLabel(
+                "No cameras yet. Choose them under Subscription in NeuroWatch Cloud."
+                if hosted
+                else "No cameras yet. Bind Camera… chooses which ones it analyses."
+            )
             none.setWordWrap(True)
             set_label_role(none, "hint")
             body.addWidget(none)
@@ -948,14 +969,15 @@ class PluginsView(QWidget):
         body.addLayout(rows)
         layout.addWidget(card)
 
-        address, address_body, _ = settings_card("Connection")
-        where = QLabel(server.address)
-        where.setObjectName("pluginMono")
-        where.setFont(mono_font(9))
-        where.setWordWrap(True)
-        where.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        address_body.addWidget(where)
-        layout.addWidget(address)
+        if server.managed is None:
+            address, address_body, _ = settings_card("Connection")
+            where = QLabel(server.address)
+            where.setObjectName("pluginMono")
+            where.setFont(mono_font(9))
+            where.setWordWrap(True)
+            where.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            address_body.addWidget(where)
+            layout.addWidget(address)
         layout.addStretch(1)
         self.plugin_page.setWidget(page)
         self._refresh_status()
@@ -1004,6 +1026,8 @@ class PluginsView(QWidget):
         if server is None:
             return
         self.camera_title.setText(self._camera_name(camera_id))
+        # A hosted plugin's cameras are chosen in NeuroWatch Cloud.
+        self.unbind_button.setVisible(server.managed is None)
         self._layers = LayerChoice()
         self.figures_shown.setChecked(self.counts_choice(camera_id))
         self._fill_layer_boxes()
@@ -1447,7 +1471,7 @@ class PluginsView(QWidget):
 
     def _title(self, server: PluginServer) -> str:
         manifest = self._manifest(server.id)
-        return manifest.name if manifest is not None and manifest.name else server.id
+        return server.shown_name(manifest.name if manifest is not None else None)
 
     def _camera_name(self, camera_id: str) -> str:
         cameras = self._snapshot.cameras if self._snapshot else []

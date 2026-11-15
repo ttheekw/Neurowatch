@@ -24,6 +24,8 @@ use crate::pipeline::supervisor::{backoff_slice, probe_source, retry_delay, NO_F
 const VIDEO_SINK: &str = "hub_video";
 const AUDIO_SINK: &str = "hub_audio";
 const SOURCE: &str = "hub_src";
+/// Where an RTSP camera's video branches meet before the video appsink.
+const VIDEO_IN: &str = "hub_video_in";
 /// How often a running connection checks its bus, progress and subscribers.
 const POLL: Duration = Duration::from_millis(100);
 
@@ -49,13 +51,24 @@ pub(super) fn description(camera: &CameraConfig) -> Option<(String, bool)> {
             Transport::Tcp => "tcp",
             Transport::Udp => "udp",
         };
-        // The audio branch takes the camera's audio track when it has one
-        // the hub selects (`select-stream`); otherwise it stays idle.
+        // H.264 and H.265 get their parser by name, which asks the appsink
+        // for its form (Matroska's `avc` / `hvc1`). Under `parsebin` the
+        // parser is not told: on GStreamer 1.24.13 (NeuroWatch 0.1.6, a
+        // Raspberry Pi, 2026-11-15) some cameras' H.264 (Hikvision
+        // DS-2CD1221-I5) stayed `byte-stream`, the link to the appsink
+        // failed and the connection retried for ever ("not-linked"). Other
+        // video still goes through `parsebin`. The branch whose caps match
+        // the camera's video pad takes it (in this order); the rest stay
+        // idle, as the audio branch does for a camera without sound, which
+        // takes the audio track the hub selects (`select-stream`).
         Some((
             format!(
                 "rtspsrc name={SOURCE} location=\"{}\" latency=100 protocols={protocols} \
                  do-rtsp-keep-alive=true retry=5 \
-                 {SOURCE}. ! application/x-rtp,media=video ! parsebin ! {video} \
+                 {SOURCE}. ! application/x-rtp,media=video,encoding-name=H264 ! rtph264depay ! h264parse ! {VIDEO_IN}. \
+                 {SOURCE}. ! application/x-rtp,media=video,encoding-name=H265 ! rtph265depay ! h265parse ! {VIDEO_IN}. \
+                 {SOURCE}. ! application/x-rtp,media=video ! parsebin ! {VIDEO_IN}. \
+                 funnel name={VIDEO_IN} ! {video} \
                  {SOURCE}. ! application/x-rtp,media=audio ! parsebin ! appsink name={AUDIO_SINK}",
                 with_credentials()
             ),
@@ -354,14 +367,22 @@ mod tests {
         assert!(!paced);
         assert!(description.contains("location=\"rtsp://admin:pass@example/main\""));
         assert!(description.contains(
-            "hub_src. ! application/x-rtp,media=video ! parsebin ! appsink name=hub_video"
+            "hub_src. ! application/x-rtp,media=video,encoding-name=H264 ! rtph264depay ! h264parse ! hub_video_in."
         ));
+        assert!(description.contains(
+            "hub_src. ! application/x-rtp,media=video,encoding-name=H265 ! rtph265depay ! h265parse ! hub_video_in."
+        ));
+        assert!(description
+            .contains("hub_src. ! application/x-rtp,media=video ! parsebin ! hub_video_in."));
+        assert!(description.contains("funnel name=hub_video_in ! appsink name=hub_video"));
         assert!(description.contains(
             "hub_src. ! application/x-rtp,media=audio ! parsebin ! appsink name=hub_audio"
         ));
         let elements: Vec<&str> = description
             .split('!')
             .filter_map(|link| link.split_whitespace().next())
+            // Caps (`application/x-rtp,…,encoding-name=H264`) are not elements.
+            .filter(|e| !e.contains('/'))
             .collect();
         assert!(
             elements
@@ -369,6 +390,63 @@ mod tests {
                 .all(|e| !e.contains("dec") && !e.contains("enc") && !e.contains("convert")),
             "nothing decodes or encodes: {elements:?}"
         );
+    }
+
+    /// An RTSP camera's H.264 and H.265 reach the video appsink in the form
+    /// Matroska stores (`avc` / `hvc1` with codec data), through the named
+    /// parsers and the funnel the RTSP description uses.
+    #[test]
+    fn named_parsers_hand_the_appsink_what_matroska_stores() {
+        gstreamer::init().unwrap();
+        for (encoder, payloader, name, depay, parser, form) in [
+            (
+                "x264enc tune=zerolatency",
+                "rtph264pay",
+                "H264",
+                "rtph264depay",
+                "h264parse",
+                "avc",
+            ),
+            (
+                "x265enc tune=zerolatency",
+                "rtph265pay",
+                "H265",
+                "rtph265depay",
+                "h265parse",
+                "hvc1",
+            ),
+        ] {
+            let element = encoder.split_whitespace().next().unwrap_or_default();
+            if gstreamer::ElementFactory::find(element).is_none() {
+                eprintln!("skipping {name}: {element} is not installed");
+                continue;
+            }
+            let pipeline = builder::build(&format!(
+                "videotestsrc num-buffers=10 ! video/x-raw,width=64,height=48 ! {encoder} ! \
+                 video/x-h264,stream-format=byte-stream;video/x-h265,stream-format=byte-stream ! {payloader} ! \
+                 application/x-rtp,media=video,encoding-name={name} ! {depay} ! {parser} ! {VIDEO_IN}. \
+                 funnel name={VIDEO_IN} ! appsink name={VIDEO_SINK} sync=false"
+            ))
+            .unwrap();
+            let sink = pipeline
+                .by_name(VIDEO_SINK)
+                .and_then(|e| e.downcast::<gstreamer_app::AppSink>().ok())
+                .unwrap();
+            configure_sink(&sink, Media::Video, false);
+            pipeline.set_state(gstreamer::State::Playing).unwrap();
+            let sample = sink.try_pull_sample(gstreamer::ClockTime::from_seconds(10));
+            pipeline.set_state(gstreamer::State::Null).unwrap();
+            let caps = sample
+                .and_then(|s| s.caps_owned())
+                .expect("a unit reached the appsink");
+            let structure = caps.structure(0).unwrap();
+            assert_eq!(
+                structure.get::<&str>("stream-format").unwrap(),
+                form,
+                "{name}: {caps}"
+            );
+            assert!(structure.has_field("codec_data"), "{name}: {caps}");
+        }
     }
 
     /// A camera without sound: its sound branch never gets a buffer, and

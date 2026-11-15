@@ -4,6 +4,7 @@ members  = [
     "crates/nw-core",
     "crates/nw-backend",
     "crates/nw-cloud-protocol",
+    "crates/nw-service-protocol",
     "crates/nw-analytics-protocol",
     "crates/nw-analytics-sdk",
     "crates/nw-backup-protocol",
@@ -24,6 +25,8 @@ rust-version = "1.75"
 publish      = false
 
 [workspace.dependencies]
+# The portal's signed tokens and key list, shared with hosted services.
+nw-service-protocol = { path = "crates/nw-service-protocol" }
 # Workspace crates
 nw-core             = { path = "crates/nw-core" }
 nw-backend          = { path = "crates/nw-backend" }

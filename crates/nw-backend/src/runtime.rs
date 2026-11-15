@@ -208,11 +208,20 @@ async fn run() -> anyhow::Result<()> {
             Arc::clone(&state),
             shutdown_tx.subscribe(),
         ));
-        let (hub, alerts) = {
+        let (hub, alerts, mqtt) = {
             let st = state.read().await;
-            (Arc::clone(&st.events), Arc::clone(&st.alerts))
+            (
+                Arc::clone(&st.events),
+                Arc::clone(&st.alerts),
+                Arc::clone(&st.mqtt),
+            )
         };
-        tokio::spawn(alerts.run(Arc::clone(&state), hub, shutdown_tx.subscribe()));
+        tokio::spawn(alerts.run(
+            Arc::clone(&state),
+            Arc::clone(&hub),
+            shutdown_tx.subscribe(),
+        ));
+        tokio::spawn(mqtt.run(Arc::clone(&state), hub, shutdown_tx.subscribe()));
     }
     // Spawn a pipeline supervisor for each configured camera
     {

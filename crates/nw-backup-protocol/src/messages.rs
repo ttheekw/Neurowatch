@@ -177,6 +177,10 @@ pub struct Welcome {
     pub ack_interval_ms: u32,
     /// Tracks this session may open.
     pub max_tracks: u32,
+    /// The ingest's signature (hex, `nw_service_protocol::instance_proof_payload`
+    /// of the ticket and this connection) with its catalog key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_proof: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -52,6 +52,7 @@ pub fn migrate(config: &mut AppConfig, path: &Path) -> Result<bool, String> {
             approval: None,
             credential_revision: 0,
             plugin_id: Some("nw.motion".into()),
+            managed: None,
         });
         changed = true;
     }
@@ -148,6 +149,24 @@ pub fn migrate_document(document: &mut serde_json::Value) -> Result<bool, String
     Ok(changed)
 }
 
+/// Development only: another `nw-motion` to run in place of the one beside
+/// the backend (`scripts/dev.sh --motion`: the Neurowatch-Motion repository's build).
+/// Release builds never read it.
+const MOTION_BIN_ENV: &str = "NW_MOTION_BIN";
+
+/// The program to run: the development override when one is given, else the
+/// one shipped beside the backend.
+fn chosen(given: Option<std::ffi::OsString>, beside: PathBuf) -> Result<PathBuf, String> {
+    let (path, what) = match given.filter(|path| !path.is_empty()) {
+        Some(path) => (PathBuf::from(path), MOTION_BIN_ENV),
+        None => (beside, "The bundled motion daemon"),
+    };
+    if !path.is_file() {
+        return Err(format!("{what} is missing: {}", path.display()));
+    }
+    Ok(path)
+}
+
 fn executable() -> Result<PathBuf, String> {
     let backend = std::env::current_exe().map_err(|error| error.to_string())?;
     let name = if cfg!(windows) {
@@ -155,17 +174,16 @@ fn executable() -> Result<PathBuf, String> {
     } else {
         "nw-motion"
     };
-    let path = backend
+    let beside = backend
         .parent()
         .ok_or("Backend folder is unavailable")?
         .join(name);
-    if !path.is_file() {
-        return Err(format!(
-            "The bundled motion daemon is missing: {}",
-            path.display()
-        ));
-    }
-    Ok(path)
+    let given = if cfg!(debug_assertions) {
+        std::env::var_os(MOTION_BIN_ENV)
+    } else {
+        None
+    };
+    chosen(given, beside)
 }
 
 pub async fn run(state: Arc<RwLock<AppState>>, mut shutdown: broadcast::Receiver<()>) {
@@ -248,6 +266,26 @@ pub async fn run(state: Arc<RwLock<AppState>>, mut shutdown: broadcast::Receiver
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_given_motion_program_replaces_the_one_beside_the_backend() {
+        let folder = std::env::temp_dir().join(format!("nw-motion-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let (beside, other) = (folder.join("nw-motion"), folder.join("other"));
+        std::fs::write(&beside, b"").unwrap();
+        std::fs::write(&other, b"").unwrap();
+        assert_eq!(chosen(None, beside.clone()).unwrap(), beside);
+        assert_eq!(chosen(Some("".into()), beside.clone()).unwrap(), beside);
+        assert_eq!(
+            chosen(Some(other.clone().into()), beside.clone()).unwrap(),
+            other
+        );
+        let missing = chosen(Some(folder.join("absent").into()), beside).unwrap_err();
+        assert!(missing.starts_with(MOTION_BIN_ENV), "{missing}");
+        assert!(chosen(None, folder.join("absent")).is_err());
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
     #[test]
     fn migration_keeps_events_only_detection_settings_and_camera_events_and_is_idempotent() {
         let path = Path::new("/tmp/nw-migration/config.json");

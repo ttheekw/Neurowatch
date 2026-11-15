@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from PySide6.QtCore import QObject, QPointF, Signal
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QCheckBox, QLabel, QPushButton, QWidget
 
 from neurowatch.models.plugins import (
     PluginBinding,
@@ -20,6 +20,7 @@ from neurowatch.models.plugins import (
     PluginServer,
     address_problem,
     binding_text,
+    connection_notices,
     form_fields,
     motion_config_from_camera,
     parse_status,
@@ -1465,3 +1466,104 @@ def test_a_count_changing_reads_the_cameras_plugins_at_once(monkeypatch):
         "plugins.cameras",
         "plugins.overlays",
     ]
+
+
+def test_a_hosted_plugin_says_who_provides_it_and_offers_no_controls(qtbot) -> None:
+    view = _view(qtbot, FakeRecorder())
+    plugin_id = "hosted.nw.vcount"
+    managed = {"service": "nw.vcount", "instance": "vcount-1.example.test"}
+
+    def provided(enabled: bool) -> QLabel:
+        view._server = lambda _plugin: PluginServer(
+            plugin_id, "quic:vcount-1.example.test:443", enabled=enabled, managed=managed
+        )
+        view._refresh_status = lambda: None
+        view._show_plugin(plugin_id)
+        page = view.plugin_page.widget()
+        buttons = [button.text() for button in page.findChildren(QPushButton)]
+        assert "Remove…" not in buttons, "the portal decides"
+        assert not [box for box in page.findChildren(QCheckBox) if box.text() == "On"]
+        texts = [label.text() for label in page.findChildren(QLabel)]
+        assert not [text for text in texts if "vcount-1.example.test" in text], (
+            "its address is not shown"
+        )
+        return page.findChild(QLabel, "pluginProvided")
+
+    assert "under Subscription" in provided(True).text()
+    assert "not available to this recorder" in provided(False).text()
+    binds = [
+        button
+        for button in view.plugin_page.widget().findChildren(QPushButton)
+        if button.text() == "Bind Camera…"
+    ]
+    assert binds and not any(button.isVisibleTo(view) for button in binds), "chosen in the portal"
+    view._show_camera(plugin_id, "cam-1")
+    assert not view.unbind_button.isVisibleTo(view), "chosen in the portal"
+
+
+def test_a_camera_a_hosted_plugin_no_longer_covers_says_so() -> None:
+    config = PluginsConfig.from_dict(
+        {
+            "bindings": [
+                {"server": "hosted.x", "camera_id": "a", "enabled": False, "withdrawn": True}
+            ]
+        }
+    )
+    assert "Subscription" in binding_text(config.bindings[0], None, True)[0]
+
+
+def test_a_hosted_plugin_round_trips_its_marker() -> None:
+    managed = {"service": "nw.vcount", "instance": "v1"}
+    assert PluginServer("hosted.nw.vcount", "quic:v1:443", managed=managed).managed == managed
+
+
+def test_a_hosted_plugin_is_shown_by_its_catalog_name() -> None:
+    hosted = PluginsConfig.from_dict(
+        {
+            "servers": [
+                {
+                    "id": "hosted.nw.vcount",
+                    "address": "quic:v1:443",
+                    "managed": {
+                        "service": "nw.vcount",
+                        "instance": "v1",
+                        "label": "Vehicle counting",
+                    },
+                }
+            ]
+        }
+    )
+    server = hosted.servers[0]
+    assert server.shown_name() == "Vehicle counting"
+    assert server.shown_name("nw-vcount") == "Vehicle counting"
+    statuses = parse_status(
+        {"plugins": [{"id": "hosted.nw.vcount", "state": "unreachable", "detail": "timed out"}]}
+    )
+    [notice] = connection_notices(hosted, statuses)
+    assert notice.text.startswith("Vehicle counting unavailable")
+    plain = PluginServer("motion", "unix:/tmp/m.sock")
+    assert plain.shown_name() == "motion"
+    assert plain.shown_name("Motion detection") == "Motion detection"
+
+
+def test_a_hosted_plugin_no_longer_provided_is_not_listed() -> None:
+    config = PluginsConfig.from_dict(
+        {
+            "servers": [
+                {
+                    "id": "hosted.nw.vcount",
+                    "address": "quic:v1:443",
+                    "enabled": False,
+                    "managed": {"service": "nw.vcount", "instance": "v1"},
+                },
+                {"id": "motion", "address": "unix:/tmp/m.sock", "enabled": False},
+            ],
+            "bindings": [
+                {"server": "motion", "camera_id": "a", "enabled": False, "withdrawn": True},
+                {"server": "motion", "camera_id": "b"},
+            ],
+        }
+    )
+    # A plugin switched off by hand stays listed; one NeuroWatch took away does not.
+    assert [s.id for s in config.shown_servers()] == ["motion"]
+    assert [b.camera_id for b in config.shown_bindings_of("motion")] == ["b"]

@@ -77,10 +77,8 @@ impl PluginHost {
                 } else {
                     "main"
                 };
-                let name: String = status
-                    .manifest
-                    .as_ref()?
-                    .name
+                let name: String = server
+                    .shown_name(Some(&status.manifest.as_ref()?.name))
                     .chars()
                     .filter(|c| !c.is_control())
                     .take(128)

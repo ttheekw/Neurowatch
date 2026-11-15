@@ -101,6 +101,9 @@ Thumbs.db
 /scripts/build.sh
 /scripts/bootstrap.sh
 /scripts/run_dev.sh
+# Starts the private parts too (web portal, backup ingest, hosted plugins);
+# the public scripts/dev.sh runs NeuroWatch alone.
+/scripts/dev_all.sh
 /tests/test_launcher.sh
 /tests/test_launcher_lifecycle.py
 /tests/test_launcher_readiness.sh

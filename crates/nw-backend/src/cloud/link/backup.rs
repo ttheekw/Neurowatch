@@ -41,6 +41,25 @@ pub struct BackupIngest {
     /// A development ingest's CA (PEM): debug builds only.
     #[serde(default)]
     pub ca_pem: Option<String>,
+    /// Its catalog key (hex), which it must prove it holds.
+    #[serde(default)]
+    pub public_key: Option<String>,
+}
+
+impl BackupAssignment {
+    /// A `service-tickets` entry for the backup ingest.
+    pub fn from_service(entry: super::services::ServiceEntry) -> Self {
+        Self {
+            ticket: entry.ticket,
+            ingest: BackupIngest {
+                name: entry.instance,
+                quic: entry.endpoint.quic,
+                tcp: entry.endpoint.tcp,
+                ca_pem: entry.ca_pem,
+                public_key: entry.public_key,
+            },
+        }
+    }
 }
 
 /// The portal's reply: `None` when no camera has a backup plan.
@@ -58,12 +77,7 @@ pub fn parse_backup_reply(reply: &Value) -> Result<Option<BackupAssignment>> {
         return Err(invalid("ticket"));
     }
     let name = &assignment.ingest.name;
-    if name.is_empty()
-        || name.len() > 253
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-    {
+    if !valid_name(name) {
         return Err(invalid("ingest name"));
     }
     for address in [&assignment.ingest.quic, &assignment.ingest.tcp]
@@ -83,8 +97,17 @@ pub fn parse_backup_reply(reply: &Value) -> Result<Option<BackupAssignment>> {
     Ok(Some(assignment))
 }
 
+/// A service instance's name, which is also its TLS name.
+pub(super) fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+}
+
 /// `host:port` (a name or IPv4, or `[IPv6]`), port 1–65535.
-fn host_port(address: &str) -> bool {
+pub(super) fn host_port(address: &str) -> bool {
     let Some((host, port)) = address.rsplit_once(':') else {
         return false;
     };

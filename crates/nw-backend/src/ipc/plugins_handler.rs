@@ -119,6 +119,7 @@ impl PluginsHandler {
             .as_str()
             .ok_or_else(|| RpcError::invalid_params("'public_key' is required"))?;
         let mut state = self.state.write().await;
+        refuse_managed(&state, id)?;
         let shown = state
             .plugins
             .status(&state.config.plugins.servers)
@@ -178,6 +179,7 @@ impl PluginsHandler {
                 )
             })?;
         let mut state = self.state.write().await;
+        refuse_managed(&state, id)?;
         let server = state
             .config
             .plugins
@@ -342,7 +344,33 @@ impl PluginsHandler {
         }))
         .map_err(|e| RpcError::invalid_params(format!("Invalid plugin settings: {e}")))?;
         let mut st = self.state.write().await;
-        for server in &mut next.servers {
+        // Hosted servers follow the portal alone: whatever was sent, they stay.
+        next.servers.retain(|server| server.managed.is_none());
+        next.servers.extend(
+            st.config
+                .plugins
+                .servers
+                .iter()
+                .filter(|server| server.managed.is_some())
+                .cloned(),
+        );
+        // Whether a hosted plugin covers a camera is the portal's to say.
+        for binding in &mut next.bindings {
+            let withdrawn = st.config.plugins.bindings.iter().any(|current| {
+                current.withdrawn
+                    && current.server == binding.server
+                    && current.camera_id == binding.camera_id
+            });
+            if withdrawn {
+                binding.withdrawn = true;
+                binding.enabled = false;
+            }
+        }
+        for server in next
+            .servers
+            .iter_mut()
+            .filter(|server| server.managed.is_none())
+        {
             if let Some(current) = st
                 .config
                 .plugins
@@ -434,6 +462,7 @@ impl PluginsHandler {
             approval: None,
             credential_revision: 0,
             plugin_id: Some(manifest.id),
+            managed: None,
         };
         let mut next = state.config.plugins.clone();
         next.servers.push(server.clone());
@@ -446,6 +475,22 @@ impl PluginsHandler {
         }
         Ok(json!(server))
     }
+}
+
+/// Hosted plugins need no approval or credential here, and take none.
+fn refuse_managed(state: &crate::app_state::AppState, id: &str) -> Result<(), RpcError> {
+    let managed = state
+        .config
+        .plugins
+        .servers
+        .iter()
+        .any(|server| server.id == id && server.managed.is_some());
+    if managed {
+        return Err(RpcError::invalid_params(
+            "This plugin is provided by NeuroWatch and cannot be changed here",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -468,6 +513,44 @@ mod tests {
             crate::db::connection::open_in_memory().unwrap(),
         )));
         (PluginsHandler::new(state), path)
+    }
+
+    #[tokio::test]
+    async fn a_hosted_plugin_cannot_be_changed_through_the_settings() {
+        let (handler, _path) = handler();
+        let hosted: crate::plugin_host::PluginServer = serde_json::from_value(json!({
+            "id": "hosted.nw.vcount", "address": "quic:v1.example.test:443",
+            "managed": {"service": "nw.vcount", "instance": "v1.example.test"}}))
+        .unwrap();
+        handler
+            .state
+            .write()
+            .await
+            .config
+            .plugins
+            .servers
+            .push(hosted.clone());
+        let forged = json!({"servers": [
+            {"id": "hosted.nw.vcount", "address": "quic:evil.example.test:443", "managed": {"service": "x", "instance": "y"}},
+            {"id": "other", "address": "quic:evil.example.test:444", "managed": {"service": "x", "instance": "y"}},
+            {"id": "motion", "address": "unix:/tmp/nw-motion-test.sock"}
+        ]});
+        let saved = handler.dispatch("plugins.set", &forged).await.unwrap();
+        let servers = saved["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+        assert!(servers.iter().any(|s| s["id"] == "motion"));
+        let kept = servers
+            .iter()
+            .find(|s| s["id"] == "hosted.nw.vcount")
+            .unwrap();
+        assert_eq!(kept["address"], "quic:v1.example.test:443");
+        let refused = handler
+            .dispatch(
+                "plugins.credentials",
+                &json!({"server": "hosted.nw.vcount", "credential": "x"}),
+            )
+            .await;
+        assert!(refused.is_err());
     }
 
     #[tokio::test]
