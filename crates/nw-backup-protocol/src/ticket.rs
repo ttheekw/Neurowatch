@@ -71,6 +71,10 @@ pub struct CameraGrant {
     /// 2026-11-08): the main stream while it fits `limits`, else the sub.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<String>,
+    /// The customer's X25519 public key (hex): stored footage is sealed to it,
+    /// and only the customer can open it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_key: Option<String>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -87,6 +91,11 @@ impl CameraGrant {
         self.stream
             .as_deref()
             .filter(|stream| GRANT_STREAMS.contains(stream))
+    }
+
+    /// The customer's public key, when the grant has a well-formed one.
+    pub fn seal_key(&self) -> Option<[u8; 32]> {
+        unhex(self.seal_key.as_deref()?)
     }
 
     /// Seconds footage stays on the ingest's disk.
@@ -229,6 +238,9 @@ pub struct FileToken {
     pub aud: String,
     /// Object keys starting with this may be read (`backup/<org>/<camera>/`).
     pub prefix: String,
+    /// When set, this one object only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
     pub exp_ms: i64,
 }
 
@@ -281,6 +293,7 @@ pub fn verify_file_token(
         && !token.prefix.is_empty()
         && token.prefix.ends_with('/')
         && key.starts_with(&token.prefix)
+        && token.file.as_deref().map_or(true, |file| file == key)
         && !key.contains("..")
         && now_ms < token.exp_ms
         && token.exp_ms - now_ms <= MAX_FILE_TOKEN_MS + CLOCK_SKEW_MS
@@ -367,6 +380,7 @@ mod tests {
             expires_at_ms: NOW + 3_600_000,
             cameras: vec![CameraGrant {
                 stream: None,
+                seal_key: None,
                 camera_id: "cam-1".into(),
                 retention_s: 3600,
                 sound: false,
@@ -567,6 +581,7 @@ mod tests {
     fn grants_say_how_long_footage_stays_hot() {
         let grant = |retention_s, hot_s, move_every_s| CameraGrant {
             stream: None,
+            seal_key: None,
             camera_id: "c".into(),
             retention_s,
             sound: false,
@@ -594,12 +609,43 @@ mod tests {
     }
 
     #[test]
+    fn a_file_token_naming_a_file_opens_only_that_file() {
+        let (portal, _) = keys();
+        let keys = [portal.verifying_key()];
+        let token = issue_file_token(
+            &FileToken {
+                v: 1,
+                aud: "ingest-1".into(),
+                prefix: "backup/org/cam-1/".into(),
+                file: Some("backup/org/cam-1/a.mp4".into()),
+                exp_ms: NOW + 180_000,
+            },
+            &portal,
+        );
+        assert!(verify_file_token(
+            &token,
+            &keys,
+            "ingest-1",
+            "backup/org/cam-1/a.mp4",
+            NOW
+        ));
+        assert!(!verify_file_token(
+            &token,
+            &keys,
+            "ingest-1",
+            "backup/org/cam-1/b.mp4",
+            NOW
+        ));
+    }
+
+    #[test]
     fn file_tokens_cover_one_prefix_on_one_ingest_for_a_while() {
         let (portal, other) = keys();
         let token = FileToken {
             v: 1,
             aud: "ingest-1".into(),
             prefix: "backup/org/cam-1/".into(),
+            file: None,
             exp_ms: NOW + 600_000,
         };
         let text = issue_file_token(&token, &portal);

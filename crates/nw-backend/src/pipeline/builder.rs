@@ -83,6 +83,9 @@ pub fn rtsp_pipeline_str(config: &CameraConfig, hwaccel: HwAccelKind) -> String 
 /// The desktop view's `appsrc` when it decodes a shared camera connection
 /// (`crate::streams`): the view pushes the hub's parsed units here.
 pub(crate) const VIEW_INPUT: &str = "view_src";
+/// The shared view's `decodebin`, told to skip hardware decoders after one
+/// failed on the stream (`hwaccel::software_only`).
+pub(crate) const VIEW_DECODE: &str = "view_decode";
 
 /// Whether a desktop view of `url` takes its pictures from the camera's
 /// shared connection: RTSP and RTMP cameras. A file keeps looping on its own
@@ -97,7 +100,7 @@ pub fn shared_view_pipeline_str(hwaccel: HwAccelKind) -> String {
     let converter = super::hwaccel::color_converter(hwaccel);
     format!(
         "appsrc name={VIEW_INPUT} format=time is-live=true do-timestamp=false block=false max-bytes=0 ! \
-         decodebin ! {converter} ! video/x-raw,format=RGB ! \
+         decodebin name={VIEW_DECODE} ! {converter} ! video/x-raw,format=RGB ! \
          appsink name=frame_sink max-buffers=2 drop=true sync=false emit-signals=true"
     )
 }
@@ -107,7 +110,7 @@ pub fn shared_view_pipeline_str(hwaccel: HwAccelKind) -> String {
 /// compressed video (no decoder of its own).
 pub fn borrowed_view_pipeline_str(hwaccel: HwAccelKind) -> String {
     shared_view_pipeline_str(hwaccel).replacen(
-        "decodebin",
+        &format!("decodebin name={VIEW_DECODE}"),
         "queue max-size-buffers=2 leaky=downstream",
         1,
     )

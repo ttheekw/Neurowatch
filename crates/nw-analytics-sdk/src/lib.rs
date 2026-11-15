@@ -2,6 +2,7 @@
 //! camera, UI or GStreamer dependencies; a daemon owns its decoding/analysis.
 pub use nw_analytics_protocol as protocol;
 pub mod cache;
+pub mod entitlement;
 pub mod identity;
 #[cfg(unix)]
 pub mod local;

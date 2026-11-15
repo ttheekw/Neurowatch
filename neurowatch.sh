@@ -237,8 +237,8 @@ configure_cxx() {
     return 1
 }
 
-# Development links to the local web portal, as scripts/dev_cloud.sh does:
-# its settings file names the cloud (http://127.0.0.1:8000) and LiveKit.
+# Development links to a local web portal when one is checked out beside
+# this repository: its settings file names the cloud (http://127.0.0.1:8000) and LiveKit.
 # Settings already in the environment win; release builds ignore all of these.
 load_portal_settings() {
     local portal_env="${NW_WEBAPP_DIR:-$ROOT/../Neurowatch-webapp}/.env.node-dev"

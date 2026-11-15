@@ -48,6 +48,8 @@
 - **Watch from anywhere, if you want to.** Optional NeuroWatch Cloud access shows your cameras in a browser. Cloud plans are separate from the desktop editions.
 - **Light by design, in Rust.** Recording, browser viewing and clip export never decode video, every reader of a camera stream shares one connection and one buffer, and a picture is decoded at most once however many walls and plugins use it. [How it works](#how-it-works).
 
+Comparing recorders? See [NeuroWatch compared with Frigate, Shinobi, Bluecherry, ZoneMinder, Agent DVR, Viseron, Scrypted and Blue Iris](docs/comparison.md), including when each one is the better choice.
+
 > **Beta:** the release workflow checks installation and generated video on Windows, Ubuntu 22.04 and 24.04, Debian 12 and 13, Fedora 43 and Arch Linux before publishing. These checks do not qualify physical cameras, GPUs or displays. Found a problem? [Tell us](https://github.com/ttheekw/Neurowatch/issues), it makes the next release better.
 
 NeuroWatch is **free and open source** ([Apache-2.0](LICENSE)), including its NeuroWatch Cloud client. The optional NeuroWatch Cloud, for watching from a browser, is an online service (see [Licensing](#licensing)).
@@ -121,6 +123,12 @@ Motion detection is a plugin, **[NeuroWatch Motion](https://github.com/ttheekw/N
 - Choose which events and cameras send alerts, set active weekly hours and a cooldown, send a test, and check delivery history.
 - Desktop notifications need the desktop app running. ntfy, Telegram and webhook deliveries run in the recorder, including headless mode. Email delivery is not implemented.
 
+### Home Assistant and MQTT
+
+- Open **Settings → Home Assistant**, enter your MQTT broker (for Home Assistant, the Mosquitto broker add-on's address, user name and password), press **Test Connection**, then **Save**.
+- Each camera then appears in Home Assistant by itself: **Motion**, **Person**, **Vehicle** and **Animal** sensors, **Online**, and a **Last event** picture. The recorder appears too, with a **Problem** sensor (recording failing, a drive full or missing, a plugin or Cloud Backup failing). Use them in automations like any other sensor.
+- Not using Home Assistant? Any MQTT system can read the same topics: `neurowatch/<camera>/person` and the others are `ON` or `OFF`, `neurowatch/events` carries every event as JSON, and `neurowatch/status` says whether the recorder is online. Give each recorder on the same broker its own topic prefix.
+
 ### Local accounts and permissions
 
 - Open **≡ → Users & Permissions…** to create local accounts and enable sign-in. Accounts are optional and are off by default; they are separate from your NeuroWatch Cloud account.
@@ -168,7 +176,7 @@ NeuroWatch Cloud is an optional online service for browser access. Its plans are
 - Light and dark themes.
 
 ### Coming later
-Email alerts, dedicated Home Assistant and MQTT integrations, a local web interface, AI object detection, a multi-site desktop dashboard and native mobile apps remain planned. Generic webhook alerts can already send events to automation services.
+Email alerts, a local web interface, a multi-site desktop dashboard and native mobile apps remain planned. Object detection (people, vehicles and animals) comes as a separate plugin, NeuroWatch Detect, which is not yet included in the downloads. It is a separate program on purpose: recording must never fail, so detection runs beside it, not inside it. If the detector crashes, falls behind or is being updated, recording carries on, and it can run on another computer.
 
 ---
 
@@ -301,7 +309,30 @@ NeuroWatch's recorder keeps running when the window is closed. **Settings → St
 
 ## Running without a screen
 
-On a Linux server or a small Linux computer with no display:
+On a Linux server or a small Linux computer with no display, you can set everything up over SSH.
+
+**1. Install it from the terminal.** This downloads the free edition straight from GitHub; use the line for your system:
+
+```bash
+# Ubuntu, Debian, Linux Mint (64-bit PC)
+curl -fLO https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch_amd64.deb && sudo apt install ./neurowatch_amd64.deb
+# Ubuntu, Debian, Raspberry Pi OS 64-bit (ARM64)
+curl -fLO https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch_arm64.deb && sudo apt install ./neurowatch_arm64.deb
+# Fedora (64-bit PC; use neurowatch.aarch64.rpm on ARM)
+sudo dnf install https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch.x86_64.rpm
+```
+
+For NeuroWatch Unlimited, sign in on the [downloads page](https://neurowatch.app/downloads) on another computer, copy the file across (for example with `scp`) and install it the same way.
+
+**2. Link it to NeuroWatch Cloud and start it.** Create a one-time enrollment code on the **Recorders** page of [NeuroWatch Cloud](https://neurowatch.app) (valid five minutes), then, as the account that should own the recordings (not root):
+
+```bash
+neurowatch --headless --link CODE --name "Head Office"
+```
+
+**3. Add cameras from your browser:** open the recorder in NeuroWatch Cloud, then **Settings**, to search for cameras, turn on recording and choose the drive.
+
+Without NeuroWatch Cloud, start it with just:
 
 ```bash
 neurowatch --headless
@@ -310,7 +341,6 @@ neurowatch --headless
 NeuroWatch starts as a background service. On Linux with systemd, it enables startup at boot using user lingering; if permission is needed, follow the command shown or see Troubleshooting below. The terminal shows what it's doing: cameras coming online, recording starting, events such as motion or a camera going offline, and the cloud connection. Press **Ctrl+C** to stop watching; NeuroWatch keeps recording. `neurowatch events` lists what happened while you weren't watching.
 
 With NeuroWatch Cloud:
-- Link it to NeuroWatch Cloud straight away with `neurowatch --headless --link CODE --name "Head Office"`, using an enrollment code from the web portal (**Nodes → Create enrollment**, valid five minutes).
 - Once linked, manage its cameras, recording and drive from the web portal (open the recorder, then **Settings**).
 - From another terminal: `neurowatch cloud status`, `neurowatch cloud link CODE --name NAME`, `neurowatch cloud unlink --yes`.
 - Opening the desktop app on the same computer switches NeuroWatch back to desktop mode.

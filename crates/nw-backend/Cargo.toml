@@ -23,6 +23,7 @@ nw-cloud-protocol  = { workspace = true }
 nw-analytics-protocol = { workspace = true }
 nw-analytics-sdk = { workspace = true }
 nw-backup-protocol = { workspace = true }
+nw-service-protocol = { workspace = true }
 nw-backup-client = { workspace = true }
 
 tokio              = { workspace = true }
@@ -45,7 +46,7 @@ rusqlite           = { workspace = true }
 time               = { version = "0.3", features = ["local-offset", "formatting", "parsing"] }
 getrandom          = "0.2"
 libc               = "0.2"
-reqwest            = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # Camera discovery: SOAP/WS-Discovery replies, multicast on a chosen interface,
 # and WS-Security UsernameToken digests.
 roxmltree          = "0.20"
@@ -57,6 +58,8 @@ sha1               = "0.10"
 ed25519-dalek      = { version = "=2.1.1", default-features = false, features = ["std"] }
 rustls             = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots       = "1"
+# MQTT and Home Assistant (src/mqtt). TLS with this crate's own rustls setup.
+rumqttc            = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
 tokio-tungstenite  = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 futures-util       = { version = "0.3", features = ["sink"] }
 # Streams a clip file into an upload (web portal export).

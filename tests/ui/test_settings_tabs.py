@@ -27,6 +27,7 @@ def test_settings_are_split_into_pages(qtbot, monkeypatch) -> None:
         "Archive",
         "Startup",
         "Cloud",
+        "Home Assistant",
         "Debug",
     ]
     assert list(TABS.values()) == titles
@@ -37,7 +38,7 @@ def test_settings_are_split_into_pages(qtbot, monkeypatch) -> None:
     assert page(2).isAncestorOf(dlg._rec_storage) and page(2).isAncestorOf(dlg._calc_cams)
     assert page(3).isAncestorOf(dlg._archive_path)
     assert page(4).isAncestorOf(dlg._start_fullscreen)
-    assert page(6).isAncestorOf(dlg._gst_log)
+    assert page(7).isAncestorOf(dlg._gst_log)
 
 
 def test_startup_choices_round_trip(qtbot, monkeypatch) -> None:
@@ -121,7 +122,7 @@ def test_extended_debug_logging_is_a_setting(qtbot, monkeypatch, tmp_path) -> No
         monkeypatch,
         {"debug": {"gst_log": "warn", "extended": False, "log_path": str(log_path)}},
     )
-    assert dlg._stack.widget(6).isAncestorOf(dlg._extended_debug)
+    assert dlg._stack.widget(list(TABS).index("debug")).isAncestorOf(dlg._extended_debug)
     assert not dlg._extended_debug.isChecked()
     assert not dlg._gst_log.isEnabled(), "GStreamer's level matters only in the debug log"
     assert dlg._gst_log.currentText() == "warning"

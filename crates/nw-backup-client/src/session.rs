@@ -142,7 +142,12 @@ async fn session(shared: &Arc<Shared>, assigner: &dyn Assigner) -> Ended {
         return Ended::Failed(format!("The backup server closed the connection: {error}"));
     }
     match tokio::time::timeout(HELLO_TIMEOUT, next_message(&mut reader)).await {
-        Ok(Ok(Some(ServerMessage::Welcome(_)))) => {}
+        Ok(Ok(Some(ServerMessage::Welcome(welcome)))) => {
+            if !proves_instance(&assignment, &binding, welcome.instance_proof.as_deref()) {
+                link.close();
+                return Ended::Failed("The backup server could not prove who it is.".into());
+            }
+        }
         Ok(Ok(Some(ServerMessage::Refused(refused)))) => {
             link.close();
             return Ended::Failed(refusal_text(refused.code, &refused.message));
@@ -526,4 +531,20 @@ fn refusal_text(code: RefusalCode, message: &str) -> String {
         RefusalCode::Busy => "The backup server is busy; trying again.".into(),
         _ => format!("The backup server refused the connection: {message}"),
     }
+}
+
+/// Whether the ingest holds the catalog key the portal named (no key named:
+/// its TLS certificate alone identifies it).
+fn proves_instance(assignment: &crate::Assignment, binding: &[u8], proof: Option<&str>) -> bool {
+    let Some(expected) = assignment.instance_key.as_deref() else {
+        return true;
+    };
+    let (Some(key), Some(proof)) = (nw_service_protocol::verifying_key(expected), proof) else {
+        return false;
+    };
+    nw_service_protocol::verify_hex(
+        &key,
+        &nw_service_protocol::instance_proof_payload(&assignment.ticket, binding),
+        proof,
+    )
 }

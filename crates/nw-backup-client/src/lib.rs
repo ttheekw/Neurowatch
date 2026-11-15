@@ -44,6 +44,9 @@ pub struct Assignment {
     /// `host:port` for QUIC, and for TLS over TCP.
     pub quic: Option<String>,
     pub tcp: Option<String>,
+    /// The ingest's catalog key (hex): it must prove it holds it. `None`:
+    /// its TLS certificate alone identifies it.
+    pub instance_key: Option<String>,
 }
 
 pub type AssignFuture<'a> = Pin<Box<dyn Future<Output = Result<Assignment, String>> + Send + 'a>>;

@@ -76,7 +76,8 @@ pub async fn dispatch(
             let manifest=status.manifest.as_ref()?;let ui=manifest.web_ui.as_ref()?;
             let cameras=cameras_for(&status.id);
             if status.state!="connected" || !manifest.permissions.iter().any(|permission|permission=="web_ui") || (cameras.is_empty()&&viewer.role!="admin") || !nw_analytics_sdk::web::valid_path(&ui.entry){return None;}
-            Some(json!({"id":status.id,"name":manifest.name,"title":ui.title,"entry":ui.entry,"topic":manifest.id,"cameras":cameras}))
+            let name=config.plugins.servers.iter().find(|server|server.id==status.id).map_or_else(||manifest.name.clone(),|server|server.shown_name(Some(&manifest.name)));
+            Some(json!({"id":status.id,"name":name,"title":ui.title,"entry":ui.entry,"topic":manifest.id,"cameras":cameras}))
         }).collect::<Vec<_>>() }),
         );
     }

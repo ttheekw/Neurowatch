@@ -140,6 +140,7 @@ TABS = {
     "archive": "Archive",
     "startup": "Startup",
     "cloud": "Cloud",
+    "home_assistant": "Home Assistant",
     "debug": "Debug",
 }
 
@@ -421,18 +422,8 @@ class SettingsDialog(QDialog):
         rec_form.setRowVisible(drive_row, self._endpoint is not None)
         self._rec_storage.textChanged.connect(self._update_drive_label)
 
-        self._rec_segment = QSpinBox()
-        self._rec_segment.setRange(1, 60)
-        self._rec_segment.setSuffix(" min")
-        self._rec_segment.setValue(int(rec_cfg.get("segment_minutes", 1)))
-        rec_form.addRow("Segment Length:", self._rec_segment)
-
-        self._rec_prebuf = QSpinBox()
-        self._rec_prebuf.setRange(5, 60)
-        self._rec_prebuf.setSuffix(" s")
-        self._rec_prebuf.setValue(int(rec_cfg.get("pre_buffer_sec", 10)))
-        rec_form.addRow("Pre-buffer:", self._rec_prebuf)
-
+        # Segment length and pre-buffer are not offered (2026-11-15): the defaults suit everyone,
+        # and the values already in the config are kept as they are.
         self._rec_local_all = QCheckBox("Enable local recording for all cameras")
         self._rec_local_all.setChecked(bool(rec_cfg.get("local_all_cameras", False)))
         rec_form.addRow("", self._rec_local_all)
@@ -515,6 +506,7 @@ class SettingsDialog(QDialog):
 
         self._build_startup(startup or StartupPrefs(), startup_note)
         self._build_cloud()
+        self._build_home_assistant()
         for page_layout in self._pages.values():
             page_layout.addStretch(1)
         # Fields keep their own width; only text and folder fields stretch.
@@ -831,6 +823,16 @@ class SettingsDialog(QDialog):
             set_label_role(hint, "hint")
             self._pages["cloud"].addWidget(hint)
 
+    def _build_home_assistant(self) -> None:
+        """The MQTT panel is made when the tab is first shown (it asks the
+        recorder for ``mqtt.get``); without a recorder, a hint."""
+        self._mqtt_panel: QWidget | None = None
+        if self._endpoint is None:
+            hint = QLabel("Connect to the recorder to send its events to Home Assistant or MQTT.")
+            hint.setWordWrap(True)
+            set_label_role(hint, "hint")
+            self._pages["home_assistant"].addWidget(hint)
+
     def current_page(self) -> str:
         """The key (``TABS``) of the page shown."""
         return list(TABS)[self._stack.currentIndex()]
@@ -839,6 +841,16 @@ class SettingsDialog(QDialog):
         if index < 0:
             return
         self._stack.setCurrentIndex(index)
+        if (
+            list(TABS)[index] == "home_assistant"
+            and self._mqtt_panel is None
+            and self._endpoint is not None
+        ):
+            from neurowatch.widgets.mqtt_panel import MqttPanel
+
+            self._mqtt_panel = MqttPanel(endpoint=self._endpoint)
+            self._pages["home_assistant"].insertWidget(1, self._mqtt_panel)  # under the title
+            return
         if list(TABS)[index] != "cloud" or self._cloud_panel is not None:
             return
         if self._endpoint is None:
@@ -1215,8 +1227,6 @@ class SettingsDialog(QDialog):
         cfg["wall"]["cols"] = int(self._cols.value())
         cfg.setdefault("recording", {})
         cfg["recording"]["storage_path"] = self._rec_storage.text().strip() or "~/Videos/neurowatch"
-        cfg["recording"]["segment_minutes"] = int(self._rec_segment.value())
-        cfg["recording"]["pre_buffer_sec"] = int(self._rec_prebuf.value())
         cfg["recording"]["local_all_cameras"] = self._rec_local_all.isChecked()
         cfg["recording"]["disk_threshold_percent"] = (
             int(self._rec_threshold.value()) if self._rec_cleanup.isChecked() else 0

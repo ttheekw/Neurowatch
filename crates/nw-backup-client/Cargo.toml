@@ -13,6 +13,7 @@ rust-version.workspace = true
 # no NeuroWatch crates beyond the protocol.
 [dependencies]
 nw-backup-protocol = { workspace = true }
+nw-service-protocol = { workspace = true }
 tokio         = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }

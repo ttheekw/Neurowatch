@@ -22,7 +22,7 @@ mod session;
 mod tests;
 pub(crate) mod web;
 
-pub use config::{PluginBinding, PluginServer, PluginsConfig};
+pub use config::{Managed, PluginBinding, PluginServer, PluginsConfig};
 pub use diagnostics::{PluginPictures, PluginStreamConsumer};
 pub use overlays::OverlayStore;
 
@@ -168,6 +168,8 @@ pub struct PluginHost {
     /// The plugins' latest drawings (`plugins.overlays`).
     pub overlays: Arc<OverlayStore>,
     queries: Arc<Mutex<HashMap<String, std::sync::mpsc::SyncSender<Query>>>>,
+    /// The portal's latest ticket for each hosted plugin server.
+    tickets: Arc<Mutex<HashMap<String, String>>>,
 }
 
 pub(super) struct Query {
@@ -177,6 +179,13 @@ pub(super) struct Query {
 }
 
 impl PluginHost {
+    /// Hosted services' tickets, from the portal's latest answer.
+    pub fn set_tickets(&self, tickets: HashMap<String, String>) {
+        if let Ok(mut held) = self.tickets.lock() {
+            *held = tickets;
+        }
+    }
+
     /// Only authenticated, approved sessions receive page requests.
     pub async fn query(&self, server: &str, method: &str, params: Value) -> Result<Value, String> {
         if !["web.request", "web.read"].contains(&method) {
@@ -243,12 +252,12 @@ impl PluginHost {
                 let since = status.unreachable_since?;
                 (since.elapsed() >= after).then(|| OfflinePlugin {
                     id: server.id.clone(),
-                    name: status
-                        .manifest
-                        .as_ref()
-                        .map(|manifest| manifest.name.clone())
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or_else(|| server.id.clone()),
+                    name: server.shown_name(
+                        status
+                            .manifest
+                            .as_ref()
+                            .map(|manifest| manifest.name.as_str()),
+                    ),
                     detail: status.detail.clone(),
                 })
             })
@@ -340,10 +349,7 @@ impl PluginHost {
                 .push(CameraAnalytics {
                     plugin: server.id.clone(),
                     topic: manifest.map(|m| m.id.clone()),
-                    name: manifest
-                        .map(|m| m.name.clone())
-                        .filter(|n| !n.is_empty())
-                        .unwrap_or_else(|| server.id.clone()),
+                    name: server.shown_name(manifest.map(|m| m.name.as_str())),
                     state,
                     layers,
                     wall_layers,
@@ -461,6 +467,8 @@ impl PluginHost {
                     status: Arc::clone(&self.status),
                     overlays: Arc::clone(&self.overlays),
                     approval: server.approval.clone(),
+                    managed: server.managed.is_some(),
+                    tickets: Arc::clone(&self.tickets),
                     config_path: config_path.clone(),
                     queries: Arc::clone(&self.queries),
                 };

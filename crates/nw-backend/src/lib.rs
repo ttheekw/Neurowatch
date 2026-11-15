@@ -18,6 +18,7 @@ pub mod events;
 pub mod export;
 pub mod ipc;
 pub mod logging;
+pub mod mqtt;
 pub mod onvif_events;
 pub mod pipeline;
 pub mod playback;

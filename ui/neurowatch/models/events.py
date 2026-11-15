@@ -15,6 +15,9 @@ EVENT_LABELS: dict[str, str] = {
     "motion": "Motion",
     "intrusion": "Intrusion",
     "line_crossing": "Line crossed",
+    "person": "Person",
+    "vehicle": "Vehicle",
+    "animal": "Animal",
     "tamper": "Tampering",
     "digital_input": "Alarm input",
     "camera_event": "Camera event",
@@ -37,7 +40,7 @@ END_LABELS: dict[str, str] = {
     "backup_failed": "Cloud Backup working again",
 }
 #: Kinds a tile shows as movement in the picture.
-ACTIVITY_KINDS = frozenset({"motion", "intrusion", "line_crossing"})
+ACTIVITY_KINDS = frozenset({"motion", "intrusion", "line_crossing", "person", "vehicle", "animal"})
 PLAYBACK_KINDS = frozenset(EVENT_LABELS) - {
     "disk_low",
     "storage_missing",
@@ -57,6 +60,9 @@ EVENT_COLORS = {
     "motion": "#f97316",
     "intrusion": "#f97316",
     "line_crossing": "#f97316",
+    "person": "#f97316",
+    "vehicle": "#f97316",
+    "animal": "#f97316",
     "tamper": "#a855f7",
     "digital_input": "#06b6d4",
     "camera_event": "#64748b",
@@ -92,6 +98,9 @@ def label(kind: str) -> str:
 #: Kinds as nouns in a sentence ("It reports motion and line crossing").
 _KIND_NOUNS: dict[str, str] = {
     "line_crossing": "line crossing",
+    "person": "people",
+    "vehicle": "vehicles",
+    "animal": "animals",
     "tamper": "tampering",
     "digital_input": "alarm inputs",
     "camera_event": "other camera events",

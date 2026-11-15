@@ -1,0 +1,20 @@
+[package]
+name        = "nw-service-protocol"
+description = "Signed tokens and the key list shared by NeuroWatch's portal, recorders and hosted services"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+rust-version.workspace = true
+
+# Services in other repositories depend on this crate by path: keep it free of
+# I/O, runtimes and NeuroWatch's own crates.
+[dependencies]
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+base64        = "0.22"
+# Pinned like nw-analytics-sdk's for the workspace Rust 1.75 MSRV.
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["std"] }

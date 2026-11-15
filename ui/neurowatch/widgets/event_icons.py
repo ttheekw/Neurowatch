@@ -33,6 +33,40 @@ def _motion(p: QPainter) -> None:
     p.drawLine(QPointF(3.0, 17.0), QPointF(6.5, 17.0))
 
 
+def _person(p: QPainter) -> None:
+    # Head and shoulders.
+    p.drawEllipse(QPointF(12.0, 8.0), 3.5, 3.5)
+    body = QPainterPath(QPointF(5.0, 20.5))
+    body.cubicTo(5.0, 15.5, 8.0, 13.5, 12.0, 13.5)
+    body.cubicTo(16.0, 13.5, 19.0, 15.5, 19.0, 20.5)
+    p.drawPath(body)
+
+
+def _vehicle(p: QPainter) -> None:
+    # A car from the side: body, cabin and two wheels.
+    body = QPainterPath(QPointF(3.0, 16.0))
+    body.lineTo(3.0, 12.5)
+    body.lineTo(6.5, 11.5)
+    body.lineTo(9.0, 7.5)
+    body.lineTo(15.5, 7.5)
+    body.lineTo(18.5, 11.5)
+    body.lineTo(21.0, 12.5)
+    body.lineTo(21.0, 16.0)
+    p.drawPath(body)
+    p.drawLine(QPointF(9.5, 16.0), QPointF(14.5, 16.0))
+    p.drawEllipse(QPointF(7.0, 16.5), 2.0, 2.0)
+    p.drawEllipse(QPointF(17.0, 16.5), 2.0, 2.0)
+
+
+def _animal(p: QPainter) -> None:
+    # A paw: pad and four toes.
+    p.drawEllipse(QPointF(12.0, 15.5), 4.5, 3.8)
+    p.drawEllipse(QPointF(6.0, 10.5), 1.7, 2.1)
+    p.drawEllipse(QPointF(9.8, 6.5), 1.7, 2.1)
+    p.drawEllipse(QPointF(14.2, 6.5), 1.7, 2.1)
+    p.drawEllipse(QPointF(18.0, 10.5), 1.7, 2.1)
+
+
 def _intrusion(p: QPainter) -> None:
     shield = QPainterPath(QPointF(12.0, 3.0))
     shield.lineTo(19.5, 6.0)
@@ -169,6 +203,9 @@ _GLYPHS: dict[str, _Glyph] = {
     "motion": _motion,
     "intrusion": _intrusion,
     "line_crossing": _line_crossing,
+    "person": _person,
+    "vehicle": _vehicle,
+    "animal": _animal,
     "tamper": _tamper,
     "digital_input": _digital_input,
     "camera_event": _camera_event,

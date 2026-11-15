@@ -322,7 +322,7 @@ impl RemoteConfig {
         tokio::task::spawn_blocking(move || {
             hub.flush();
             let conn = db.lock().map_err(|_| "event database unavailable".to_owned())?;
-            let mut statement = conn.prepare("SELECT camera_id, SUM(acknowledged = 0), COALESCE(MAX(CASE WHEN acknowledged = 0 THEN id END),0), SUM(end_ts IS NULL) FROM events WHERE event_type IN ('motion','intrusion','line_crossing') AND camera_id IS NOT NULL GROUP BY camera_id").map_err(|e| e.to_string())?;
+            let mut statement = conn.prepare("SELECT camera_id, SUM(acknowledged = 0), COALESCE(MAX(CASE WHEN acknowledged = 0 THEN id END),0), SUM(end_ts IS NULL) FROM events WHERE event_type IN ('motion','intrusion','line_crossing','person','vehicle','animal') AND camera_id IS NOT NULL GROUP BY camera_id").map_err(|e| e.to_string())?;
             let rows = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?))).map_err(|e| e.to_string())?;
             let mut cameras = Map::new();
             for row in rows { let (id,pending,through_id,active) = row.map_err(|e| e.to_string())?; cameras.insert(id,json!({"pending":pending,"through_id":through_id,"active":active>0})); }
@@ -363,7 +363,7 @@ impl RemoteConfig {
             let ids: Vec<i64> = tokio::task::spawn_blocking(move || -> Result<Vec<i64>,String> {
                 hub.flush();
                 let conn=db.lock().map_err(|_|"event database unavailable".to_owned())?;
-                let mut statement=conn.prepare("SELECT id FROM events WHERE camera_id=?1 AND id<=?2 AND acknowledged=0 AND event_type IN ('motion','intrusion','line_crossing') LIMIT 500").map_err(|e|e.to_string())?;
+                let mut statement=conn.prepare("SELECT id FROM events WHERE camera_id=?1 AND id<=?2 AND acknowledged=0 AND event_type IN ('motion','intrusion','line_crossing','person','vehicle','animal') LIMIT 500").map_err(|e|e.to_string())?;
                 let rows=statement.query_map(rusqlite::params![camera,through],|row|row.get(0)).map_err(|e|e.to_string())?;
                 rows.collect::<rusqlite::Result<Vec<i64>>>().map_err(|e|e.to_string())
             }).await.map_err(|e|e.to_string())??;

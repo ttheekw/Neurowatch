@@ -55,6 +55,9 @@ pub(crate) struct Context {
     pub status: Arc<Mutex<HashMap<String, ServerStatus>>>,
     pub overlays: Arc<OverlayStore>,
     pub approval: Option<nw_analytics_protocol::auth::Approval>,
+    /// Provided by NeuroWatch: presents the portal's ticket after signing in.
+    pub managed: bool,
+    pub tickets: Arc<Mutex<HashMap<String, String>>>,
     pub config_path: std::path::PathBuf,
     pub queries: Arc<Mutex<HashMap<String, mpsc::SyncSender<super::Query>>>>,
 }
@@ -160,6 +163,8 @@ fn session(
         locality: None,
         local_decoded: false,
         credential: None,
+        node_key: None,
+        presented: None,
         challenge: String::new(),
         authenticated: false,
         authentication_requested: None,
@@ -204,6 +209,7 @@ enum Incoming {
 enum Pending {
     Hello,
     Authenticate,
+    Entitlement,
     Proxy(tokio::sync::oneshot::Sender<Result<Value, String>>),
     Ping,
     Attach { camera_id: String, binding: u32 },
@@ -270,6 +276,9 @@ struct Session<'a> {
     local_decoded: bool,
     credential: Option<String>,
     challenge: String,
+    /// The recorder's identity key, and the ticket last shown (hosted plugins).
+    node_key: Option<nw_analytics_sdk::identity::SigningKey>,
+    presented: Option<String>,
     authenticated: bool,
     authentication_requested: Option<Instant>,
     quic: Option<nw_analytics_sdk::quic::QuicIo>,
@@ -436,6 +445,20 @@ impl Session<'_> {
                         if let Err(error) = result {
                             self.refusal(&error);
                             return Err(format!("The plugin refused authorization: {}", self.plugin_detail(error.message)));
+                        }
+                        if self.context.managed {
+                            self.present_ticket()?;
+                            self.authentication_requested = Some(Instant::now());
+                        } else {
+                            self.authentication_requested = None;
+                            self.authenticated = true;
+                            self.context.update(|status| { status.state = "connected"; status.detail = None; });
+                        }
+                    }
+                    Pending::Entitlement => {
+                        if let Err(error) = result {
+                            self.refusal(&error);
+                            return Err(format!("The service refused this recorder: {}", self.plugin_detail(error.message)));
                         }
                         self.authentication_requested = None;
                         self.authenticated = true;
@@ -607,6 +630,7 @@ impl Session<'_> {
                 Err(error) => return Err(format!("Could not read plugin credential: {error}")),
             };
             self.credential = credential.clone();
+            self.node_key = Some(key.clone());
             let authentication = nw_analytics_sdk::identity::authenticate(
                 &key,
                 &self.challenge,
@@ -616,6 +640,36 @@ impl Session<'_> {
             self.request(method::AUTHENTICATE, authentication, Pending::Authenticate)?;
             self.authentication_requested = Some(Instant::now());
         }
+        Ok(())
+    }
+
+    fn latest_ticket(&self) -> Option<String> {
+        self.context
+            .tickets
+            .lock()
+            .ok()
+            .and_then(|tickets| tickets.get(&self.context.server_id).cloned())
+    }
+
+    /// Show the portal's ticket, bound to this connection by the recorder's key.
+    fn present_ticket(&mut self) -> Result<(), String> {
+        let ticket = self
+            .latest_ticket()
+            .ok_or("Waiting for NeuroWatch to provide this service")?;
+        let key = self
+            .node_key
+            .as_ref()
+            .ok_or("This recorder has no identity key")?;
+        let signature = nw_service_protocol::sign_hex(
+            key,
+            &nw_service_protocol::entitlement_payload(&ticket, self.channel_binding.as_bytes()),
+        );
+        self.presented = Some(ticket.clone());
+        self.request(
+            method::ENTITLEMENT,
+            messages::Entitlement { ticket, signature },
+            Pending::Entitlement,
+        )?;
         Ok(())
     }
 
@@ -656,6 +710,15 @@ impl Session<'_> {
         }
         if !self.authenticated {
             return Ok(());
+        }
+        if self.context.managed {
+            let latest = self.latest_ticket();
+            if latest.is_none() {
+                return Err("NeuroWatch no longer provides this service to this recorder".into());
+            }
+            if latest != self.presented {
+                self.present_ticket()?;
+            }
         }
         let now = Instant::now();
         let gone: Vec<String> = self

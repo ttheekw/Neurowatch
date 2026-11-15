@@ -262,7 +262,7 @@ def test_unlink_needs_confirmation(monkeypatch):
                 "cloud_problem": "endpoint_unusable",
                 "cloud_endpoint": "http://127.0.0.1:8000",
             },
-            "scripts/dev_cloud_headless.sh",
+            "NW_CLOUD_DEV_ALLOW_LOOPBACK_HTTP=1",
         ),
         (
             {**LINKED, "cloud_reachable": False, "cloud_problem": "endpoint_unusable"},

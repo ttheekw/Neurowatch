@@ -39,6 +39,7 @@ mod dpapi;
 mod exports;
 mod inventory;
 pub mod sealed;
+pub mod services;
 mod websocket;
 pub use clock::CloudClock;
 pub use diagnostics::{diagnostics_snapshot, SystemInfo, MAX_DIAGNOSTICS_BYTES};
@@ -215,7 +216,17 @@ pub(crate) fn thumbnail_demand_url(
 }
 
 /// How often the node looks for camera status changes to report early.
-pub const INVENTORY_CHANGE_CHECK: Duration = Duration::from_secs(5);
+pub const INVENTORY_CHANGE_CHECK: Duration = Duration::from_secs(2);
+/// A camera just added or restarted reports "connecting" for a moment: hold
+/// the change report this long (from when the change was first seen) so one
+/// report usually carries "streaming", instead of "connecting" followed by
+/// "streaming" a minimum gap later (2026-11-15: a new camera took ~15-25 s to
+/// show as live on the web).
+pub const INVENTORY_SETTLE: Duration = Duration::from_secs(8);
+/// How often the cloud loop looks for a link made while it runs, so the first
+/// check-in follows the link at once rather than at the next minute's cycle
+/// (2026-11-15: a newly paired recorder showed offline for up to a minute).
+pub const LINK_WATCH: Duration = Duration::from_secs(1);
 /// Minimum spacing of change-driven inventory reports, so a flapping camera
 /// stays well inside the cloud's per-window challenge allowance.
 pub const INVENTORY_CHANGE_MIN_GAP: Duration = Duration::from_secs(10);
@@ -286,10 +297,22 @@ pub(crate) fn inventory_change_due(
     last: Option<&(Vec<CameraSnapshot>, std::time::Instant)>,
     current: &[CameraSnapshot],
     now: std::time::Instant,
+    first_seen: Option<std::time::Instant>,
 ) -> bool {
     last.is_some_and(|(reported, at)| {
-        reported.as_slice() != current
-            && now.saturating_duration_since(*at) >= INVENTORY_CHANGE_MIN_GAP
+        if reported.as_slice() == current
+            || now.saturating_duration_since(*at) < INVENTORY_CHANGE_MIN_GAP
+        {
+            return false;
+        }
+        // A camera changed to "connecting" is about to change again: wait for
+        // it, for at most INVENTORY_SETTLE since the change was first seen.
+        let settling = current
+            .iter()
+            .any(|camera| camera.status == "connecting" && !reported.contains(camera));
+        !settling
+            || first_seen
+                .is_some_and(|seen| now.saturating_duration_since(seen) >= INVENTORY_SETTLE)
     })
 }
 
@@ -1295,6 +1318,7 @@ pub struct CloudNode {
     websocket: Option<Arc<websocket::WsTransport>>,
     signals: Arc<CloudSignals>,
     clock: Arc<CloudClock>,
+    services: Arc<services::ServicesCache>,
 }
 impl CloudNode {
     /// Production-policy open for tests; the binary uses `open_with_options`.
@@ -1350,6 +1374,7 @@ impl CloudNode {
             websocket: Some(Arc::new(websocket::WsTransport::with_events())),
             signals: Arc::default(),
             clock,
+            services: Arc::default(),
         })
     }
     fn lock(&self) -> Result<MutexGuard<'_, Inner>> {
@@ -1803,6 +1828,7 @@ impl CloudNode {
                     "export-pulls" => EXPORT_PULL_OPERATION,
                     "export-reports" => EXPORT_REPORT_OPERATION,
                     "backup-tickets" => backup::BACKUP_TICKET_OPERATION,
+                    "service-tickets" => services::SERVICE_TICKETS_OPERATION,
                     "departures" => DEPARTURE_OPERATION,
                     "unlink-indications" => UNLINK_OPERATION,
                     _ => return Err(CloudError::Invalid("unsupported control operation".into())),
@@ -3174,6 +3200,10 @@ impl CloudScheduler {
             // An event asked for a pull, made once the minimum gap allows.
             let mut directive_wanted = false;
             let mut change_tick = Self::ticker(INVENTORY_CHANGE_CHECK);
+            let mut link_tick = Self::ticker(LINK_WATCH);
+            let mut was_linked = self.node.status().phase == LinkPhase::Linked;
+            // When the current, not yet reported camera change was first seen.
+            let mut change_seen: Option<std::time::Instant> = None;
             let mut coverage_tick = Self::ticker(COVERAGE_CHANGE_CHECK);
             let mut last_coverage: Option<(Vec<CameraCoverage>, std::time::Instant)> = None;
             let mut last_inventory: Option<(Vec<CameraSnapshot>, std::time::Instant)> = None;
@@ -3241,11 +3271,23 @@ impl CloudScheduler {
                             }
                         }
                     }
+                    _ = link_tick.tick() => {
+                        // Linked while running: check in now, not at the next cycle.
+                        let linked = self.node.status().phase == LinkPhase::Linked;
+                        if linked && !was_linked {
+                            tick.reset_immediately();
+                        }
+                        was_linked = linked;
+                    }
                     _ = change_tick.tick(), if self.inventory.is_some() => {
                         if self.node.status().phase == LinkPhase::Linked {
                             let source = self.inventory.as_ref().expect("guarded inventory source");
                             if let Some(cameras) = collect_inventory(source, budget).await {
-                                if inventory_change_due(last_inventory.as_ref(), &cameras, std::time::Instant::now()) {
+                                let now = std::time::Instant::now();
+                                let differs = last_inventory.as_ref().is_some_and(|(reported, _)| reported != &cameras);
+                                change_seen = if differs { change_seen.or(Some(now)) } else { None };
+                                if inventory_change_due(last_inventory.as_ref(), &cameras, now, change_seen) {
+                                    change_seen = None;
                                     let reported = tokio::time::timeout(budget, self.node.push_inventory(cameras.clone())).await;
                                     if let Some(reason) = inventory_failure_reason(&reported) {
                                         tracing::warn!(error = %reason, "Cloud camera status update failed");

@@ -13,6 +13,7 @@ use nw_analytics_protocol::{
 };
 use nw_core::event::{EventPhase, EventSource};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -73,6 +74,8 @@ fn a_plugin_receives_the_cameras_video_and_its_events_reach_the_hub() {
     let host = PluginHost::default();
     let hubs = Arc::new(StreamHubs::default());
     let context = Context {
+        managed: false,
+        tickets: Default::default(),
         server_id: "fake".into(),
         address: Address::Unix(path.clone()),
         node: NodeInfo {
@@ -282,6 +285,7 @@ fn a_plugin_receives_the_cameras_video_and_its_events_reach_the_hub() {
             approval: None,
             credential_revision: 0,
             plugin_id: None,
+            managed: None,
         }],
         bindings: vec![super::PluginBinding {
             server: "fake".into(),
@@ -291,6 +295,7 @@ fn a_plugin_receives_the_cameras_video_and_its_events_reach_the_hub() {
             stream: None,
             wall_layers: None,
             own_decoder: false,
+            withdrawn: false,
         }],
     };
     let shown = &host.cameras(&config)[&fixture.camera.id][0];
@@ -342,6 +347,8 @@ fn an_unreachable_plugin_is_reported_and_retried() {
     let dir = std::env::temp_dir().join(format!("nw-plugin-{}", uuid::Uuid::new_v4().simple()));
     let host = PluginHost::default();
     let context = Context {
+        managed: false,
+        tickets: Default::default(),
         server_id: "gone".into(),
         address: Address::Unix(dir.join("missing.sock")),
         node: NodeInfo {
@@ -378,6 +385,7 @@ fn an_unreachable_plugin_is_reported_and_retried() {
             approval: None,
             credential_revision: 0,
             plugin_id: None,
+            managed: None,
         }]);
         state = servers[0].state;
         if state == "error" {
@@ -412,6 +420,8 @@ fn an_unapproved_or_changed_key_gets_no_camera_bindings_or_credentials() {
         let listener = UnixListener::bind(&path).unwrap();
         let host = PluginHost::default();
         let context = Context {
+            managed: false,
+            tickets: Default::default(),
             server_id: "test".into(),
             address: Address::Unix(path),
             node: NodeInfo {
@@ -506,6 +516,8 @@ fn unsigned_legacy_and_invalid_signed_plugins_are_refused_before_authorization()
         let host = PluginHost::default();
         let key = nw_analytics_sdk::identity::SigningKey::from_bytes(&[3; 32]);
         let context = Context {
+            managed: false,
+            tickets: Default::default(),
             server_id: "test".into(),
             address: Address::Unix(path),
             node: NodeInfo {
@@ -608,6 +620,7 @@ fn a_plugin_is_offline_after_staying_unreachable_until_it_answers() {
         approval: None,
         credential_revision: 0,
         plugin_id: None,
+        managed: None,
     };
     let servers = [server("motion", true), server("off", false)];
     host.set_server(
@@ -795,4 +808,131 @@ fn a_bindings_own_decoder_choice_is_saved_only_when_set() {
     let saved = serde_json::to_value(&config).unwrap();
     assert_eq!(saved["bindings"][0]["own_decoder"], true);
     assert!(saved["bindings"][1].get("own_decoder").is_none());
+}
+
+#[test]
+fn a_hosted_plugin_gets_the_ticket_before_any_camera() {
+    let dir = std::env::temp_dir().join(format!("nw-plugin-hosted-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("cloud-node")).unwrap();
+    let path = dir.join("p.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let host = PluginHost::default();
+    host.set_tickets(HashMap::from([(
+        "hosted".to_owned(),
+        "claims.signature".to_owned(),
+    )]));
+    let key = nw_analytics_sdk::identity::SigningKey::from_bytes(&[3; 32]);
+    let node_key = crate::cloud::link::ProtectedKeyStore::open(dir.join("cloud-node/node.key"))
+        .and_then(|store| store.load_or_generate())
+        .unwrap();
+    let context = Context {
+        managed: true,
+        tickets: Arc::clone(&host.tickets),
+        server_id: "hosted".into(),
+        address: Address::Unix(path),
+        node: NodeInfo {
+            name: "Test".into(),
+            version: "0".into(),
+        },
+        streams: Arc::new(StreamHubs::default()),
+        events: Arc::new(EventHub::new(Arc::new(Mutex::new(
+            crate::db::connection::open_in_memory().unwrap(),
+        )))),
+        status: Arc::clone(&host.status),
+        overlays: Arc::clone(&host.overlays),
+        approval: Some(nw_analytics_protocol::auth::Approval {
+            public_key: nw_analytics_sdk::identity::public_key(&key),
+            permissions: vec!["video".into(), "events".into(), "overlays".into()],
+        }),
+        config_path: dir.join("config.json"),
+        queries: Arc::clone(&host.queries),
+    };
+    let camera = nw_core::camera::CameraConfig::new("Camera", "rtsp://example.invalid");
+    let desired = Arc::new(Mutex::new(Desired {
+        bindings: vec![DesiredBinding {
+            camera,
+            config: json!({}),
+            stream: None,
+            moving: false,
+            own_decoder: false,
+        }],
+    }));
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || session::run(context, desired, stop))
+    };
+    let (conn, _) = listener.accept().unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut plugin = FakePlugin { conn };
+    let ok = |value: Value| Ok::<_, nw_analytics_protocol::rpc::RpcError>(value);
+
+    let Message::Request { id, params, .. } = plugin.message() else {
+        panic!("hello expected");
+    };
+    let mut signed = serde_json::from_value(manifest()).unwrap();
+    nw_analytics_sdk::identity::sign_manifest(
+        &mut signed,
+        &key,
+        params["challenge"].as_str().unwrap(),
+        "",
+    )
+    .unwrap();
+    plugin.send(Message::reply(
+        id,
+        ok(serde_json::to_value(signed).unwrap()),
+    ));
+
+    let Message::Request {
+        id, method: name, ..
+    } = plugin.message()
+    else {
+        panic!("authenticate expected");
+    };
+    assert_eq!(name, method::AUTHENTICATE);
+    plugin.send(Message::reply(id, ok(json!({"authorized": true}))));
+
+    let Message::Request {
+        id,
+        method: name,
+        params,
+    } = plugin.message()
+    else {
+        panic!("entitlement expected");
+    };
+    assert_eq!(name, method::ENTITLEMENT, "no camera before the ticket");
+    assert_eq!(params["ticket"], "claims.signature");
+    assert!(nw_service_protocol::verify_hex(
+        &node_key.verifying_key(),
+        &nw_service_protocol::entitlement_payload("claims.signature", b""),
+        params["signature"].as_str().unwrap()
+    ));
+    plugin.send(Message::reply(
+        id,
+        ok(json!({"cameras": 8, "expires_at_ms": 1})),
+    ));
+
+    let Message::Request { method: name, .. } = plugin.message() else {
+        panic!("attach expected");
+    };
+    assert_eq!(name, method::ATTACH);
+    // Withdrawn by the portal: the session ends.
+    host.set_tickets(HashMap::new());
+    let ended = (0..80).any(|_| {
+        std::thread::sleep(Duration::from_millis(50));
+        host.status
+            .lock()
+            .unwrap()
+            .get("hosted")
+            .is_some_and(|status| {
+                status
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("no longer provides"))
+            })
+    });
+    assert!(ended);
+    stop.store(true, Ordering::Release);
+    drop(plugin);
+    thread.join().unwrap();
 }

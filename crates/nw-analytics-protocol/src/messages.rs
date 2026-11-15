@@ -73,6 +73,25 @@ pub struct EventKindInfo {
     pub label: String,
 }
 
+// ---- Hosted plugins ---------------------------------------------------------
+
+/// `entitlement` (node → plugin), after `authenticate` and again on renewal:
+/// the portal's ticket, and the recorder's signature binding it to this
+/// connection (`nw_service_protocol::entitlement_payload`, hex).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Entitlement {
+    pub ticket: String,
+    pub signature: String,
+}
+
+/// What a plugin accepted from an [`Entitlement`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntitlementAccepted {
+    /// Cameras this recorder may bind.
+    pub cameras: u32,
+    pub expires_at_ms: i64,
+}
+
 // ---- Media ------------------------------------------------------------------
 
 /// Which of the camera's streams.

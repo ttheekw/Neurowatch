@@ -242,6 +242,8 @@ mod tests {
             available_bytes: 200,
             recommended: true,
             selected,
+            folder: format!("{mount_point}/nw-storage"),
+            writable: true,
         }
     }
 

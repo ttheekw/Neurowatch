@@ -1969,21 +1969,62 @@ fn a_camera_status_change_is_reported_within_seconds_but_not_more_than_every_ten
     };
     let reported = (snap("connecting"), start);
     // Nothing reported yet: the regular check-in cycle sends the first one.
-    assert!(!inventory_change_due(None, &snap("streaming"), start));
+    assert!(!inventory_change_due(None, &snap("streaming"), start, None));
     assert!(!inventory_change_due(
         Some(&reported),
         &snap("connecting"),
-        start + Duration::from_secs(30)
+        start + Duration::from_secs(30),
+        None
     ));
     assert!(!inventory_change_due(
         Some(&reported),
         &snap("streaming"),
-        start + Duration::from_secs(5)
+        start + Duration::from_secs(5),
+        None
     ));
     assert!(inventory_change_due(
         Some(&reported),
         &snap("streaming"),
-        start + INVENTORY_CHANGE_MIN_GAP
+        start + INVENTORY_CHANGE_MIN_GAP,
+        None
+    ));
+}
+
+#[test]
+fn a_camera_still_connecting_is_reported_once_it_settles_or_after_a_while() {
+    let start = std::time::Instant::now();
+    let snap = |status: &'static str| {
+        vec![CameraSnapshot {
+            camera_id: "cam-a".into(),
+            name: "Door".into(),
+            status,
+            recording: false,
+            live: None,
+            formats: None,
+        }]
+    };
+    let reported = (Vec::new(), start);
+    let later = start + Duration::from_secs(60);
+    // Just added and still connecting: held back.
+    assert!(!inventory_change_due(
+        Some(&reported),
+        &snap("connecting"),
+        later,
+        Some(later)
+    ));
+    // Streaming a moment later: reported at once.
+    assert!(inventory_change_due(
+        Some(&reported),
+        &snap("streaming"),
+        later + Duration::from_secs(2),
+        Some(later)
+    ));
+    // Still connecting after the settle time: reported as connecting.
+    assert!(inventory_change_due(
+        Some(&reported),
+        &snap("connecting"),
+        later + INVENTORY_SETTLE,
+        Some(later)
     ));
 }
 

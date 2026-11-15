@@ -276,7 +276,7 @@ pub async fn run(
     state: Arc<tokio::sync::RwLock<crate::app_state::AppState>>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
-    use nw_core::event::{EventKind, EventPhase};
+    use nw_core::event::EventPhase;
     let mut notices = state.read().await.events.subscribe();
     let mut tasks = tokio::task::JoinSet::new();
     loop {
@@ -285,7 +285,7 @@ pub async fn run(
             _ = tasks.join_next(), if !tasks.is_empty() => {},
             notice = notices.recv() => {
                 let notice = match notice { Ok(notice) => notice, Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue, Err(_) => break };
-                if notice.phase != EventPhase::Start || !matches!(notice.event.kind, EventKind::Motion | EventKind::Intrusion | EventKind::LineCrossing) || tasks.len() >= 2 { continue; }
+                if notice.phase != EventPhase::Start || !notice.event.kind.is_activity() || tasks.len() >= 2 { continue; }
                 let Some(camera_id) = notice.event.camera_id else { continue; };
                 let (camera, pictures, hub, db) = {
                     let state = state.read().await;

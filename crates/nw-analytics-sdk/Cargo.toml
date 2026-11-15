@@ -19,6 +19,7 @@ getrandom = { version = "0.2", features = ["std"] }
 libc = "0.2"
 subtle = "2.6"
 tokio = { workspace = true }
+nw-service-protocol = { workspace = true }
 ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["std"] }
 sha2 = "0.10"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }

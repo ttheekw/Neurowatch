@@ -28,6 +28,7 @@ use tokio::sync::{watch, RwLock};
 
 use super::backup_sound::SoundPath;
 use super::link::backup::{parse_backup_reply, BackupAssignment};
+use super::link::services::BACKUP_SERVICE;
 use super::link::{CloudError, CloudNode, LinkPhase};
 use crate::app_state::AppState;
 use crate::streams::{annexb::AnnexB, Delivery, Media, Phase, SubscriberPolicy, Unit};
@@ -202,6 +203,7 @@ impl Assigner for PortalAssigner {
                 server_name: assignment.ingest.name,
                 quic: assignment.ingest.quic,
                 tcp: assignment.ingest.tcp,
+                instance_key: assignment.ingest.public_key,
             })
         })
     }
@@ -216,6 +218,13 @@ async fn fetch(node: &CloudNode) -> Result<Option<BackupAssignment>, String> {
         let reply: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         return parse_backup_reply(&reply).map_err(|e| e.to_string());
+    }
+    // An older portal has no `service-tickets`: ask the way it understands.
+    if let Ok(entries) = node.hosted_services().await {
+        return Ok(entries
+            .into_iter()
+            .find(|entry| entry.service == BACKUP_SERVICE)
+            .map(BackupAssignment::from_service));
     }
     node.backup_assignment().await.map_err(|error| match error {
         CloudError::Network(message) if message == "HTTP 404 Not Found" => UNSUPPORTED.to_owned(),

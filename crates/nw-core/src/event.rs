@@ -51,6 +51,12 @@ pub enum EventKind {
     DigitalInput,
     /// Another camera event, named by its ONVIF topic.
     CameraEvent,
+    /// A person in view (an object-detection plugin).
+    Person,
+    /// A car, bus, lorry, motorbike or bicycle in view (an object-detection plugin).
+    Vehicle,
+    /// An animal in view (an object-detection plugin).
+    Animal,
     CameraOffline,
     RecordingFailed,
     DiskLow,
@@ -68,13 +74,16 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 14] = [
+    pub const ALL: [EventKind; 17] = [
         Self::Motion,
         Self::Intrusion,
         Self::LineCrossing,
         Self::Tamper,
         Self::DigitalInput,
         Self::CameraEvent,
+        Self::Person,
+        Self::Vehicle,
+        Self::Animal,
         Self::CameraOffline,
         Self::RecordingFailed,
         Self::DiskLow,
@@ -93,6 +102,9 @@ impl EventKind {
             Self::Tamper => "tamper",
             Self::DigitalInput => "digital_input",
             Self::CameraEvent => "camera_event",
+            Self::Person => "person",
+            Self::Vehicle => "vehicle",
+            Self::Animal => "animal",
             Self::CameraOffline => "camera_offline",
             Self::RecordingFailed => "recording_failed",
             Self::DiskLow => "disk_low",
@@ -107,6 +119,24 @@ impl EventKind {
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.as_str() == name)
     }
+
+    /// Something seen happening on a camera: what tiles flag, event
+    /// pictures are taken for and event-based recording keeps.
+    pub fn is_activity(self) -> bool {
+        matches!(
+            self,
+            Self::Motion
+                | Self::Intrusion
+                | Self::LineCrossing
+                | Self::Person
+                | Self::Vehicle
+                | Self::Animal
+        )
+    }
+
+    /// [`Self::is_activity`] kinds as an SQL list: `('motion', …)`.
+    pub const ACTIVITY_SQL: &'static str =
+        "('motion','intrusion','line_crossing','person','vehicle','animal')";
 }
 
 /// Who reported an event.

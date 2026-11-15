@@ -105,6 +105,8 @@ pub struct AppState {
     pub ptz: Arc<crate::ptz::PtzService>,
     /// Alert notifications (`crate::alerts`).
     pub alerts: Arc<crate::alerts::AlertService>,
+    /// MQTT and Home Assistant (`crate::mqtt`).
+    pub mqtt: Arc<crate::mqtt::MqttService>,
     /// Signed-in local accounts (`crate::accounts`).
     pub sessions: Arc<crate::accounts::Sessions>,
     /// Two-way audio: who talks through which camera (`crate::talk`).
@@ -189,6 +191,7 @@ impl AppState {
             onvif_events: Arc::new(crate::onvif_events::OnvifEvents::new()),
             ptz: Arc::new(crate::ptz::PtzService::default()),
             alerts: Arc::new(crate::alerts::AlertService::default()),
+            mqtt: Arc::new(crate::mqtt::MqttService::default()),
             sessions: Arc::new(crate::accounts::Sessions::default()),
             talk: Arc::new(crate::talk::TalkService::default()),
             plugins,

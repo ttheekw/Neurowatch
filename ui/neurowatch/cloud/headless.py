@@ -84,7 +84,7 @@ def _unreachable_reason(cloud: dict[str, Any]) -> str:
         if endpoint.startswith(("http://127.", "http://localhost", "http://[::1]")):
             return (
                 "this local development address is only allowed with "
-                "NW_CLOUD_DEV_ALLOW_LOOPBACK_HTTP=1: start with scripts/dev_cloud_headless.sh"
+                "NW_CLOUD_DEV_ALLOW_LOOPBACK_HTTP=1 (a development build)"
             )
         return "the saved cloud address is not usable (details in the backend log)"
     return "cannot reach it"
