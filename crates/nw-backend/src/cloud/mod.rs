@@ -580,3 +580,76 @@ impl media_publish::TalkSink for CameraSpeaker {
         tokio::spawn(async move { state.read().await.talk.stop(&client) });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stats::test_support::{StaticCameras, StaticGpu, StaticIpc, StaticSystem};
+    use nw_core::stats::{GpuStatus, IpcMetrics, ProcessMetrics};
+
+    /// The runtime's three calls with nothing linked: the taps are installed,
+    /// the cloud starts (its node in the config's folder, its loops idle: an
+    /// unlinked node makes no request), answers `cloud.status`, and stops.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unlinked_cloud_starts_answers_and_stops() {
+        let dir = std::env::temp_dir().join(format!("nw-cloud-start-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let mut app = AppState::with_database(
+            crate::config::AppConfig::default(),
+            config_path.clone(),
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+            crate::db::connection::open_in_memory().unwrap(),
+        );
+        let cloud = Cloud::new();
+        cloud.prepare(&mut app);
+        let (exports, overlays, backup) = (
+            Arc::clone(&app.exports),
+            Arc::clone(&app.plugins.overlays),
+            Arc::clone(&app.backup),
+        );
+        let state = Arc::new(RwLock::new(app));
+        let stats = Arc::new(PerformanceAggregator::new(
+            Arc::new(StaticSystem(ProcessMetrics {
+                cpu_percent: 0.0,
+                rss_bytes: 0,
+                memory_percent: 0.0,
+                system_cpu_percent: None,
+                system_memory_percent: None,
+                network: None,
+                siblings: vec![],
+            })),
+            Arc::new(StaticGpu(GpuStatus::unavailable("test"))),
+            Arc::new(StaticIpc(IpcMetrics::default())),
+            Arc::new(StaticCameras(std::sync::Mutex::new(vec![]))),
+        ));
+        let running = cloud.start(Services {
+            state: Arc::clone(&state),
+            viewer_manager: Arc::new(ViewerManager::new(
+                crate::pipeline::hwaccel::HwAccelKind::Software,
+                crate::viewer::capabilities::ViewerCapabilities::unavailable("test"),
+            )),
+            stats,
+            discovery: Arc::new(DiscoveryService::new()),
+            exports,
+            overlays,
+            backup,
+            config_path,
+            headless: true,
+        });
+        let rpc = running.rpc().expect("the cloud node opened");
+        let status = rpc
+            .dispatch("cloud.status", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status["phase"], "unlinked", "{status}");
+        assert!(
+            dir.join("cloud-node").is_dir(),
+            "the node lives beside the config"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(20), running.shutdown())
+            .await
+            .expect("shutdown finishes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

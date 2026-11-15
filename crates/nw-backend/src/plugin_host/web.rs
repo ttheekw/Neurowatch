@@ -193,3 +193,63 @@ pub async fn dispatch(
         _ => Err("Unknown plugin web method".into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> Arc<RwLock<AppState>> {
+        Arc::new(RwLock::new(AppState::with_database(
+            crate::config::AppConfig::default(),
+            std::env::temp_dir().join(format!("nw-web-{}.json", uuid::Uuid::new_v4())),
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+            crate::db::connection::open_in_memory().unwrap(),
+        )))
+    }
+
+    fn viewer(role: &str) -> Viewer {
+        Viewer {
+            user: "u-1".into(),
+            role: role.into(),
+            cameras: vec![],
+            session: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_known_roles_and_short_names_are_served() {
+        let state = state();
+        let err = dispatch(&state, "plugins.pages", &json!({}), &viewer("root")).await;
+        assert_eq!(err.unwrap_err(), "Invalid viewer");
+        let mut long = viewer("viewer");
+        long.user = "x".repeat(129);
+        let err = dispatch(&state, "plugins.pages", &json!({}), &long).await;
+        assert_eq!(err.unwrap_err(), "Invalid viewer");
+        assert_eq!(Viewer::owner().role, "admin");
+    }
+
+    #[tokio::test]
+    async fn pages_list_only_connected_plugins_with_a_page() {
+        let state = state();
+        let pages = dispatch(&state, "plugins.pages", &json!({}), &viewer("viewer"))
+            .await
+            .unwrap();
+        assert_eq!(pages["viewer"], json!({"user": "u-1", "role": "viewer"}));
+        assert_eq!(pages["plugins"], json!([]), "none is connected");
+    }
+
+    #[tokio::test]
+    async fn a_request_names_a_connected_plugin() {
+        let state = state();
+        let missing = dispatch(&state, "plugins.web.request", &json!({}), &viewer("admin")).await;
+        assert_eq!(missing.unwrap_err(), "'server' is required");
+        let absent = dispatch(
+            &state,
+            "plugins.web.read",
+            &json!({"server": "nw-motion-bundled"}),
+            &viewer("admin"),
+        )
+        .await;
+        assert_eq!(absent.unwrap_err(), "Plugin is not connected");
+    }
+}

@@ -325,7 +325,9 @@ mod tests {
     #[tokio::test]
     async fn a_snapshot_uses_the_open_sub_stream_instead_of_connecting_main() {
         use crate::streams::{Delivery, StreamHubs, SubscriberPolicy};
-        let fixture = crate::streams::testing::CameraFile::new(150);
+        // 30 s of video: a shorter one could end before the picture is asked for
+        // on a loaded machine (coverage builds), leaving no open stream.
+        let fixture = crate::streams::testing::CameraFile::new(750);
         let streams = Arc::new(StreamHubs::default());
         let service = SnapshotService::new(Arc::clone(&streams));
         let mut camera = fixture.camera.clone();
@@ -347,6 +349,12 @@ mod tests {
         })
         .await
         .unwrap();
+        // The stream is marked streaming by its poll after its first unit:
+        // wait for that, not only for a unit, or this races it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while streams.streaming_source(&camera).is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let started = Instant::now();
         let jpeg = service.capture_from(camera, true).await.unwrap();
         assert!(
@@ -361,7 +369,9 @@ mod tests {
     #[tokio::test]
     async fn snapshot_fallback_reuses_an_open_hub_and_closes_an_unwatched_one() {
         use crate::streams::{Delivery, StreamHubs, SubscriberPolicy};
-        let fixture = crate::streams::testing::CameraFile::new(150);
+        // 30 s of video: a shorter one could end before the picture is asked for
+        // on a loaded machine (coverage builds), leaving no open stream.
+        let fixture = crate::streams::testing::CameraFile::new(750);
         let streams = Arc::new(StreamHubs::default());
         let service = SnapshotService::new(Arc::clone(&streams));
         let subscriber = streams

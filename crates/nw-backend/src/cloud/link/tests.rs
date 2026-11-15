@@ -2599,3 +2599,152 @@ fn a_correct_clock_reports_no_offset_until_the_cloud_answers_and_no_warning() {
     assert!(json.get("clock_warning").is_none());
     fs::remove_dir_all(dir).unwrap();
 }
+
+fn export_challenge(operation: &str, value: &str) -> Value {
+    json!({
+        "protocol_version": 1,
+        "audience": NODE_AUDIENCE,
+        "operation": operation,
+        "challenge": value,
+        "expires_at": "2099-01-01T00:01:00Z"
+    })
+}
+
+fn linked_export_node(endpoint: &str, name: &str) -> (CloudNode, PathBuf) {
+    let dir = temp_dir(name);
+    let mut node = CloudNode::open(dir.clone()).unwrap();
+    node.install_linked_for_test(
+        endpoint,
+        "6ba7b811-9dad-11d1-80b4-00c04fd430c8",
+        "6ba7b812-9dad-11d1-80b4-00c04fd430c8",
+        7,
+    )
+    .unwrap();
+    (node, dir)
+}
+
+#[tokio::test]
+async fn export_jobs_are_pulled_with_a_signed_proof_and_checked() {
+    let job = json!({
+        "export_id": "0123456789abcdef0123456789abcdef", "camera_id": "cam-1",
+        "start_ms": 1_000, "end_ms": 61_000, "max_bytes": 1_000_000
+    });
+    let (endpoint, captured, server) = serve_scripted(vec![
+        (
+            201,
+            Some(export_challenge(
+                EXPORT_PULL_OPERATION,
+                "pull-challenge-000000000001",
+            )),
+        ),
+        (200, Some(json!({"exports": [job]}))),
+        (
+            201,
+            Some(export_challenge(
+                EXPORT_PULL_OPERATION,
+                "pull-challenge-000000000002",
+            )),
+        ),
+        // A job with an id that is not one: nothing is run.
+        (
+            200,
+            Some(
+                json!({"exports": [{"export_id": "../../etc", "camera_id": "cam-1",
+            "start_ms": 1, "end_ms": 2, "max_bytes": 1}]}),
+            ),
+        ),
+    ]);
+    let (node, dir) = linked_export_node(&endpoint, "export-pull");
+    let jobs = node.pull_exports(Duration::from_secs(0)).await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].camera_id, "cam-1");
+    assert_eq!((jobs[0].start_ms, jobs[0].end_ms), (1_000, 61_000));
+    assert!(matches!(
+        node.pull_exports(Duration::from_secs(0)).await,
+        Err(CloudError::Network(message)) if message == "invalid export jobs"
+    ));
+    server.join().unwrap();
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests[0]["operation"], EXPORT_PULL_OPERATION);
+    assert_eq!(requests[1]["challenge"], "pull-challenge-000000000001");
+    assert!(requests[1]["signature"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    drop(requests);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn export_progress_is_reported_and_the_reply_says_what_next() {
+    use super::exports::{ExportProgress, ExportReply};
+    let (endpoint, captured, server) = serve_scripted(vec![
+        (
+            201,
+            Some(export_challenge(
+                EXPORT_REPORT_OPERATION,
+                "report-challenge-0000000001",
+            )),
+        ),
+        (200, Some(json!({"cancel": false}))),
+        (
+            201,
+            Some(export_challenge(
+                EXPORT_REPORT_OPERATION,
+                "report-challenge-0000000002",
+            )),
+        ),
+        (
+            200,
+            Some(
+                json!({"cancel": false, "upload_url": "https://objects.example.com/e.mp4?X-Amz-Signature=1"}),
+            ),
+        ),
+        (
+            201,
+            Some(export_challenge(
+                EXPORT_REPORT_OPERATION,
+                "report-challenge-0000000003",
+            )),
+        ),
+        (200, Some(json!({"cancel": true}))),
+    ]);
+    let (node, dir) = linked_export_node(&endpoint, "export-report");
+    let id = "0123456789abcdef0123456789abcdef";
+    let running = ExportProgress {
+        state: "running",
+        progress: 0.5,
+        ..ExportProgress::default()
+    };
+    assert_eq!(
+        node.report_export(id, &running).await.unwrap(),
+        ExportReply::default()
+    );
+    let ready = ExportProgress {
+        state: "ready",
+        progress: 1.0,
+        size_bytes: Some(4_321),
+        duration_ms: Some(60_000),
+        first_ms: Some(1_000),
+        audio: Some(false),
+        error: None,
+    };
+    let reply = node.report_export(id, &ready).await.unwrap();
+    assert!(!reply.cancel);
+    assert!(reply
+        .upload_url
+        .is_some_and(|url| url.starts_with("https://objects.example.com/")));
+    let failed = ExportProgress {
+        state: "failed",
+        error: Some("no recordings".into()),
+        ..ExportProgress::default()
+    };
+    assert!(node.report_export(id, &failed).await.unwrap().cancel);
+    server.join().unwrap();
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests[1]["export_id"], id);
+    assert_eq!(requests[1]["state"], "running");
+    assert_eq!(requests[3]["size_bytes"], 4_321);
+    assert_eq!(requests[5]["error"], "no recordings");
+    drop(requests);
+    fs::remove_dir_all(dir).unwrap();
+}

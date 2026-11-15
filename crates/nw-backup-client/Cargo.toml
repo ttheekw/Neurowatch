@@ -28,3 +28,5 @@ getrandom     = { version = "0.2", features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
+# A throwaway certificate for the tests' stand-in ingest (tests/session.rs).
+rcgen    = "0.13"
