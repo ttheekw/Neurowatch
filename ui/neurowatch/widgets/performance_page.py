@@ -632,7 +632,9 @@ class PerformancePage(QWidget):
 
         # Cameras
         self._camera_diagnostics.update_snapshot(
-            snap.get("cameras") or [], snap.get("stream_connections"), self._names,
+            snap.get("cameras") or [],
+            snap.get("stream_connections"),
+            self._names,
             plugin_consumers=snap.get("plugin_stream_consumers"),
             decoder=(snap.get("video_acceleration") or {}).get("label"),
         )

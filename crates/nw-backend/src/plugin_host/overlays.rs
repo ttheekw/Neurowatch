@@ -73,12 +73,14 @@ pub struct ShownFigure {
     pub style: Option<nw_analytics_protocol::messages::Style>,
 }
 
+/// A plugin's latest figures for a camera, and when they end.
+type FiguresUntil = (Vec<nw_analytics_protocol::messages::Figure>, Instant);
+
 pub struct OverlayStore {
     entries: Mutex<HashMap<Key, Entry>>,
     wall_layers: Mutex<HashSet<Key>>,
     /// Camera, plugin → its latest figures and when they end.
-    figures:
-        Mutex<HashMap<(String, String), (Vec<nw_analytics_protocol::messages::Figure>, Instant)>>,
+    figures: Mutex<HashMap<(String, String), FiguresUntil>>,
     seq: watch::Sender<u64>,
     pub history: Option<Arc<super::history::History>>,
 }
