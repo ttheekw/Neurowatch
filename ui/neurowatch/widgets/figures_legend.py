@@ -42,6 +42,13 @@ _CELL_MIN_WIDTH = 128
 #: compact: one line per cell (icon, number, colour), smaller type, tighter gaps.
 _COMPACT_BELOW = 1100
 _COMPACT_ICON_SIZE = 14
+#: A small tile whose counts do not fit one row even with less padding: smaller
+#: digits and icons first, before wrapping onto another row. Wider interface
+#: fonts (DejaVu Sans, as on Ubuntu servers and the Docker image) need it on a
+#: 390 px tile where Noto Sans does not.
+_SMALL_ICON_SIZE = 12
+_COMPACT_POINTS = 9.5
+_SMALL_POINTS = 8.5
 _INLINE_ICON_SIZE = 18
 _COMPACT_ROW_GAP_X = 10
 #: Less room than this over a tile and only the cells are shown.
@@ -94,6 +101,8 @@ class _Cell(QFrame):
         self.setObjectName("figureCell")
         self._inline = inline
         self._tight = False
+        #: Smaller digits and icon too (the second step before wrapping).
+        self._small = False
         self._figure: Figure | None = None
         self.icon_color = "#e6eaf2"
         self.icon_shown: tuple[object, ...] | None = None
@@ -139,18 +148,36 @@ class _Cell(QFrame):
         self._show_color()
         self._show_icon()
 
-    def set_tight(self, tight: bool) -> None:
-        """Use less padding before wrapping a small tile's counts onto another row."""
-        if tight != self._tight:
-            self._tight = tight
+    def set_squeeze(self, level: int) -> None:
+        """How much a compact cell gives up before a small tile's counts wrap
+        onto another row: 0 nothing, 1 padding, 2 also smaller digits and icon."""
+        tight, small = level >= 1, level >= 2
+        if (tight, small) != (self._tight, self._small):
+            self._tight, self._small = tight, small
             self._density()
+            self._show_icon()
             self.updateGeometry()
+
+    def compact_width(self, level: int) -> int:
+        """This cell's width when compact at squeeze `level`, from the font
+        alone (not from its current state, so choosing a level never makes it
+        change its mind): border, padding, icon, gap and number."""
+        points = _SMALL_POINTS if level >= 2 else _COMPACT_POINTS
+        number = QFontMetrics(ui_font(points, QFont.Weight.DemiBold)).horizontalAdvance(
+            self.number.text()
+        )
+        icon = _SMALL_ICON_SIZE if level >= 2 else _COMPACT_ICON_SIZE
+        padding = 4 if level >= 1 else 8
+        gap = 2 if level >= 2 else 3 if level >= 1 else 4
+        return 2 + padding + icon + gap + number
 
     def _density(self) -> None:
         compact = self._compact
-        side = _COMPACT_ICON_SIZE if compact else _INLINE_ICON_SIZE if self._inline else _ICON_SIZE
+        compact_side = _SMALL_ICON_SIZE if self._small else _COMPACT_ICON_SIZE
+        side = compact_side if compact else _INLINE_ICON_SIZE if self._inline else _ICON_SIZE
         self.icon.setFixedSize(side, side)
-        points = 9.5 if compact else 11.5 if self._inline else 15
+        compact_points = _SMALL_POINTS if self._small else _COMPACT_POINTS
+        points = compact_points if compact else 11.5 if self._inline else 15
         self.number.setFont(ui_font(points, QFont.Weight.DemiBold))
         self.name.setFont(ui_font(9 if self._inline else 10))
         self.name.setVisible(not compact)
@@ -166,7 +193,8 @@ class _Cell(QFrame):
             else ((6, 4, 6, 4) if self._inline else (10, 6, 10, 6))
         )
         self._row.setContentsMargins(*margins)
-        self._row.setSpacing((3 if self._tight else 4) if compact else 6 if self._inline else 10)
+        compact_gap = 2 if self._small else 3 if self._tight else 4
+        self._row.setSpacing(compact_gap if compact else 6 if self._inline else 10)
 
     def labelled_width(self) -> int:
         """The natural inline width, independent of whether compact mode is active."""
@@ -576,12 +604,16 @@ class FiguresLegend(QFrame):
         margins = layout.contentsMargins() if layout is not None else None
         available = self.width() - (margins.left() + margins.right() if margins else 20)
         if self._floating:
-            # Calculate normal spacing without toggling it off and on on each
-            # layout pass (which would keep posting LayoutRequest events).
-            normal = sum(c.sizeHint().width() + (5 if c._tight else 0) for c in shown)
-            tight = self._compact and normal + max(0, len(shown) - 1) * 2 > available
+            # The least squeeze that keeps one row, measured from the font
+            # alone so a layout pass never toggles it off and on again (which
+            # would keep posting LayoutRequest events).
+            gaps = max(0, len(shown) - 1) * 2
+            level = 0
+            if self._compact:
+                fits = [sum(c.compact_width(n) for c in shown) + gaps <= available for n in (0, 1)]
+                level = 0 if fits[0] else 1 if fits[1] else 2
             for cell in self._cells:
-                cell.set_tight(tight)
+                cell.set_squeeze(level)
         least = _CELL_MIN_WIDTH
         if self._compact:
             # As wide as the longest count, so big numbers are never cut off.
