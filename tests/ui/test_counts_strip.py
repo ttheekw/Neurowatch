@@ -80,3 +80,33 @@ def test_small_tile_keeps_the_total_on_the_same_row_for_normal_counts(qtbot):
     qtbot.waitUntil(lambda: len({cell.y() for cell in panel._cells}) == 1)
     assert panel.height() <= 34
     assert all(cell.number.isVisibleTo(panel) for cell in panel._cells)
+
+
+def test_small_tile_keeps_one_row_with_a_wide_interface_font(qtbot):
+    """The app uses the system's font: DejaVu Sans (Ubuntu servers, the Docker
+    image, CI) is wider than Noto Sans, and the counts still keep one row."""
+    from PySide6.QtGui import QFont, QFontDatabase, QFontInfo
+    from PySide6.QtWidgets import QApplication
+
+    if "DejaVu Sans" not in QFontDatabase.families():
+        import pytest
+
+        pytest.skip("DejaVu Sans is not installed")
+    app = QApplication.instance()
+    before = app.font()
+    app.setFont(QFont("DejaVu Sans", 9))
+    try:
+        assert QFontInfo(app.font()).family() == "DejaVu Sans"
+        host = QWidget()
+        qtbot.addWidget(host)
+        host.resize(390, 220)
+        host.show()
+        panel = FiguresLegend(host, floating=True)
+        panel.set_figures(_figures())
+        panel.place_in(host.rect())
+        qtbot.waitUntil(lambda: len({cell.y() for cell in panel._cells}) == 1)
+        assert panel.height() <= 34
+        assert all(cell.geometry().right() < panel.width() for cell in panel._cells)
+        assert all(cell.number.isVisibleTo(panel) for cell in panel._cells)
+    finally:
+        app.setFont(before)
