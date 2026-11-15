@@ -156,11 +156,15 @@ class _Cell(QFrame):
         self.name.setVisible(not compact)
         self._text.setDirection(
             QBoxLayout.Direction.LeftToRight
-            if compact or self._inline else QBoxLayout.Direction.TopToBottom
+            if compact or self._inline
+            else QBoxLayout.Direction.TopToBottom
         )
         self._text.setSpacing(6 if self._inline and not compact else 0)
-        margins = ((2, 2, 2, 2) if self._tight else (4, 2, 4, 2)) if compact else (
-            (6, 4, 6, 4) if self._inline else (10, 6, 10, 6))
+        margins = (
+            ((2, 2, 2, 2) if self._tight else (4, 2, 4, 2))
+            if compact
+            else ((6, 4, 6, 4) if self._inline else (10, 6, 10, 6))
+        )
         self._row.setContentsMargins(*margins)
         self._row.setSpacing((3 if self._tight else 4) if compact else 6 if self._inline else 10)
 
@@ -170,8 +174,14 @@ class _Cell(QFrame):
             return 0
         number = QFontMetrics(ui_font(11.5, QFont.Weight.DemiBold))
         name = QFontMetrics(ui_font(9))
-        return (number.horizontalAdvance(self.number.text())
-                + name.horizontalAdvance(self.name.text()) + _INLINE_ICON_SIZE + 12 + 12 + 2)
+        return (
+            number.horizontalAdvance(self.number.text())
+            + name.horizontalAdvance(self.name.text())
+            + _INLINE_ICON_SIZE
+            + 12
+            + 12
+            + 2
+        )
 
     def show_figure(self, figure: Figure) -> None:
         self._figure = figure
@@ -205,8 +215,11 @@ class _Cell(QFrame):
         if key == self.icon_shown:
             return
         self.icon_shown = key
-        pixmap = (count_icon(figure.icon, self.icon_color, self.icon.width(), dpr, empty)
-                  if self._inline else _icon(figure.icon, dpr, empty))
+        pixmap = (
+            count_icon(figure.icon, self.icon_color, self.icon.width(), dpr, empty)
+            if self._inline
+            else _icon(figure.icon, dpr, empty)
+        )
         self.icon.setPixmap(pixmap)
 
     def _show_color(self) -> None:

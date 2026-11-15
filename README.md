@@ -311,18 +311,14 @@ NeuroWatch's recorder keeps running when the window is closed. **Settings → St
 
 On a Linux server or a small Linux computer with no display, you can set everything up over SSH.
 
-**1. Install it from the terminal.** This downloads the free edition straight from GitHub; use the line for your system:
+**1. Install it.** Download the package for the computer from the downloads page ([Ubuntu/Debian 64-bit PC](https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=deb), [Ubuntu/Debian/Raspberry Pi OS ARM64](https://neurowatch.app/downloads?version=latest&platform=linux&arch=arm64&kind=deb), [Fedora](https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=rpm), [Fedora ARM](https://neurowatch.app/downloads?version=latest&platform=linux&arch=arm64&kind=rpm)), copy it across if you downloaded it on another computer (for example with `scp`), and install it:
 
 ```bash
-# Ubuntu, Debian, Linux Mint (64-bit PC)
-curl -fLO https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch_amd64.deb && sudo apt install ./neurowatch_amd64.deb
-# Ubuntu, Debian, Raspberry Pi OS 64-bit (ARM64)
-curl -fLO https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch_arm64.deb && sudo apt install ./neurowatch_arm64.deb
-# Fedora (64-bit PC; use neurowatch.aarch64.rpm on ARM)
-sudo dnf install https://github.com/ttheekw/Neurowatch/releases/latest/download/neurowatch.x86_64.rpm
+sudo apt install ./neurowatch_*.deb      # Ubuntu, Debian, Raspberry Pi OS
+sudo dnf install ./neurowatch*.rpm       # Fedora
 ```
 
-For NeuroWatch Unlimited, sign in on the [downloads page](https://neurowatch.app/downloads) on another computer, copy the file across (for example with `scp`) and install it the same way.
+NeuroWatch Unlimited is installed the same way, from the same page once you are signed in.
 
 **2. Link it to NeuroWatch Cloud and start it.** Create a one-time enrollment code on the **Recorders** page of [NeuroWatch Cloud](https://neurowatch.app) (valid five minutes), then, as the account that should own the recordings (not root):
 
