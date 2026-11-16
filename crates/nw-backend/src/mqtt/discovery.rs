@@ -104,6 +104,7 @@ pub fn is_problem(kind: EventKind) -> bool {
             | EventKind::StorageMissing
             | EventKind::PluginOffline
             | EventKind::BackupFailed
+            | EventKind::PluginLagging
     )
 }
 

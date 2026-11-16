@@ -15,6 +15,7 @@ mod decoded;
 mod diagnostics;
 pub(crate) mod discovery;
 pub mod history;
+pub mod lag;
 pub mod overlays;
 mod pump;
 mod session;
@@ -170,6 +171,8 @@ pub struct PluginHost {
     queries: Arc<Mutex<HashMap<String, std::sync::mpsc::SyncSender<Query>>>>,
     /// The portal's latest ticket for each hosted plugin server.
     tickets: Arc<Mutex<HashMap<String, String>>>,
+    /// Bindings to plugins over the network losing video (`lagging`).
+    lag: Arc<Mutex<lag::LagWatch>>,
 }
 
 pub(super) struct Query {
@@ -262,6 +265,15 @@ impl PluginHost {
                 })
             })
             .collect()
+    }
+
+    /// Bindings to plugins over the network that cannot keep up
+    /// ([`lag::LagWatch`]); call at a steady pace (the health loop).
+    pub fn lagging(&self, order: &[PluginServer]) -> Vec<lag::LaggingBinding> {
+        let (Ok(status), Ok(mut lag)) = (self.status.lock(), self.lag.lock()) else {
+            return vec![];
+        };
+        lag.lagging(order, &status, Instant::now())
     }
 
     /// Every configured plugin's status, in config order.

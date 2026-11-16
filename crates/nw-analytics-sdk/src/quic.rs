@@ -424,6 +424,9 @@ struct Lane {
     units: Option<mpsc::Sender<Chunk>>,
     waiting: bool,
     gap: bool,
+    /// Units given up on this binding (no room, or a newer GOP took the
+    /// place of an unfinished one): a link too slow for the stream.
+    lost: Arc<std::sync::atomic::AtomicU64>,
 }
 struct Output {
     formats: HashMap<u32, StreamFormat>,
@@ -688,6 +691,7 @@ impl QuicIo {
                 units: None,
                 waiting: true,
                 gap: false,
+                lost: Arc::default(),
             }
         });
         if unit.keyframe() {
@@ -697,6 +701,8 @@ impl QuicIo {
             lane.waiting = false;
         }
         if lane.waiting {
+            // The rest of a GOP after a loss.
+            lane.lost.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
         // Acquire the byte budget before copying or starting another task.
@@ -704,6 +710,7 @@ impl QuicIo {
         let permit = match Arc::clone(&self.shared.budget).try_acquire_many_owned(size as u32) {
             Ok(permit) => permit,
             Err(_) => {
+                lane.lost.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 lane.waiting = true;
                 lane.gap = true;
                 lane.units = None;
@@ -729,6 +736,7 @@ impl QuicIo {
                 header,
                 rx,
                 lane.newest.subscribe(),
+                Arc::clone(&lane.lost),
             ));
         }
         let sent = lane.units.as_ref().is_some_and(|tx| {
@@ -740,12 +748,34 @@ impl QuicIo {
             .is_ok()
         });
         if !sent {
+            lane.lost.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             lane.waiting = true;
             lane.gap = true;
             lane.units = None;
         }
         Ok(())
     }
+
+    /// Units of `binding` given up so far because the link could not take
+    /// them; 0 for a binding never sent.
+    pub fn lost(&self, binding: u32) -> u64 {
+        self.shared.output.lock().map_or(0, |output| {
+            output.lanes.get(&binding).map_or(0, |lane| {
+                lane.lost.load(std::sync::atomic::Ordering::Relaxed)
+            })
+        })
+    }
+}
+
+/// A GOP abandoned: count what it held, and refuse what follows (counted by
+/// `media` as it is offered).
+fn abandon(units: &mut mpsc::Receiver<Chunk>, lost: &std::sync::atomic::AtomicU64, unsent: u64) {
+    units.close();
+    let mut count = unsent;
+    while units.try_recv().is_ok() {
+        count += 1;
+    }
+    lost.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
 }
 
 async fn send_gop(
@@ -753,19 +783,23 @@ async fn send_gop(
     header: Gop,
     mut units: mpsc::Receiver<Chunk>,
     mut newest: watch::Receiver<u64>,
+    lost: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let opened = tokio::time::timeout(
         Duration::from_millis(u64::from(header.max_buffer_ms.clamp(100, 10000))),
         connection.open_uni(),
     );
     let result = if header.delivery == DeliveryMode::Latest {
-        tokio::select! { result=opened=>result, _=newest.changed()=>return }
+        tokio::select! { result=opened=>result, _=newest.changed()=>{abandon(&mut units,&lost,0);return} }
     } else {
         opened.await
     };
     let mut stream = match result {
         Ok(Ok(stream)) => stream,
-        _ => return,
+        _ => {
+            abandon(&mut units, &lost, 0);
+            return;
+        }
     };
     let mut bytes = Vec::new();
     if frame::write_frame(
@@ -774,6 +808,7 @@ async fn send_gop(
     )
     .is_err()
     {
+        abandon(&mut units, &lost, 0);
         return;
     }
     let header_write = tokio::time::timeout(
@@ -781,12 +816,13 @@ async fn send_gop(
         stream.write_all(&bytes),
     );
     let written = if header.delivery == DeliveryMode::Latest {
-        tokio::select! {result=header_write=>result, _=newest.changed()=>{let _=stream.reset(1u32.into());return;}}
+        tokio::select! {result=header_write=>result, _=newest.changed()=>{let _=stream.reset(1u32.into());abandon(&mut units,&lost,0);return;}}
     } else {
         header_write.await
     };
     if !matches!(written, Ok(Ok(()))) {
         let _ = stream.reset(1u32.into());
+        abandon(&mut units, &lost, 0);
         return;
     }
     while let Some(chunk) = units.recv().await {
@@ -796,12 +832,13 @@ async fn send_gop(
             stream.write_all(&chunk.bytes),
         );
         let result = if header.delivery == DeliveryMode::Latest {
-            tokio::select! {result=write=>result, _=newest.changed()=>{let _=stream.reset(1u32.into());return;}}
+            tokio::select! {result=write=>result, _=newest.changed()=>{let _=stream.reset(1u32.into());abandon(&mut units,&lost,1);return;}}
         } else {
             write.await
         };
         if !matches!(result, Ok(Ok(()))) {
             let _ = stream.reset(1u32.into());
+            abandon(&mut units, &lost, 1);
             return;
         }
     }
@@ -981,6 +1018,7 @@ mod tests {
             units.iter().map(|unit| unit.seq).collect::<Vec<_>>(),
             (1..=12).collect::<Vec<_>>()
         );
+        assert_eq!(node.lost(units[0].binding), 0, "nothing given up");
         for received in units {
             assert_eq!(received.data, vec![received.seq as u8; 128]);
         }
@@ -1015,6 +1053,11 @@ mod tests {
         assert!(gap);
         assert!(last.keyframe() && last.discontinuity());
         assert_eq!(last.data, vec![last.seq as u8; 128]);
+        // What was given up is counted, so the recorder can say the link is
+        // too slow (`plugin_lagging`), not only the plugin.
+        let lost = node.lost(last.binding);
+        assert!(lost > 0 && lost < 200, "lost {lost}");
+        assert_eq!(node.lost(last.binding + 1), 0);
         node.shutdown();
     }
 }

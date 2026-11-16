@@ -177,6 +177,17 @@ def _backup_failed(p: QPainter) -> None:
     p.drawLine(QPointF(3.0, 3.0), QPointF(21.0, 21.0))
 
 
+def _plugin_lagging(p: QPainter) -> None:
+    """The plugin hexagon with a clock's hands: late."""
+    hexagon = QPainterPath(QPointF(12.0, 3.0))
+    for x, y in ((19.8, 7.5), (19.8, 16.5), (12.0, 21.0), (4.2, 16.5), (4.2, 7.5)):
+        hexagon.lineTo(x, y)
+    hexagon.closeSubpath()
+    p.drawPath(hexagon)
+    p.drawLine(QPointF(12.0, 12.0), QPointF(12.0, 7.5))
+    p.drawLine(QPointF(12.0, 12.0), QPointF(15.5, 14.0))
+
+
 def _backend_started(p: QPainter) -> None:
     arc = QRectF(4.0, 4.5, 16.0, 16.0)
     p.drawArc(arc, 125 * 16, 290 * 16)
@@ -215,6 +226,7 @@ _GLYPHS: dict[str, _Glyph] = {
     "storage_missing": _storage_missing,
     "plugin_offline": _plugin_offline,
     "backup_failed": _backup_failed,
+    "plugin_lagging": _plugin_lagging,
     "backend_started": _backend_started,
     "bookmark": _bookmark,
 }

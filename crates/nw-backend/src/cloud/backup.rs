@@ -122,7 +122,7 @@ fn trouble(report: &StatusReport, camera: &CameraReport) -> Option<String> {
     }
     (camera.behind_ms > BEHIND_FAILS_MS).then(|| {
         format!(
-            "Footage is {} min behind: it is not being sent fast enough.",
+            "Footage is {} min behind: the internet upload is too slow for this camera's stream.",
             camera.behind_ms / 60_000
         )
     })

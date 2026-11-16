@@ -87,13 +87,12 @@ pub fn apply_limit(config: &mut AppConfig, limit: Option<usize>) -> Vec<CameraCo
     promoted
 }
 
-/// The first `count` cameras in wall order (placed cameras by page, row and
-/// column, then unplaced ones in configuration order), and the rest; each part
-/// in configuration order.
-fn split_by_wall_order(
-    cameras: Vec<CameraConfig>,
-    count: usize,
-) -> (Vec<CameraConfig>, Vec<CameraConfig>) {
+/// Indexes of `cameras` in wall order: placed cameras by page, row and
+/// column, then unplaced ones in configuration order. The free build runs the
+/// first [`FREE_CAMERA_LIMIT`] in this order, and the cloud inventory lists
+/// cameras in it, so the portal's plan (which serves the first cameras a
+/// recorder reports) picks the same ones (2026-11-16).
+pub fn wall_order(cameras: &[CameraConfig]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..cameras.len()).collect();
     order.sort_by_key(|&index| {
         let place = cameras[index]
@@ -102,7 +101,18 @@ fn split_by_wall_order(
             .map(|p| (p.page, p.row, p.col));
         (place.is_none(), place.unwrap_or_default(), index)
     });
-    let chosen: std::collections::HashSet<usize> = order.into_iter().take(count).collect();
+    order
+}
+
+/// The first `count` cameras in wall order (placed cameras by page, row and
+/// column, then unplaced ones in configuration order), and the rest; each part
+/// in configuration order.
+fn split_by_wall_order(
+    cameras: Vec<CameraConfig>,
+    count: usize,
+) -> (Vec<CameraConfig>, Vec<CameraConfig>) {
+    let chosen: std::collections::HashSet<usize> =
+        wall_order(&cameras).into_iter().take(count).collect();
     let mut keep = Vec::new();
     let mut rest = Vec::new();
     for (index, camera) in cameras.into_iter().enumerate() {

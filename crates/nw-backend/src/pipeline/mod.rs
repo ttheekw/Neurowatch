@@ -58,7 +58,11 @@ pub fn encoded_probe_pipeline_str(url: &str) -> String {
             builder::gst_quote(path)
         )
     };
-    format!("{head} ! appsink name=probe_sink max-buffers=1 drop=true sync=false")
+    // A live source keeps only its newest buffer; a file is read far faster
+    // than real time, so dropping there could pass over every keyframe before
+    // the reader takes one: wait for the reader instead.
+    let live = !head.starts_with("filesrc");
+    format!("{head} ! appsink name=probe_sink max-buffers=1 drop={live} sync=false")
 }
 
 fn probe_encoded_blocking(url: &str) -> anyhow::Result<ProbeResult> {

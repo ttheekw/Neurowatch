@@ -1034,7 +1034,14 @@ impl Session<'_> {
                 pump: Some(pump), ..
             }) => {
                 let sent = pump.counters.sent.load(Ordering::Relaxed);
-                let dropped = pump.counters.dropped.load(Ordering::Relaxed);
+                // Units the QUIC sender gave up as well (no room on a slow
+                // link): queued here, never delivered.
+                let binding = self.runs.get(camera_id).map(|run| run.binding);
+                let lost = binding
+                    .zip(self.quic.as_ref())
+                    .map_or(0, |(binding, quic)| quic.lost(binding));
+                let dropped = pump.counters.dropped.load(Ordering::Relaxed) + lost;
+                let sent = sent.saturating_sub(lost);
                 let problem = pump.counters.problem.lock().ok().and_then(|p| p.clone());
                 let format = pump.counters.format.lock().ok().and_then(|f| f.clone());
                 let shared = pump.counters.shared_pictures.load(Ordering::Relaxed);

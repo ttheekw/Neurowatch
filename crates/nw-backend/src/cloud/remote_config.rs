@@ -37,14 +37,76 @@ use crate::ipc::handler::RpcHandler;
 pub struct RemoteConfig {
     rpc: RpcHandler,
     state: Arc<RwLock<AppState>>,
+    /// The cameras the portal serves (`CloudNode::served_cameras`): the
+    /// others' events and pictures are not relayed (sealed answers are the
+    /// one thing the portal cannot read; its page filters them as well).
+    /// `None`: not known, nothing hidden.
+    served: crate::cloud::link::ServedCameras,
 }
+
+/// Most pictures asked for in one `events.thumbnails` request.
+const THUMBNAILS_PER_ANSWER: usize = 16;
+/// Picture data (base64) per answer: sealed, an answer may be at most 256 KiB
+/// (`cloud::link` `MAX_CONFIG_RESULT_BYTES`), and sealing adds a third.
+const THUMBNAIL_BYTES: usize = 180_000;
+
+/// The portal vouches the requester is an owner or admin of the recorder.
+fn portal_manager(params: &Map<String, Value>) -> bool {
+    matches!(
+        params
+            .get("_portal_viewer")
+            .and_then(|viewer| viewer.get("role"))
+            .and_then(Value::as_str),
+        Some("owner" | "admin")
+    )
+}
+
+/// Why a camera's data is not relayed.
+const PAST_PLAN: &str = "This camera is past the recorder's plan in NeuroWatch Cloud";
 
 type Outcome = Result<Value, String>;
 
 impl RemoteConfig {
     /// `rpc` must share `state` and must not have the cloud handler attached.
     pub fn new(rpc: RpcHandler, state: Arc<RwLock<AppState>>) -> Self {
-        Self { rpc, state }
+        Self {
+            rpc,
+            state,
+            served: crate::cloud::link::ServedCameras::default(),
+        }
+    }
+
+    pub fn with_served_cameras(mut self, served: crate::cloud::link::ServedCameras) -> Self {
+        self.served = served;
+        self
+    }
+
+    /// Local ids of the cameras the portal does not serve.
+    async fn hidden_cameras(&self) -> std::collections::HashSet<String> {
+        let Some(served) = self.served.read().ok().and_then(|held| held.clone()) else {
+            return std::collections::HashSet::new();
+        };
+        let state = self.state.read().await;
+        let reported = crate::cloud::link::reported_camera_ids(&state.config.cameras);
+        state
+            .config
+            .cameras
+            .iter()
+            .filter(|camera| {
+                reported
+                    .get(&camera.id)
+                    .map_or(true, |id| !served.contains(id))
+            })
+            .map(|camera| camera.id.clone())
+            .collect()
+    }
+
+    /// Refuse a request about a camera past the plan.
+    async fn check_shown(&self, camera_id: Option<&str>) -> Result<(), String> {
+        match camera_id {
+            Some(id) if self.hidden_cameras().await.contains(id) => Err(PAST_PLAN.into()),
+            _ => Ok(()),
+        }
     }
 
     /// A request as it came from the web portal; `sealed` says whether it
@@ -71,6 +133,71 @@ impl RemoteConfig {
         let params = params
             .as_object()
             .ok_or_else(|| "params must be an object".to_owned())?;
+        // A camera past the portal's plan: nothing of it is relayed.
+        if method == "camera.snapshot"
+            || method == "talk.probe"
+            || method == "events.bookmark"
+            || method.starts_with("ptz.")
+        {
+            let named = params
+                .get("camera_id")
+                .or_else(|| params.get("id"))
+                .and_then(Value::as_str);
+            self.check_shown(named).await?;
+        }
+        let answer = self.execute_shown(method, params).await?;
+        self.without_hidden(method, answer).await
+    }
+
+    /// `answer` without what belongs to cameras past the plan.
+    async fn without_hidden(&self, method: &str, mut answer: Value) -> Outcome {
+        if !method.starts_with("events.") {
+            return Ok(answer);
+        }
+        let hidden = self.hidden_cameras().await;
+        if hidden.is_empty() {
+            return Ok(answer);
+        }
+        let of_hidden = |event: &Value| {
+            event["camera_id"]
+                .as_str()
+                .is_some_and(|camera| hidden.contains(camera))
+        };
+        match method {
+            "events.list" => {
+                if let Some(events) = answer["events"].as_array_mut() {
+                    events.retain(|event| !of_hidden(event));
+                }
+            }
+            "events.wait" => {
+                if let Some(notices) = answer["notices"].as_array_mut() {
+                    notices.retain(|notice| !of_hidden(&notice["event"]));
+                }
+            }
+            "events.activity" => {
+                if let Some(cameras) = answer["cameras"].as_object_mut() {
+                    cameras.retain(|camera, _| !hidden.contains(camera));
+                }
+                if let Some(cameras) = answer["plugins"]["cameras"].as_object_mut() {
+                    cameras.retain(|camera, _| !hidden.contains(camera));
+                }
+            }
+            "events.get" | "events.bookmark" | "events.update_bookmark" => {
+                let event = if answer.get("event").is_some() {
+                    &answer["event"]
+                } else {
+                    &answer
+                };
+                if of_hidden(event) {
+                    return Err(PAST_PLAN.into());
+                }
+            }
+            _ => {}
+        }
+        Ok(answer)
+    }
+
+    async fn execute_shown(&self, method: &str, params: &Map<String, Value>) -> Outcome {
         match method {
             "plugins.pages" | "plugins.web.request" | "plugins.web.read" => {
                 let principal = params
@@ -153,8 +280,33 @@ impl RemoteConfig {
                 trim_event_detail(&mut answer);
                 Ok(answer)
             }
-            "events.activity" => self.event_activity().await,
+            "events.activity" => {
+                let mut answer = self.event_activity().await?;
+                // Plugin status rides along (2026-11-16): one request a tab
+                // instead of two. Managers only, as the portal vouches (the
+                // role travels outside the browser's envelope).
+                if params.get("plugins") == Some(&Value::Bool(true)) && portal_manager(params) {
+                    if let Ok(plugins) = self.call("plugins.cameras", json!({})).await {
+                        answer["plugins"] = plugins;
+                    }
+                }
+                Ok(answer)
+            }
+            // Several event pictures in one answer (2026-11-16): a page of
+            // events asks for its pictures in a few requests, not one each.
+            "events.thumbnails" => self.event_thumbnails(params).await,
             "events.thumbnail" => {
+                if !self.hidden_cameras().await.is_empty() {
+                    let event = self
+                        .call("events.get", json!({"id":params.get("id")}))
+                        .await?;
+                    let event = if event.get("event").is_some() {
+                        &event["event"]
+                    } else {
+                        &event
+                    };
+                    self.check_shown(event["camera_id"].as_str()).await?;
+                }
                 self.call("events.thumbnail", json!({"id":params.get("id")}))
                     .await
             }
@@ -328,6 +480,60 @@ impl RemoteConfig {
             for row in rows { let (id,pending,through_id,active) = row.map_err(|e| e.to_string())?; cameras.insert(id,json!({"pending":pending,"through_id":through_id,"active":active>0})); }
             Ok(json!({"cameras":cameras}))
         }).await.map_err(|e| e.to_string())?
+    }
+
+    /// `ids` (at most [`THUMBNAILS_PER_ANSWER`]) → `images {id: picture}` as
+    /// `events.thumbnail` answers, as many as fit [`THUMBNAIL_BYTES`] (the
+    /// first always does), and `more`: the ids left for another request.
+    async fn event_thumbnails(&self, params: &Map<String, Value>) -> Outcome {
+        let ids: Vec<i64> = params
+            .get("ids")
+            .and_then(Value::as_array)
+            .ok_or("Missing 'ids'")?
+            .iter()
+            .map(|id| id.as_i64().filter(|id| *id > 0).ok_or("invalid event id"))
+            .collect::<Result<_, _>>()?;
+        if ids.is_empty() || ids.len() > THUMBNAILS_PER_ANSWER {
+            return Err(format!("ask for 1 to {THUMBNAILS_PER_ANSWER} pictures"));
+        }
+        let hidden = self.hidden_cameras().await;
+        let mut images = Map::new();
+        let mut more = Vec::new();
+        let mut used = 0;
+        for id in ids {
+            if !more.is_empty() {
+                more.push(id);
+                continue;
+            }
+            if !hidden.is_empty() {
+                let Ok(event) = self.call("events.get", json!({ "id": id })).await else {
+                    continue;
+                };
+                let event = if event.get("event").is_some() {
+                    &event["event"]
+                } else {
+                    &event
+                };
+                if event["camera_id"]
+                    .as_str()
+                    .is_some_and(|camera| hidden.contains(camera))
+                {
+                    continue;
+                }
+            }
+            let picture = match self.call("events.thumbnail", json!({ "id": id })).await {
+                Ok(picture) => picture,
+                Err(_) => json!({ "available": false }),
+            };
+            let size = picture["jpeg_b64"].as_str().map_or(0, str::len);
+            if !images.is_empty() && used + size > THUMBNAIL_BYTES {
+                more.push(id);
+                continue;
+            }
+            used += size;
+            images.insert(id.to_string(), picture);
+        }
+        Ok(json!({ "images": images, "more": more }))
     }
 
     async fn acknowledge_activity(&self, params: &Map<String, Value>) -> Outcome {
@@ -874,6 +1080,129 @@ mod tests {
         );
         assert!(settings["recording"].is_object());
         assert!(sealed_list.is_ok());
+    }
+
+    #[tokio::test]
+    async fn pictures_come_several_at_a_time_and_plugin_status_only_for_managers() {
+        use crate::events::NewEvent;
+        use nw_core::event::{EventKind, EventSource};
+        let (remote, state, path) = remote("portal-batch");
+        let hub = Arc::clone(&state.read().await.events);
+        let ids: Vec<i64> = (0..3)
+            .map(|n| {
+                hub.start_at(
+                    NewEvent::new(Some("a".into()), EventKind::Motion, EventSource::Onvif),
+                    1000 + n,
+                )
+                .id
+            })
+            .collect();
+        let answer = remote
+            .execute("events.thumbnails", &json!({ "ids": ids }))
+            .await
+            .unwrap();
+        for id in &ids {
+            assert_eq!(answer["images"][id.to_string()]["available"], false);
+        }
+        assert_eq!(answer["more"], json!([]));
+        assert!(remote
+            .execute("events.thumbnails", &json!({ "ids": [] }))
+            .await
+            .is_err());
+        let too_many: Vec<i64> = (1..=17).collect();
+        assert!(remote
+            .execute("events.thumbnails", &json!({ "ids": too_many }))
+            .await
+            .is_err());
+        // Plugin status with the activity marks: only when the portal says a
+        // manager asks.
+        let manager = json!({"plugins": true, "_portal_viewer": {"role": "admin"}});
+        let viewer = json!({"plugins": true, "_portal_viewer": {"role": "viewer"}});
+        let with = remote.execute("events.activity", &manager).await.unwrap();
+        assert!(with["plugins"].is_object(), "{with}");
+        let without = remote.execute("events.activity", &viewer).await.unwrap();
+        assert!(without.get("plugins").is_none());
+        let unasked = remote
+            .execute("events.activity", &json!({"plugins": true}))
+            .await
+            .unwrap();
+        assert!(
+            unasked.get("plugins").is_none(),
+            "no role, no plugin status"
+        );
+        done(&state, &path).await;
+    }
+
+    #[tokio::test]
+    async fn cameras_past_the_portals_plan_are_not_relayed() {
+        use crate::events::NewEvent;
+        use nw_core::camera::{CameraConfig, WallPosition};
+        use nw_core::event::{EventKind, EventSource};
+        let (remote, state, path) = remote("portal-plan");
+        let served = crate::cloud::link::ServedCameras::default();
+        let remote = remote.with_served_cameras(Arc::clone(&served));
+        {
+            let mut state = state.write().await;
+            for (id, col) in [("late", 1), ("first", 0)] {
+                let mut camera = CameraConfig::new(id, format!("rtsp://cam.invalid/{id}"));
+                camera.id = id.into();
+                camera.wall_position = Some(WallPosition {
+                    page: 0,
+                    row: 0,
+                    col,
+                    row_span: 1,
+                    col_span: 1,
+                });
+                state.config.cameras.push(camera);
+            }
+        }
+        let hub = Arc::clone(&state.read().await.events);
+        let shown = hub.start_at(
+            NewEvent::new(Some("first".into()), EventKind::Motion, EventSource::Onvif),
+            1000,
+        );
+        let hidden = hub.start_at(
+            NewEvent::new(Some("late".into()), EventKind::Motion, EventSource::Onvif),
+            2000,
+        );
+        let ids = |answer: &Value| -> Vec<i64> {
+            answer["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["id"].as_i64().unwrap())
+                .collect()
+        };
+        // No limit known (an older portal): everything, as before.
+        let all = remote.execute("events.list", &json!({})).await.unwrap();
+        assert_eq!(ids(&all).len(), 2);
+        // The portal serves one camera, "first", under the id it was reported as.
+        let first = crate::cloud::link::reported_camera_ids(&state.read().await.config.cameras)
+            ["first"]
+            .clone();
+        *served.write().unwrap() = Some([first].into_iter().collect());
+        let listed = remote.execute("events.list", &json!({})).await.unwrap();
+        assert_eq!(ids(&listed), [shown.id]);
+        let activity = remote.execute("events.activity", &json!({})).await.unwrap();
+        assert!(activity["cameras"].get("late").is_none());
+        assert!(activity["cameras"].get("first").is_some());
+        assert!(remote
+            .execute("events.get", &json!({"id": hidden.id}))
+            .await
+            .is_err());
+        assert!(remote
+            .execute("events.thumbnail", &json!({"id": hidden.id}))
+            .await
+            .is_err_and(|e| e.contains("past the recorder's plan")));
+        assert!(remote
+            .execute("camera.snapshot", &json!({"id": "late"}))
+            .await
+            .is_err_and(|e| e.contains("past the recorder's plan")));
+        assert!(remote
+            .execute("events.get", &json!({"id": shown.id}))
+            .await
+            .is_ok());
+        done(&state, &path).await;
     }
 
     #[tokio::test]

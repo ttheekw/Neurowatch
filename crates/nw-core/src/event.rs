@@ -69,12 +69,15 @@ pub enum EventKind {
     /// connection to the backup server, a camera problem, or footage piling
     /// up unsent); the recorder keeps trying.
     BackupFailed,
+    /// A plugin over the network is not getting a camera's video fast enough
+    /// (the connection is too slow, so the recorder skips some of it).
+    PluginLagging,
     BackendStarted,
     Bookmark,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 17] = [
+    pub const ALL: [EventKind; 18] = [
         Self::Motion,
         Self::Intrusion,
         Self::LineCrossing,
@@ -90,6 +93,7 @@ impl EventKind {
         Self::StorageMissing,
         Self::PluginOffline,
         Self::BackupFailed,
+        Self::PluginLagging,
         Self::BackendStarted,
         Self::Bookmark,
     ];
@@ -111,6 +115,7 @@ impl EventKind {
             Self::StorageMissing => "storage_missing",
             Self::PluginOffline => "plugin_offline",
             Self::BackupFailed => "backup_failed",
+            Self::PluginLagging => "plugin_lagging",
             Self::BackendStarted => "backend_started",
             Self::Bookmark => "bookmark",
         }
