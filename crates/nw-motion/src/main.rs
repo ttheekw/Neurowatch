@@ -271,7 +271,9 @@ fn watch_parent(parent: u32) -> std::io::Result<()> {
         use std::os::windows::io::{FromRawHandle, OwnedHandle};
         let handle = unsafe {
             windows_sys::Win32::System::Threading::OpenProcess(
-                windows_sys::Win32::System::Threading::SYNCHRONIZE,
+                // windows-sys 0.60 has SYNCHRONIZE only as a file access
+                // right; OpenProcess takes the process one (same value).
+                windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE,
                 0,
                 parent,
             )

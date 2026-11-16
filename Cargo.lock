@@ -2099,7 +2099,7 @@ dependencies = [
 
 [[package]]
 name = "nw-analytics-protocol"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "nw-analytics-sdk"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2131,7 +2131,7 @@ dependencies = [
 
 [[package]]
 name = "nw-api"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -2158,7 +2158,7 @@ dependencies = [
 
 [[package]]
 name = "nw-backend"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "nw-backup-client"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "nw-backup-protocol"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2246,7 +2246,7 @@ dependencies = [
 
 [[package]]
 name = "nw-cloud-protocol"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -2256,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "nw-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -2287,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "nw-service-protocol"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
