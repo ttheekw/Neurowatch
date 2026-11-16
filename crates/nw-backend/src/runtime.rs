@@ -112,10 +112,6 @@ async fn run() -> anyhow::Result<()> {
     let cloud = Cloud::new();
     cloud.prepare(&mut initial_state);
     let state = Arc::new(RwLock::new(initial_state));
-    tokio::spawn(crate::plugin_host::bundled::run(
-        Arc::clone(&state),
-        shutdown_tx.subscribe(),
-    ));
     crate::debug_monitor::spawn(Arc::clone(&state));
     {
         let policy_state = Arc::clone(&state);

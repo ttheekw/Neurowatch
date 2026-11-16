@@ -65,11 +65,10 @@ from neurowatch.models.discovery import (
 from neurowatch.models.motion import (
     camera_event_topics,
     camera_events_status,
-    source_of,
     uses_camera_events,
     with_camera_events,
 )
-from neurowatch.models.plugins import camera_plugins_text, without_builtin_motion
+from neurowatch.models.plugins import camera_plugins_text
 from neurowatch.models.recording_policy import policy_problem
 from neurowatch.theme import (
     active_colors,
@@ -1771,20 +1770,6 @@ class AddEditCameraDialog(QDialog):
         self._motion_status_lbl = camera_card.status
         body.addWidget(camera_card)
 
-        # The built-in detector is replaced by the motion plugin: a camera
-        # that still uses it can only turn it off here.
-        self._builtin_events: QCheckBox | None = None
-        if source_of(self._motion) in ("builtin", "both"):
-            builtin_card = OptionCard(
-                "NeuroWatch's built-in detection (being replaced)",
-                "Motion detection by NeuroWatch now runs as the Motion plugin: bind this "
-                "camera to it on the Plugins page, which copies its sensitivity and zones "
-                "and turns this off. Or untick this and save to turn it off now; it cannot "
-                "be turned back on here.",
-            )
-            self._builtin_events = builtin_card.checkbox
-            self._builtin_events.setChecked(True)
-            body.addWidget(builtin_card)
         vl.addWidget(card)
 
         # ── Analytics plugins ───────────────────────────────────────────
@@ -2490,9 +2475,6 @@ class AddEditCameraDialog(QDialog):
             cam.motion = with_camera_events(self._motion, self._camera_events.isChecked())
         else:
             cam.motion = dict(self._motion)
-
-        if self._builtin_events is not None and not self._builtin_events.isChecked():
-            cam.motion = without_builtin_motion(cam.motion)
 
         logger.info(
             "Camera config built: name='%s', protocol=%s, has_sub=%s, streams=%d, local_rec=%s",

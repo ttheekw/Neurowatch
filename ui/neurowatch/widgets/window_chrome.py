@@ -902,7 +902,8 @@ def install_dialog_chrome(dialog: QDialog, title: str, *, resizable: bool = Fals
         margin = max(margin, GRIP_WIDTH)
     shell = _ShadowShell(dialog, margin if effects else 0)
     # The dialog's minimum size is its content's: the shell carries it.
-    shell.setMinimumSize(dialog.minimumSize())
+    minimum = dialog.minimumSize()
+    shell.setMinimumSize(minimum)
     dialog.setMinimumSize(0, 0)
     shell_layout = QVBoxLayout(shell)
     shell_layout.setContentsMargins(margin, margin, margin, margin)
@@ -929,6 +930,11 @@ def install_dialog_chrome(dialog: QDialog, title: str, *, resizable: bool = Fals
     frame = QFrame(shell)
     frame.setObjectName("chromeFrame")
     frame.setProperty("rounded", effects)
+    # And the frame: the shell's fixed-size layout (the Wayland card) sizes it
+    # to its content and would drop a minimum set on the shell alone.
+    frame.setMinimumSize(
+        max(0, minimum.width() - 2 * margin), max(0, minimum.height() - 2 * margin)
+    )
     shell_layout.addWidget(frame)
     inner = QVBoxLayout(frame)
     inner.setContentsMargins(1, 1, 1, 1)

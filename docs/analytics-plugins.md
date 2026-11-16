@@ -2,27 +2,31 @@
 
 Analytics execute in separate daemons. The recorder connects, sends the camera's compressed
 H.264/H.265 access units, and accepts bounded events, status and drawings. It never starts a
-decoder, scaler or colour converter for analytics. The included `nw-motion` daemon implements
-motion detection; camera-side ONVIF events remain independent.
+decoder, scaler or colour converter for analytics. Motion detection is the NeuroWatch Motion
+plugin (`nw-motion`), a separate install like any other plugin; camera-side ONVIF events remain
+independent.
 
 ## Install and approve
 
-Linux and Windows packages include `nw-motion`; source launches build it beside `nw-backend`.
-Existing builtin/both/legacy-enabled motion settings migrate before config deserialization into
-its bindings. ONVIF, event recording, sensitivity, timing, zones and low-CPU settings survive.
-The reserved bundled server is preapproved with its persistent local key. Removing it stays
-removed. Only the backend's own child is managed, and that child exits when its parent dies.
+NeuroWatch does not ship or start `nw-motion` (since 0.1.8; until then its packages bundled a copy
+the recorder ran as a child). Install it from its own release and add it on the Plugins page: on
+the same computer it listens on its default address (`unix:$XDG_RUNTIME_DIR/neurowatch/plugins/nw-motion.sock`,
+Windows `pipe:\\.\pipe\neurowatch-motion`), which Add Plugin → Local socket finds. Configurations from
+the bundled era keep their Motion server (`nw-motion-bundled`) and bindings, pointed at that
+default address without the old automatic approval (`plugin_host/legacy_motion.rs`), so an
+installed Motion connects and is approved once. Older built-in detector settings
+(builtin/both/legacy-enabled) still become bindings to it before config deserialization; ONVIF,
+event recording, sensitivity, timing, zones and low-CPU settings survive.
 
 `nw-motion` is developed in its own repository, [Neurowatch-Motion](https://github.com/ttheekw/Neurowatch-Motion), whose release workflow
-publishes standalone builds for running it on another machine or ahead of a NeuroWatch release:
+publishes its builds, on the same computer as NeuroWatch or on another machine:
 a Windows x86_64 zip and Linux x86_64/arm64 `.deb`, `.rpm`, `.tar.gz` (plus Arch on x86_64),
 each installed and checked in clean containers before publishing. They carry NeuroWatch's own
 GStreamer build (`scripts/build_release_gstreamer.sh`, pinned by that repository's
 `neurowatch.ref`), only the plugins the analysis uses, found through the binary's DT_RPATH and
 its own registry. `nw-motion --check` lists any GStreamer element its pipelines need that is
 missing (`appsrc`, `appsink`, `h264parse`, `h265parse`, `decodebin`, `videorate`, `videoscale`,
-`videoconvert`, `avdec_h264`, `avdec_h265`); the release smoke check runs it on the bundled
-copy. `crates/nw-motion` here is a source snapshot (`scripts/sync_motion_plugin.py`).
+`videoconvert`, `avdec_h264`, `avdec_h265`); its release checks run it on each package.
 
 Add another server through Plugins, inspect its identity fingerprint and requested permissions,
 and approve that key. The recorder sends no media, bindings or licence credential before this.
@@ -73,8 +77,8 @@ payload). Identity is full-width `seq` and UTC capture `time_us`, allocated befo
 validation, detach, camera-moving hints and liveness travel on control. Plugins return events,
 status and normalized drawings. Refused attachments retry after their delay or 30 seconds.
 
-Rust authors use `nw-analytics-sdk`; the reference implementation is `crates/nw-motion` (source
-snapshot of `../Neurowatch-Motion`, checked with `scripts/sync_motion_plugin.py --check`). Python
+Rust authors use `nw-analytics-sdk`; the reference implementation is
+[Neurowatch-Motion](https://github.com/ttheekw/Neurowatch-Motion). Python
 authors use [the Python SDK](../sdk/python/README.md) and its `nw-analytics-bridge` transport helper.
 The helper owns sockets, TLS and signing; Python owns decoding and application logic. SDKs do not
 require recorder internals. Keep the persistent identity file across restarts.

@@ -37,7 +37,6 @@ from PySide6.QtWidgets import (
 
 from neurowatch.ipc.sync_client import SyncIpcClient
 from neurowatch.models.plugins import (
-    MOTION_PLUGIN_ID,
     FormField,
     Manifest,
     PluginBinding,
@@ -46,10 +45,8 @@ from neurowatch.models.plugins import (
     ServerStatus,
     address_problem,
     form_fields,
-    motion_config_from_camera,
     parse_status,
     server_id_problem,
-    uses_builtin_motion,
 )
 from neurowatch.models.shapes import DRAWN_KINDS
 from neurowatch.theme import (
@@ -165,6 +162,10 @@ class CredentialDialog(QDialog):
         return self.credential_edit.text()
 
 
+#: The Add Plugin window's width (pixels), where the screen allows it.
+ADD_PLUGIN_WIDTH = 760
+
+
 class AddPluginDialog(QDialog):
     """Choose a discovered local daemon or supply an encrypted plugin URL."""
 
@@ -180,7 +181,13 @@ class AddPluginDialog(QDialog):
         self._started = False
         self._added: PluginServer | None = None
         self.setWindowTitle("Add Plugin")
-        self.setMinimumWidth(520)
+        # Wide enough for a local plugin's socket path and a full URL on one
+        # line, never wider than most of the screen.
+        screen = (
+            parent.screen() if parent is not None else None
+        ) or QGuiApplication.primaryScreen()
+        available = screen.availableGeometry().width() if screen is not None else ADD_PLUGIN_WIDTH
+        self.setMinimumWidth(min(ADD_PLUGIN_WIDTH, int(available * 0.9)))
         apply_dialog_theme(self)
         layout = install_dialog_chrome(self, "Add plugin")
         layout.setSpacing(12)
@@ -527,23 +534,7 @@ class BindingEditor(QWidget):
         general_body.addLayout(form)
         layout.addWidget(general)
 
-        self.builtin_card, builtin_body, _ = settings_card("Built-in motion detection")
-        self.builtin = QCheckBox("Turn off NeuroWatch's built-in motion detection for this camera")
-        self.builtin.setChecked(True)
-        self.builtin.setToolTip(
-            "With both on, every movement is reported twice: once by each detector"
-        )
-        self.builtin_note = QLabel(
-            "This camera still uses the built-in motion detection, which this plugin "
-            "replaces. Its sensitivity and zones were copied here."
-        )
-        self.builtin_note.setWordWrap(True)
-        set_label_role(self.builtin_note, "hint")
-        builtin_body.addWidget(self.builtin_note)
-        builtin_body.addWidget(self.builtin)
-        layout.addWidget(self.builtin_card)
-
-        config = binding.config if binding is not None else self._starting_config()
+        config = binding.config if binding is not None else {}
         settings_fields = [f for f in self._fields if f.kind not in DRAWN_KINDS]
         note: QLabel | None = None
         if manifest is None:
@@ -635,55 +626,11 @@ class BindingEditor(QWidget):
     def camera_id(self) -> str:
         return str(self.camera.currentData() or "")
 
-    def _camera(self) -> Camera | None:
-        return next((c for c in self._cameras if c.id == self.camera_id()), None)
-
-    def _is_motion_plugin(self) -> bool:
-        return self._manifest is not None and self._manifest.id == MOTION_PLUGIN_ID
-
-    def _starting_config(self) -> dict[str, Any]:
-        camera = self._cameras[0] if self._cameras else None
-        if self._is_motion_plugin() and camera is not None and uses_builtin_motion(camera.motion):
-            return motion_config_from_camera(camera.motion)
-        return {}
-
     def _on_camera(self) -> None:
-        camera = self._camera()
-        moving = self._builtin_applies()
-        self.builtin_card.setVisible(moving)
-        self.builtin.setVisible(moving)
-        if moving and camera is not None and self._existing is None:
-            self._fill(motion_config_from_camera(camera.motion))
         for editor in self._pictures():
             editor.set_camera(self.camera_id() or None)
             if self.isVisible():
                 editor.load_snapshot()
-
-    def _fill(self, config: dict[str, Any]) -> None:
-        """Show ``config``'s values in the form (a new binding's camera choice)."""
-        self._config.update(config)
-        for key, widget in self._inputs.items():
-            if key not in config:
-                continue
-            value = config[key]
-            if isinstance(widget, _ManyChoices):
-                widget.set_values(value)
-            elif isinstance(widget, QCheckBox):
-                widget.setChecked(bool(value))
-            elif isinstance(widget, QComboBox):
-                index = widget.findData(str(value))
-                if index >= 0:
-                    widget.setCurrentIndex(index)
-            elif isinstance(widget, QSpinBox) and isinstance(value, (int, float)):
-                widget.setValue(int(value))
-            elif isinstance(widget, QDoubleSpinBox) and isinstance(value, (int, float)):
-                widget.setValue(float(value))
-            elif isinstance(widget, QLineEdit):
-                widget.setText(str(value))
-        if self._zones is not None and isinstance(config.get(self._zones_key), list):
-            self._zones.canvas.set_zones(config[self._zones_key])
-        if self._shapes is not None:
-            self._shapes.set_values(self._config)
 
     def load_snapshot(self) -> None:
         """Take the camera's picture for the zones and lanes, once."""
@@ -767,16 +714,6 @@ class BindingEditor(QWidget):
             self.own_decoder.isChecked(),
         )
 
-    def turn_off_builtin(self) -> bool:
-        """Switch the camera's built-in motion detection off once bound."""
-        return self._builtin_applies() and self.builtin.isChecked()
-
-    def _builtin_applies(self) -> bool:
-        camera = self._camera()
-        return (
-            self._is_motion_plugin() and camera is not None and uses_builtin_motion(camera.motion)
-        )
-
     def problem(self) -> str | None:
         """Why these settings cannot be saved (shown where the problem is)."""
         if self._shapes is not None:
@@ -851,9 +788,6 @@ class BindingDialog(QDialog):
 
     def binding(self, server: str) -> PluginBinding:
         return self.editor.binding(server)
-
-    def turn_off_builtin(self) -> bool:
-        return self.editor.turn_off_builtin()
 
     def accept(self) -> None:
         if self.editor.problem() is None:

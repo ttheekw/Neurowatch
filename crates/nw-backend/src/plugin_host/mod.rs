@@ -8,7 +8,6 @@
 //! `plugins`, reconciled every second as motion and ONVIF events are. One
 //! session (thread) per plugin; a slow or failing plugin loses its own units
 //! and never holds up a camera connection, recording or the IPC.
-pub(crate) mod bundled;
 mod config;
 pub(crate) mod credentials;
 mod decoded;
@@ -16,6 +15,7 @@ mod diagnostics;
 pub(crate) mod discovery;
 pub mod history;
 pub mod lag;
+pub(crate) mod legacy_motion;
 pub mod overlays;
 mod pump;
 mod session;

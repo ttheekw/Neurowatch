@@ -9,7 +9,6 @@ members  = [
     "crates/nw-analytics-sdk",
     "crates/nw-backup-protocol",
     "crates/nw-backup-client",
-    "crates/nw-motion",
     "crates/nw-api",
 ]
 # Vendored, patched LiveKit crate (see [patch] below): not a member.

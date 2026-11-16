@@ -352,3 +352,21 @@ def test_the_resize_cursor_clears_once_the_pointer_is_over_the_content(
 
     QApplication.sendEvent(content, QEvent(QEvent.Type.Enter))
     assert not surface.testAttribute(Qt.WidgetAttribute.WA_SetCursor), "the content's own cursor"
+
+
+@pytest.mark.parametrize("on_wayland", [True, False])
+def test_a_dialogs_minimum_width_holds_on_wayland_too(
+    qtbot, parent: QMainWindow, monkeypatch: pytest.MonkeyPatch, on_wayland: bool
+) -> None:
+    """The card's fixed-size layout sized it to its content and dropped a
+    minimum set on the dialog (Add Plugin opened narrower than asked)."""
+    monkeypatch.setattr(window_chrome, "positions_windows", lambda: not on_wayland)
+    dialog = QDialog(parent)
+    dialog.setMinimumWidth(640)
+    layout = install_dialog_chrome(dialog, "Wide")
+    layout.addWidget(QLabel("short"))
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitUntil(lambda: (_shell(dialog) if on_wayland else dialog).width() > 0)
+    card = _shell(dialog) if on_wayland else dialog
+    assert card.width() >= 640, card.width()

@@ -524,7 +524,7 @@ case "$MODE" in
             # service (started now, or running already) uses this build and
             # rebuilds by itself after later changes.
             printf '%s\n' '==> Building Rust backend'
-            (cd "$BACKEND_WORKSPACE" && cargo build -p "$BACKEND_PACKAGE" -p nw-motion --locked)
+            (cd "$BACKEND_WORKSPACE" && cargo build -p "$BACKEND_PACKAGE" --locked)
         fi
         if (( HEADLESS && ! FOREGROUND )); then
             printf '%s\n' '==> Headless: NeuroWatch runs as a background service; status follows'
@@ -554,7 +554,7 @@ case "$MODE" in
         backend_log="$(mktemp "${TMPDIR:-/tmp}/neurowatch-backend.XXXXXX.log")"
         printf '%s\n' '==> Building Rust backend'
         cd "$BACKEND_WORKSPACE"
-        cargo build -p "$BACKEND_PACKAGE" -p nw-motion --locked
+        cargo build -p "$BACKEND_PACKAGE" --locked
         printf '%s\n' '==> Starting Rust backend'
         backend_env=()
         if [[ -n "$GSTREAMER_SDK" ]]; then

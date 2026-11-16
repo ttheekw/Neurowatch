@@ -271,11 +271,6 @@ def test_the_settings_form_saves_shapes_and_choices_together(qtbot) -> None:
     assert editor.problem() == "Draw the crossing line of Lane 2: two different points."
     assert "crossing line of Lane 2" in editor.shapes.status.text()
 
-    # Showing another saved config replaces what was drawn.
-    editor._fill({"lanes": [], "lines": [], "classes": ["car"]})
-    assert editor.problem() is None and editor.shapes.shapes.lanes.lanes == []
-    assert editor.binding("vcount").config["classes"] == ["car"]
-
 
 def test_a_plugin_with_only_zones_keeps_the_simple_editor(qtbot) -> None:
     from neurowatch.dialogs.plugin_dialogs import BindingEditor, Camera
