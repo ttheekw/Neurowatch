@@ -27,6 +27,7 @@ EVENT_LABELS: dict[str, str] = {
     "storage_missing": "Recording storage missing",
     "plugin_offline": "Plugin offline",
     "backup_failed": "Cloud Backup failed",
+    "plugin_lagging": "Plugin connection too slow",
     "backend_started": "NeuroWatch started",
     "bookmark": "Bookmark",
 }
@@ -38,6 +39,7 @@ END_LABELS: dict[str, str] = {
     "storage_missing": "Recording storage is back",
     "plugin_offline": "Plugin back online",
     "backup_failed": "Cloud Backup working again",
+    "plugin_lagging": "Plugin keeping up again",
 }
 #: Kinds a tile shows as movement in the picture.
 ACTIVITY_KINDS = frozenset({"motion", "intrusion", "line_crossing", "person", "vehicle", "animal"})
@@ -46,6 +48,7 @@ PLAYBACK_KINDS = frozenset(EVENT_LABELS) - {
     "storage_missing",
     "plugin_offline",
     "backup_failed",
+    "plugin_lagging",
     "backend_started",
 }
 EVENT_PRIORITY = {
@@ -73,6 +76,7 @@ EVENT_COLORS = {
     "storage_missing": "#ef4444",
     "plugin_offline": "#f59e0b",
     "backup_failed": "#ef4444",
+    "plugin_lagging": "#f59e0b",
     "backend_started": "#64748b",
 }
 #: Kinds about the system rather than the picture.
@@ -84,6 +88,7 @@ SYSTEM_KINDS = frozenset(
         "storage_missing",
         "plugin_offline",
         "backup_failed",
+        "plugin_lagging",
         "backend_started",
     }
 )

@@ -290,7 +290,7 @@ mod tests {
             label: Some("  Vehicle counting ".into()),
             ..entry("nw.vcount", "v1")
         };
-        let next = offered(&PluginsConfig::default(), &[named.clone()]).unwrap();
+        let next = offered(&PluginsConfig::default(), std::slice::from_ref(&named)).unwrap();
         assert_eq!(next.servers[0].shown_name(None), "Vehicle counting");
         assert_eq!(
             next.servers[0].shown_name(Some("nw-vcount")),

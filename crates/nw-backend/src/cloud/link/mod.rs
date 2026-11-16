@@ -1312,13 +1312,21 @@ impl CloudSignals {
     }
 }
 
+/// The reported ids of the cameras the portal serves (`CloudNode::served_cameras`).
+pub type ServedCameras = Arc<std::sync::RwLock<Option<std::collections::HashSet<String>>>>;
+
 #[derive(Clone)]
+
 pub struct CloudNode {
     inner: Arc<Mutex<Inner>>,
     websocket: Option<Arc<websocket::WsTransport>>,
     signals: Arc<CloudSignals>,
     clock: Arc<CloudClock>,
     services: Arc<services::ServicesCache>,
+    /// The cameras (as reported) the portal serves under the recorder's
+    /// plan, from each inventory reply. `None`: not known yet (or an older
+    /// portal), nothing hidden.
+    served_cameras: ServedCameras,
 }
 impl CloudNode {
     /// Production-policy open for tests; the binary uses `open_with_options`.
@@ -1375,7 +1383,15 @@ impl CloudNode {
             signals: Arc::default(),
             clock,
             services: Arc::default(),
+            served_cameras: ServedCameras::default(),
         })
+    }
+    /// The cameras the portal serves, shared with the portal relay, which
+    /// hides the others from what it relays sealed. The portal decides them
+    /// and refuses everything else itself; this only keeps an honest
+    /// recorder from sending what the portal would not show.
+    pub fn served_cameras(&self) -> ServedCameras {
+        Arc::clone(&self.served_cameras)
     }
     fn lock(&self) -> Result<MutexGuard<'_, Inner>> {
         self.inner
@@ -2000,6 +2016,17 @@ impl CloudNode {
             .await?;
         if response["node_id"] != node_id {
             return Err(CloudError::Network("invalid inventory response".into()));
+        }
+        // Portals from before 2026-11-16 send none: nothing is hidden then.
+        if let Some(ids) = response["served_camera_ids"].as_array() {
+            let served = ids
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            if let Ok(mut held) = self.served_cameras.write() {
+                *held = Some(served);
+            }
         }
         Ok(response["accepted"].as_bool() == Some(true))
     }
@@ -3363,7 +3390,10 @@ async fn run_remote_request(
         Some(envelope) => match node.open_sealed(&method, envelope) {
             Ok(opened) => {
                 let mut params = opened.params.clone();
-                if method == "plugins.pages" || method.starts_with("plugins.web.") {
+                if method == "plugins.pages"
+                    || method.starts_with("plugins.web.")
+                    || method == "events.activity"
+                {
                     if let Some(params) = params.as_object_mut() {
                         params.insert(
                             "_portal_viewer".into(),

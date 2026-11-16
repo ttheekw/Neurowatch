@@ -47,6 +47,9 @@ pub struct HealthSnapshot {
     /// Cameras whose Cloud Backup is failing (`cloud::backup::FAIL_AFTER`),
     /// with why.
     pub backup_failing: Vec<(CameraId, String)>,
+    /// Bindings to plugins over the network losing video
+    /// (`plugin_host::lag`).
+    pub plugin_lagging: Vec<crate::plugin_host::lag::LaggingBinding>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +81,7 @@ enum Key {
     Storage(PathBuf),
     Plugin(String),
     Backup(CameraId),
+    PluginLag(String, CameraId),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -210,9 +214,27 @@ impl HealthTracker {
                 ),
             );
         }
+        // A plugin over the network not getting a camera's video fast enough:
+        // one event per plugin and camera until it keeps up again.
+        for lag in &snapshot.plugin_lagging {
+            let camera: CameraId = lag.camera_id.clone();
+            let key = Key::PluginLag(lag.server.clone(), camera.clone());
+            known.insert(key.clone());
+            let detail = format!(
+                "{}: {}% of the video was not delivered in the last minute; the connection to the plugin is too slow.",
+                lag.name, lag.percent_lost
+            );
+            wanted.insert(
+                key.clone(),
+                spec(key, Some(&camera), EventKind::PluginLagging, Some(detail)),
+            );
+        }
         // A location that is back (or no longer used) ends its event.
         for key in self.open.keys() {
-            if matches!(key, Key::Storage(_) | Key::Plugin(_) | Key::Backup(_)) {
+            if matches!(
+                key,
+                Key::Storage(_) | Key::Plugin(_) | Key::Backup(_) | Key::PluginLag(..)
+            ) {
                 known.insert(key.clone());
             }
         }
@@ -264,7 +286,7 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 async fn snapshot(state: &Arc<RwLock<AppState>>) -> HealthSnapshot {
-    let (cameras, roots, missing_storage, plugins, backup_failing) = {
+    let (cameras, roots, missing_storage, plugins, backup_failing, plugin_lagging) = {
         let st = state.read().await;
         let backup_failing = st
             .backup
@@ -339,7 +361,15 @@ async fn snapshot(state: &Arc<RwLock<AppState>>) -> HealthSnapshot {
             .filter(|(root, _)| in_use.contains(root))
             .collect();
         roots.retain(|root| st.storage.is_ready(root));
-        (cameras, roots, missing_storage, plugins, backup_failing)
+        let plugin_lagging = st.plugins.lagging(&st.config.plugins.servers);
+        (
+            cameras,
+            roots,
+            missing_storage,
+            plugins,
+            backup_failing,
+            plugin_lagging,
+        )
     };
     let drives = tokio::task::spawn_blocking(move || {
         roots
@@ -358,6 +388,7 @@ async fn snapshot(state: &Arc<RwLock<AppState>>) -> HealthSnapshot {
         missing_storage,
         plugins,
         backup_failing,
+        plugin_lagging,
     }
 }
 
@@ -453,6 +484,7 @@ mod tests {
             missing_storage: vec![],
             plugins: vec![],
             backup_failing: vec![],
+            plugin_lagging: vec![],
         }
     }
 
@@ -527,6 +559,7 @@ mod tests {
             },
             plugins: vec![],
             backup_failing: vec![],
+            plugin_lagging: vec![],
         };
         let blocked = || {
             let mut cam = camera("a", "streaming", Some("failed"));
@@ -565,6 +598,7 @@ mod tests {
             missing_storage: vec![],
             plugins: vec![],
             backup_failing: vec![],
+            plugin_lagging: vec![],
         };
         let mut t = HealthTracker::default();
         assert!(observe(&mut t, drive(40 * GB)).is_empty());
@@ -641,5 +675,40 @@ mod tests {
             "one event"
         );
         assert_eq!(tracker.observe(&failing(&[])), vec![HealthChange::End(9)]);
+    }
+
+    #[test]
+    fn a_plugin_too_slow_to_reach_is_one_event_per_camera_until_it_keeps_up() {
+        use crate::plugin_host::lag::LaggingBinding;
+        let mut tracker = HealthTracker::default();
+        let lagging = |on: bool| HealthSnapshot {
+            plugin_lagging: on
+                .then(|| LaggingBinding {
+                    server: "hosted.example".into(),
+                    name: "Example plugin".into(),
+                    camera_id: "cam-1".into(),
+                    percent_lost: 20,
+                })
+                .into_iter()
+                .collect(),
+            ..HealthSnapshot::default()
+        };
+        assert!(observe(&mut tracker, lagging(false)).is_empty());
+        let started = tracker.observe(&lagging(true));
+        let [HealthChange::Start(spec)] = started.as_slice() else {
+            panic!("one start: {started:?}");
+        };
+        assert_eq!(spec.kind, EventKind::PluginLagging);
+        assert_eq!(spec.camera_id.as_deref(), Some("cam-1"));
+        assert!(spec
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.starts_with("Example plugin: 20% of the video")));
+        tracker.started(spec, 11);
+        assert!(observe(&mut tracker, lagging(true)).is_empty(), "one event");
+        assert_eq!(
+            tracker.observe(&lagging(false)),
+            vec![HealthChange::End(11)]
+        );
     }
 }

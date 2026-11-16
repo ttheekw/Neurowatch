@@ -205,6 +205,7 @@ pub fn list(conn: &Connection, filter: &Filter) -> rusqlite::Result<Vec<EventRec
              WHEN 'storage_missing' THEN 'Recording storage missing' \
              WHEN 'plugin_offline' THEN 'Plugin offline' \
              WHEN 'backup_failed' THEN 'Cloud Backup failed' \
+             WHEN 'plugin_lagging' THEN 'Plugin connection too slow' \
              WHEN 'backend_started' THEN 'NeuroWatch started' \
              WHEN 'tamper' THEN 'Tampering' ELSE replace(event_type, '_', ' ') END), {mark}) > 0"
         )];

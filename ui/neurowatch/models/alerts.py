@@ -32,6 +32,7 @@ KIND_CHOICES: tuple[tuple[str, str], ...] = (
     ("storage_missing", "Recording storage missing"),
     ("plugin_offline", "Plugin offline"),
     ("backup_failed", "Cloud Backup failed"),
+    ("plugin_lagging", "Plugin connection too slow"),
     ("bookmark", "Bookmark added"),
     ("backend_started", "Recorder started"),
 )

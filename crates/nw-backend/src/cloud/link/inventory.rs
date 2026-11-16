@@ -85,21 +85,31 @@ pub fn camera_inventory_with_live(
     formats: impl Fn(&CameraConfig) -> Option<StreamVideos>,
 ) -> Vec<CameraSnapshot> {
     let cameras = &cameras[..cameras.len().min(MAX_REPORTED_CAMERAS)];
-    cameras
+    // Ids and names come from configuration order (a replacement id such as
+    // `camera-3` must not change); the list is then in wall order, so the
+    // portal's plan, which serves the first cameras reported, serves the ones
+    // a free build would run.
+    let mut listed: Vec<Option<CameraSnapshot>> = cameras
         .iter()
         .zip(reported_ids(cameras))
         .enumerate()
-        .map(|(index, (camera, camera_id))| CameraSnapshot {
-            camera_id,
-            name: safe_name(&camera.name, index),
-            status: cloud_status(states.get(&camera.id).map(String::as_str)),
-            // Recording now: a segment is open. The camera's own switch is
-            // not enough — "record all cameras" records cameras with it off,
-            // and an offline camera records nothing.
-            recording: states.get(&camera.id).map(String::as_str) == Some("recording_ready"),
-            live: live(camera),
-            formats: formats(camera).filter(|streams| !streams.is_empty()),
+        .map(|(index, (camera, camera_id))| {
+            Some(CameraSnapshot {
+                camera_id,
+                name: safe_name(&camera.name, index),
+                status: cloud_status(states.get(&camera.id).map(String::as_str)),
+                // Recording now: a segment is open. The camera's own switch is
+                // not enough — "record all cameras" records cameras with it off,
+                // and an offline camera records nothing.
+                recording: states.get(&camera.id).map(String::as_str) == Some("recording_ready"),
+                live: live(camera),
+                formats: formats(camera).filter(|streams| !streams.is_empty()),
+            })
         })
+        .collect();
+    crate::edition::wall_order(cameras)
+        .into_iter()
+        .filter_map(|index| listed.get_mut(index).and_then(Option::take))
         .collect()
 }
 
@@ -254,6 +264,47 @@ fn utc_second(seconds: i64) -> Option<String> {
 #[cfg(test)]
 mod status_tests {
     use super::cloud_status;
+
+    #[test]
+    fn cameras_are_reported_in_wall_order_with_their_own_ids() {
+        use super::{camera_inventory, reported_camera_ids, CameraConfig, HashMap};
+        use nw_core::camera::WallPosition;
+        let camera = |id: &str, place: Option<(u32, u32, u32)>| {
+            let mut camera = CameraConfig::new(id, format!("rtsp://cam.invalid/{id}"));
+            camera.id = id.into();
+            camera.wall_position = place.map(|(page, row, col)| WallPosition {
+                page,
+                row,
+                col,
+                row_span: 1,
+                col_span: 1,
+            });
+            camera
+        };
+        let cameras = vec![
+            camera("6ba7b810-9dad-11d1-80b4-00c04fd430c1", None),
+            camera("6ba7b810-9dad-11d1-80b4-00c04fd430c2", Some((1, 0, 0))),
+            camera("6ba7b810-9dad-11d1-80b4-00c04fd430c3", Some((0, 1, 0))),
+            camera("6ba7b810-9dad-11d1-80b4-00c04fd430c4", Some((0, 0, 1))),
+            camera("cam 5", None),
+        ];
+        let ids: Vec<String> = camera_inventory(&cameras, &HashMap::new())
+            .into_iter()
+            .map(|c| c.camera_id)
+            .collect();
+        let reported = reported_camera_ids(&cameras);
+        assert_eq!(
+            ids,
+            [
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c4",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c3",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c2",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c1",
+                reported["cam 5"].as_str(),
+            ],
+            "placed by page, row and column, then unplaced in configuration order"
+        );
+    }
 
     #[test]
     fn a_camera_refusing_its_password_is_an_error_to_the_portal() {

@@ -473,15 +473,18 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
     }
     {
         // The portal's settings, events and PTZ, desktop or headless alike.
-        let remote = Arc::new(remote_config::RemoteConfig::new(
-            ipc::handler::RpcHandler::new(
+        let remote = Arc::new(
+            remote_config::RemoteConfig::new(
+                ipc::handler::RpcHandler::new(
+                    Arc::clone(&state),
+                    Arc::clone(&viewer_manager),
+                    Arc::clone(&aggregator),
+                )
+                .with_discovery(Arc::clone(&discovery)),
                 Arc::clone(&state),
-                Arc::clone(&viewer_manager),
-                Arc::clone(&aggregator),
             )
-            .with_discovery(Arc::clone(&discovery)),
-            Arc::clone(&state),
-        ));
+            .with_served_cameras(node.served_cameras()),
+        );
         let handler: link::RemoteConfigHandler = Arc::new(move |method, params, sealed| {
             let remote = Arc::clone(&remote);
             Box::pin(async move { remote.execute_from_portal(&method, &params, sealed).await })
