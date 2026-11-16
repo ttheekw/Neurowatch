@@ -225,7 +225,8 @@ def smoke(bundle: Path) -> None:
                 "appsrc",
                 "appsink",
                 "decodebin",
-                # The motion plugin's pipelines (nw-motion src/worker.rs).
+                # Picture scaling and software decoding (snapshots, desktop
+                # views; also what Motion's release builds against).
                 "videoscale",
                 "videoconvert",
                 "avdec_h264",
@@ -277,13 +278,6 @@ def smoke(bundle: Path) -> None:
                     check=True,
                     timeout=30,
                 )
-            # The bundled motion plugin finds every element its analysis uses.
-            subprocess.run(
-                [str(bundle / f"bin/nw-motion{suffix}"), "--check"],
-                env=media_env,
-                check=True,
-                timeout=60,
-            )
         finally:
             try:
                 ui_command("service", "stop")

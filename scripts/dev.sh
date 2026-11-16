@@ -5,9 +5,10 @@
 #
 # Builds and opens the desktop app (./neurowatch.sh; `--headless` runs the
 # recorder headless). Any other arguments go to ./neurowatch.sh.
-#   --motion   run the motion plugin from its own repository
-#              (../Neurowatch-Motion, or NW_MOTION_DIR), built here, in place
-#              of the copy in crates/nw-motion. Debug builds only.
+#   --motion   also build and run the Motion plugin from its own repository
+#              (../Neurowatch-Motion, or NW_MOTION_DIR) on its default
+#              address, stopped when NeuroWatch exits. Add it once on the
+#              Plugins page (Local socket) and approve its key.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,21 +21,23 @@ args=()
 for arg in "$@"; do
   case "$arg" in
     --motion) motion=1 ;;
-    -h|--help) sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) args+=("$arg") ;;
   esac
 done
 
-# The recorder starts the motion plugin itself; debug builds run
-# NW_MOTION_BIN in place of their own copy when it is set.
-unset NW_MOTION_BIN
-if [[ $motion == 1 ]]; then
-  [[ -f "$MOTION/Cargo.toml" ]] || die "--motion: motion plugin not found at $MOTION (set NW_MOTION_DIR)"
-  log "building the motion plugin in $MOTION"
-  (cd "$MOTION" && cargo build --locked) || die "--motion: the motion plugin did not build"
-  NW_MOTION_BIN="$(cd "$MOTION" && pwd)/target/debug/nw-motion"
-  [[ -x "$NW_MOTION_BIN" ]] || die "--motion: no program at $NW_MOTION_BIN"
-  export NW_MOTION_BIN
+if [[ $motion == 0 ]]; then
+  exec "$ROOT/neurowatch.sh" "${args[@]}"
 fi
 
-exec "$ROOT/neurowatch.sh" "${args[@]}"
+# Motion is a separate plugin: NeuroWatch never starts it.
+[[ -f "$MOTION/Cargo.toml" ]] || die "--motion: Motion not found at $MOTION (set NW_MOTION_DIR)"
+log "building Motion in $MOTION"
+(cd "$MOTION" && cargo build --locked) || die "--motion: Motion did not build"
+program="$(cd "$MOTION" && pwd)/target/debug/nw-motion"
+[[ -x "$program" ]] || die "--motion: no program at $program"
+log "starting Motion on its default address"
+"$program" --parent-pid "$$" &
+motion_pid=$!
+trap 'kill "$motion_pid" 2>/dev/null || true' EXIT
+"$ROOT/neurowatch.sh" "${args[@]}"

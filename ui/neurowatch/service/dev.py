@@ -296,8 +296,6 @@ class DevSupervisor:
     def _run_cargo(self) -> bool:
         select_cxx(self._env)
         command = ["cargo", "build", "-p", backend_package()]
-        if backend_package() == "nw-backend":
-            command.extend(["-p", "nw-motion"])
         logger.info("$ %s (CXX=%s)", " ".join(command), self._env.get("CXX", "default"))
         try:
             result = subprocess.run(command, cwd=self._workspace, env=self._env, check=False)

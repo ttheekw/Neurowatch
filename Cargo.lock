@@ -2267,25 +2267,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nw-motion"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "gstreamer",
- "gstreamer-app",
- "gstreamer-video",
- "libc",
- "nw-analytics-protocol",
- "nw-analytics-sdk",
- "ring",
- "serde",
- "serde_json",
- "tracing",
- "tracing-subscriber",
- "windows-sys 0.60.2",
-]
-
-[[package]]
 name = "nw-service-protocol"
 version = "0.1.8"
 dependencies = [

@@ -58,9 +58,6 @@ $CargoArgs = @('build', '--manifest-path', $BackendManifest, '--release', '--loc
 if ($Edition -eq 'unlimited') { $CargoArgs += @('--features', 'nw-backend/unlimited') }
 Invoke-Native 'cargo' $CargoArgs | Set-Content -Encoding utf8 (Join-Path $WorkDir 'backend-build.jsonl')
 Copy-Item (Join-Path $BackendTarget 'release/nw-backend.exe') (Join-Path $BundleDir 'bin/nw-backend.exe') -Force
-Invoke-Native 'cargo' @('build', '--manifest-path', (Join-Path $Root 'Cargo.toml'), '--release', '--locked', '-p', 'nw-motion')
-$MotionTarget = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Root 'target' }
-Copy-Item (Join-Path $MotionTarget 'release/nw-motion.exe') (Join-Path $BundleDir 'bin/nw-motion.exe') -Force
 # The licence and notice ship with every artifact.
 Copy-Item (Join-Path $Root 'LICENSE') (Join-Path $BundleDir 'LICENSE') -Force
 Copy-Item (Join-Path $Root 'NOTICE') (Join-Path $BundleDir 'NOTICE') -Force

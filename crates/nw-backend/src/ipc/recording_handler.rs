@@ -560,7 +560,6 @@ mod tests {
     #[tokio::test]
     async fn policy_copy_is_atomic_preserves_destinations_credentials_and_manual_override() {
         let mut config = AppConfig {
-            plugins_initialized: true,
             ..AppConfig::default()
         };
         let source = camera("source");

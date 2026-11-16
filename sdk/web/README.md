@@ -2,7 +2,7 @@
 
 `plugin-sdk.js` is injected by the host into an opaque sandbox iframe. A plugin page uses
 `window.NeuroWatch` after `await NeuroWatch.ready`; it does not import recorder credentials.
-See the working motion dashboard in `crates/nw-motion/web/index.html`.
+See the working motion dashboard in [Neurowatch-Motion's `web/index.html`](https://github.com/ttheekw/Neurowatch-Motion/blob/main/web/index.html).
 
 The SDK provides `request`, scoped `snapshot`, `live.open`, plugin-only `events.list` and
 `playback.open`, and admin-only `binding.get` / `binding.save`. `init` returns signed-in user,

@@ -49,9 +49,6 @@ pub struct AppConfig {
         skip_serializing_if = "crate::plugin_host::PluginsConfig::is_empty"
     )]
     pub plugins: crate::plugin_host::PluginsConfig,
-    /// One-time bundled-plugin installation; removing it remains a user choice.
-    #[serde(default)]
-    pub plugins_initialized: bool,
 }
 
 #[cfg(test)]
@@ -809,7 +806,6 @@ impl Default for AppConfig {
             monitors: MonitorsConfig::default(),
             desktop: DesktopConfig::default(),
             plugins: crate::plugin_host::PluginsConfig::default(),
-            plugins_initialized: false,
         }
     }
 }
@@ -819,15 +815,13 @@ impl AppConfig {
     pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
             tracing::info!(path = %path.display(), "Config not found — using defaults");
-            let mut config = Self::default();
-            crate::plugin_host::bundled::migrate(&mut config, path).map_err(anyhow::Error::msg)?;
-            return Ok(config);
+            return Ok(Self::default());
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Cannot read config: {}", path.display()))?;
         let mut document: serde_json::Value = serde_json::from_str(&text)
             .with_context(|| format!("Invalid JSON in config: {}", path.display()))?;
-        let motion_migrated = crate::plugin_host::bundled::migrate_document(&mut document)
+        let motion_migrated = crate::plugin_host::legacy_motion::migrate_document(&mut document)
             .map_err(anyhow::Error::msg)?;
         let mut config: Self = serde_json::from_value(document)
             .with_context(|| format!("Invalid JSON in config: {}", path.display()))?;
@@ -866,8 +860,7 @@ impl AppConfig {
                 "Camera limit of this free version reached; the other cameras are kept but not run"
             );
         }
-        let plugins_changed =
-            crate::plugin_host::bundled::migrate(&mut config, path).map_err(anyhow::Error::msg)?;
+        let plugins_changed = crate::plugin_host::legacy_motion::migrate(&mut config, path);
         if old_version < 4 || plugins_changed || motion_migrated {
             config.version = 4;
             if let Err(e) = config.save(path) {

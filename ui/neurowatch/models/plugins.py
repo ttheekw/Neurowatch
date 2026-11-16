@@ -12,14 +12,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-#: The motion plugin's id in its manifest (``nw-motion``).
-MOTION_PLUGIN_ID = "nw.motion"
-
 #: Plugin ids the recorder accepts (``plugin_host::config``).
 _ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-
-#: Motion settings a camera's built-in detector had, carried into a binding.
-_MOTION_FIELDS = ("sensitivity", "cooldown_sec", "min_duration_sec", "low_cpu", "zones")
 
 
 def default_motion_address() -> str:
@@ -87,6 +81,10 @@ class PluginServer:
             out["credential_revision"] = self.credential_revision
         if self.plugin_id:
             out["plugin_id"] = self.plugin_id
+        if self.managed is not None:
+            # The recorder keeps hosted plugins as the portal set them; sent
+            # back without this, it read as a second plugin of that name.
+            out["managed"] = self.managed
         return out
 
     def shown_name(self, manifest_name: str | None = None) -> str:
@@ -551,35 +549,6 @@ def form_fields(schema: object) -> list[FormField]:
             )
         )
     return fields
-
-
-def motion_config_from_camera(motion: object) -> dict[str, Any]:
-    """A motion plugin binding's settings, from the camera's built-in
-    detector settings (same names), so a move keeps them."""
-    if not isinstance(motion, dict):
-        return {}
-    return {key: motion[key] for key in _MOTION_FIELDS if key in motion}
-
-
-def uses_builtin_motion(motion: object) -> bool:
-    """The camera's built-in detector is on (``source`` builtin/both, or the
-    legacy ``enabled`` switch)."""
-    if not isinstance(motion, dict):
-        return False
-    source = motion.get("source")
-    if source in ("builtin", "both"):
-        return True
-    return source in (None, "off") and bool(motion.get("enabled"))
-
-
-def without_builtin_motion(motion: dict[str, Any]) -> dict[str, Any]:
-    """``motion`` with the built-in detector off; the camera's own (ONVIF)
-    detection stays as it was."""
-    updated = dict(motion)
-    source = updated.get("source")
-    updated["source"] = "onvif" if source in ("onvif", "both") else "off"
-    updated["enabled"] = False
-    return updated
 
 
 def camera_plugins_text(result: object, camera_id: str) -> str:

@@ -10,8 +10,9 @@ from typing import Any
 
 from neurowatch.models.events import kinds_text
 
-#: ``motion.source`` values, as the backend names them.
-SOURCES = ("off", "builtin", "onvif", "both")
+#: ``motion.source`` values, as the backend names them. Detection by
+#: NeuroWatch itself is the Motion plugin, bound like any other.
+SOURCES = ("off", "onvif")
 
 
 def valid_motion_zones(zones: object) -> bool:
@@ -67,27 +68,20 @@ _STATE_TONE = {
 
 
 def source_of(motion: dict[str, Any]) -> str:
-    """The detection in use, like the backend's ``effective_source``."""
-    source = motion.get("source")
-    if source in SOURCES and source != "off":
-        return str(source)
-    return "builtin" if motion.get("enabled") else "off"
+    """The camera's own detection in use (``onvif``) or none, like the
+    backend's ``effective_source``."""
+    return "onvif" if motion.get("source") == "onvif" else "off"
 
 
 def uses_camera_events(motion: dict[str, Any]) -> bool:
-    return source_of(motion) in ("onvif", "both")
+    return source_of(motion) == "onvif"
 
 
 def with_camera_events(motion: dict[str, Any], enabled: bool) -> dict[str, Any]:
-    """``motion`` with the camera's own events turned on or off; the built-in
-    detector and every other setting stay as they are."""
-    builtin = source_of(motion) in ("builtin", "both")
-    if enabled:
-        source = "both" if builtin else "onvif"
-    else:
-        source = "builtin" if builtin else "off"
+    """``motion`` with the camera's own events turned on or off; every other
+    setting stays as it is."""
     updated = dict(motion)
-    updated["source"] = source
+    updated["source"] = "onvif" if enabled else "off"
     # ``source`` decides from now on (the backend does the same).
     updated["enabled"] = False
     return updated

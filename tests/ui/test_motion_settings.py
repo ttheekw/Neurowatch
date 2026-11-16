@@ -41,19 +41,21 @@ def test_camera_model_round_trips_motion_and_onvif():
 
 
 def test_sources_follow_the_backend_rules():
+    """The recorder knows only off and onvif: NeuroWatch's own detection is the
+    Motion plugin, bound like any other."""
     assert source_of({}) == "off"
-    assert source_of({"enabled": True}) == "builtin"
+    assert source_of({"enabled": True}) == "off"
     assert source_of({"enabled": True, "source": "onvif"}) == "onvif"
-    assert uses_camera_events({"source": "both"})
-    assert not uses_camera_events({"source": "builtin"})
+    assert uses_camera_events({"source": "onvif"})
+    assert not uses_camera_events({"source": "off"})
 
 
-def test_switching_camera_events_keeps_the_builtin_detector_and_settings():
-    on = with_camera_events({"source": "builtin", "sensitivity": 3}, True)
-    assert on == {"source": "both", "sensitivity": 3, "enabled": False}
-    assert with_camera_events(on, False)["source"] == "builtin"
+def test_switching_camera_events_keeps_the_other_settings():
+    on = with_camera_events({"source": "off", "sensitivity": 3}, True)
+    assert on == {"source": "onvif", "sensitivity": 3, "enabled": False}
+    assert with_camera_events(on, False) == {"source": "off", "sensitivity": 3, "enabled": False}
     assert with_camera_events({}, True) == {"source": "onvif", "enabled": False}
-    assert with_camera_events({"enabled": True}, False)["source"] == "builtin"
+    assert with_camera_events({"enabled": True}, False)["source"] == "off"
 
 
 def test_camera_events_status_text():
@@ -113,39 +115,14 @@ def test_motion_tab_on_a_new_camera(qtbot):
     assert dlg.get_config().to_dict()["motion"] == {"source": "onvif", "enabled": False}
 
 
-def test_the_builtin_detector_can_only_be_turned_off_keeping_everything_else(qtbot):
-    """Built-in detection moved to the motion plugin: a camera that still
-    uses it gets one switch, to turn it off."""
-    from neurowatch.dialogs.camera_dialog import AddEditCameraDialog
-
-    both = {**MOTION, "source": "both", "low_cpu": True}
-    camera = _camera(motion=both, username="admin", password_b64="c2VjcmV0")
-    dialog = AddEditCameraDialog(camera=camera)
-    qtbot.addWidget(dialog)
-    assert dialog._builtin_events is not None and dialog._builtin_events.isChecked()
-    assert dialog.get_config().motion == both, "kept as it was unless switched off"
-    dialog._builtin_events.setChecked(False)
-    updated = dialog.get_config()
-    assert updated.motion["source"] == "onvif"
-    assert updated.motion["zones"] == MOTION["zones"]
-    assert updated.motion["low_cpu"] is True
-    assert updated.password_b64 == "c2VjcmV0"
-
-    legacy = AddEditCameraDialog(camera=_camera(motion={"enabled": True}))
-    qtbot.addWidget(legacy)
-    legacy._builtin_events.setChecked(False)
-    assert legacy.get_config().motion["source"] == "off"
-    assert legacy.get_config().motion["enabled"] is False
-
-
-def test_cameras_without_the_builtin_detector_never_offer_it(qtbot):
+def test_the_camera_dialog_has_no_detector_of_its_own(qtbot):
     from neurowatch.dialogs.camera_dialog import AddEditCameraDialog
 
     for motion in (MOTION, {"source": "off"}, None):
         extra = {"motion": motion} if motion is not None else {}
         dialog = AddEditCameraDialog(camera=_camera(**extra))
         qtbot.addWidget(dialog)
-        assert dialog._builtin_events is None
+        assert not hasattr(dialog, "_builtin_events")
         assert not hasattr(dialog, "_zone_canvas"), "zones belong to the motion plugin now"
 
 

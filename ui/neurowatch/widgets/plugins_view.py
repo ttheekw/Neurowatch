@@ -80,7 +80,6 @@ from neurowatch.models.plugins import (
     connection_notices,
     parse_status,
     server_text,
-    without_builtin_motion,
 )
 from neurowatch.theme import (
     mono_font,
@@ -1327,17 +1326,8 @@ class PluginsView(QWidget):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         binding = dialog.binding(server.id)
-        camera = next((c for c in snapshot.cameras if c.id == binding.camera_id), None)
-        then = None
-        if dialog.turn_off_builtin() and camera is not None:
-            camera_id = camera.id
-            source = without_builtin_motion(camera.motion)["source"]
-
-            def then(rpc: PluginsRpc) -> None:
-                rpc("motion.configure", {"camera_id": camera_id, "source": source})
-
         self._selection = (server.id, binding.camera_id)
-        self._apply(snapshot.config.with_binding(binding), then=then)
+        self._apply(snapshot.config.with_binding(binding))
 
     def _on_unbind_selected(self) -> None:
         selected = self._selected_binding()

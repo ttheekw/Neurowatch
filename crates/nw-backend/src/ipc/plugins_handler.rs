@@ -345,7 +345,18 @@ impl PluginsHandler {
         .map_err(|e| RpcError::invalid_params(format!("Invalid plugin settings: {e}")))?;
         let mut st = self.state.write().await;
         // Hosted servers follow the portal alone: whatever was sent, they stay.
-        next.servers.retain(|server| server.managed.is_none());
+        // A client that sends one back without its `managed` part (the desktop
+        // before 0.1.8) must not add a second server of that name.
+        let hosted: Vec<String> = st
+            .config
+            .plugins
+            .servers
+            .iter()
+            .filter(|server| server.managed.is_some())
+            .map(|server| server.id.clone())
+            .collect();
+        next.servers
+            .retain(|server| server.managed.is_none() && !hosted.contains(&server.id));
         next.servers.extend(
             st.config
                 .plugins
@@ -513,6 +524,35 @@ mod tests {
             crate::db::connection::open_in_memory().unwrap(),
         )));
         (PluginsHandler::new(state), path)
+    }
+
+    #[tokio::test]
+    async fn a_hosted_plugin_sent_back_without_its_managed_part_stays_one_plugin() {
+        // The desktop before 0.1.8 sent every server back without `managed`:
+        // removing another plugin failed with "Two plugins are named …".
+        let (handler, _path) = handler();
+        let hosted: crate::plugin_host::PluginServer = serde_json::from_value(json!({
+            "id": "hosted.nw.vcount", "address": "quic:v1.example.test:443", "enabled": false,
+            "managed": {"service": "nw.vcount", "instance": "v1.example.test"}}))
+        .unwrap();
+        handler
+            .state
+            .write()
+            .await
+            .config
+            .plugins
+            .servers
+            .push(hosted);
+        let sent = json!({"servers": [
+            {"id": "hosted.nw.vcount", "address": "quic:v1.example.test:443", "enabled": false}
+        ]});
+        let saved = handler.dispatch("plugins.set", &sent).await.unwrap();
+        let servers = saved["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1, "{servers:?}");
+        assert!(
+            servers[0]["managed"].is_object(),
+            "kept as the portal set it"
+        );
     }
 
     #[tokio::test]
@@ -814,10 +854,7 @@ mod discovery_tests {
         std::fs::create_dir_all(&folder).unwrap();
         let first = format!("unix:{}", folder.join("p.sock").display());
         let server = daemon(UnixListener::bind(folder.join("p.sock")).unwrap(), 2, 1);
-        let config = crate::config::AppConfig {
-            plugins_initialized: true,
-            ..Default::default()
-        };
+        let config = crate::config::AppConfig::default();
         let state = Arc::new(RwLock::new(crate::app_state::AppState::new(
             config,
             dir.join("config.json"),

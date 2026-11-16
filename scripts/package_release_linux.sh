@@ -239,8 +239,6 @@ BACKEND_TARGET="${CARGO_TARGET_DIR:-$(dirname "$BACKEND_MANIFEST")/target}"
 cargo build --manifest-path "$BACKEND_MANIFEST" --release --locked -p "${NW_BACKEND_PACKAGE:-nw-backend}" \
     --message-format=json-render-diagnostics "${BACKEND_FEATURES[@]}" > "$WORK_DIR/backend-build.jsonl"
 install -m 0755 "$BACKEND_TARGET/release/nw-backend" "$BUNDLE_DIR/bin/nw-backend"
-cargo build --manifest-path "$ROOT/Cargo.toml" --release --locked -p nw-motion
-install -m 0755 "${CARGO_TARGET_DIR:-$ROOT/target}/release/nw-motion" "$BUNDLE_DIR/bin/nw-motion"
 # The licence and notice ship with every artifact.
 install -m 0644 "$ROOT/LICENSE" "$BUNDLE_DIR/LICENSE"
 install -m 0644 "$ROOT/NOTICE" "$BUNDLE_DIR/NOTICE"

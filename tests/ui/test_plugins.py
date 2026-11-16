@@ -22,12 +22,9 @@ from neurowatch.models.plugins import (
     binding_text,
     connection_notices,
     form_fields,
-    motion_config_from_camera,
     parse_status,
     server_id_problem,
     server_text,
-    uses_builtin_motion,
-    without_builtin_motion,
 )
 
 
@@ -186,28 +183,6 @@ def test_the_form_shows_what_it_can_and_keeps_the_rest() -> None:
     assert form_fields(None) == [] and form_fields({"properties": 3}) == []
 
 
-def test_built_in_motion_settings_move_to_a_binding() -> None:
-    motion = {
-        "source": "both",
-        "sensitivity": 8,
-        "cooldown_sec": 4.0,
-        "zones": ZONES,
-        "enabled": False,
-        "low_cpu": True,
-    }
-    assert uses_builtin_motion(motion)
-    assert uses_builtin_motion({"enabled": True})
-    assert not uses_builtin_motion({"source": "onvif"}) and not uses_builtin_motion(None)
-    assert motion_config_from_camera(motion) == {
-        "sensitivity": 8,
-        "cooldown_sec": 4.0,
-        "zones": ZONES,
-        "low_cpu": True,
-    }
-    assert without_builtin_motion(motion)["source"] == "onvif"
-    assert without_builtin_motion({"enabled": True}) == {"enabled": False, "source": "off"}
-
-
 class FakeRecorder:
     """``plugins.*``, ``camera.list`` and ``motion.configure``, in memory."""
 
@@ -335,16 +310,16 @@ def test_adding_a_plugin_binding_a_camera_and_removing_it(qtbot, monkeypatch) ->
     assert view.tree.topLevelItem(0).text(0) == "Motion detection"
     assert view.tree.topLevelItem(0).toolTip(0).startswith("Connected")
 
-    # Binding Door, which still uses the built-in detector: its settings
-    # move over, the built-in detector is switched off, and its page opens.
+    # Binding Door: the plugin's own settings (nothing carried over from the
+    # old built-in detector, which the recorder no longer has), and its page opens.
     monkeypatch.setattr(BindingDialog, "exec", lambda self: BindingDialog.DialogCode.Accepted)
     view._on_bind(view._snapshot.config.servers[0])
     _wait_saved(qtbot, view, recorder, 2)
     binding = recorder.config["bindings"][0]
     assert binding["camera_id"] == "c1"
-    assert binding["config"]["sensitivity"] == 8 and binding["config"]["zones"] == ZONES
+    assert binding["config"].get("zones") != ZONES, "the old detector's zones are not copied"
     assert "stream" not in binding and "wall_layers" not in binding, "defaults stay unset"
-    assert ("motion.configure", {"camera_id": "c1", "source": "off"}) in recorder.calls
+    assert not any(method == "motion.configure" for method, _ in recorder.calls)
     assert view.pages.currentWidget() is view.camera_page
     assert view.camera_title.text() == "Door"
     assert view.tree.topLevelItem(0).child(0).toolTip(0).startswith("Running")
@@ -452,7 +427,6 @@ def test_a_cameras_settings_draw_the_plugins_schema(qtbot) -> None:
     assert not editor.camera.isEnabled(), "an existing binding keeps its camera"
     assert editor._inputs["sensitivity"].value() == 3
     assert editor._inputs["mode"].currentText() == "accurate"
-    assert editor.builtin.isHidden(), "this camera never used the built-in detector"
     assert editor.stream.currentData() is None
     assert editor._layer_boxes["detections"].isChecked()
     assert not editor._layer_boxes["debug"].isChecked()
@@ -467,7 +441,6 @@ def test_a_cameras_settings_draw_the_plugins_schema(qtbot) -> None:
     assert saved.stream is None and saved.wall_layers is None
     editor._layer_boxes["detections"].setChecked(False)
     assert editor.binding("motion").wall_layers == []
-    assert not editor.turn_off_builtin()
 
     # A zone with too few points is not saved.
     editor.zones.add_zone("include")
@@ -486,7 +459,6 @@ def test_the_binding_dialog_without_a_connected_plugin_keeps_settings(qtbot) -> 
     saved = dialog.binding("motion")
     assert saved.config == {"sensitivity": 4}
     assert saved.stream == "sub" and saved.wall_layers == ["detections"]
-    assert not dialog.turn_off_builtin(), "only the motion plugin replaces it"
 
 
 def test_drawings_and_markers_reach_the_tiles(qtbot) -> None:
@@ -713,6 +685,11 @@ def test_plugin_picker_discovers_local_daemons_and_rejects_added_ones(qtbot) -> 
     dialog = AddPluginDialog(["included-motion"], rpc=rpc)
     qtbot.addWidget(dialog)
     dialog.show()
+    from neurowatch.dialogs.plugin_dialogs import ADD_PLUGIN_WIDTH
+    from PySide6.QtGui import QGuiApplication
+
+    screen = QGuiApplication.primaryScreen().availableGeometry().width()
+    assert dialog.width() >= min(ADD_PLUGIN_WIDTH, int(screen * 0.9)), "room for a socket path"
     qtbot.waitUntil(lambda: dialog.local_plugins.count() == 2)
     assert dialog.local_plugins.currentText() == "Counter"
     dialog.local_plugins.setCurrentIndex(0)
@@ -1370,7 +1347,7 @@ def test_a_settings_choice_shows_its_label_and_saves_its_value(qtbot) -> None:
     assert editor.config()["decoder"] == "software", "the value is saved, not the label"
     combo.setCurrentIndex(0)
     assert editor.config()["decoder"] == "auto"
-    editor._fill({"decoder": "vaapi"})
+    combo.setCurrentIndex(combo.findData("vaapi"))
     assert combo.currentText() == "vaapi"
     assert editor.config()["decoder"] == "vaapi"
 
@@ -1567,3 +1544,22 @@ def test_a_hosted_plugin_no_longer_provided_is_not_listed() -> None:
     # A plugin switched off by hand stays listed; one NeuroWatch took away does not.
     assert [s.id for s in config.shown_servers()] == ["motion"]
     assert [b.camera_id for b in config.shown_bindings_of("motion")] == ["b"]
+
+
+def test_a_hosted_plugin_goes_back_to_the_recorder_as_it_came() -> None:
+    """Sent back without ``managed`` it read as a second plugin of that name,
+    and every change on the Plugins page (Remove included) was refused."""
+    raw = {
+        "servers": [
+            {
+                "id": "hosted.nw.vcount",
+                "address": "quic:v1.example.test:443",
+                "enabled": False,
+                "managed": {"service": "nw.vcount", "instance": "v1"},
+            },
+            {"id": "motion", "address": "unix:/tmp/m.sock"},
+        ]
+    }
+    config = PluginsConfig.from_dict(raw)
+    sent = config.without_server("motion").to_dict()["servers"]
+    assert sent == [raw["servers"][0]], "the hidden hosted plugin goes back unchanged"
