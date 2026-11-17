@@ -1,3 +1,3 @@
 """Neurowatch NVR — Python/PySide6 frontend."""
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
