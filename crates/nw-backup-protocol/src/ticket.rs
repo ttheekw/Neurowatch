@@ -75,6 +75,96 @@ pub struct CameraGrant {
     /// and only the customer can open it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seal_key: Option<String>,
+    /// The stream as it was when the plan was priced (2026-11-17): a stream
+    /// that later sends clearly more is still backed up, and the recorder
+    /// raises an event so its owner can price it again. Absent (older
+    /// tickets): nothing is compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priced: Option<PricedStream>,
+}
+
+/// A stream as a plan priced it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PricedStream {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    /// Compressed video bits a second (the recorder's minute average).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_bps: Option<u64>,
+    /// `h264` or `h265`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    /// How much more the bitrate or frame rate may be before it counts as
+    /// changed (percent; the portal's `BACKUP_CHANGE_TOLERANCE_PERCENT`).
+    #[serde(default = "default_tolerance")]
+    pub tolerance_percent: u32,
+}
+
+fn default_tolerance() -> u32 {
+    20
+}
+
+/// A stream as the recorder sees it now.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SeenStream<'a> {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<f64>,
+    pub bitrate_bps: Option<u64>,
+    pub codec: Option<&'a str>,
+}
+
+fn codec_name(codec: &str) -> &str {
+    match codec {
+        "h264" => "H.264",
+        "h265" => "H.265",
+        other => other,
+    }
+}
+
+impl PricedStream {
+    /// What the stream sends more of than when it was priced, in plain
+    /// words (empty: nothing). Less never counts; neither does what is not
+    /// measured yet.
+    pub fn changes(&self, now: &SeenStream<'_>) -> Vec<String> {
+        let allowed = 1.0 + f64::from(self.tolerance_percent) / 100.0;
+        let mut changes = Vec::new();
+        if let (Some(width), Some(height)) = (now.width, now.height) {
+            if u64::from(width) * u64::from(height) > u64::from(self.width) * u64::from(self.height)
+            {
+                changes.push(format!(
+                    "picture size {width}×{height} (priced {}×{})",
+                    self.width, self.height
+                ));
+            }
+        }
+        if let Some(fps) = now.fps {
+            if fps > self.fps * allowed {
+                changes.push(format!("{fps:.0} fps (priced {:.0} fps)", self.fps));
+            }
+        }
+        if let (Some(bps), Some(priced)) = (now.bitrate_bps, self.bitrate_bps) {
+            if priced > 0 && bps as f64 > priced as f64 * allowed {
+                changes.push(format!(
+                    "{:.1} Mbit/s (priced {:.1} Mbit/s)",
+                    bps as f64 / 1e6,
+                    priced as f64 / 1e6
+                ));
+            }
+        }
+        if let (Some(codec), Some(priced)) = (now.codec, self.codec.as_deref()) {
+            // H.265 is about half H.264's size for the same picture.
+            if priced == "h265" && codec != "h265" {
+                changes.push(format!(
+                    "{} (priced {})",
+                    codec_name(codec),
+                    codec_name(priced)
+                ));
+            }
+        }
+        changes
+    }
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -381,6 +471,7 @@ mod tests {
             cameras: vec![CameraGrant {
                 stream: None,
                 seal_key: None,
+                priced: None,
                 camera_id: "cam-1".into(),
                 retention_s: 3600,
                 sound: false,
@@ -578,10 +669,66 @@ mod tests {
     }
 
     #[test]
+    fn a_priced_stream_counts_only_clearly_more_as_changed() {
+        let priced = PricedStream {
+            width: 1920,
+            height: 1080,
+            fps: 15.0,
+            bitrate_bps: Some(1_000_000),
+            codec: Some("h265".into()),
+            tolerance_percent: 20,
+        };
+        let seen = SeenStream {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(17.0),
+            bitrate_bps: Some(1_150_000),
+            codec: Some("h265"),
+        };
+        assert!(priced.changes(&seen).is_empty(), "within 20 %");
+        assert!(
+            priced.changes(&SeenStream::default()).is_empty(),
+            "nothing measured yet"
+        );
+        let smaller = SeenStream {
+            width: Some(1280),
+            height: Some(720),
+            fps: Some(10.0),
+            bitrate_bps: Some(500_000),
+            ..seen
+        };
+        assert!(
+            priced.changes(&smaller).is_empty(),
+            "less is never a change"
+        );
+        let more = SeenStream {
+            width: Some(2560),
+            height: Some(1440),
+            fps: Some(25.0),
+            bitrate_bps: Some(2_100_000),
+            codec: Some("h264"),
+        };
+        assert_eq!(
+            priced.changes(&more),
+            vec![
+                "picture size 2560×1440 (priced 1920×1080)".to_owned(),
+                "25 fps (priced 15 fps)".to_owned(),
+                "2.1 Mbit/s (priced 1.0 Mbit/s)".to_owned(),
+                "H.264 (priced H.265)".to_owned(),
+            ]
+        );
+        // Read from a ticket without a tolerance: 20 %.
+        let read: PricedStream =
+            serde_json::from_str(r#"{"width":1920,"height":1080,"fps":15}"#).unwrap();
+        assert_eq!((read.tolerance_percent, read.bitrate_bps), (20, None));
+    }
+
+    #[test]
     fn grants_say_how_long_footage_stays_hot() {
         let grant = |retention_s, hot_s, move_every_s| CameraGrant {
             stream: None,
             seal_key: None,
+            priced: None,
             camera_id: "c".into(),
             retention_s,
             sound: false,

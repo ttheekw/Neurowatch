@@ -117,6 +117,8 @@ pub struct AppState {
     /// Cloud Backup's latest status (set by `crate::cloud::backup`; "off"
     /// without a cloud link or plan): health events, `system.status`.
     pub backup: Arc<crate::cloud::backup::BackupStatus>,
+    /// Which physical camera is behind each configured one (`camera_identity`).
+    pub identities: Arc<crate::camera_identity::CameraIdentities>,
 }
 
 impl AppState {
@@ -197,6 +199,7 @@ impl AppState {
             plugins,
             snapshots,
             backup: Arc::default(),
+            identities: Arc::default(),
         }
     }
 

@@ -50,6 +50,18 @@ async fn run() -> anyhow::Result<()> {
 
     let cfg = crate::config::AppConfig::load_or_default(&config_path)?;
     crate::logging::init(&cfg.debug);
+    // First in the service log: which NeuroWatch this is (an update restarts
+    // the service, so the log shows when the new version took over).
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        edition = crate::edition::EDITION,
+        pid = std::process::id(),
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        supervised = crate::supervise::supervised(),
+        headless = std::env::var("NW_HEADLESS").is_ok_and(|v| v == "1"),
+        "NeuroWatch backend starting"
+    );
     if let Some((reason, restarts)) = crate::supervise::previous_exit() {
         tracing::warn!(
             reason = %reason,
@@ -177,6 +189,16 @@ async fn run() -> anyhow::Result<()> {
         Arc::clone(&state),
         shutdown_tx.subscribe(),
     ));
+    // Which physical camera is behind each configured one (its MAC), for
+    // NeuroWatch Cloud to notice a camera swapped at the same address.
+    {
+        let identities = Arc::clone(&state.read().await.identities);
+        tokio::spawn(crate::camera_identity::run(
+            Arc::clone(&state),
+            identities,
+            shutdown_tx.subscribe(),
+        ));
+    }
     // Older recordings move to the archive tier, when one is configured.
     tokio::spawn(crate::recording::archive::run(
         Arc::clone(&state),

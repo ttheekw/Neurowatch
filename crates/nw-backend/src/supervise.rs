@@ -125,6 +125,7 @@ pub fn main() -> i32 {
         });
         tracing::info!(
             pid = std::process::id(),
+            version = env!("CARGO_PKG_VERSION"),
             "Supervising the backend: it is started again if it stops unexpectedly"
         );
         supervise(&Child { program, args }, Policy::default(), stop_rx).await

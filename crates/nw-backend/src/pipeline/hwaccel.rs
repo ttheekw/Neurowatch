@@ -720,6 +720,20 @@ pub fn software_only(decodebin: &gstreamer::Element) {
     });
 }
 
+/// [`software_only`] for every `decodebin` directly in `bin`: one-picture
+/// decodes (snapshots, event pictures, portal thumbnails). One picture gains
+/// nothing from a hardware decoder, and some never give it back (2026-11-17:
+/// an H.264 camera's thumbnail stayed empty on a Raspberry Pi, whose V4L2
+/// H.264 decoder decodebin picks, while H.265, decoded on the CPU there, showed).
+pub fn software_only_in(bin: &gstreamer::Bin) {
+    use gstreamer::prelude::*;
+    for element in bin.iterate_elements().into_iter().filter_map(Result::ok) {
+        if element.factory().is_some_and(|f| f.name() == "decodebin") {
+            software_only(&element);
+        }
+    }
+}
+
 /// Returns the GStreamer element for YUV→RGB colour conversion.
 ///
 /// On NVIDIA, `nvvidconv` performs the conversion on the GPU (zero CPU cost).
@@ -1050,6 +1064,48 @@ mod tests {
         assert_eq!(hardware, None);
         assert!(software, "decodebin plugged the CPU decoder");
         assert_eq!(pictures.load(std::sync::atomic::Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn one_picture_decodes_never_plug_a_hardware_decoder() {
+        use gstreamer::prelude::*;
+
+        gstreamer::init().unwrap();
+        for factory in ["x264enc", "h264parse", "avdec_h264"] {
+            if gstreamer::ElementFactory::find(factory).is_none() {
+                eprintln!("skipping: GStreamer element {factory} is not installed");
+                return;
+            }
+        }
+        let pipeline = gstreamer::parse::launch(
+            "videotestsrc num-buffers=1 ! video/x-raw,width=320,height=240 ! x264enc \
+             ! h264parse ! decodebin ! fakesink",
+        )
+        .unwrap()
+        .downcast::<gstreamer::Pipeline>()
+        .unwrap();
+        super::software_only_in(pipeline.upcast_ref());
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let ended = pipeline.bus().unwrap().timed_pop_filtered(
+            gstreamer::ClockTime::from_seconds(10),
+            &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+        );
+        let plugged: Vec<String> = pipeline
+            .iterate_recurse()
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter_map(|e| e.factory().map(|f| f.name().to_string()))
+            .collect();
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        assert!(ended.is_some_and(|m| m.type_() == gstreamer::MessageType::Eos));
+        assert!(
+            plugged.iter().any(|name| name == "avdec_h264"),
+            "{plugged:?}"
+        );
+        assert!(
+            !plugged.iter().any(|name| super::is_hardware_decoder(name)),
+            "{plugged:?}"
+        );
     }
 
     #[test]

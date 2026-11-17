@@ -8,6 +8,7 @@ pub mod alerts;
 pub mod app_state;
 pub mod assignment;
 mod camera_credentials;
+pub mod camera_identity;
 pub mod cloud;
 pub mod config;
 pub mod db;

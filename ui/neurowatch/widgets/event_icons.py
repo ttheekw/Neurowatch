@@ -177,6 +177,19 @@ def _backup_failed(p: QPainter) -> None:
     p.drawLine(QPointF(3.0, 3.0), QPointF(21.0, 21.0))
 
 
+def _backup_stream_changed(p: QPainter) -> None:
+    """A cloud with a rising line: the stream sends more than it was priced for."""
+    cloud = QPainterPath(QPointF(7.0, 18.0))
+    cloud.cubicTo(QPointF(3.0, 18.0), QPointF(2.5, 12.0), QPointF(6.8, 11.5))
+    cloud.cubicTo(QPointF(7.2, 6.0), QPointF(14.5, 4.5), QPointF(16.2, 9.6))
+    cloud.cubicTo(QPointF(21.5, 9.6), QPointF(22.0, 18.0), QPointF(17.0, 18.0))
+    cloud.closeSubpath()
+    p.drawPath(cloud)
+    p.drawLine(QPointF(8.0, 15.5), QPointF(11.0, 12.5))
+    p.drawLine(QPointF(11.0, 12.5), QPointF(13.0, 14.0))
+    p.drawLine(QPointF(13.0, 14.0), QPointF(16.0, 10.5))
+
+
 def _plugin_lagging(p: QPainter) -> None:
     """The plugin hexagon with a clock's hands: late."""
     hexagon = QPainterPath(QPointF(12.0, 3.0))
@@ -226,6 +239,7 @@ _GLYPHS: dict[str, _Glyph] = {
     "storage_missing": _storage_missing,
     "plugin_offline": _plugin_offline,
     "backup_failed": _backup_failed,
+    "backup_stream_changed": _backup_stream_changed,
     "plugin_lagging": _plugin_lagging,
     "backend_started": _backend_started,
     "bookmark": _bookmark,

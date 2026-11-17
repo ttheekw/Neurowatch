@@ -369,6 +369,7 @@ async fn websocket_real_portal_contract() {
                 bitrate_bps: Some(2_048_000),
             },
         )])),
+        hardware: None,
     };
     assert!(node.push_inventory(vec![camera]).await.unwrap());
     assert!(node.push_coverage(vec![]).await.unwrap());

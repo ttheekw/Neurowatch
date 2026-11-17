@@ -136,6 +136,7 @@ pub fn label(kind: EventKind) -> &'static str {
         EventKind::StorageMissing => "Recording storage missing",
         EventKind::PluginOffline => "Plugin offline",
         EventKind::BackupFailed => "Cloud Backup failed",
+        EventKind::BackupStreamChanged => "Backup stream changed",
         EventKind::PluginLagging => "Plugin connection too slow",
         EventKind::BackendStarted => "Recorder started",
         EventKind::Bookmark => "Bookmark",

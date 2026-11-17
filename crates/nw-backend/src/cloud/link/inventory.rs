@@ -6,7 +6,9 @@
 //! frame rate and bitrate (which Cloud Backup qualities fit it) ever leave
 //! the node. Stream URLs, credentials,
 //! network addresses and storage paths are never read into this type; unsafe
-//! display names are replaced rather than sent.
+//! display names are replaced rather than sent. Since 2026-11-17 also the
+//! camera's hardware (MAC, serial, maker, model: `camera_identity`), so the
+//! cloud notices another camera put in the same place.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -66,6 +68,9 @@ pub struct CameraSnapshot {
     /// refuses that key anywhere, as a guard against media in reports.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub formats: Option<StreamVideos>,
+    /// Which physical camera this is, when known (`camera_identity`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<crate::camera_identity::CameraHardware>,
 }
 
 /// Build the cloud snapshot from local config and supervisor states.
@@ -74,7 +79,7 @@ pub fn camera_inventory(
     cameras: &[CameraConfig],
     states: &HashMap<String, String>,
 ) -> Vec<CameraSnapshot> {
-    camera_inventory_with_live(cameras, states, |_| None, |_| None)
+    camera_inventory_with_live(cameras, states, |_| None, |_| None, |_| None)
 }
 
 /// [`camera_inventory`], also reporting each camera's live streams.
@@ -83,6 +88,7 @@ pub fn camera_inventory_with_live(
     states: &HashMap<String, String>,
     live: impl Fn(&CameraConfig) -> Option<LiveStreams>,
     formats: impl Fn(&CameraConfig) -> Option<StreamVideos>,
+    hardware: impl Fn(&CameraConfig) -> Option<crate::camera_identity::CameraHardware>,
 ) -> Vec<CameraSnapshot> {
     let cameras = &cameras[..cameras.len().min(MAX_REPORTED_CAMERAS)];
     // Ids and names come from configuration order (a replacement id such as
@@ -104,6 +110,7 @@ pub fn camera_inventory_with_live(
                 recording: states.get(&camera.id).map(String::as_str) == Some("recording_ready"),
                 live: live(camera),
                 formats: formats(camera).filter(|streams| !streams.is_empty()),
+                hardware: hardware(camera).filter(|found| !found.is_empty()),
             })
         })
         .collect();

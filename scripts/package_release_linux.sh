@@ -353,6 +353,8 @@ LONG_DESCRIPTION_DEB="$(printf '%s\n' "$LONG_DESCRIPTION" | sed '2,$s/^/ /')"
 GPU_ACCESS="$(cat "$LINUX_FILES/gpu-access.sh")"
 # Updates: say so, and remove what the old version leaves behind.
 LEFTOVERS="$(cat "$LINUX_FILES/leftovers.sh")"
+# Updates: a running service restarts on the new version (every user's).
+RESTART="$(cat "$LINUX_FILES/restart-service.sh")"
 
 join_by() {
     local separator="$1"
@@ -405,8 +407,8 @@ CONTROL
         printf 'if [ -n "${2:-}" ]; then\n    neurowatch_update_notice "$2" "%s"\nfi\nexit 0\n' "$DEB_VERSION"
     } > "$root/DEBIAN/preinst"
     {
-        printf '#!/bin/sh\nset -e\n%s\n%s\n' "$GPU_ACCESS" "$LEFTOVERS"
-        printf 'case "$1" in\n    configure)\n        neurowatch_grant_gpu_access\n        neurowatch_remove_leftovers\n        ;;\nesac\nexit 0\n'
+        printf '#!/bin/sh\nset -e\n%s\n%s\n%s\n' "$GPU_ACCESS" "$LEFTOVERS" "$RESTART"
+        printf 'case "$1" in\n    configure)\n        neurowatch_grant_gpu_access\n        neurowatch_remove_leftovers\n        neurowatch_restart_services\n        ;;\nesac\nexit 0\n'
     } > "$root/DEBIAN/postinst"
     {
         printf '#!/bin/sh\nset -e\n%s\n' "$GPU_ACCESS"
@@ -463,8 +465,10 @@ exit 0
 
 %posttrans
 $LEFTOVERS
+$RESTART
 # After the whole transaction: the old package's own files are gone by now.
 neurowatch_remove_leftovers
+neurowatch_restart_services
 exit 0
 
 %postun
@@ -525,11 +529,11 @@ build_arch() {
         done
     } > "$root/.PKGINFO"
     {
-        printf '%s\n\n%s\n\n' "$GPU_ACCESS" "$LEFTOVERS"
+        printf '%s\n\n%s\n\n%s\n\n' "$GPU_ACCESS" "$LEFTOVERS" "$RESTART"
         printf 'post_install() {\n    neurowatch_grant_gpu_access\n    neurowatch_remove_leftovers\n}\n\n'
         # pacman passes the new version, then the old one.
         printf 'pre_upgrade() {\n    neurowatch_update_notice "$2" "$1"\n}\n\n'
-        printf 'post_upgrade() {\n    neurowatch_grant_gpu_access\n    neurowatch_remove_leftovers\n}\n\n'
+        printf 'post_upgrade() {\n    neurowatch_grant_gpu_access\n    neurowatch_remove_leftovers\n    neurowatch_restart_services\n}\n\n'
         printf 'post_remove() {\n    neurowatch_revoke_gpu_access\n}\n'
     } > "$root/.INSTALL"
     # Same metadata layout makepkg produces: .PKGINFO, .MTREE, then the payload.

@@ -1327,7 +1327,15 @@ pub struct CloudNode {
     /// plan, from each inventory reply. `None`: not known yet (or an older
     /// portal), nothing hidden.
     served_cameras: ServedCameras,
+    /// Until when inventories leave out camera hardware: a portal from before
+    /// 2026-11-17 refuses a whole inventory that carries it (HTTP 422).
+    hardware_refused_until: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
+
+/// How long inventories leave camera hardware out after a portal refused it,
+/// before trying again (the portal may have been updated).
+const HARDWARE_RETRY_AFTER: Duration = Duration::from_secs(6 * 3600);
+
 impl CloudNode {
     /// Production-policy open for tests; the binary uses `open_with_options`.
     #[cfg(test)]
@@ -1384,6 +1392,7 @@ impl CloudNode {
             clock,
             services: Arc::default(),
             served_cameras: ServedCameras::default(),
+            hardware_refused_until: Arc::default(),
         })
     }
     /// The cameras the portal serves, shared with the portal relay, which
@@ -1975,7 +1984,37 @@ impl CloudNode {
     }
 
     /// Report the allowlisted camera inventory; `Ok(false)` if the cloud kept a newer one.
-    pub async fn push_inventory(&self, cameras: Vec<CameraSnapshot>) -> Result<bool> {
+    /// A portal that refuses camera hardware (older than the field) gets the
+    /// inventory without it, and none for [`HARDWARE_RETRY_AFTER`].
+    pub async fn push_inventory(&self, mut cameras: Vec<CameraSnapshot>) -> Result<bool> {
+        let strip =
+            |cameras: &mut Vec<CameraSnapshot>| cameras.iter_mut().for_each(|c| c.hardware = None);
+        let refused = self
+            .hardware_refused_until
+            .lock()
+            .ok()
+            .and_then(|until| *until)
+            .is_some_and(|until| std::time::Instant::now() < until);
+        if refused {
+            strip(&mut cameras);
+        }
+        let carries = cameras.iter().any(|camera| camera.hardware.is_some());
+        match self.send_inventory(&cameras).await {
+            Err(CloudError::Network(message)) if carries && message.starts_with("HTTP 422") => {
+                tracing::info!(
+                    "The portal does not take camera hardware yet; reporting cameras without it"
+                );
+                if let Ok(mut until) = self.hardware_refused_until.lock() {
+                    *until = Some(std::time::Instant::now() + HARDWARE_RETRY_AFTER);
+                }
+                strip(&mut cameras);
+                self.send_inventory(&cameras).await
+            }
+            other => other,
+        }
+    }
+
+    async fn send_inventory(&self, cameras: &[CameraSnapshot]) -> Result<bool> {
         let (endpoint, key, status) = {
             let i = self.lock()?;
             (

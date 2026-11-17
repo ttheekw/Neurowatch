@@ -111,7 +111,8 @@ pub struct VideoFormat {
     pub height: Option<u32>,
     /// Pictures a second, measured from what arrived.
     pub fps: Option<f64>,
-    /// Compressed video bits a second, measured.
+    /// Compressed video bits a second, measured: the last minute's average
+    /// once 10 s were measured (`Rates::average_video_bps`), else the last second.
     pub video_bps: Option<u64>,
 }
 
