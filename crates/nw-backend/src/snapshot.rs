@@ -242,6 +242,7 @@ fn take_picture(pipeline: &gstreamer::Pipeline) -> Result<Vec<u8>, String> {
         .ok_or("Snapshot output missing")?
         .downcast::<gstreamer_app::AppSink>()
         .map_err(|_| "Invalid snapshot output")?;
+    crate::pipeline::hwaccel::software_only_in(pipeline.upcast_ref());
     pipeline
         .set_state(gstreamer::State::Playing)
         .map_err(|_| "Snapshot stream failed")?;

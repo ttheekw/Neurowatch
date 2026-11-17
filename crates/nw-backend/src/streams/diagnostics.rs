@@ -134,6 +134,7 @@ impl StreamHubs {
                 let core = lock(&hub.core);
                 let size = core.size();
                 let (_, rates, _) = core.metrics(now);
+                let average = core.average_video_bps();
                 drop(core);
                 let seen = remembered.entry(key.clone()).or_default();
                 if let Some((width, height)) = size {
@@ -143,6 +144,11 @@ impl StreamHubs {
                 if let Some(rates) = rates.filter(|rates| rates.fps > 0.0) {
                     seen.fps = Some(rates.fps);
                     seen.video_bps = Some(rates.video_bps);
+                }
+                // The minute's average, once there is one: a single second
+                // swings with every keyframe, and backup prices follow it.
+                if let Some(average) = average.filter(|bps| *bps > 0) {
+                    seen.video_bps = Some(average);
                 }
             }
             if let Some(format) = remembered

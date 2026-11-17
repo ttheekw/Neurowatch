@@ -759,6 +759,7 @@ fn camera_inventory_reports_which_streams_a_browser_can_be_sent() {
                 .then(|| std::collections::BTreeMap::from([("main", Some("h265")), ("sub", None)]))
         },
         |_| None,
+        |_| None,
     );
     let json = serde_json::to_value(&snapshot).unwrap();
     assert_eq!(json[0]["live"], json!({"main": "h265", "sub": null}));
@@ -804,6 +805,7 @@ fn camera_inventory_reports_each_streams_size_and_measured_rates() {
                 _ => std::collections::BTreeMap::new(),
             })
         },
+        |_| None,
     );
     let json = serde_json::to_value(&snapshot).unwrap();
     assert_eq!(
@@ -814,6 +816,36 @@ fn camera_inventory_reports_each_streams_size_and_measured_rates() {
     assert!(json[1].get("formats").is_none(), "nothing seen: left out");
     let text = json.to_string();
     assert!(!text.contains("rtsp") && !text.contains("192.168") && !text.contains("hunter2"));
+}
+
+#[test]
+fn camera_inventory_says_which_physical_camera_each_one_is() {
+    use crate::camera_identity::CameraHardware;
+    let cameras = vec![
+        camera("cam-a", "Front door", true),
+        camera("cam-b", "Gate", false),
+    ];
+    let snapshot = camera_inventory_with_live(
+        &cameras,
+        &std::collections::HashMap::new(),
+        |_| None,
+        |_| None,
+        |camera| {
+            (camera.id == "cam-a").then(|| CameraHardware {
+                mac: Some("bc:ba:c2:01:02:03".into()),
+                serial: Some("DS-2CD1221-I5X".into()),
+                manufacturer: Some("HIKVISION".into()),
+                model: Some("DS-2CD1221-I5".into()),
+            })
+        },
+    );
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(
+        json[0]["hardware"],
+        json!({"mac": "bc:ba:c2:01:02:03", "serial": "DS-2CD1221-I5X",
+               "manufacturer": "HIKVISION", "model": "DS-2CD1221-I5"})
+    );
+    assert!(json[1].get("hardware").is_none(), "not known: left out");
 }
 
 #[test]
@@ -1965,6 +1997,7 @@ fn a_camera_status_change_is_reported_within_seconds_but_not_more_than_every_ten
             recording: false,
             live: None,
             formats: None,
+            hardware: None,
         }]
     };
     let reported = (snap("connecting"), start);
@@ -2001,6 +2034,7 @@ fn a_camera_still_connecting_is_reported_once_it_settles_or_after_a_while() {
             recording: false,
             live: None,
             formats: None,
+            hardware: None,
         }]
     };
     let reported = (Vec::new(), start);

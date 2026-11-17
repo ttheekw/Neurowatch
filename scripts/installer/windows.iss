@@ -64,6 +64,10 @@ const
 var
   PreviousVersion: String;
   RemovedFiles: Integer;
+  // The service was running before the update stopped it: it is started
+  // again on the new version (and the tray with it), so recording goes on.
+  ServiceWasRunning: Boolean;
+  ServiceRestarted: Boolean;
 
 function RunServiceCommand(const Command: String): Boolean;
 var
@@ -77,9 +81,43 @@ begin
       SW_HIDE, ewWaitUntilTerminated, ExitCode) and (ExitCode = 0);
 end;
 
+// Whether the installed version's service is running (`service status` exits 0).
+function ServiceRunning(): Boolean;
+var
+  Exe: String;
+  ExitCode: Integer;
+begin
+  Exe := ExpandConstant('{app}\app\neurowatch-ui\neurowatch-ui.exe');
+  Result := FileExists(Exe) and Exec(Exe, 'service status', ExpandConstant('{app}'),
+    SW_HIDE, ewWaitUntilTerminated, ExitCode) and (ExitCode = 0);
+end;
+
+// After the update: the service on the new version, in the mode it ran in,
+// changing nothing about what starts at sign-in; and the tray, when NeuroWatch
+// starts at sign-in (Restart Manager closed the old one to replace its files).
+procedure RestartService();
+var
+  ExitCode: Integer;
+begin
+  if not ServiceWasRunning then
+    Exit;
+  WizardForm.StatusLabel.Caption := 'Starting NeuroWatch again...';
+  ServiceRestarted := RunServiceCommand('start --no-autostart');
+  if ServiceRestarted then
+    Log('NeuroWatch service started on version {#AppVersion}')
+  else
+    Log('NeuroWatch service did not start after the update');
+  if RegValueExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'NeuroWatch') then
+    Exec(ExpandConstant('{app}\app\neurowatch-ui\neurowatch-ui.exe'), '--tray', ExpandConstant('{app}'),
+      SW_SHOWNORMAL, ewNoWait, ExitCode);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+  ServiceWasRunning := ServiceRunning();
+  if ServiceWasRunning then
+    Log('NeuroWatch service is running: it is started again after the update');
   if not RunServiceCommand('stop') then
     Result := 'NeuroWatch could not stop recording. Stop it from the tray, then retry the update.';
 end;
@@ -224,6 +262,7 @@ begin
   begin
     WizardForm.StatusLabel.Caption := 'Removing files the previous version left behind...';
     RemoveLeftovers();
+    RestartService();
   end;
 end;
 
@@ -237,6 +276,10 @@ begin
     Note := 'NeuroWatch was updated from ' + PreviousVersion + ' to {#AppVersion}.';
     if RemovedFiles > 0 then
       Note := Note + ' ' + IntToStr(RemovedFiles) + ' file(s) left over from the old version were removed.';
+    if ServiceRestarted then
+      Note := Note + ' NeuroWatch is recording again on the new version.'
+    else if ServiceWasRunning then
+      Note := Note + ' NeuroWatch could not start again by itself: open NeuroWatch to start recording.';
     WizardForm.FinishedLabel.Caption := Note + #13#10#13#10 + WizardForm.FinishedLabel.Caption;
     Grown := WizardForm.AdjustLabelHeight(WizardForm.FinishedLabel);
     WizardForm.RunList.Top := WizardForm.RunList.Top + Grown;

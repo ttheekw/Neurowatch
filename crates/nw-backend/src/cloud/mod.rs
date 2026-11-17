@@ -303,6 +303,7 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
                             .collect(),
                     )
                 },
+                |camera| st.identities.get(&camera.id),
             )
         })
     });

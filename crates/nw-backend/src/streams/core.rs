@@ -156,6 +156,11 @@ impl<U: Unit> HubCore<U> {
     pub fn size(&self) -> Option<(u32, u32)> {
         self.size
     }
+
+    /// Video bits a second over the last minute of streaming, once measured.
+    pub fn average_video_bps(&self) -> Option<u64> {
+        self.rates.average_video_bps()
+    }
 }
 
 #[cfg(test)]

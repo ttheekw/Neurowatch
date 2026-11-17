@@ -9,6 +9,12 @@
 //! (the outage folder), reconnects and renews. Main is used when it fits the
 //! plan, else the sub stream. With sound in the plan, the camera's sound
 //! goes too: AAC as it is, other sound converted to AAC (`backup_sound`).
+//!
+//! A ticket names how each stream was when its plan was priced
+//! (`CameraGrant::priced`); a stream that sends clearly more for
+//! [`CHANGED_AFTER`] (bitrate, frame rate, size, H.265 → H.264) is still
+//! backed up, and is reported (`CameraReport::stream_changed`, the
+//! `backup_stream_changed` event) until it is back or priced again.
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +26,7 @@ use nw_backup_protocol::{
     frame::{flags, MediaKind, MediaUnit},
     limits::Limits,
     messages::{Codec, TrackFormat, TrackKind},
-    ticket,
+    ticket::{self, PricedStream, SeenStream},
 };
 use nw_core::encoded::VideoCodec;
 use serde::Serialize;
@@ -71,6 +77,9 @@ pub struct BackupSource {
 pub const FAIL_AFTER: Duration = Duration::from_secs(90);
 /// Footage waiting to be confirmed longer than this is a backup not keeping up.
 const BEHIND_FAILS_MS: i64 = 120_000;
+/// A stream sending more than its plan was priced for this long is changed
+/// (the bitrate is already a minute's average; a brief burst is not).
+pub const CHANGED_AFTER: Duration = Duration::from_secs(300);
 
 /// The latest status, for `cloud.backup_status`, `system.status` and the
 /// recorder's health events.
@@ -107,6 +116,49 @@ pub struct CameraReport {
     pub failing: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trouble: Option<String>,
+    /// The stream sends more than its plan was priced for (still backed up), and how.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_changed: Option<String>,
+}
+
+/// Which backed-up streams have sent more than they were priced for, and
+/// since when: a change counts once it lasted [`CHANGED_AFTER`].
+#[derive(Default)]
+struct ChangeWatch {
+    since: HashMap<String, Instant>,
+    shown: HashMap<String, String>,
+}
+
+impl ChangeWatch {
+    /// `seen`: each backed-up camera's changes now (empty: none).
+    fn observe(&mut self, seen: Vec<(String, Vec<String>)>, now: Instant) {
+        let mut since = HashMap::new();
+        let mut shown = HashMap::new();
+        for (camera, changes) in seen {
+            if changes.is_empty() {
+                continue;
+            }
+            let began = self.since.get(&camera).copied().unwrap_or(now);
+            since.insert(camera.clone(), began);
+            if now.saturating_duration_since(began) >= CHANGED_AFTER {
+                shown.insert(camera, changed_text(&changes));
+            }
+        }
+        self.since = since;
+        self.shown = shown;
+    }
+
+    fn changed(&self, camera: &str) -> Option<String> {
+        self.shown.get(camera).cloned()
+    }
+}
+
+fn changed_text(changes: &[String]) -> String {
+    format!(
+        "The stream now sends more than its backup was priced for: {}. It is still backed up; \
+         set the camera back, or start its backup again in NeuroWatch Cloud to price it as it is.",
+        changes.join(", ")
+    )
 }
 
 /// What is wrong with a camera's backup now, if anything.
@@ -247,6 +299,9 @@ struct Running {
     backup: Arc<Backup>,
     assigner: Arc<PortalAssigner>,
     captures: HashMap<String, Capture>,
+    /// Each camera's stream as its plan priced it (tickets that say).
+    priced: HashMap<String, PricedStream>,
+    changes: ChangeWatch,
 }
 
 pub(crate) async fn run_loop(
@@ -292,6 +347,10 @@ pub(crate) async fn run_loop(
                     }
                 }
             }
+        }
+        if let Some(running) = running.as_mut() {
+            let seen = seen_changes(&source.state, running).await;
+            running.changes.observe(seen, Instant::now());
         }
         source.status.set(report(&running, off.as_deref()));
         tokio::select! {
@@ -346,12 +405,19 @@ fn apply(
             backup,
             assigner,
             captures: HashMap::new(),
+            priced: HashMap::new(),
+            changes: ChangeWatch::default(),
         });
     }
     let Some(running) = running.as_mut() else {
         return Ok(());
     };
     running.assigner.remember(assignment);
+    running.priced = claims
+        .cameras
+        .iter()
+        .filter_map(|grant| Some((grant.camera_id.clone(), grant.priced.clone()?)))
+        .collect();
     // Cameras with a plan get a capture (limits follow plan changes);
     // cameras that lost theirs stop.
     for grant in &claims.cameras {
@@ -390,6 +456,34 @@ fn apply(
         }
     }
     Ok(())
+}
+
+/// What each priced camera's stream sends more of than its plan was priced
+/// for: its size and codec from the capture, its rates as the recorder
+/// measures them (`StreamHubs::video_formats`: a minute's average bitrate).
+async fn seen_changes(state: &RwLock<AppState>, running: &Running) -> Vec<(String, Vec<String>)> {
+    let state = state.read().await;
+    running
+        .priced
+        .iter()
+        .filter_map(|(camera_id, priced)| {
+            let capture = running.captures.get(camera_id)?.info();
+            let camera = state.config.cameras.iter().find(|c| &c.id == camera_id)?;
+            let format = state
+                .streams
+                .video_formats(camera)
+                .get(capture.stream)
+                .copied();
+            let seen = SeenStream {
+                width: format.and_then(|f| f.width),
+                height: format.and_then(|f| f.height),
+                fps: format.and_then(|f| f.fps),
+                bitrate_bps: format.and_then(|f| f.video_bps),
+                codec: capture.codec,
+            };
+            Some((camera_id.clone(), priced.changes(&seen)))
+        })
+        .collect()
 }
 
 async fn stop_running(running: &mut Option<Running>) {
@@ -433,6 +527,7 @@ fn report(running: &Option<Running>, off: Option<&str>) -> StatusReport {
                 behind_ms: track.map_or(0, |t| t.behind_ms),
                 failing: false,
                 trouble: None,
+                stream_changed: running.changes.changed(id),
             }
         })
         .collect();
@@ -465,6 +560,8 @@ fn pem_der(pem: &str) -> Option<Vec<u8>> {
 struct CaptureInfo {
     stream: &'static str,
     problem: Option<String>,
+    /// The codec being sent (`h264`, `h265`), once known.
+    codec: Option<&'static str>,
 }
 
 /// The stream a plan is for, as the capture names it (`None`: an older
@@ -502,6 +599,7 @@ impl Capture {
         let info = Arc::new(Mutex::new(CaptureInfo {
             stream: named.unwrap_or("main"),
             problem: None,
+            codec: None,
         }));
         let limits = Arc::new(Mutex::new(limits));
         let thread = std::thread::Builder::new()
@@ -712,6 +810,12 @@ fn capture(
                     Some(existing) if same_codec => existing.set_format(format),
                     _ => track = Some(backup.track(camera_id, TrackKind::Video, format)),
                 }
+                if let Ok(mut info) = info.lock() {
+                    info.codec = Some(match next.codec {
+                        VideoCodec::H264 => "h264",
+                        VideoCodec::H265 => "h265",
+                    });
+                }
                 converter = Some((unit.caps.clone(), Some(next)));
                 restart = true;
             }
@@ -838,6 +942,35 @@ mod health_tests {
             behind_ms,
             ..CameraReport::default()
         }
+    }
+
+    #[test]
+    fn a_changed_stream_counts_once_the_change_lasts() {
+        let mut watch = ChangeWatch::default();
+        let start = Instant::now();
+        let more = || {
+            vec![(
+                "cam-1".to_owned(),
+                vec!["4.0 Mbit/s (priced 1.0 Mbit/s)".to_owned()],
+            )]
+        };
+        watch.observe(more(), start);
+        assert_eq!(watch.changed("cam-1"), None, "not yet");
+        watch.observe(more(), start + CHANGED_AFTER - Duration::from_secs(1));
+        assert_eq!(watch.changed("cam-1"), None);
+        watch.observe(more(), start + CHANGED_AFTER);
+        let shown = watch.changed("cam-1").unwrap();
+        assert!(
+            shown.contains("4.0 Mbit/s (priced 1.0 Mbit/s)") && shown.contains("still backed up")
+        );
+        // Back within its price: no longer changed, and the clock starts over.
+        watch.observe(
+            vec![("cam-1".to_owned(), vec![])],
+            start + CHANGED_AFTER * 2,
+        );
+        assert_eq!(watch.changed("cam-1"), None);
+        watch.observe(more(), start + CHANGED_AFTER * 3);
+        assert_eq!(watch.changed("cam-1"), None, "a new change waits again");
     }
 
     #[test]

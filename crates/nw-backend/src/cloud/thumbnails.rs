@@ -161,6 +161,7 @@ pub fn decode_keyframe(caps: &gstreamer::Caps, buffer: &gstreamer::Buffer) -> Op
         .by_name("keyframe_sink")?
         .downcast::<gstreamer_app::AppSink>()
         .ok()?;
+    crate::pipeline::hwaccel::software_only_in(pipeline.upcast_ref());
     source.set_caps(Some(caps));
     // A shallow copy: the stream's timestamps are not this picture's.
     let mut picture = buffer.copy();

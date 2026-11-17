@@ -581,6 +581,128 @@ def test_linux_leftover_cleanup_removes_only_unlisted_program_files(tmp_path: Pa
         assert (tmp_path / kept).exists() or (tmp_path / kept).is_symlink(), kept
 
 
+def test_linux_packages_restart_a_running_service_on_the_new_version() -> None:
+    linux = LINUX_SCRIPT.read_text()
+    assert 'RESTART="$(cat "$LINUX_FILES/restart-service.sh")"' in linux
+    deb = linux[linux.index("build_deb() {") : linux.index("build_rpm() {")]
+    postinst = deb[
+        deb.index('"$GPU_ACCESS" "$LEFTOVERS" "$RESTART"') : deb.index('DEBIAN/postinst"')
+    ]
+    # After the old version's leftovers are gone: the new files are all in place.
+    assert postinst.index("neurowatch_remove_leftovers") < postinst.index(
+        "neurowatch_restart_services"
+    )
+    rpm = linux[linux.index("build_rpm() {") : linux.index("build_arch() {")]
+    posttrans = rpm[rpm.index("\n%posttrans\n") : rpm.index("\n%postun\n")]
+    assert "$RESTART" in posttrans
+    assert posttrans.index("neurowatch_remove_leftovers\n") < posttrans.index(
+        "neurowatch_restart_services"
+    )
+    arch = linux[linux.index("build_arch() {") :]
+    upgrade = arch[arch.index("post_upgrade() {") : arch.index("post_remove() {")]
+    assert "neurowatch_restart_services" in upgrade
+    helper = (ROOT / "scripts/installer/linux/restart-service.sh").read_text()
+    assert "%" not in helper, "a percent sign is a macro in rpm scriptlets"
+    assert "service restart --no-autostart" in helper, "changes nothing about what starts at login"
+
+
+@pytest.mark.skipif(
+    shutil.which("sh") is None
+    or not Path("/proc/self/exe").exists()
+    or shutil.which("sleep") is None,
+    reason="needs a POSIX shell and /proc",
+)
+def test_linux_restart_finds_each_running_backend_once_and_restarts_it_as_it_ran(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "opt"
+    (root / "bin").mkdir(parents=True)
+    sleep = shutil.which("sleep")
+    assert sleep is not None
+    shutil.copy(sleep, root / "bin/nw-backend")
+    called = tmp_path / "called"
+    launcher = root / "neurowatch"
+    launcher.write_text(
+        f'#!/bin/sh\n{{ echo "args: $*"; env; }} >> "{called}"\necho ---- >> "{called}"\n'
+    )
+    launcher.chmod(0o755)
+    backend = str(root / "bin/nw-backend")
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    running = [
+        # A supervisor and the backend it supervises: one service.
+        subprocess.Popen(
+            [backend, "60"],
+            env={**env, "NW_IPC_ENDPOINT": "unix:/a.sock", "NW_CONFIG": "/c.json", "SECRET": "x"},
+        ),
+        subprocess.Popen(
+            [backend, "60"], env={**env, "NW_IPC_ENDPOINT": "unix:/a.sock", "NW_SUPERVISED": "1"}
+        ),
+        # Another service of the same user (its own endpoint).
+        subprocess.Popen([backend, "60"], env={**env, "NW_IPC_ENDPOINT": "unix:/b.sock"}),
+    ]
+    try:
+        # The update replaced the binary: the running ones are "(deleted)".
+        replacement = root / "bin/nw-backend.new"
+        shutil.copy(sleep, replacement)
+        replacement.replace(root / "bin/nw-backend")
+        script = ROOT / "scripts/installer/linux/restart-service.sh"
+        result = subprocess.run(
+            ["sh", "-c", f'set -e; . "{script}"; neurowatch_restart_services "$1"', "sh", root],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    finally:
+        for process in running:
+            process.kill()
+            process.wait()
+    assert result.stdout.count("runs the new version") == 2, result.stdout
+    runs = [run for run in called.read_text().split("----\n") if run.strip()]
+    assert len(runs) == 2
+    endpoints = sorted(
+        line for run in runs for line in run.splitlines() if line.startswith("NW_IPC_ENDPOINT=")
+    )
+    assert endpoints == ["NW_IPC_ENDPOINT=unix:/a.sock", "NW_IPC_ENDPOINT=unix:/b.sock"]
+    for run in runs:
+        assert run.startswith("args: service restart --no-autostart")
+        assert "SECRET=" not in run and "NW_SUPERVISED" not in run, (
+            "only the service's own settings"
+        )
+    assert "NW_CONFIG=/c.json" in next(run for run in runs if "unix:/a.sock" in run)
+
+
+def test_linux_restart_is_quiet_when_nothing_runs(tmp_path: Path) -> None:
+    script = ROOT / "scripts/installer/linux/restart-service.sh"
+    result = subprocess.run(
+        ["sh", "-c", f'set -e; . "{script}"; neurowatch_restart_services "$1"', "sh", tmp_path],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout == ""
+
+
+def test_windows_installer_starts_a_service_that_was_running_again_after_an_update() -> None:
+    script = (ROOT / "scripts/installer/windows.iss").read_text()
+    prepare = script[
+        script.index("function PrepareToInstall") : script.index("function InitializeUninstall")
+    ]
+    # Asked before the update stops it.
+    assert prepare.index("ServiceWasRunning := ServiceRunning();") < prepare.index(
+        "RunServiceCommand('stop')"
+    )
+    assert "Exec(Exe, 'service status'" in script
+    post_install = script[script.index("procedure CurStepChanged") :]
+    assert post_install.index("RemoveLeftovers();") < post_install.index("RestartService();")
+    restart = script[
+        script.index("procedure RestartService();") : script.index("function PrepareToInstall")
+    ]
+    assert "if not ServiceWasRunning then" in restart
+    assert "RunServiceCommand('start --no-autostart')" in restart, "changes nothing about sign-in"
+    assert "'--tray'" in restart
+    assert "NeuroWatch is recording again on the new version." in script
+
+
 def test_windows_installer_announces_updates_and_removes_leftovers() -> None:
     script = (ROOT / "scripts/installer/windows.iss").read_text()
     # The previous installation's version, before this one replaces the record.

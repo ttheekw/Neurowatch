@@ -47,6 +47,9 @@ pub struct HealthSnapshot {
     /// Cameras whose Cloud Backup is failing (`cloud::backup::FAIL_AFTER`),
     /// with why.
     pub backup_failing: Vec<(CameraId, String)>,
+    /// Cameras whose backed-up stream sends more than its plan was priced
+    /// for (`cloud::backup::CHANGED_AFTER`), with how.
+    pub backup_stream_changed: Vec<(CameraId, String)>,
     /// Bindings to plugins over the network losing video
     /// (`plugin_host::lag`).
     pub plugin_lagging: Vec<crate::plugin_host::lag::LaggingBinding>,
@@ -81,6 +84,7 @@ enum Key {
     Storage(PathBuf),
     Plugin(String),
     Backup(CameraId),
+    BackupStream(CameraId),
     PluginLag(String, CameraId),
 }
 
@@ -214,6 +218,21 @@ impl HealthTracker {
                 ),
             );
         }
+        // A backed-up stream sending more than its plan was priced for: one
+        // event per camera until it is back, priced again, or its plan ends.
+        for (camera, how) in &snapshot.backup_stream_changed {
+            let key = Key::BackupStream(camera.clone());
+            known.insert(key.clone());
+            wanted.insert(
+                key.clone(),
+                spec(
+                    key,
+                    Some(camera),
+                    EventKind::BackupStreamChanged,
+                    Some(how.clone()),
+                ),
+            );
+        }
         // A plugin over the network not getting a camera's video fast enough:
         // one event per plugin and camera until it keeps up again.
         for lag in &snapshot.plugin_lagging {
@@ -233,7 +252,11 @@ impl HealthTracker {
         for key in self.open.keys() {
             if matches!(
                 key,
-                Key::Storage(_) | Key::Plugin(_) | Key::Backup(_) | Key::PluginLag(..)
+                Key::Storage(_)
+                    | Key::Plugin(_)
+                    | Key::Backup(_)
+                    | Key::BackupStream(_)
+                    | Key::PluginLag(..)
             ) {
                 known.insert(key.clone());
             }
@@ -286,12 +309,14 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 async fn snapshot(state: &Arc<RwLock<AppState>>) -> HealthSnapshot {
-    let (cameras, roots, missing_storage, plugins, backup_failing, plugin_lagging) = {
+    let (cameras, roots, missing_storage, plugins, backup, plugin_lagging) = {
         let st = state.read().await;
-        let backup_failing = st
-            .backup
-            .report()
-            .cameras
+        let backup = st.backup.report().cameras;
+        let backup_stream_changed = backup
+            .iter()
+            .filter_map(|camera| Some((camera.camera_id.clone(), camera.stream_changed.clone()?)))
+            .collect::<Vec<_>>();
+        let backup_failing = backup
             .into_iter()
             .filter(|camera| camera.failing)
             .map(|camera| {
@@ -367,10 +392,11 @@ async fn snapshot(state: &Arc<RwLock<AppState>>) -> HealthSnapshot {
             roots,
             missing_storage,
             plugins,
-            backup_failing,
+            (backup_failing, backup_stream_changed),
             plugin_lagging,
         )
     };
+    let (backup_failing, backup_stream_changed) = backup;
     let drives = tokio::task::spawn_blocking(move || {
         roots
             .into_iter()
@@ -388,6 +414,7 @@ async fn snapshot(state: &Arc<RwLock<AppState>>) -> HealthSnapshot {
         missing_storage,
         plugins,
         backup_failing,
+        backup_stream_changed,
         plugin_lagging,
     }
 }
@@ -484,6 +511,7 @@ mod tests {
             missing_storage: vec![],
             plugins: vec![],
             backup_failing: vec![],
+            backup_stream_changed: vec![],
             plugin_lagging: vec![],
         }
     }
@@ -559,6 +587,7 @@ mod tests {
             },
             plugins: vec![],
             backup_failing: vec![],
+            backup_stream_changed: vec![],
             plugin_lagging: vec![],
         };
         let blocked = || {
@@ -598,6 +627,7 @@ mod tests {
             missing_storage: vec![],
             plugins: vec![],
             backup_failing: vec![],
+            backup_stream_changed: vec![],
             plugin_lagging: vec![],
         };
         let mut t = HealthTracker::default();
@@ -641,6 +671,30 @@ mod tests {
         assert!(observe(&mut tracker, offline(true)).is_empty(), "one event");
         // Answering again, switched off or removed: no longer offline.
         assert_eq!(tracker.observe(&offline(false)), vec![HealthChange::End(7)]);
+    }
+
+    #[test]
+    fn a_changed_backup_stream_is_one_event_per_camera_until_it_is_back() {
+        let mut tracker = HealthTracker::default();
+        let changed = |cameras: &[&str]| HealthSnapshot {
+            backup_stream_changed: cameras
+                .iter()
+                .map(|id| (id.to_string(), "4.0 Mbit/s (priced 1.0 Mbit/s)".to_owned()))
+                .collect(),
+            ..HealthSnapshot::default()
+        };
+        let started = tracker.observe(&changed(&["cam-1"]));
+        let [HealthChange::Start(spec)] = started.as_slice() else {
+            panic!("one start: {started:?}");
+        };
+        assert_eq!(spec.kind, EventKind::BackupStreamChanged);
+        assert_eq!(spec.camera_id.as_deref(), Some("cam-1"));
+        tracker.started(spec, 11);
+        assert!(
+            observe(&mut tracker, changed(&["cam-1"])).is_empty(),
+            "one event"
+        );
+        assert_eq!(tracker.observe(&changed(&[])), vec![HealthChange::End(11)]);
     }
 
     #[test]
