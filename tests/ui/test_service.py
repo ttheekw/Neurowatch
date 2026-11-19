@@ -964,3 +964,231 @@ def test_cli_install_and_uninstall_change_the_startup_choice(tmp_path, packaged,
     assert not load_prefs().at_login
     assert cli.main(["install"], controller=controller) == 0
     assert load_prefs().at_login and controller.starts_at_login()
+
+
+# -- system tools under a packaged build -------------------------------------
+# On a distribution newer than the build machine, NeuroWatch never started
+# again after a restart: the packaged build (PyInstaller) ran `systemctl --user`
+# with its bundled libraries on LD_LIBRARY_PATH, systemctl failed on the
+# bundle's older OpenSSL, and the service fell back to a background process
+# that nothing registered to start again.
+
+_BUNDLE = "/opt/neurowatch/app/neurowatch-ui/_internal"
+_linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux service")
+
+
+@_linux_only
+def test_host_environment_drops_the_bundles_library_path() -> None:
+    from neurowatch.service.paths import host_environment
+
+    env = host_environment({"LD_LIBRARY_PATH": _BUNDLE, "PATH": "/usr/bin"}, frozen=True)
+    assert "LD_LIBRARY_PATH" not in env
+    assert env["PATH"] == "/usr/bin"
+
+    # The user's own library path, which PyInstaller kept aside, comes back.
+    env = host_environment(
+        {"LD_LIBRARY_PATH": f"{_BUNDLE}:/opt/mine", "LD_LIBRARY_PATH_ORIG": "/opt/mine"},
+        frozen=True,
+    )
+    assert env["LD_LIBRARY_PATH"] == "/opt/mine"
+    assert "LD_LIBRARY_PATH_ORIG" not in env
+
+
+def test_host_environment_changes_nothing_outside_a_packaged_build(monkeypatch) -> None:
+    from neurowatch.service import paths
+
+    given = {"LD_LIBRARY_PATH": "/opt/dev/lib", "PATH": "/usr/bin"}
+    assert paths.host_environment(given, frozen=False) == given, "a checkout keeps its own"
+    monkeypatch.setattr(paths, "IS_WINDOWS", True)
+    assert paths.host_environment(given, frozen=True) == given, "Windows: nothing to undo"
+
+
+@_linux_only
+def test_restore_host_environment_fixes_the_process_environment(monkeypatch) -> None:
+    from neurowatch.service.paths import restore_host_environment
+
+    monkeypatch.setenv("LD_LIBRARY_PATH", _BUNDLE)
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
+    restore_host_environment(frozen=False)
+    assert os.environ["LD_LIBRARY_PATH"] == _BUNDLE, "untouched outside a packaged build"
+
+    restore_host_environment(frozen=True)
+    assert "LD_LIBRARY_PATH" not in os.environ
+
+    monkeypatch.setenv("LD_LIBRARY_PATH", _BUNDLE)
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/opt/mine")
+    restore_host_environment(frozen=True)
+    assert os.environ["LD_LIBRARY_PATH"] == "/opt/mine"
+    assert "LD_LIBRARY_PATH_ORIG" not in os.environ
+
+
+def test_the_packaged_entry_point_restores_the_environment_before_anything_else() -> None:
+    entry = Path(__file__).resolve().parents[2] / "scripts" / "entrypoints" / "neurowatch_ui.py"
+    text = entry.read_text()
+    assert text.index("restore_host_environment()") < text.index("from neurowatch.main import")
+
+
+@_linux_only
+def test_systemctl_and_loginctl_run_with_the_systems_libraries(tmp_path, monkeypatch) -> None:
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.append((argv[0], kwargs["env"]))
+        return subprocess.CompletedProcess(argv, 0, "no", "")
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", _BUNDLE)
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
+    systemd = SystemdUser(runner=runner, unit_dir=tmp_path / "units")
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/systemctl")
+
+    assert systemd.available()
+    systemd.lingering()
+
+    assert [tool for tool, _env in seen] == ["systemctl", "loginctl"]
+    for tool, env in seen:
+        assert "LD_LIBRARY_PATH" not in env, f"{tool} must not load the bundle's libraries"
+
+
+@_linux_only
+def test_systemctl_gets_the_login_runtime_folder_when_the_session_has_none(
+    tmp_path, monkeypatch
+) -> None:
+    seen: list[dict[str, str]] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.append(kwargs["env"])
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr("neurowatch.service.manager.login_runtime_dir", lambda: tmp_path)
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/systemctl")
+    assert SystemdUser(runner=runner, unit_dir=tmp_path / "units").available()
+    assert seen[0]["XDG_RUNTIME_DIR"] == str(tmp_path)
+
+
+@_linux_only
+def test_a_failing_systemctl_is_reported_not_taken_for_no_systemd(
+    tmp_path, packaged, monkeypatch
+) -> None:
+    from neurowatch.service.manager import HEADLESS
+
+    error = (
+        "systemctl: /opt/neurowatch/app/neurowatch-ui/_internal/libcrypto.so.3: version"
+        " `OPENSSL_3.4.0' not found (required by libsystemd-shared-257.so)"
+    )
+
+    def runner(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 1, "", error)
+
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/systemctl")
+    backend = FakeBackend()
+    controller = ServiceController(
+        systemd=SystemdUser(runner=runner, unit_dir=tmp_path / "units"),
+        login_items=LoginItems(autostart_dir=tmp_path / "autostart"),
+        spawn=lambda command, _log: backend.started(command.env["NW_HEADLESS"] == "1"),
+        status=backend.status,
+        shutdown=backend.shutdown,
+        sleep=lambda _s: None,
+    )
+    assert controller.ensure_running(autostart=True, mode=HEADLESS), "still runs now"
+    problem = controller.autostart_problem(HEADLESS)
+    assert problem is not None and "OPENSSL_3.4.0" in problem
+
+
+@_linux_only
+def test_autostart_problem_names_what_is_missing(tmp_path, packaged) -> None:
+    from neurowatch.service.manager import DESKTOP, HEADLESS
+    from neurowatch.service.startup import StartupPrefs, save_prefs
+
+    systemctl, backend = FakeSystemctl(), FakeBackend()
+    controller, _ = _controller(tmp_path, systemctl, backend)
+    assert controller.ensure_running(autostart=True, mode=HEADLESS)
+    assert controller.autostart_problem(HEADLESS) is None, "registered and lingering"
+
+    systemctl.linger = False
+    assert "sudo loginctl enable-linger" in (controller.autostart_problem(HEADLESS) or "")
+    assert controller.autostart_problem(DESKTOP) is None, "desktop mode starts at login"
+
+    save_prefs(StartupPrefs(at_login=False, open_window=False, at_boot=False))
+    assert controller.autostart_problem(HEADLESS) is None, "the user switched it off"
+
+    save_prefs(StartupPrefs(at_login=True, open_window=False, at_boot=False))
+    plain, backend2 = FakeSystemctl(available=False), FakeBackend()
+    controller2, _ = _controller(tmp_path / "plain", plain, backend2)
+    assert controller2.ensure_running(autostart=True, mode=DESKTOP)
+    assert controller2.autostart_problem(DESKTOP) is None, "the tray's login item starts it"
+    assert "not registered to start by itself" in (controller2.autostart_problem(HEADLESS) or "")
+
+
+# -- the endpoint in sessions without XDG_RUNTIME_DIR --------------------------
+
+
+@pytest.fixture
+def no_runtime_env(tmp_path, monkeypatch) -> Path:
+    """A session without XDG_RUNTIME_DIR (as some SSH servers open) whose user has a
+    login runtime folder; returns that folder."""
+    from neurowatch.service import paths
+
+    runtime = tmp_path / "run-user-1000"
+    runtime.mkdir()
+    monkeypatch.delenv("NW_IPC_ENDPOINT", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(paths, "login_runtime_dir", lambda: runtime)
+    monkeypatch.setattr(paths, "_socket_exists", lambda _endpoint: False)
+    return runtime
+
+
+@_linux_only
+def test_endpoint_without_xdg_runtime_dir_is_the_login_runtime_folder(no_runtime_env) -> None:
+    from neurowatch.service.paths import service_endpoint
+
+    assert service_endpoint() == f"unix:{no_runtime_env}/neurowatch/control.sock"
+
+
+@_linux_only
+def test_endpoint_without_any_runtime_folder_stays_in_tmp(monkeypatch) -> None:
+    from neurowatch.service import paths
+
+    monkeypatch.delenv("NW_IPC_ENDPOINT", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(paths, "login_runtime_dir", lambda: None)
+    assert paths.service_endpoint() == "unix:/tmp/neurowatch/control.sock"
+
+
+@_linux_only
+def test_a_service_already_on_the_tmp_endpoint_keeps_it(no_runtime_env, monkeypatch) -> None:
+    from neurowatch.service import paths
+
+    legacy = "unix:/tmp/neurowatch/control.sock"
+    monkeypatch.setattr(paths, "_socket_exists", lambda endpoint: endpoint == legacy)
+    assert paths.service_endpoint() == legacy, "running: no second service"
+
+    monkeypatch.setattr(paths, "_socket_exists", lambda _endpoint: False)
+    unit = paths.systemd_unit_path()
+    unit.parent.mkdir(parents=True)
+    unit.write_text(systemd_unit(service_command(legacy)))
+    assert paths.service_endpoint() == legacy, "registered on it: the unit stays the user's"
+
+
+@_linux_only
+def test_the_xdg_runtime_dir_still_wins(no_runtime_env, monkeypatch) -> None:
+    from neurowatch.service.paths import service_endpoint
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/4242")
+    assert service_endpoint() == "unix:/run/user/4242/neurowatch/control.sock"
+    monkeypatch.setenv("NW_IPC_ENDPOINT", "unix:/somewhere/else.sock")
+    assert service_endpoint() == "unix:/somewhere/else.sock"
+
+
+@_linux_only
+def test_login_runtime_dir_is_only_the_users_own(tmp_path) -> None:
+    from neurowatch.service.paths import login_runtime_dir
+
+    uid = os.getuid()
+    assert login_runtime_dir(uid, root=tmp_path) is None, "missing"
+    (tmp_path / str(uid)).mkdir()
+    assert login_runtime_dir(uid, root=tmp_path) == tmp_path / str(uid)
+    (tmp_path / str(uid + 1)).mkdir()
+    assert login_runtime_dir(uid + 1, root=tmp_path) is None, "owned by someone else"

@@ -54,13 +54,17 @@ from neurowatch.service.lock import InstanceLock
 from neurowatch.service.paths import (
     IS_WINDOWS,
     SERVICE_NAME,
+    host_environment,
     lock_path,
     log_path,
+    login_runtime_dir,
     packaged_backend,
     python_command,
+    read_unit_endpoint,
     service_endpoint,
     source_root,
     state_dir,
+    systemd_unit_path,
     ui_command,
 )
 from neurowatch.service.startup import StartupPrefs, load_prefs, save_prefs
@@ -422,34 +426,39 @@ class SystemdUser:
 
     def __init__(self, runner: Runner = subprocess.run, unit_dir: Path | None = None) -> None:
         self._run = runner
-        self.unit_dir = unit_dir or (
-            Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd" / "user"
-        )
+        self.unit_dir = unit_dir or systemd_unit_path().parent
         self.unit_name = f"{SERVICE_NAME}.service"
+        #: Why the last ``available()`` found no user manager, in plain words.
+        self.unavailable_reason: str | None = None
 
     @property
     def unit_path(self) -> Path:
         return self.unit_dir / self.unit_name
 
     def available(self) -> bool:
-        if IS_WINDOWS or shutil.which("systemctl") is None:
+        if IS_WINDOWS:
             return False
-        return self._systemctl("show-environment", check=False).returncode == 0
+        if shutil.which("systemctl") is None:
+            self.unavailable_reason = "systemctl was not found"
+            return False
+        result = self._systemctl("show-environment", check=False)
+        if result.returncode == 0:
+            self.unavailable_reason = None
+            return True
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        self.unavailable_reason = (
+            "no systemd user manager answered (systemctl --user: "
+            f"{detail[-1] if detail else f'exit {result.returncode}'})"
+        )
+        logger.info("systemd user services are not available: %s", self.unavailable_reason)
+        return False
 
     def installed(self) -> bool:
         return self.unit_path.is_file()
 
     def unit_endpoint(self) -> str | None:
         """The IPC endpoint the installed unit's service listens on."""
-        try:
-            text = self.unit_path.read_text()
-        except OSError:
-            return None
-        prefix = 'Environment="NW_IPC_ENDPOINT='
-        for line in text.splitlines():
-            if line.startswith(prefix) and line.endswith('"'):
-                return line[len(prefix) : -1].replace("%%", "%")
-        return None
+        return read_unit_endpoint(self.unit_path)
 
     def active(self) -> bool:
         result = self._systemctl("is-active", self.unit_name, check=False)
@@ -533,14 +542,24 @@ class SystemdUser:
 
     def _loginctl(self, *args: str) -> subprocess.CompletedProcess[str]:
         try:
-            return self._run(["loginctl", *args], capture_output=True, text=True, timeout=30)
+            return self._run(
+                ["loginctl", *args],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=_system_tool_env(),
+            )
         except (OSError, subprocess.TimeoutExpired) as error:
             return subprocess.CompletedProcess(args, 1, "", str(error))
 
     def _systemctl(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         try:
             result = self._run(
-                ["systemctl", "--user", *args], capture_output=True, text=True, timeout=60
+                ["systemctl", "--user", *args],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=_system_tool_env(),
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             if check:
@@ -550,6 +569,19 @@ class SystemdUser:
             detail = (result.stderr or result.stdout).strip()
             raise ServiceError(f"systemctl --user {' '.join(args)} failed: {detail}")
         return result
+
+
+def _system_tool_env() -> dict[str, str]:
+    """The environment for ``systemctl`` and ``loginctl``: the system's own
+    libraries (a packaged build's bundled ones can stop them from starting),
+    and the user's runtime folder when the session did not set one (it holds
+    the user manager's bus)."""
+    env = host_environment()
+    if not env.get("XDG_RUNTIME_DIR"):
+        runtime = login_runtime_dir()
+        if runtime is not None:
+            env["XDG_RUNTIME_DIR"] = str(runtime)
+    return env
 
 
 class LoginItems:
@@ -668,6 +700,7 @@ class ServiceController:
         self._sleep = sleep
         self._alive = alive
         self._systemd_ok: bool | None = None
+        self._no_systemd_reason: str | None = None
         self._process: Any = None  # a detached service started here
         self._started_at = 0.0
         #: A startup delay the welcome screen can explain while this worker waits.
@@ -696,6 +729,9 @@ class ServiceController:
                     " background process instead",
                     unit_endpoint,
                     self.endpoint,
+                )
+                self._no_systemd_reason = (
+                    f"the systemd unit already runs a NeuroWatch service on {unit_endpoint}"
                 )
                 available = False
             self._systemd_ok = available
@@ -729,6 +765,33 @@ class ServiceController:
         if self.uses_systemd():
             return self.systemd.installed() and self.systemd.enabled()
         return self.login_items.installed()
+
+    def autostart_problem(self, mode: str) -> str | None:
+        """Why the service in ``mode`` does not start at boot (headless) or
+        login (desktop) although starting was asked for, in plain words; None
+        when it does, or when the user switched starting at sign-in off."""
+        if not load_prefs().at_login:
+            return None
+        if IS_WINDOWS:
+            return None if self.login_items.installed() else "its login entry is missing"
+        if not self.uses_systemd():
+            # Desktop mode: the tray's login item starts the service.
+            if mode == DESKTOP and self.login_items.installed():
+                return None
+            reason = (
+                self._no_systemd_reason
+                or self.systemd.unavailable_reason
+                or "systemd user services are not available"
+            )
+            return f"it is not registered to start by itself ({reason})"
+        if not self.starts_at_login():
+            return "it is not registered with systemd; run: neurowatch service install"
+        if mode == HEADLESS and not self.systemd.lingering():
+            return (
+                "it starts at login, not at boot; to start it at boot run: "
+                f"sudo loginctl enable-linger {getpass.getuser()}"
+            )
+        return None
 
     # -- install -------------------------------------------------------
 
