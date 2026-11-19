@@ -450,9 +450,14 @@ def _start_headless_service(say: Callable[[str], None], *, autostart: bool) -> i
         when = "starts at boot"
     elif info["starts_at_login"]:
         when = "starts at login"
-    else:
+    elif not autostart:
         when = "runs until stopped or the next restart (--no-autostart)"
+    else:
+        when = "runs until stopped or the next restart"
     say(f"Service running ({info['manager']}, headless); it {when}")
+    problem = service.autostart_problem(HEADLESS) if autostart else None
+    if problem:
+        say(f"Warning: after a restart or power cut NeuroWatch will not start by itself: {problem}")
     return 0
 
 

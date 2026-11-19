@@ -13,6 +13,7 @@ import socket
 from typing import Any
 
 from neurowatch.ipc.auth import with_auth
+from neurowatch.service.paths import login_runtime_dir
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,12 @@ class SyncIpcClient:
         runtime_dir = os.getenv("XDG_RUNTIME_DIR")
         if runtime_dir:
             candidates.append(f"unix:{runtime_dir}/neurowatch/control.sock")
+        else:
+            # A session without XDG_RUNTIME_DIR (some SSH servers): the
+            # service still listens in the user's login runtime folder.
+            login_runtime = login_runtime_dir()
+            if login_runtime is not None:
+                candidates.append(f"unix:{login_runtime}/neurowatch/control.sock")
         candidates.append("unix:/tmp/neurowatch/control.sock")
         candidates.append(DEFAULT_ENDPOINT)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+from pathlib import Path
 
 import pytest
 
@@ -96,6 +97,7 @@ def test_resolve_endpoints_uses_env_override(monkeypatch):
 def test_resolve_endpoints_ignores_root_control_socket(monkeypatch):
     monkeypatch.setenv("NW_IPC_ENDPOINT", "unix:/control.sock")
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr("neurowatch.ipc.sync_client.login_runtime_dir", lambda: None)
 
     client = SyncIpcClient()
 
@@ -115,6 +117,27 @@ def test_resolve_endpoints_prefers_existing_runtime_socket(monkeypatch):
     client = SyncIpcClient()
     assert client._endpoints[0] == "unix:/run/user/1000/neurowatch/control.sock"
     assert "unix:/run/neurowatch/control.sock" in client._endpoints
+
+
+def test_resolve_endpoints_without_xdg_runtime_dir_tries_the_login_runtime_folder(monkeypatch):
+    # Some SSH servers open sessions without XDG_RUNTIME_DIR; the service
+    # still listens in /run/user/<uid>.
+    monkeypatch.delenv("NW_IPC_ENDPOINT", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(
+        "neurowatch.ipc.sync_client.login_runtime_dir", lambda: Path("/run/user/1000")
+    )
+    monkeypatch.setattr(os.path, "exists", lambda _path: False)
+
+    client = SyncIpcClient()
+    assert client._endpoints[:2] == [
+        "unix:/run/user/1000/neurowatch/control.sock",
+        "unix:/tmp/neurowatch/control.sock",
+    ]
+
+    # A service an older version started on the /tmp fallback is still found.
+    monkeypatch.setattr(os.path, "exists", lambda path: path == "/tmp/neurowatch/control.sock")
+    assert SyncIpcClient()._endpoints[0] == "unix:/tmp/neurowatch/control.sock"
 
 
 def test_connect_socket_falls_back_to_secondary_endpoint(monkeypatch):

@@ -172,6 +172,9 @@ def test_headless_starts_the_service_in_headless_mode_and_outlives_ctrl_c(monkey
                 "starts_at_login": True,
             }
 
+        def autostart_problem(self, mode: str) -> str | None:
+            return None
+
     def interrupted(*_args: Any, **_kwargs: Any) -> int:
         raise KeyboardInterrupt
 
@@ -185,6 +188,7 @@ def test_headless_starts_the_service_in_headless_mode_and_outlives_ctrl_c(monkey
     assert calls == [(True, "headless")], "registered to start at boot by default"
     assert "Restarting the NeuroWatch service in headless mode" in text
     assert "it starts at boot" in text
+    assert "Warning" not in text
     assert "NeuroWatch keeps running in the background" in text
     assert text.splitlines()[0].endswith(headless.NO_WARRANTY), "the notice comes first"
     assert "ABSOLUTELY NO WARRANTY" in headless._parser().format_help()
@@ -192,6 +196,58 @@ def test_headless_starts_the_service_in_headless_mode_and_outlives_ctrl_c(monkey
     calls.clear()
     headless.main(["monitor", "--service", "--no-autostart"], out=io.StringIO())
     assert calls == [(False, "headless")]
+
+
+def test_headless_warns_when_the_service_will_not_start_by_itself(monkeypatch):
+    # systemctl --user failed under the packaged build's bundled libraries,
+    # so the service ran as a plain background process that nothing started
+    # again after a restart, and nothing said so.
+    from neurowatch.service import manager
+
+    problems: list[str] = []
+
+    class Controller:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def status(self):
+            return None
+
+        def ensure_running(self, *, autostart: bool, mode: str) -> bool:
+            return True
+
+        def describe(self):
+            return {
+                "manager": "background process",
+                "starts_at_boot": False,
+                "starts_at_login": False,
+            }
+
+        def autostart_problem(self, mode: str) -> str | None:
+            problems.append(mode)
+            return "it is not registered to start by itself (systemctl --user failed)"
+
+    def interrupted(*_args: Any, **_kwargs: Any) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(manager, "ServiceController", Controller)
+    monkeypatch.setattr(headless, "monitor", interrupted)
+    monkeypatch.setattr(headless, "client_rpc", lambda _endpoint: FakeBackend({}))
+    out = io.StringIO()
+
+    assert headless.main(["monitor", "--service"], out=out) == 0
+    text = out.getvalue()
+    assert problems == ["headless"]
+    assert "(--no-autostart)" not in text, "not blamed on a flag nobody passed"
+    assert "Warning: after a restart or power cut NeuroWatch will not start by itself" in text
+    assert "systemctl --user failed" in text
+
+    problems.clear()
+    out = io.StringIO()
+    headless.main(["monitor", "--service", "--no-autostart"], out=out)
+    assert problems == [], "--no-autostart asked for exactly this"
+    assert "(--no-autostart)" in out.getvalue()
+    assert "Warning" not in out.getvalue()
 
 
 def test_the_cloud_adds_its_status_line_link_options_and_command(monkeypatch):
