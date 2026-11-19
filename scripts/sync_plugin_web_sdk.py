@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Check/copy canonical browser SDK files into the sibling portal checkout."""
+"""Check/copy canonical browser SDK files into a web portal checkout
+(--portal PATH, or the NW_WEBAPP_DIR environment variable)."""
 
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,9 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--portal", type=Path, default=ROOT.parent / "Neurowatch-webapp")
+    default = os.environ.get("NW_WEBAPP_DIR")
+    parser.add_argument("--portal", type=Path, default=Path(default) if default else None,
+                        help="the web portal checkout (default: $NW_WEBAPP_DIR)")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    if args.portal is None:
+        parser.error("pass --portal PATH or set NW_WEBAPP_DIR to the web portal checkout")
     target = args.portal / "frontend/src/features/plugins"
     differences = []
     for source_name, target_name in [

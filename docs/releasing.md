@@ -55,7 +55,7 @@ values to copy into the secrets. It needs only bash and curl.
 
 Before accepting purchases, deploy the webapp's downloads page and configure
 its read-only bucket credentials, live payments.lk key and signing secret
-(`../Neurowatch-webapp/docs/integrations/downloads.md`). Publish a release and
+(see the web portal's downloads documentation). Publish a release and
 verify that Free downloads work signed out and Unlimited downloads require a
 confirmed purchase. The advertised desktop offer is USD 50 once, no software
 camera limit (capacity depends on hardware), and a support response within

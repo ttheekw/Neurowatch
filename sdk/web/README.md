@@ -21,7 +21,7 @@ own binding config. Event actions validate both camera and plugin ownership befo
 
 `host.js` is canonical parent-side code shared with the portal; its nonce/source/origin checks,
 operation allowlist, body/chunk bounds and camera scope are security boundaries. Use
-`scripts/sync_plugin_web_sdk.py --check` to verify the portal copies.
+`scripts/sync_plugin_web_sdk.py --check --portal PATH` (or `NW_WEBAPP_DIR`) to verify the portal copies.
 
 Run `node --test sdk/web/tests/*.test.mjs` from the repository root.
 
