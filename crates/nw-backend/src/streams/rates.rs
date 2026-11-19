@@ -94,9 +94,10 @@ impl Rates {
         if now.saturating_duration_since(self.start) < Duration::from_secs(1) {
             return None;
         }
-        if self.last.map_or(true, |last| {
-            now.saturating_duration_since(last) > Duration::from_secs(1)
-        }) {
+        if self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) > Duration::from_secs(1))
+        {
             return Some(RateSample {
                 video_bps: 0,
                 audio_bps: 0,

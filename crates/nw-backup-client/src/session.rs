@@ -421,7 +421,7 @@ async fn send_live(track: Arc<TrackState>, link: Link) {
                 let new_run = match &run {
                     None => true,
                     Some((_, started)) => {
-                        after.map_or(true, |a| unit.seq != a + 1)
+                        after.is_none_or(|a| unit.seq != a + 1)
                             || (unit.media == MediaKind::Video && unit.keyframe())
                             || (unit.media == MediaKind::Audio
                                 && unit.time_us - started > SOUND_RUN_US)
@@ -474,7 +474,7 @@ async fn send_backlog(track: Arc<TrackState>, link: Link) {
                 let new_run = match &run {
                     None => true,
                     Some((_, started)) => {
-                        last.map_or(true, |l| unit.seq != l + 1)
+                        last.is_none_or(|l| unit.seq != l + 1)
                             || (unit.media == MediaKind::Video && unit.keyframe())
                             || (unit.media == MediaKind::Audio
                                 && unit.time_us - started > SOUND_RUN_US)

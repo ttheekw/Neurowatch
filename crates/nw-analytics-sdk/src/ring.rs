@@ -114,7 +114,7 @@ impl RingWriter {
             use std::os::fd::FromRawFd;
             let descriptor = unsafe {
                 libc::memfd_create(
-                    b"nw-analytics-picture\0".as_ptr().cast(),
+                    c"nw-analytics-picture".as_ptr().cast(),
                     libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
                 )
             };
@@ -233,7 +233,7 @@ impl RingWriter {
                     || (height - 1)
                         .checked_mul(strides[index])
                         .and_then(|size| size.checked_add(*width))
-                        .map_or(true, |size| size > planes[index].len()))
+                        .is_none_or(|size| size > planes[index].len()))
             {
                 return Err(RingError::Invalid);
             }

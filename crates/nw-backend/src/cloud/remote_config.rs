@@ -95,7 +95,7 @@ impl RemoteConfig {
             .filter(|camera| {
                 reported
                     .get(&camera.id)
-                    .map_or(true, |id| !served.contains(id))
+                    .is_none_or(|id| !served.contains(id))
             })
             .map(|camera| camera.id.clone())
             .collect()
@@ -540,7 +540,7 @@ impl RemoteConfig {
         if let Some(ids) = params.get("ids").and_then(Value::as_array) {
             if ids.is_empty()
                 || ids.len() > 200
-                || ids.iter().any(|id| id.as_i64().map_or(true, |id| id <= 0))
+                || ids.iter().any(|id| id.as_i64().is_none_or(|id| id <= 0))
             {
                 return Err("invalid event ids".into());
             }

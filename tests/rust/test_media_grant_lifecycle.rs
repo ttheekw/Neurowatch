@@ -936,9 +936,9 @@ async fn adversarial_grant_denials_are_audited_without_presented_material() {
     }
     assert!(rows.iter().all(|row| {
         row.0.len() <= 32
-            && row.1.as_deref().map_or(true, |value| value.len() <= 64)
-            && row.2.as_deref().map_or(true, |value| value.len() <= 128)
-            && row.3.as_deref().map_or(true, |value| value.len() <= 128)
+            && row.1.as_deref().is_none_or(|value| value.len() <= 64)
+            && row.2.as_deref().is_none_or(|value| value.len() <= 128)
+            && row.3.as_deref().is_none_or(|value| value.len() <= 128)
     }));
 
     drop(connection);

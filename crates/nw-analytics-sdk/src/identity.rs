@@ -15,7 +15,7 @@ pub fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut bytes = [0; N];
-    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let digit = |value: u8| match value {
             b'0'..=b'9' => Some(value - b'0'),
             b'a'..=b'f' => Some(value - b'a' + 10),

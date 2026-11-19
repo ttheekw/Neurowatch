@@ -468,7 +468,7 @@ pub async fn run(
             }
         }
         polls = polls.wrapping_add(1);
-        if polls % TOUCH_EVERY == 0 {
+        if polls.is_multiple_of(TOUCH_EVERY) {
             hub.touch_open();
         }
     }

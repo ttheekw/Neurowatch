@@ -120,7 +120,7 @@ impl ShmRingBufferWriter {
                         .saturating_sub(1)
                         .checked_mul(strides[i])
                         .and_then(|n| n.checked_add(*row))
-                        .map_or(true, |n| n > planes[i].len())
+                        .is_none_or(|n| n > planes[i].len())
             })
         {
             return false;

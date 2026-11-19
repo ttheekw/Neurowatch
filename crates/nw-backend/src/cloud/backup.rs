@@ -757,7 +757,7 @@ fn capture(
             }
             if converter
                 .as_ref()
-                .map_or(true, |(caps, _)| *caps != unit.caps)
+                .is_none_or(|(caps, _)| *caps != unit.caps)
             {
                 let next = match AnnexB::from_caps(&unit.caps) {
                     Ok(next) => next,
@@ -887,7 +887,7 @@ fn back_up_sound(
         return;
     }
     let Some(format) = path.format() else { return };
-    if track.as_ref().map_or(true, |(known, _)| *known != format) {
+    if track.as_ref().is_none_or(|(known, _)| *known != format) {
         *track = Some((
             format.clone(),
             backup.track(camera_id, TrackKind::Audio, format),

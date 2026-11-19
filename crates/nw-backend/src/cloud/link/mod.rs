@@ -159,7 +159,7 @@ impl ThumbnailSchedule {
             .filter(|id| {
                 self.next_at
                     .get(*id)
-                    .map_or(true, |at| now + THUMBNAIL_DUE_SLACK >= *at)
+                    .is_none_or(|at| now + THUMBNAIL_DUE_SLACK >= *at)
             })
             .cloned()
             .collect()

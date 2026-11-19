@@ -454,7 +454,7 @@ impl SharedSource {
                 Some(Delivery::Unit { unit, .. }) if unit.media == Media::Video => {
                     if converter
                         .as_ref()
-                        .map_or(true, |(caps, _)| *caps != unit.caps)
+                        .is_none_or(|(caps, _)| *caps != unit.caps)
                     {
                         match AnnexB::from_caps(&unit.caps) {
                             Ok(found) => {

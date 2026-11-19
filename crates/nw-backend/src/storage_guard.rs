@@ -271,7 +271,7 @@ impl StorageGuard {
     /// Whether `root` may be written to, by its last check; a location never
     /// checked yet counts as ready (its first use checks it).
     pub fn is_ready(&self, root: &Path) -> bool {
-        self.status(root).map_or(true, |status| status.is_ready())
+        self.status(root).is_none_or(|status| status.is_ready())
     }
 
     /// Record `root`'s readiness; whether it changed.

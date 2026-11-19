@@ -850,9 +850,9 @@ impl PlaybackPublication {
         let (applied, run) = guard;
         // Compared as instants: the same position may be written with or
         // without fractional seconds by the browser and the control plane.
-        let seek = applied.as_ref().map_or(true, |applied| {
-            applied.position().ok() != control.position().ok()
-        });
+        let seek = applied
+            .as_ref()
+            .is_none_or(|applied| applied.position().ok() != control.position().ok());
         match (seek, run.as_ref(), applied.as_ref()) {
             (false, Some(current), Some(previous)) => {
                 if previous.speed_percent != control.speed_percent {
@@ -1756,7 +1756,7 @@ impl<C: RoomConnector> EncodedMediaBridge<C> {
             if !awaiting_viewer
                 && keyframe_wanted
                 && !gop.units.is_empty()
-                && last_replay.map_or(true, |at| at.elapsed() >= GOP_REPLAY_MIN_GAP)
+                && last_replay.is_none_or(|at| at.elapsed() >= GOP_REPLAY_MIN_GAP)
             {
                 keyframe_wanted = false;
                 last_replay = Some(std::time::Instant::now());

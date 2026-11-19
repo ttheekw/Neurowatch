@@ -115,7 +115,7 @@ pub fn check_cameras(session: &Session, method: &str, params: &mut Value) -> Res
         && params
             .get("camera_ids")
             .and_then(Value::as_array)
-            .map_or(true, Vec::is_empty)
+            .is_none_or(Vec::is_empty)
     {
         if let Some(object) = params.as_object_mut() {
             object.insert("camera_ids".into(), serde_json::json!(session.cameras));
@@ -203,7 +203,7 @@ pub fn filter_result(session: &Session, method: &str, mut result: Value) -> Resu
                 list.retain(|notice| {
                     notice
                         .get("event")
-                        .map_or(true, |event| keep_event(session, event))
+                        .is_none_or(|event| keep_event(session, event))
                 });
             }
         }

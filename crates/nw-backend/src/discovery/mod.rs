@@ -569,7 +569,7 @@ impl DiscoveryService {
         let mut ordered: Vec<&CachedStream> = vec![main];
         ordered.extend(sub);
         ordered.extend(candidate.streams.iter().filter(|s| {
-            s.stream_id != main.stream_id && sub.map_or(true, |sub| s.stream_id != sub.stream_id)
+            s.stream_id != main.stream_id && sub.is_none_or(|sub| s.stream_id != sub.stream_id)
         }));
         camera.streams = ordered
             .into_iter()

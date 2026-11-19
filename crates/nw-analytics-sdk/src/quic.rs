@@ -286,7 +286,7 @@ struct Receivers {
 impl Receivers {
     fn prune(&mut self) {
         self.allowed
-            .retain(|_, expiry| expiry.map_or(true, |expiry| expiry > std::time::Instant::now()));
+            .retain(|_, expiry| expiry.is_none_or(|expiry| expiry > std::time::Instant::now()));
         let allowed = &self.allowed;
         self.lanes
             .retain(|binding, _| allowed.contains_key(binding));

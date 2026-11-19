@@ -543,7 +543,7 @@ impl EventsHandler {
                 .config
                 .cameras
                 .iter()
-                .filter(|c| camera_id.map_or(true, |id| id == c.id))
+                .filter(|c| camera_id.is_none_or(|id| id == c.id))
                 .map(|c| (c.id.clone(), c.motion.effective_source()))
                 .collect();
             (
