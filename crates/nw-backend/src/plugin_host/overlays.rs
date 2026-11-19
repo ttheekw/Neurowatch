@@ -249,7 +249,7 @@ impl OverlayStore {
         all.retain(|_, (_, until)| *until > now);
         let mut mine: Vec<_> = all
             .iter()
-            .filter(|((camera, _), _)| cameras.map_or(true, |ids| ids.contains(camera)))
+            .filter(|((camera, _), _)| cameras.is_none_or(|ids| ids.contains(camera)))
             .collect();
         mine.sort_by(|a, b| a.0.cmp(b.0));
         let mut by_camera: BTreeMap<String, Vec<ShownFigure>> = BTreeMap::new();
@@ -288,7 +288,7 @@ impl OverlayStore {
                 let keys: Vec<Key> = entries
                     .keys()
                     .filter(|(camera, owner, _)| {
-                        owner == plugin && camera_id.map_or(true, |id| id == camera)
+                        owner == plugin && camera_id.is_none_or(|id| id == camera)
                     })
                     .cloned()
                     .collect();
@@ -332,7 +332,7 @@ impl OverlayStore {
         let wall_layers = self.wall_layers.lock().ok();
         let mut shown: Vec<Shown> = entries
             .iter()
-            .filter(|((camera, _, _), _)| cameras.map_or(true, |ids| ids.contains(camera)))
+            .filter(|((camera, _, _), _)| cameras.is_none_or(|ids| ids.contains(camera)))
             .map(|((camera, plugin, layer), entry)| Shown {
                 camera_id: camera.clone(),
                 plugin: plugin.clone(),

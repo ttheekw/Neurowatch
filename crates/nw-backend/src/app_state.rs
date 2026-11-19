@@ -549,7 +549,7 @@ impl AppState {
         let stale: Vec<(CameraId, String)> = self
             .always_decoders
             .iter()
-            .filter(|(key, (url, _))| wanted.get(*key).map_or(true, |source| &source.url != url))
+            .filter(|(key, (url, _))| wanted.get(*key).is_none_or(|source| &source.url != url))
             .map(|(key, _)| key.clone())
             .collect();
         // Views of a camera whose always-on decoding changes are rebuilt below:
@@ -1398,7 +1398,7 @@ fn install_local_assignment(
                         "Prior supervisor teardown is slow; the replacement waits for it"
                     );
                     on_slow();
-                } else if attempt < REPORT_AFTER_ATTEMPTS || attempt % 30 == 0 {
+                } else if attempt < REPORT_AFTER_ATTEMPTS || attempt.is_multiple_of(30) {
                     tracing::warn!(
                         cam_id = %assignment.camera_id,
                         attempt,

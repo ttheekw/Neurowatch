@@ -420,7 +420,7 @@ impl PluginHost {
                 .filter(|(id, run)| {
                     wanted
                         .get(id.as_str())
-                        .map_or(true, |server| *server != &run.server)
+                        .is_none_or(|server| *server != &run.server)
                 })
                 .map(|(id, _)| id.clone())
                 .collect();

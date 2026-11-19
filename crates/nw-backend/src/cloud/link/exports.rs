@@ -129,9 +129,9 @@ fn valid_job(job: &ExportJob) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         && job.end_ms > job.start_ms
         && job.max_bytes > 0
-        && job.timelapse.map_or(true, |options| {
-            options.validate(job.start_ms, job.end_ms).is_ok()
-        })
+        && job
+            .timelapse
+            .is_none_or(|options| options.validate(job.start_ms, job.end_ms).is_ok())
 }
 
 /// The signed `export-reports` body. Every field is present (null when

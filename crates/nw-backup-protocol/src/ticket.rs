@@ -383,7 +383,7 @@ pub fn verify_file_token(
         && !token.prefix.is_empty()
         && token.prefix.ends_with('/')
         && key.starts_with(&token.prefix)
-        && token.file.as_deref().map_or(true, |file| file == key)
+        && token.file.as_deref().is_none_or(|file| file == key)
         && !key.contains("..")
         && now_ms < token.exp_ms
         && token.exp_ms - now_ms <= MAX_FILE_TOKEN_MS + CLOCK_SKEW_MS

@@ -92,7 +92,7 @@ fn modified_within(path: &str, ms: u128) -> bool {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .map_or(true, |age| age.as_millis() < ms)
+        .is_none_or(|age| age.as_millis() < ms)
 }
 
 /// The playlist as pipelines: each run's consecutive, finished segments
@@ -920,7 +920,7 @@ fn wire_appsink(
             }
 
             let n = counter_cb.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-            if n % 300 == 0 {
+            if n.is_multiple_of(300) {
                 tracing::debug!(
                     shm_key = %key_cb,
                     frame = n,
@@ -1088,8 +1088,10 @@ mod tests {
         );
         let start = slot + SLOT_HEADER_BYTES;
         assert!(ring[start..start + 854 * 4 * 3]
-            .chunks_exact(3)
-            .all(|pixel| pixel == [0x12, 0x34, 0x56]));
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .all(|pixel| *pixel == [0x12, 0x34, 0x56]));
     }
 
     #[test]

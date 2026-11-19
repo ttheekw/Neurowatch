@@ -157,7 +157,7 @@ async fn run() -> anyhow::Result<()> {
             indexer.index_segments().await;
             retention.run_once(&retention_state).await;
             // Old events: every 10 minutes is plenty.
-            if passes % 20 == 0 {
+            if passes.is_multiple_of(20) {
                 events::prune_old(&retention_state).await;
                 let db = Arc::clone(&retention_state.read().await.db);
                 let history = retention_state

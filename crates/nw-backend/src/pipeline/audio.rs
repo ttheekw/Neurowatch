@@ -163,7 +163,9 @@ pub fn pcm_samples(sample: &gstreamer::Sample) -> Option<Vec<i16>> {
     let buffer = sample.buffer()?;
     let map = buffer.map_readable().ok()?;
     Some(
-        map.chunks_exact(2)
+        map.as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
             .collect(),
     )

@@ -178,7 +178,7 @@ pub fn node(reply: &str) -> (bool, bool) {
     let home = text(doc.root_element(), "HomeSupported").is_some_and(|s| s == "true" || s == "1");
     let presets = text(doc.root_element(), "MaximumNumberOfPresets")
         .and_then(|s| s.parse::<u32>().ok())
-        .map_or(true, |n| n > 0);
+        .is_none_or(|n| n > 0);
     (home, presets)
 }
 pub fn idle(reply: &str) -> Option<bool> {

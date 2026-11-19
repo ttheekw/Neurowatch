@@ -1226,7 +1226,7 @@ impl Session<'_> {
         let ending: Vec<u64> = self
             .open
             .iter()
-            .filter(|(_, open)| binding.map_or(true, |b| open.binding == b))
+            .filter(|(_, open)| binding.is_none_or(|b| open.binding == b))
             .map(|(event, _)| *event)
             .collect();
         for event in ending {
@@ -1446,7 +1446,7 @@ pub(super) fn inspect(address: &Address) -> Result<Manifest, String> {
                 manifest
                     .identity
                     .as_ref()
-                    .map_or(true, |identity| identity.public_key != key)
+                    .is_none_or(|identity| identity.public_key != key)
             })
         {
             return Err("The plugin did not prove its session identity".into());

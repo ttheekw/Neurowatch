@@ -732,7 +732,7 @@ impl RpcHandler {
         // The wall layout (`camera.set_positions`) places cameras; editing one
         // never moves it (the camera dialog sends none, which put the edited
         // camera last on the wall).
-        if params.get("wall_position").map_or(true, Value::is_null) {
+        if params.get("wall_position").is_none_or(Value::is_null) {
             cam.wall_position = old.wall_position.clone();
         }
         // Old clients must not erase modes/rules/padding they do not know.

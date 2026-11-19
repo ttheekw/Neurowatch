@@ -592,7 +592,7 @@ async fn run(
                 if !inner.lock().is_ok_and(|state| binding.still_linked(&state)) { reason = "unlinked".into(); break; }
                 let now = Instant::now();
                 if pending.values().any(|p| p.reply.is_none() && p.deadline <= now) { reason = "heartbeat not answered in time".into(); break; }
-                pending.retain(|_, p| p.deadline > now && p.reply.as_ref().map_or(true, |r| !r.is_closed()));
+                pending.retain(|_, p| p.deadline > now && p.reply.as_ref().is_none_or(|r| !r.is_closed()));
                 if now >= next_heartbeat {
                     let id = uuid::Uuid::new_v4().simple().to_string();
                     let text = json!({"id":id,"method":"heartbeat","body":{}}).to_string();

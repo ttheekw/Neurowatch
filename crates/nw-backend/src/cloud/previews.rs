@@ -209,7 +209,7 @@ mod tests {
         )
         .unwrap();
         let mut bytes = vec![81; info.size()];
-        for pair in bytes[info.offset()[1]..].chunks_exact_mut(2) {
+        for pair in bytes[info.offset()[1]..].as_chunks_mut::<2>().0 {
             pair.copy_from_slice(&[90, 240]);
         }
         let sample = gstreamer::Sample::builder()

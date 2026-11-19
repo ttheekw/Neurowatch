@@ -334,7 +334,7 @@ async fn refresh(identities: &CameraIdentities, camera: &Target) {
     }
     let due = learned
         .onvif_at
-        .map_or(true, |at| at.elapsed() >= ONVIF_EVERY);
+        .is_none_or(|at| at.elapsed() >= ONVIF_EVERY);
     if let Some(device_url) = camera.device_url.as_deref().filter(|_| due || moved) {
         if let Some(hardware) = ask_onvif(device_url, camera.credentials.as_ref()).await {
             if hardware != learned.onvif {
