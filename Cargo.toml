@@ -20,7 +20,7 @@ edition      = "2021"
 authors      = ["Neurowatch Contributors"]
 license      = "Apache-2.0"
 repository   = "https://github.com/ttheekw/Neurowatch"
-rust-version = "1.75"
+rust-version = "1.88"
 publish      = false
 
 [workspace.dependencies]
@@ -47,8 +47,8 @@ tracing             = "0.1"
 tracing-subscriber  = { version = "0.3",  features = ["env-filter", "json"] }
 # IDs
 uuid                = { version = "1",    features = ["v4", "serde"] }
-# Pinned for the workspace Rust 1.75 MSRV; newer 0.3 releases require a newer compiler.
-time                = { version = "=0.3.36", features = ["parsing"] }
+# At least 0.3.47 (RUSTSEC-2026-0009, stack exhaustion when parsing); needs Rust 1.88.
+time                = { version = "0.3.47", features = ["parsing"] }
 # GStreamer (0.24 targets GStreamer >= 1.24; system has 1.24.2)
 gstreamer           = "0.24"
 gstreamer-app       = "0.24"
@@ -57,8 +57,9 @@ gstreamer-video     = "0.24"
 memmap2             = "0.9"
 # Platform dirs
 dirs                = "5"
-# Database (V3+)
-rusqlite            = { version = "0.32", features = ["bundled"] }
+# Database (V3+). 0.41 bundles a SQLite patched for RUSTSEC-2026-0459; needs Rust 1.88.
+# fallible_uint keeps u64 columns as before 0.36 (an error above i64::MAX).
+rusqlite            = { version = "0.41", features = ["bundled", "fallible_uint"] }
 
 [profile.release]
 opt-level     = 3
