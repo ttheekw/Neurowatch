@@ -599,4 +599,168 @@ mod tests {
         assert!(bounded(&dir, Some("other"), &guard).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    fn state_for(
+        root: &Path,
+        config_dir: &Path,
+    ) -> std::sync::Arc<tokio::sync::RwLock<crate::app_state::AppState>> {
+        let mut config = crate::config::AppConfig::default();
+        config.recording.storage_path = root.to_string_lossy().into_owned();
+        std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::app_state::AppState::with_database(
+                config,
+                config_dir.join("config.json"),
+                crate::pipeline::hwaccel::HwAccelKind::Software,
+                crate::db::connection::open_in_memory().unwrap(),
+            ),
+        ))
+    }
+
+    #[test]
+    fn markers_that_are_not_ours_do_not_count() {
+        let dir = temp();
+        // Too big, a folder, or without an id: none of them is a marker.
+        std::fs::write(dir.join(MARKER_FILE), vec![b'x'; 5000]).unwrap();
+        assert_eq!(marker_id(&dir).unwrap(), None);
+        assert!(check(&dir, "id").reason().unwrap().contains("not there"));
+        std::fs::remove_file(dir.join(MARKER_FILE)).unwrap();
+        std::fs::create_dir(dir.join(MARKER_FILE)).unwrap();
+        assert_eq!(marker_id(&dir).unwrap(), None);
+        std::fs::remove_dir(dir.join(MARKER_FILE)).unwrap();
+        std::fs::write(dir.join(MARKER_FILE), "header only\nid=\n").unwrap();
+        assert_eq!(marker_id(&dir).unwrap(), None);
+        // A missing marker is an error the callers read as "gone".
+        std::fs::remove_file(dir.join(MARKER_FILE)).unwrap();
+        assert!(marker_id(&dir).is_err());
+        // A location that is a file cannot be read, and cannot be claimed.
+        let file = dir.join("plain-file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(check(&file, "id").reason().is_some());
+        assert!(claim(&file.join("below"))
+            .unwrap_err()
+            .contains("cannot create"));
+        assert!(reclaim(&file, None).unwrap_err().contains("not there"));
+        // Without a remembered id a restored folder gets a fresh one.
+        let fresh = reclaim(&dir, None).unwrap();
+        assert_eq!(check(&dir, &fresh), Readiness::Ready);
+        assert!(!Readiness::Ready.reason().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_check_still_running_is_not_started_again() {
+        let guard = StorageGuard::default();
+        let root = Path::new("/srv/hung-share");
+        assert!(guard.begin(root));
+        let error = bounded_with(root, &guard, |_| Ok("never".into())).unwrap_err();
+        assert!(error.contains("not responding"), "{error}");
+        guard.end(root);
+        assert_eq!(
+            bounded_with(root, &guard, |_| Ok("done".into())).unwrap(),
+            "done"
+        );
+        assert!(guard.begin(root), "a finished check frees the location");
+    }
+
+    #[tokio::test]
+    async fn ensure_marks_a_location_once_and_notices_when_it_goes() {
+        let dir = temp();
+        let root = dir.join("recordings");
+        let state = state_for(&root, &dir);
+        ensure(&state, &root).await.unwrap();
+        let key = root.to_string_lossy().into_owned();
+        let id = state.read().await.config.recording.storage_ids[&key].clone();
+        assert!(dir.join("config.json").exists(), "the id is saved");
+        assert!(state.read().await.storage.is_ready(&root));
+        // Known now: checked against its marker.
+        ensure(&state, &root).await.unwrap();
+        assert_eq!(state.read().await.config.recording.storage_ids[&key], id);
+        std::fs::remove_file(root.join(MARKER_FILE)).unwrap();
+        assert!(ensure(&state, &root).await.is_err());
+        let st = state.read().await;
+        assert!(!st.storage.is_ready(&root));
+        assert_eq!(st.storage.missing_roots(), vec![root.clone()]);
+        drop(st);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_missing_location_can_be_confirmed_by_the_user_only_when_it_is_in_use() {
+        let dir = temp();
+        let root = dir.join("recordings");
+        let state = state_for(&root, &dir);
+        ensure(&state, &root).await.unwrap();
+        let key = root.to_string_lossy().into_owned();
+        let id = state.read().await.config.recording.storage_ids[&key].clone();
+        std::fs::remove_file(root.join(MARKER_FILE)).unwrap();
+        assert!(ensure(&state, &root).await.is_err());
+
+        let other = dir.join("elsewhere");
+        let error = use_location(&state, &other).await.unwrap_err();
+        assert!(error.contains("not a recording location"), "{error}");
+
+        use_location(&state, &root).await.unwrap();
+        assert_eq!(check(&root, &id), Readiness::Ready, "its id is kept");
+        assert!(state.read().await.storage.is_ready(&root));
+        // The folder gone: nothing to confirm.
+        std::fs::remove_dir_all(&root).unwrap();
+        let error = use_location(&state, &root).await.unwrap_err();
+        assert!(error.contains("not there"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_notices_missing_and_returning_locations_until_shutdown() {
+        let dir = temp();
+        let root = dir.join("recordings");
+        let state = state_for(&root, &dir);
+        let archive = dir.join("archive");
+        {
+            let mut st = state.write().await;
+            st.config.recording.archive.enabled = true;
+            st.config.recording.archive.path = archive.to_string_lossy().into_owned();
+        }
+        ensure(&state, &root).await.unwrap();
+        let locations = locations(&*state.read().await);
+        assert_eq!(locations.len(), 2, "recordings and the archive");
+        assert!(locations[0].1.is_some() && locations[1].1.is_none());
+        let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(watch(std::sync::Arc::clone(&state), shutdown_rx));
+
+        async fn wait_for(
+            state: &tokio::sync::RwLock<crate::app_state::AppState>,
+            root: &Path,
+            ready: bool,
+        ) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while state
+                .read()
+                .await
+                .storage
+                .status(root)
+                .map(|s| s.is_ready())
+                != Some(ready)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "watch never saw {ready}"
+                );
+                tokio::time::sleep(RECHECK).await;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        wait_for(&state, &root, true).await;
+        std::fs::remove_file(root.join(MARKER_FILE)).unwrap();
+        wait_for(&state, &root, false).await;
+        write_marker(
+            &root,
+            &state.read().await.config.recording.storage_ids[&root.to_string_lossy().into_owned()]
+                .clone(),
+        )
+        .unwrap();
+        wait_for(&state, &root, true).await;
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

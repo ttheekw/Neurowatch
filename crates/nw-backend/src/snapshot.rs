@@ -490,4 +490,252 @@ mod tests {
             "dense walls must not retain unlimited main-stream keyframes"
         );
     }
+
+    fn jpeg_sample() -> (gstreamer::Caps, gstreamer::Buffer) {
+        gstreamer::init().unwrap();
+        let pipeline = crate::pipeline::builder::build("videotestsrc num-buffers=1 ! video/x-raw,width=320,height=180 ! jpegenc ! appsink name=test_sink sync=false").unwrap();
+        let sink = pipeline
+            .by_name("test_sink")
+            .unwrap()
+            .downcast::<gstreamer_app::AppSink>()
+            .unwrap();
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let sample = sink
+            .try_pull_sample(gstreamer::ClockTime::from_seconds(5))
+            .unwrap();
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        (
+            sample.caps().unwrap().to_owned(),
+            sample.buffer().unwrap().to_owned(),
+        )
+    }
+
+    #[test]
+    fn empty_and_oversized_keyframes_are_not_cached_and_replacements_keep_the_budget() {
+        gstreamer::init().unwrap();
+        let service = SnapshotService::default();
+        let caps = gstreamer::Caps::builder("image/jpeg").build();
+        service.record("empty", caps.clone(), gstreamer::Buffer::new());
+        service.record(
+            "huge",
+            caps.clone(),
+            gstreamer::Buffer::with_size(MAX_KEYFRAME_BYTES + 1).unwrap(),
+        );
+        assert!(service.latest("empty").is_none() && service.latest("huge").is_none());
+        assert_eq!(service.used.load(Ordering::Relaxed), 0);
+        service.record(
+            "cam",
+            caps.clone(),
+            gstreamer::Buffer::with_size(100).unwrap(),
+        );
+        service.record(
+            "cam",
+            caps.clone(),
+            gstreamer::Buffer::with_size(40).unwrap(),
+        );
+        assert_eq!(
+            service.used.load(Ordering::Relaxed),
+            40,
+            "the old frame is released"
+        );
+        service.forget("unknown");
+        assert_eq!(service.used.load(Ordering::Relaxed), 40);
+        service.forget("cam");
+        assert_eq!(service.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_cache_never_holds_more_than_a_thousand_cameras() {
+        gstreamer::init().unwrap();
+        let service = SnapshotService::default();
+        let caps = gstreamer::Caps::builder("image/jpeg").build();
+        for i in 0..1030 {
+            service.record(
+                &format!("c{i}"),
+                caps.clone(),
+                gstreamer::Buffer::with_size(8).unwrap(),
+            );
+        }
+        assert_eq!(service.cache.lock().unwrap().len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn requests_beyond_the_two_workers_are_refused_while_they_are_busy() {
+        let service = SnapshotService::default();
+        let first = service.slots.clone().try_acquire_owned().unwrap();
+        let second = service.slots.clone().try_acquire_owned().unwrap();
+        let camera = nw_core::camera::CameraConfig::new("Gate", "rtsp://127.0.0.1:9/live");
+        let error = service
+            .capture_from(camera.clone(), false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("busy"), "{error}");
+        drop((first, second));
+        // A cached picture is served from the decoder, never from the camera.
+        let (caps, buffer) = jpeg_sample();
+        service.record(&camera.id, caps, buffer);
+        let jpeg = service.capture_from(camera, false).await.unwrap();
+        assert!(jpeg.starts_with(&[255, 216]));
+    }
+
+    #[test]
+    fn the_cloud_and_local_caches_both_receive_keyframes_and_forgetting() {
+        #[derive(Default)]
+        struct Counting(
+            std::sync::atomic::AtomicUsize,
+            std::sync::atomic::AtomicUsize,
+        );
+        impl KeyframeSink for Counting {
+            fn record(&self, _: &str, _: gstreamer::Caps, _: gstreamer::Buffer) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn forget(&self, _: &str) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        gstreamer::init().unwrap();
+        let cloud = Arc::new(Counting::default());
+        let local = Arc::new(SnapshotService::default());
+        let fanout = KeyframeFanout {
+            local: Arc::clone(&local),
+            cloud: Some(Arc::clone(&cloud) as Arc<dyn KeyframeSink>),
+        };
+        let caps = gstreamer::Caps::builder("image/jpeg").build();
+        fanout.record(
+            "cam",
+            caps.clone(),
+            gstreamer::Buffer::with_size(10).unwrap(),
+        );
+        assert!(local.latest("cam").is_some());
+        assert_eq!(cloud.0.load(Ordering::SeqCst), 1);
+        fanout.forget("cam");
+        assert!(local.latest("cam").is_none());
+        assert_eq!(cloud.1.load(Ordering::SeqCst), 1);
+        // Without a cloud only the local cache is kept.
+        let local_only = KeyframeFanout {
+            local: Arc::clone(&local),
+            cloud: None,
+        };
+        local_only.record("cam", caps, gstreamer::Buffer::with_size(10).unwrap());
+        assert!(local.latest("cam").is_some());
+        local_only.forget("cam");
+        assert!(local.latest("cam").is_none());
+    }
+
+    #[test]
+    fn a_picture_that_is_missing_wrong_or_not_a_jpeg_is_an_error() {
+        gstreamer::init().unwrap();
+        let build = |description: &str| crate::pipeline::builder::build(description).unwrap();
+        // No output element at all, or one that is not an appsink.
+        let error = take_picture(&build("videotestsrc num-buffers=1 ! fakesink")).unwrap_err();
+        assert_eq!(error, "Snapshot output missing");
+        let error = take_picture(&build(
+            "videotestsrc num-buffers=1 ! fakesink name=snapshot_sink",
+        ))
+        .unwrap_err();
+        assert_eq!(error, "Invalid snapshot output");
+        // A stream that ends before a picture arrives.
+        let error = take_picture(&build(
+            "videotestsrc num-buffers=0 ! appsink name=snapshot_sink sync=false",
+        ))
+        .unwrap_err();
+        assert!(error.contains("No snapshot picture"), "{error}");
+        // A raw picture is not a JPEG.
+        let error = take_picture(&build(
+            "videotestsrc num-buffers=1 ! video/x-raw,width=16,height=16 ! appsink name=snapshot_sink sync=false",
+        ))
+        .unwrap_err();
+        assert!(error.contains("too large or invalid"), "{error}");
+        // A JPEG over the size limit is refused as well.
+        let error = take_picture(&build(
+            "videotestsrc num-buffers=1 pattern=snow ! video/x-raw,width=1280,height=720 ! jpegenc quality=100 ! appsink name=snapshot_sink sync=false",
+        ))
+        .unwrap_err();
+        assert!(error.contains("too large or invalid"), "{error}");
+    }
+
+    #[test]
+    fn event_picture_names_are_the_event_id_and_nothing_else() {
+        for bad in [
+            "0.jpg", "-3.jpg", "01.jpg", "+1.jpg", "1.png", "1", "a.jpg", "1/2.jpg", "",
+        ] {
+            assert!(thumbnail_path(bad).is_err(), "{bad}");
+        }
+        let path = thumbnail_path("42.jpg").unwrap();
+        assert!(path.ends_with("events/42.jpg") || path.ends_with("events\\42.jpg"));
+    }
+
+    #[tokio::test]
+    async fn a_new_activity_event_gets_its_picture_saved_and_attached() {
+        use nw_core::event::{EventKind, EventSource};
+        let data = std::env::temp_dir().join(format!("nw-snapshot-run-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data).unwrap();
+        // Event pictures live under the user's data directory: use a private one.
+        std::env::set_var("XDG_DATA_HOME", &data);
+        let mut config = crate::config::AppConfig::default();
+        let camera = nw_core::camera::CameraConfig::new("Gate", "rtsp://127.0.0.1:9/live");
+        config.cameras.push(camera.clone());
+        let state = Arc::new(tokio::sync::RwLock::new(
+            crate::app_state::AppState::with_database(
+                config,
+                data.join("config.json"),
+                crate::pipeline::hwaccel::HwAccelKind::Software,
+                crate::db::connection::open_in_memory().unwrap(),
+            ),
+        ));
+        let (hub, pictures) = {
+            let st = state.read().await;
+            (Arc::clone(&st.events), Arc::clone(&st.snapshots))
+        };
+        let (caps, buffer) = jpeg_sample();
+        pictures.record(&camera.id, caps, buffer);
+        let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(run(Arc::clone(&state), shutdown_rx));
+        // Ignored: not an activity, no camera, and an unknown camera.
+        let started = Instant::now();
+        let attached = loop {
+            hub.start(crate::events::NewEvent::new(
+                None,
+                EventKind::Motion,
+                EventSource::Onvif,
+            ));
+            hub.start(crate::events::NewEvent::new(
+                Some("unknown".into()),
+                EventKind::Motion,
+                EventSource::Onvif,
+            ));
+            hub.start(crate::events::NewEvent::new(
+                Some(camera.id.clone()),
+                EventKind::CameraOffline,
+                EventSource::System,
+            ));
+            hub.start(crate::events::NewEvent::new(
+                Some(camera.id.clone()),
+                EventKind::Motion,
+                EventSource::Onvif,
+            ));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Some(event) = hub
+                .open_events()
+                .into_iter()
+                .find(|e| e.thumbnail.is_some())
+            {
+                break event;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "no picture was attached"
+            );
+        };
+        let relative = attached.thumbnail.unwrap();
+        assert_eq!(relative, format!("{}.jpg", attached.id));
+        let saved = std::fs::read(data.join("neurowatch/events").join(&relative)).unwrap();
+        assert!(saved.starts_with(&[255, 216]));
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&data);
+    }
 }

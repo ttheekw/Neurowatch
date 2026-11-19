@@ -310,4 +310,190 @@ mod tests {
         assert_eq!(get_jpeg(&url, None).await, None);
         server.await.unwrap();
     }
+
+    /// Serves `replies` (status line, extra headers, body), one connection
+    /// each; returns the address and what each request head said.
+    async fn serve_sequence(
+        replies: Vec<(&'static str, &'static str, Vec<u8>)>,
+    ) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let heads = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen = heads.clone();
+        tokio::spawn(async move {
+            for (status, headers, body) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let n = socket.read(&mut request).await.unwrap();
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request[..n]).to_string());
+                let head = format!(
+                    "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+        });
+        (format!("http://{address}/snap.jpg?channel=1"), heads)
+    }
+
+    fn jpeg() -> Vec<u8> {
+        vec![0xFF, 0xD8, 9, 9, 0xFF, 0xD9]
+    }
+
+    fn creds() -> Credentials {
+        Credentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_digest_challenge_is_answered_for_the_same_path_and_query() {
+        let (url, heads) = serve_sequence(vec![
+            (
+                "401 Unauthorized",
+                "WWW-Authenticate: Digest realm=\"cam\", nonce=\"abc123\", qop=\"auth\"\r\n",
+                vec![],
+            ),
+            ("200 OK", "Content-Type: image/jpeg\r\n", jpeg()),
+        ])
+        .await;
+        assert_eq!(get_jpeg(&url, Some(&creds())).await, Some(jpeg()));
+        let heads = heads.lock().unwrap();
+        assert!(!heads[0].to_ascii_lowercase().contains("authorization"));
+        let second = heads[1].to_ascii_lowercase();
+        assert!(second.contains("authorization: digest username=\"admin\""));
+        assert!(second.contains("uri=\"/snap.jpg?channel=1\""), "{second}");
+    }
+
+    #[tokio::test]
+    async fn a_basic_challenge_is_answered_with_basic_credentials() {
+        let (url, heads) = serve_sequence(vec![
+            (
+                "401 Unauthorized",
+                "WWW-Authenticate: Basic realm=\"cam\"\r\n",
+                vec![],
+            ),
+            ("200 OK", "", jpeg()),
+        ])
+        .await;
+        assert_eq!(get_jpeg(&url, Some(&creds())).await, Some(jpeg()));
+        // base64("admin:secret")
+        assert!(heads.lock().unwrap()[1].contains("YWRtaW46c2VjcmV0"));
+    }
+
+    #[tokio::test]
+    async fn a_challenge_without_credentials_and_bad_replies_give_no_picture() {
+        let (url, _) = serve_sequence(vec![("401 Unauthorized", "", vec![])]).await;
+        assert_eq!(get_jpeg(&url, None).await, None);
+        // A digest this node cannot compute (SHA-256) is not answered.
+        let (url, _) = serve_sequence(vec![(
+            "401 Unauthorized",
+            "WWW-Authenticate: Digest realm=\"cam\", nonce=\"n\", algorithm=SHA-256\r\n",
+            vec![],
+        )])
+        .await;
+        assert_eq!(get_jpeg(&url, Some(&creds())).await, None);
+        let (url, _) = serve_sequence(vec![("404 Not Found", "", vec![])]).await;
+        assert_eq!(get_jpeg(&url, None).await, None);
+        // A body that is not a JPEG.
+        let (url, _) = serve_sequence(vec![("200 OK", "", b"<html>".to_vec())]).await;
+        assert_eq!(get_jpeg(&url, None).await, None);
+        // Unreachable.
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}/s.jpg", listener.local_addr().unwrap())
+        };
+        assert_eq!(get_jpeg(&closed, None).await, None);
+    }
+
+    #[test]
+    fn digest_without_qop_answers_with_the_short_form_and_refuses_other_algorithms() {
+        let challenge = r#"Digest realm=cam, nonce=n0nce, algorithm=md5"#;
+        let header = digest_authorization(challenge, &creds(), "GET", "/s").unwrap();
+        let md5 = |text: String| format!("{:x}", Md5::digest(text.as_bytes()));
+        let ha1 = md5("admin:cam:secret".into());
+        let ha2 = md5("GET:/s".into());
+        assert!(header.contains(&format!(
+            "response=\"{}\"",
+            md5(format!("{ha1}:n0nce:{ha2}"))
+        )));
+        assert!(!header.contains("cnonce") && !header.contains("opaque"));
+        assert!(digest_authorization(
+            "Digest realm=cam, nonce=n, algorithm=SHA-256",
+            &creds(),
+            "GET",
+            "/s"
+        )
+        .is_none());
+        assert!(digest_authorization("Digest nonce=n", &creds(), "GET", "/s").is_none());
+        assert!(digest_authorization("Digest realm=cam", &creds(), "GET", "/s").is_none());
+    }
+
+    fn camera(url: &str) -> CameraConfig {
+        let mut camera = CameraConfig::new("Camera", url);
+        camera.id = "cam-1".into();
+        camera
+    }
+
+    #[test]
+    fn credentials_come_from_the_camera_when_it_has_a_user() {
+        let mut cam = camera("rtsp://192.168.1.64/s");
+        assert!(credentials(&cam).is_none());
+        cam.username = Some(String::new());
+        assert!(credentials(&cam).is_none());
+        cam.username = Some("admin".into());
+        let none = credentials(&cam).unwrap();
+        assert_eq!(
+            (none.username.as_str(), none.password.as_str()),
+            ("admin", "")
+        );
+        cam.password_b64 = Some(STANDARD.encode("p@ss"));
+        assert_eq!(credentials(&cam).unwrap().password, "p@ss");
+        cam.password_b64 = Some("%%not base64%%".into());
+        assert_eq!(credentials(&cam).unwrap().password, "");
+    }
+
+    #[tokio::test]
+    async fn a_remembered_snapshot_url_is_used_without_asking_the_camera_again() {
+        let (url, _) = serve_sequence(vec![("200 OK", "", jpeg())]).await;
+        let cam = camera("rtsp://127.0.0.1:554/stream");
+        let snapshots = CameraSnapshots::default();
+        assert_eq!(snapshots.cached(&cam), None, "nothing remembered yet");
+        snapshots
+            .sources
+            .lock()
+            .unwrap()
+            .insert(cam.id.clone(), (cam.url.clone(), Some(url), Instant::now()));
+        assert!(snapshots.cached(&cam).unwrap().is_some());
+        assert_eq!(
+            snapshots.fetch(&cam).await,
+            Some(STANDARD.encode(jpeg())),
+            "the picture is passed on as base64"
+        );
+        // Another stream address: the lookup is stale.
+        let moved = camera("rtsp://127.0.0.1:554/other");
+        assert_eq!(snapshots.cached(&moved), None);
+    }
+
+    #[tokio::test]
+    async fn a_camera_known_to_have_no_snapshot_or_no_lan_address_gives_none() {
+        let cam = camera("rtsp://127.0.0.1:554/stream");
+        let snapshots = CameraSnapshots::default();
+        snapshots
+            .sources
+            .lock()
+            .unwrap()
+            .insert(cam.id.clone(), (cam.url.clone(), None, Instant::now()));
+        assert_eq!(snapshots.cached(&cam), Some(None));
+        assert_eq!(snapshots.fetch(&cam).await, None);
+        assert_eq!(
+            snapshots.fetch(&camera("rtsp://cam.example.com/s")).await,
+            None
+        );
+    }
 }

@@ -1047,3 +1047,576 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod run_tests {
+    /// `NW_BACKUP_DEV_ASSIGNMENT` is process-wide and `fetch` reads it: the
+    /// test that sets it and every test that can reach `fetch` (directly, or
+    /// through a running backup client asking `PortalAssigner`) take turns.
+    static DEV_ASSIGNMENT_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    use super::*;
+    use crate::streams::testing::CameraFile;
+    use nw_backup_protocol::ticket::{CameraGrant, Ticket, TICKET_VERSION};
+    use nw_core::camera::CameraConfig;
+
+    /// An assigner with nothing to give: the client keeps what it is pushed.
+    struct NoPlan;
+    impl Assigner for NoPlan {
+        fn assign(&self) -> AssignFuture<'_> {
+            Box::pin(async { Err("No camera has a backup plan.".to_owned()) })
+        }
+    }
+
+    fn client_config() -> ClientConfig {
+        ClientConfig {
+            node_key: ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]),
+            recorder: "test".into(),
+            tls: nw_backup_client::tls_config(None).unwrap(),
+            outage_dir: None,
+            memory_bytes_per_track: 1 << 20,
+            disk_bytes_per_track: 0,
+        }
+    }
+
+    fn state_with(cameras: Vec<CameraConfig>) -> Arc<RwLock<AppState>> {
+        let config = crate::config::AppConfig {
+            cameras,
+            ..crate::config::AppConfig::default()
+        };
+        Arc::new(RwLock::new(AppState::with_database(
+            config,
+            std::env::temp_dir().join("nw-backup-run-config.json"),
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+            crate::db::connection::open_in_memory().unwrap(),
+        )))
+    }
+
+    fn grant(camera: &str, stream: Option<&str>, sound: bool, limits: Limits) -> CameraGrant {
+        CameraGrant {
+            camera_id: camera.into(),
+            retention_s: 3600,
+            sound,
+            limits,
+            hot_s: 0,
+            move_every_s: 0,
+            stream: stream.map(str::to_owned),
+            seal_key: None,
+            priced: Some(PricedStream {
+                width: 160,
+                height: 120,
+                fps: 5.0,
+                bitrate_bps: Some(1_000),
+                codec: Some("h265".into()),
+                tolerance_percent: 20,
+            }),
+        }
+    }
+
+    fn ticket_for(grants: Vec<CameraGrant>) -> String {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        ticket::issue(
+            &Ticket {
+                v: TICKET_VERSION,
+                id: "t-1".into(),
+                org_id: "org".into(),
+                node_id: "node".into(),
+                node_key: ticket::hex(key.verifying_key().as_bytes()),
+                audience: "ingest.example.com".into(),
+                issued_at_ms: 0,
+                expires_at_ms: i64::MAX / 2,
+                cameras: grants,
+            },
+            &key,
+        )
+    }
+
+    fn assignment(ticket: String, ca_pem: Option<&str>) -> BackupAssignment {
+        BackupAssignment {
+            ticket,
+            ingest: super::super::link::backup::BackupIngest {
+                name: "ingest.example.com".into(),
+                quic: None,
+                tcp: Some("127.0.0.1:1".into()),
+                ca_pem: ca_pem.map(str::to_owned),
+                public_key: None,
+            },
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nw-backup-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn until(mut done: impl FnMut() -> bool) {
+        for _ in 0..1500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the condition never held");
+    }
+
+    async fn drop_off_thread<T: Send + 'static>(value: T) {
+        tokio::task::spawn_blocking(move || drop(value))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capture_copies_a_cameras_video_and_reports_it() {
+        let _env = DEV_ASSIGNMENT_ENV.lock().await;
+        let fixture = CameraFile::new(250);
+        let id = fixture.camera.id.clone();
+        let state = state_with(vec![fixture.camera.clone()]);
+        let backup = Arc::new(Backup::start(client_config(), Arc::new(NoPlan)));
+        let capture = Capture::start(
+            state.clone(),
+            backup.clone(),
+            id.clone(),
+            Limits::P1080_10,
+            false,
+            Some("main"),
+        );
+        until(|| {
+            backup
+                .status()
+                .tracks
+                .iter()
+                .any(|t| t.kind == TrackKind::Video && t.unconfirmed_units > 0)
+        })
+        .await;
+        until(|| capture.info().codec.is_some()).await;
+        assert_eq!(capture.info().codec, Some("h264"));
+        assert_eq!(capture.info().problem, None);
+        capture.set_limits(Limits::P1080_10);
+
+        let node_dir = temp_dir("node");
+        let node = CloudNode::open(node_dir.join("node")).unwrap();
+        let mut captures = HashMap::new();
+        captures.insert(id.clone(), capture);
+        let mut priced = HashMap::new();
+        priced.insert(
+            id.clone(),
+            grant(&id, None, false, Limits::P1080_10).priced.unwrap(),
+        );
+        let mut running = Some(Running {
+            backup: backup.clone(),
+            assigner: Arc::new(PortalAssigner {
+                node: node.shared(),
+                cached: Mutex::new(None),
+            }),
+            captures,
+            priced,
+            changes: ChangeWatch::default(),
+        });
+
+        // The stream is H.264, the plan was priced for H.265: a change.
+        let seen = seen_changes(&state, running.as_ref().unwrap()).await;
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].1.iter().any(|c| c.contains("H.264")), "{seen:?}");
+        let now = Instant::now();
+        let later = now + CHANGED_AFTER;
+        {
+            let running = running.as_mut().unwrap();
+            running.changes.observe(seen.clone(), now);
+            running.changes.observe(seen, later);
+        }
+        let shown = report(&running, None);
+        assert_eq!(shown.cameras.len(), 1);
+        let camera = &shown.cameras[0];
+        assert_eq!(
+            (camera.camera_id.as_str(), camera.stream.as_str()),
+            (id.as_str(), "main")
+        );
+        assert!(camera.unconfirmed_units > 0 && camera.problem.is_none());
+        assert!(camera
+            .stream_changed
+            .as_deref()
+            .unwrap()
+            .contains("still backed up"));
+        assert_ne!(shown.state, "off");
+        let with_problem = report(&running, Some("paused"));
+        assert_eq!(with_problem.problem.as_deref(), Some("paused"));
+
+        stop_running(&mut running).await;
+        assert!(running.is_none());
+        assert_eq!(report(&running, Some("gone")).state, "off");
+        // Stopping what is not running is nothing.
+        stop_running(&mut running).await;
+        let _ = std::fs::remove_dir_all(node_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capture_says_why_a_camera_cannot_be_backed_up() {
+        let _env = DEV_ASSIGNMENT_ENV.lock().await;
+        let fixture = CameraFile::new(250);
+        let id = fixture.camera.id.clone();
+        let state = state_with(vec![fixture.camera.clone()]);
+        let backup = Arc::new(Backup::start(client_config(), Arc::new(NoPlan)));
+        let start = |camera: &str, limits: Limits, named: Option<&'static str>| {
+            Capture::start(
+                state.clone(),
+                backup.clone(),
+                camera.to_owned(),
+                limits,
+                false,
+                named,
+            )
+        };
+        let problem_of = |capture: &Capture| capture.info().problem;
+
+        let missing = start("not-here", Limits::P1080_10, None);
+        until(|| problem_of(&missing).is_some()).await;
+        assert_eq!(
+            problem_of(&missing).as_deref(),
+            Some("This camera is not on this recorder.")
+        );
+
+        // The plan is for a substream the camera does not have.
+        let no_sub = start(&id, Limits::P1080_10, Some("sub"));
+        until(|| problem_of(&no_sub).is_some()).await;
+        assert!(problem_of(&no_sub).unwrap().contains("substream"));
+        assert_eq!(no_sub.info().stream, "sub");
+
+        // The named main stream is larger than the plan: said, not swapped.
+        let small = Limits {
+            max_long_side: 200,
+            max_short_side: 100,
+            ..Limits::P1080_10
+        };
+        let too_big = start(&id, small, Some("main"));
+        until(|| problem_of(&too_big).is_some()).await;
+        let why = problem_of(&too_big).unwrap();
+        assert!(
+            why.contains("320×240") && why.ends_with("Give the camera a smaller stream."),
+            "{why}"
+        );
+        assert_eq!(too_big.info().stream, "main");
+
+        // An older ticket names no stream: main is too large, so the sub is tried.
+        {
+            let mut app = state.write().await;
+            app.config.cameras[0].sub_url = Some(fixture.camera.url.clone());
+        }
+        let switching = start(&id, small, None);
+        until(|| switching.info().stream == "sub" && problem_of(&switching).is_some()).await;
+        assert!(problem_of(&switching).unwrap().contains("Give the camera"));
+
+        for capture in [missing, no_sub, too_big, switching] {
+            drop_off_thread(capture).await;
+        }
+        backup.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_plans_cameras_start_change_and_stop_with_each_ticket() {
+        let _env = DEV_ASSIGNMENT_ENV.lock().await;
+        let dir = temp_dir("apply");
+        let node = CloudNode::open(dir.join("node")).unwrap();
+        let source = BackupSource {
+            state: state_with(vec![]),
+            outage_dir: dir.join("outage"),
+            status: Arc::new(BackupStatus::default()),
+        };
+        let mut running: Option<Running> = None;
+        let main = Limits::P1080_10;
+
+        // A ticket nobody can read, and a development CA that is not one.
+        assert_eq!(
+            apply(
+                &node,
+                &source,
+                &mut running,
+                assignment("junk".into(), None)
+            )
+            .unwrap_err(),
+            "The backup ticket could not be read."
+        );
+        let one = ticket_for(vec![grant("cam-a", Some("main"), false, main)]);
+        assert_eq!(
+            apply(
+                &node,
+                &source,
+                &mut running,
+                assignment(one.clone(), Some("not pem"))
+            )
+            .unwrap_err(),
+            "The backup server's development CA is not PEM."
+        );
+        let bad_ca = "-----BEGIN CERTIFICATE-----\nAAEC\n-----END CERTIFICATE-----\n";
+        assert!(apply(
+            &node,
+            &source,
+            &mut running,
+            assignment(one.clone(), Some(bad_ca))
+        )
+        .is_err());
+        assert!(running.is_none());
+
+        // Camera A starts.
+        apply(&node, &source, &mut running, assignment(one, None)).unwrap();
+        {
+            let running = running.as_ref().unwrap();
+            assert_eq!(running.captures.len(), 1);
+            assert!(running.priced.contains_key("cam-a"));
+        }
+        // A ticket just fetched goes to the client once, then the portal is asked.
+        let assigner = PortalAssigner {
+            node: node.shared(),
+            cached: Mutex::new(None),
+        };
+        assigner.remember(assignment(ticket_for(vec![]), None));
+        let given = assigner.assign().await.unwrap();
+        assert_eq!(
+            (given.server_name.as_str(), given.tcp.as_deref()),
+            ("ingest.example.com", Some("127.0.0.1:1"))
+        );
+        assert!(
+            assigner.assign().await.is_err(),
+            "nothing cached, nothing linked"
+        );
+
+        // A new limit for A, B joins: A keeps its capture.
+        let roomy = Limits {
+            max_bitrate_bps: 9_000_000,
+            ..main
+        };
+        let two = ticket_for(vec![
+            grant("cam-a", Some("main"), false, roomy),
+            grant("cam-b", None, false, main),
+        ]);
+        apply(&node, &source, &mut running, assignment(two, None)).unwrap();
+        assert_eq!(running.as_ref().unwrap().captures.len(), 2);
+        assert_eq!(
+            *running.as_ref().unwrap().captures["cam-a"]
+                .limits
+                .lock()
+                .unwrap(),
+            roomy
+        );
+
+        // Sound switched on for A restarts it; B left the plan and stops.
+        let three = ticket_for(vec![grant("cam-a", Some("main"), true, roomy)]);
+        apply(&node, &source, &mut running, assignment(three, None)).unwrap();
+        {
+            let running = running.as_ref().unwrap();
+            assert_eq!(running.captures.len(), 1);
+            assert!(running.captures["cam-a"].sound);
+        }
+        // The capture's thread says why on its own time.
+        until(|| report(&running, None).cameras[0].problem.is_some()).await;
+        let shown = report(&running, None);
+        assert_eq!(shown.cameras[0].camera_id, "cam-a");
+        assert_eq!(
+            shown.cameras[0].problem.as_deref(),
+            Some("This camera is not on this recorder.")
+        );
+        stop_running(&mut running).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_plan_names_main_or_sub_or_neither() {
+        let main = Limits::P1080_10;
+        assert_eq!(named(&grant("c", Some("main"), false, main)), Some("main"));
+        assert_eq!(named(&grant("c", Some("sub"), false, main)), Some("sub"));
+        assert_eq!(named(&grant("c", Some("third"), false, main)), None);
+        assert_eq!(named(&grant("c", None, false, main)), None);
+    }
+
+    #[test]
+    fn waiting_ends_early_when_asked_to_stop() {
+        let stop = AtomicBool::new(true);
+        assert!(wait(&stop, Duration::from_secs(30)));
+        let go = AtomicBool::new(false);
+        assert!(!wait(&go, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn the_outage_folder_is_private_to_the_test_process() {
+        let dir = default_outage_dir();
+        assert!(dir.starts_with(std::env::temp_dir()));
+        assert!(dir
+            .to_string_lossy()
+            .contains(&std::process::id().to_string()));
+    }
+
+    fn sound_unit(caps: &gstreamer::Caps, i: u64) -> crate::streams::SharedUnit {
+        let mut buffer = gstreamer::Buffer::from_mut_slice(vec![0x7fu8; 160]);
+        buffer
+            .get_mut()
+            .unwrap()
+            .set_pts(gstreamer::ClockTime::from_mseconds(i * 20));
+        crate::streams::SharedUnit {
+            media: Media::Audio,
+            buffer,
+            caps: caps.clone(),
+            arrived_us: 1_000_000_000 + i as i64 * 20_000,
+            frame: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sound_is_converted_into_a_track_and_unusable_sound_is_said_once() {
+        let _env = DEV_ASSIGNMENT_ENV.lock().await;
+        gstreamer::init().unwrap();
+        let backup = Backup::start(client_config(), Arc::new(NoPlan));
+        let mut state = SoundState::None;
+        let mut track = None;
+
+        // Sound that cannot be backed up: failed once, nothing sent.
+        let odd = gstreamer::Caps::builder("audio/x-unknown").build();
+        back_up_sound(&mut state, &mut track, &backup, "cam", &sound_unit(&odd, 0));
+        assert!(matches!(&state, SoundState::Failed(caps) if *caps == odd));
+        back_up_sound(&mut state, &mut track, &backup, "cam", &sound_unit(&odd, 1));
+        assert!(track.is_none());
+
+        let encoder = ["voaacenc", "fdkaacenc", "avenc_aac", "faac"]
+            .iter()
+            .any(|name| gstreamer::ElementFactory::find(name).is_some());
+        if !encoder || gstreamer::ElementFactory::find("alawdec").is_none() {
+            eprintln!("no AAC encoder or G.711 decoder here: skipped");
+            backup.stop().await;
+            return;
+        }
+        let alaw = gstreamer::Caps::builder("audio/x-alaw")
+            .field("rate", 8000i32)
+            .field("channels", 1i32)
+            .build();
+        for i in 0..150 {
+            back_up_sound(
+                &mut state,
+                &mut track,
+                &backup,
+                "cam",
+                &sound_unit(&alaw, i),
+            );
+            if track.is_some() {
+                break;
+            }
+        }
+        assert!(matches!(&state, SoundState::Ready(caps, _) if *caps == alaw));
+        // The encoder may need a moment before its first frame.
+        for i in 150..400 {
+            if track.is_some() {
+                break;
+            }
+            back_up_sound(
+                &mut state,
+                &mut track,
+                &backup,
+                "cam",
+                &sound_unit(&alaw, i),
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if track.is_some() {
+            assert!(backup
+                .status()
+                .tracks
+                .iter()
+                .any(|t| t.kind == TrackKind::Audio && t.camera_id == "cam"));
+        }
+        drop(track);
+        backup.stop().await;
+    }
+
+    /// `NW_BACKUP_DEV_ASSIGNMENT` is process-wide: everything that reads it
+    /// (the dev file, the plan check loop) is in this one test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_plan_check_follows_the_development_assignment_file() {
+        let _env = DEV_ASSIGNMENT_ENV.lock().await;
+        let dir = temp_dir("loop");
+        let file = dir.join("assignment.json");
+        let node = CloudNode::open(dir.join("node")).unwrap();
+
+        // Unlinked and without a file: asking the portal fails, plainly.
+        assert!(fetch(&node).await.is_err());
+
+        std::env::set_var("NW_BACKUP_DEV_ASSIGNMENT", &file);
+        // Missing file, then a file that is not JSON, then no plan.
+        let missing = fetch(&node).await.unwrap_err();
+        assert!(missing.contains("assignment.json"), "{missing}");
+        std::fs::write(&file, "not json").unwrap();
+        assert!(fetch(&node).await.is_err());
+        std::fs::write(&file, r#"{"backup": null}"#).unwrap();
+        assert_eq!(fetch(&node).await, Ok(None));
+        let plan = serde_json::json!({"backup": {
+            "ticket": ticket_for(vec![grant("cam-x", Some("main"), false, Limits::P1080_10)]),
+            "ingest": {"name": "ingest.example.com", "tcp": "127.0.0.1:1"}
+        }});
+        std::fs::write(&file, plan.to_string()).unwrap();
+        assert!(fetch(&node).await.unwrap().is_some());
+
+        let run = |file_text: Option<String>| {
+            let dir = dir.clone();
+            let node = node.shared();
+            async move {
+                if let Some(text) = file_text {
+                    std::fs::write(dir.join("assignment.json"), text).unwrap();
+                }
+                let status = Arc::new(BackupStatus::default());
+                let source = BackupSource {
+                    state: state_with(vec![]),
+                    outage_dir: dir.join("outage"),
+                    status: status.clone(),
+                };
+                let (stop, stopped) = watch::channel(false);
+                let task = tokio::spawn(run_loop(node, source, stopped));
+                (status, stop, task)
+            }
+        };
+        let finish = |stop: watch::Sender<bool>, task: tokio::task::JoinHandle<()>| async move {
+            stop.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("the loop stops")
+                .unwrap();
+        };
+
+        // No camera has a plan.
+        let (status, stop, task) = run(Some(r#"{"backup": null}"#.into())).await;
+        until(|| status.report().problem.as_deref() == Some("No camera has a backup plan.")).await;
+        assert_eq!(status.report().state, "off");
+        finish(stop, task).await;
+
+        // A ticket that cannot be read.
+        let junk = serde_json::json!({"backup": {
+            "ticket": "junk", "ingest": {"name": "ingest.example.com", "tcp": "127.0.0.1:1"}
+        }});
+        let (status, stop, task) = run(Some(junk.to_string())).await;
+        until(|| {
+            status.report().problem.as_deref() == Some("The backup ticket could not be read.")
+        })
+        .await;
+        finish(stop, task).await;
+
+        // A plan for a camera this recorder lacks: running, with the camera's problem.
+        let (status, stop, task) = run(Some(plan.to_string())).await;
+        until(|| {
+            let report = status.report();
+            report.state != "off" && report.cameras.iter().any(|c| c.problem.is_some())
+        })
+        .await;
+        let report = status.report();
+        assert_eq!(report.cameras[0].camera_id, "cam-x");
+        assert!(report.cameras[0].trouble.is_some());
+        finish(stop, task).await;
+
+        // A failed check keeps the loop alive without a report of its own.
+        let (status, stop, task) = run(Some("not json".into())).await;
+        until(|| {
+            let report = status.report();
+            report.state == "off" && report.problem.is_none()
+        })
+        .await;
+        finish(stop, task).await;
+
+        std::env::remove_var("NW_BACKUP_DEV_ASSIGNMENT");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

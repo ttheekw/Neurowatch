@@ -742,3 +742,109 @@ mod binding_tests {
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    #[test]
+    fn a_success_answer_yields_its_body() {
+        let raw = json!({"status": 200, "body": {"ok": true}});
+        assert_eq!(response_body(&raw).unwrap(), json!({"ok": true}));
+        // A body may be null, but it must be there.
+        assert_eq!(
+            response_body(&json!({"status": 204, "body": null})).unwrap(),
+            Value::Null
+        );
+        assert!(matches!(
+            response_body(&json!({"status": 200})),
+            Err(CloudError::Network(message)) if message == "missing WebSocket response body"
+        ));
+    }
+
+    #[test]
+    fn a_status_outside_http_is_invalid() {
+        for raw in [
+            json!({}),
+            json!({"status": "200"}),
+            json!({"status": 99}),
+            json!({"status": 600}),
+            json!({"status": -1}),
+        ] {
+            assert!(
+                matches!(
+                    response_body(&raw),
+                    Err(CloudError::Network(message)) if message == "invalid WebSocket status"
+                ),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_statuses_map_like_http_ones() {
+        assert!(matches!(
+            response_body(&json!({"status": 401, "body": {}})),
+            Err(CloudError::Refused(401))
+        ));
+        assert!(matches!(
+            response_body(&json!({"status": 403})),
+            Err(CloudError::Refused(403))
+        ));
+        assert!(matches!(
+            response_body(&json!({"status": 503})),
+            Err(CloudError::Network(message)) if message.contains("503")
+        ));
+        // 1xx and 3xx are not successes either.
+        assert!(response_body(&json!({"status": 101, "body": {}})).is_err());
+        assert!(response_body(&json!({"status": 302, "body": {}})).is_err());
+    }
+
+    #[test]
+    fn the_envelope_clock_is_learnt_only_when_the_portal_sends_one() {
+        let clock = CloudClock::new();
+        let sent = clock.system_now();
+        observe_server_time(&clock, &json!({"status": 200}), sent);
+        assert!(clock.measured_offset().is_none());
+        observe_server_time(&clock, &json!({"server_time": 5}), sent);
+        assert!(clock.measured_offset().is_none(), "not a string");
+        let ahead = clock.system_now() + TimeDuration::hours(3);
+        observe_server_time(
+            &clock,
+            &json!({"server_time": fmt_time(ahead).unwrap()}),
+            sent,
+        );
+        assert!(clock.measured_offset().is_some());
+    }
+
+    #[test]
+    fn retry_delay_grows_and_is_capped_with_jitter() {
+        let low = retry_delay(0, 0);
+        let high = retry_delay(0, 1000);
+        assert!(low < high);
+        assert!(low >= Duration::from_millis(800) && high <= Duration::from_millis(1200));
+        assert!(retry_delay(3, 500) > retry_delay(1, 500));
+        // Capped at 30 s (plus jitter), however many failures there were.
+        assert_eq!(retry_delay(30, 0), retry_delay(5, 0));
+        assert!(retry_delay(30, 1000) <= Duration::from_millis(36_000));
+    }
+
+    #[test]
+    fn the_socket_url_swaps_the_scheme_and_names_the_node() {
+        let policy = EndpointPolicy {
+            allow_loopback_http: true,
+            pinned: None,
+        };
+        let secure =
+            CloudEndpoint::parse_with("https://cloud.example.com/portal/", policy).unwrap();
+        assert_eq!(
+            socket_url(&secure, "n-1").unwrap().as_str(),
+            "wss://cloud.example.com/portal/v1/nodes/n-1/ws"
+        );
+        let local = CloudEndpoint::parse_with("http://127.0.0.1:8000", policy).unwrap();
+        assert_eq!(
+            socket_url(&local, "n-1").unwrap().as_str(),
+            "ws://127.0.0.1:8000/v1/nodes/n-1/ws"
+        );
+    }
+}

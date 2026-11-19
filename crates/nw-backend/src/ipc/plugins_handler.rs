@@ -781,6 +781,234 @@ mod tests {
         }
         let _ = std::fs::remove_file(path);
     }
+
+    fn approved_server(id: &str) -> Value {
+        let key = nw_analytics_sdk::identity::public_key(
+            &nw_analytics_sdk::identity::SigningKey::from_bytes(&[5; 32]),
+        );
+        json!({"id": id, "address": "unix:/tmp/nw-approved-test.sock",
+               "approval": {"public_key": key, "permissions": ["video"]}})
+    }
+
+    #[tokio::test]
+    async fn approving_needs_the_plugins_signed_manifest() {
+        let (handler, path) = handler();
+        for bad in [json!({}), json!({"server": "motion"})] {
+            let e = handler.dispatch("plugins.approve", &bad).await.unwrap_err();
+            assert_eq!(e.code, -32602, "{}", e.message);
+        }
+        let e = handler
+            .dispatch(
+                "plugins.approve",
+                &json!({"server": "motion", "public_key": "abc"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("signed manifest"), "{}", e.message);
+        let hosted: crate::plugin_host::PluginServer = serde_json::from_value(json!({
+            "id": "hosted.nw.vcount", "address": "quic:v1.example.test:443",
+            "managed": {"service": "nw.vcount", "instance": "v1.example.test"}}))
+        .unwrap();
+        handler
+            .state
+            .write()
+            .await
+            .config
+            .plugins
+            .servers
+            .push(hosted);
+        let e = handler
+            .dispatch(
+                "plugins.approve",
+                &json!({"server": "hosted.nw.vcount", "public_key": "abc"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("provided by NeuroWatch"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_credential_is_stored_for_the_approved_key_and_forgotten_with_it() {
+        let (handler, path) = handler();
+        for bad in [
+            json!({}),
+            json!({"server": "m"}),
+            json!({"server": "m", "credential": "x".repeat(8193)}),
+        ] {
+            let e = handler
+                .dispatch("plugins.credentials", &bad)
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, -32602);
+        }
+        let e = handler
+            .dispatch(
+                "plugins.credentials",
+                &json!({"server": "m", "credential": "secret"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("Plugin not found"));
+        handler
+            .dispatch(
+                "plugins.set",
+                &json!({"servers": [{"id": "m", "address": "unix:/tmp/nw-unapproved.sock"}]}),
+            )
+            .await
+            .unwrap();
+        let e = handler
+            .dispatch(
+                "plugins.credentials",
+                &json!({"server": "m", "credential": "secret"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("Approve the plugin's key"));
+
+        handler
+            .dispatch("plugins.set", &json!({"servers": [approved_server("m")]}))
+            .await
+            .unwrap();
+        let key = handler.state.read().await.config.plugins.servers[0]
+            .approval
+            .as_ref()
+            .unwrap()
+            .public_key
+            .clone();
+        let stored = crate::plugin_host::credentials::path(&path, "m", &key).unwrap();
+        let set = handler
+            .dispatch(
+                "plugins.credentials",
+                &json!({"server": "m", "credential": "secret"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(set, json!({"ok": true, "credential_set": true}));
+        assert!(stored.is_file());
+        assert_eq!(
+            handler.state.read().await.config.plugins.servers[0].credential_revision,
+            1
+        );
+        // Removing the plugin forgets its credential.
+        handler
+            .dispatch("plugins.set", &json!({"servers": []}))
+            .await
+            .unwrap();
+        assert!(!stored.exists());
+        // Clearing an absent credential is fine.
+        handler
+            .dispatch("plugins.set", &json!({"servers": [approved_server("m")]}))
+            .await
+            .unwrap();
+        let cleared = handler
+            .dispatch(
+                "plugins.credentials",
+                &json!({"server": "m", "credential": ""}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared["credential_set"], false);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn plugin_pages_need_a_viewer_once_sign_in_is_on() {
+        let (handler, path) = handler();
+        // Sign-in off: the owner sees the (empty) page list.
+        let pages = handler.dispatch("plugins.pages", &json!({})).await.unwrap();
+        assert_eq!(pages["viewer"]["role"], "admin");
+        assert_eq!(pages["plugins"], json!([]));
+        let e = handler
+            .dispatch("plugins.pages", &json!({"_nw_web_viewer": "nobody"}))
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("Invalid viewer context"));
+        let named = handler
+            .dispatch(
+                "plugins.pages",
+                &json!({"_nw_web_viewer": {"user": "ann", "role": "viewer"}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(named["viewer"]["user"], "ann");
+        let e = handler
+            .dispatch(
+                "plugins.pages",
+                &json!({"_nw_web_viewer": {"user": "ann", "role": "root"}}),
+            )
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("Invalid viewer"));
+        handler.state.write().await.config.accounts.enabled = true;
+        let e = handler
+            .dispatch("plugins.web.read", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("signed-in viewer"));
+        assert_eq!(
+            handler
+                .dispatch("plugins.nope", &json!({}))
+                .await
+                .unwrap_err()
+                .code,
+            -32601
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn inspecting_and_adding_need_a_reachable_address() {
+        let (handler, path) = handler();
+        for method in ["plugins.inspect", "plugins.add"] {
+            let e = handler.dispatch(method, &json!({})).await.unwrap_err();
+            assert!(e.message.contains("address is required"));
+            let long = "u".repeat(3000);
+            let e = handler
+                .dispatch(method, &json!({"address": long}))
+                .await
+                .unwrap_err();
+            assert!(e.message.contains("address is required"));
+            let e = handler
+                .dispatch(
+                    method,
+                    &json!({"address": "unix:/nonexistent-nw/none.sock"}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, -32602, "{}", e.message);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn history_reports_what_it_lacks() {
+        let (handler, path) = handler();
+        for bad in [
+            json!({"camera_id": "cam-1"}),
+            json!({"camera_id": "cam-1", "from_us": 0}),
+            json!({"camera_id": "x".repeat(65), "from_us": 0, "to_us": 1}),
+            json!({"camera_id": "cam-1", "from_us": 0, "to_us": 1, "after_us": 1}),
+        ] {
+            assert_eq!(
+                handler
+                    .dispatch("plugins.history", &bad)
+                    .await
+                    .unwrap_err()
+                    .code,
+                -32602
+            );
+        }
+        let empty = handler
+            .dispatch(
+                "plugins.history",
+                &json!({"camera_id": "cam-1", "from_us": 0, "to_us": 1}),
+            )
+            .await
+            .unwrap();
+        assert!(empty["next"].is_null() && empty["trimmed"] == false);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -894,6 +1122,30 @@ mod discovery_tests {
             before,
             "duplicate adds must not change saved config"
         );
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspecting_a_plugin_reports_its_manifest_and_whether_it_was_added() {
+        gstreamer::init().unwrap();
+        let dir = std::env::temp_dir().join(format!("nw-inspect-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let address = format!("unix:{}", dir.join("p.sock").display());
+        let server = daemon(UnixListener::bind(dir.join("p.sock")).unwrap(), 1, 4);
+        let state = Arc::new(RwLock::new(crate::app_state::AppState::new(
+            crate::config::AppConfig::default(),
+            dir.join("config.json"),
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+        )));
+        let handler = PluginsHandler::new(state);
+        let inspected = handler
+            .dispatch("plugins.inspect", &json!({"address": address}))
+            .await
+            .unwrap();
+        assert_eq!(inspected["manifest"]["id"], "test.discovery");
+        assert!(inspected["added_as"].is_null());
+        assert!(inspected["address"].as_str().unwrap().starts_with("unix:"));
         server.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -834,4 +834,393 @@ mod tests {
             vec![(Representation::Main, None), (Representation::Sub, None)]
         );
     }
+
+    // ---- sources, driven without a camera: local files and empty states ----
+
+    use crate::cloud::media_publish::{encoded_channel, EncodedFeed};
+    use crate::config::AppConfig;
+    use crate::pipeline::hwaccel::HwAccelKind;
+    use crate::streams::testing::CameraFile;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn state_with(cameras: Vec<CameraConfig>) -> Arc<RwLock<AppState>> {
+        let config = AppConfig {
+            cameras,
+            ..AppConfig::default()
+        };
+        let path = std::env::temp_dir().join(format!(
+            "neurowatch-live-publish-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        Arc::new(RwLock::new(AppState::new(
+            config,
+            path,
+            HwAccelKind::Software,
+        )))
+    }
+
+    fn channel() -> (Arc<EncodedSubmitter>, EncodedFeed) {
+        gstreamer::init().unwrap();
+        let (submitter, feed) = encoded_channel();
+        (Arc::new(submitter), feed)
+    }
+
+    fn file_camera(fixture: &CameraFile) -> CameraConfig {
+        let mut camera = fixture.camera.clone();
+        camera.id = "cam-1".into();
+        camera
+    }
+
+    fn avcc() -> Vec<u8> {
+        let sps = [0x67u8, 0x42, 0x00, 0x1e];
+        let pps = [0x68u8, 0xce, 0x3c];
+        let mut data = vec![1, 0x42, 0x00, 0x1e, 0xff, 0xe1, 0, sps.len() as u8];
+        data.extend_from_slice(&sps);
+        data.extend_from_slice(&[1, 0, pps.len() as u8]);
+        data.extend_from_slice(&pps);
+        data
+    }
+
+    fn h264_caps(width: i32) -> gstreamer::Caps {
+        gstreamer::init().unwrap();
+        gstreamer::Caps::builder("video/x-h264")
+            .field("stream-format", "avc")
+            .field("alignment", "au")
+            .field("width", width)
+            .field("height", 360i32)
+            .field("codec_data", gstreamer::Buffer::from_slice(avcc()))
+            .build()
+    }
+
+    fn shared(caps: gstreamer::Caps, media: Media, data: Vec<u8>, delta: bool) -> SharedUnit {
+        let mut buffer = gstreamer::Buffer::from_slice(data);
+        {
+            let buffer = buffer.get_mut().unwrap();
+            buffer.set_pts(gstreamer::ClockTime::from_mseconds(40));
+            if delta {
+                buffer.set_flags(gstreamer::BufferFlags::DELTA_UNIT);
+            }
+        }
+        SharedUnit {
+            media,
+            buffer,
+            caps,
+            arrived_us: 1_234,
+            frame: None,
+        }
+    }
+
+    #[test]
+    fn a_hub_unit_becomes_an_annexb_access_unit_with_its_timing() {
+        let caps = h264_caps(640);
+        let converter = AnnexB::from_caps(&caps).unwrap();
+        // One IDR slice with a 4-byte length prefix.
+        let data = vec![0, 0, 0, 3, 0x65, 0x88, 0x84];
+        let key = access_unit(&converter, &shared(caps.clone(), Media::Video, data, false))
+            .expect("a keyframe converts");
+        assert!(key.keyframe);
+        assert_eq!((key.width, key.height), (640, 360));
+        assert_eq!(key.codec, VideoCodec::H264);
+        assert_eq!(key.timestamp_us, 1_234);
+        assert_eq!(key.pts_us, Some(40_000));
+        // Parameter sets come first, then the slice.
+        assert_eq!(&key.payload[..5], &[0, 0, 0, 1, 0x67]);
+        assert!(key.payload.ends_with(&[0, 0, 0, 1, 0x65, 0x88, 0x84]));
+
+        let data = vec![0, 0, 0, 3, 0x41, 0x9a, 0x02];
+        let delta = access_unit(&converter, &shared(caps, Media::Video, data, true)).unwrap();
+        assert!(!delta.keyframe);
+        assert_eq!(delta.payload, vec![0, 0, 0, 1, 0x41, 0x9a, 0x02]);
+    }
+
+    #[test]
+    fn a_malformed_unit_or_an_unsized_stream_gives_no_access_unit() {
+        let caps = h264_caps(640);
+        let converter = AnnexB::from_caps(&caps).unwrap();
+        // The length prefix claims more than there is.
+        let torn = shared(caps, Media::Video, vec![0, 0, 0, 9, 0x65], false);
+        assert!(access_unit(&converter, &torn).is_none());
+
+        let unsized_caps = h264_caps(0);
+        let converter = AnnexB::from_caps(&unsized_caps).unwrap();
+        let unit = shared(
+            unsized_caps,
+            Media::Video,
+            vec![0, 0, 0, 3, 0x65, 0x88, 0x84],
+            false,
+        );
+        assert!(access_unit(&converter, &unit).is_none());
+    }
+
+    #[test]
+    fn source_runs_stop_by_flag_and_on_drop() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let shared_run = SharedRun(Arc::clone(&flag));
+        shared_run.stop();
+        assert!(flag.load(Ordering::Relaxed));
+
+        let flag = Arc::new(AtomicBool::new(false));
+        drop(SharedRun(Arc::clone(&flag)));
+        assert!(flag.load(Ordering::Relaxed), "dropping stops the source");
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let (audio_stop, audio_rx) = watch::channel(false);
+        drop(SourceRun(Arc::clone(&flag), audio_stop));
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(*audio_rx.borrow(), "the audio connection is told to stop");
+    }
+
+    #[test]
+    fn sound_in_a_codec_nobody_reads_is_given_up_on_once() {
+        gstreamer::init().unwrap();
+        let (units, _feed) = channel();
+        let caps = gstreamer::Caps::builder("audio/x-nw-unknown").build();
+        let unit = shared(caps, Media::Audio, vec![0; 16], false);
+        let mut sound = Sound::default();
+        sound.push(&unit, &units, "cam-1");
+        assert!(sound.failed);
+        assert!(sound.decoder.is_none());
+        // Not retried for every unit.
+        sound.push(&unit, &units, "cam-1");
+        assert!(sound.failed);
+        sound.reset();
+        assert!(sound.decoder.is_none());
+    }
+
+    #[test]
+    fn camera_sound_is_decoded_into_the_publications_audio() {
+        gstreamer::init().unwrap();
+        let (units, feed) = channel();
+        let mut audio = feed.take_audio().unwrap();
+        let caps = gstreamer::Caps::builder("audio/x-mulaw")
+            .field("rate", 8000i32)
+            .field("channels", 1i32)
+            .build();
+        let mut sound = Sound::default();
+        let mut got = false;
+        let rt = runtime();
+        for index in 0..50u64 {
+            let mut unit = shared(caps.clone(), Media::Audio, vec![0xff; 160], false);
+            unit.buffer
+                .get_mut()
+                .unwrap()
+                .set_pts(gstreamer::ClockTime::from_mseconds(index * 20));
+            sound.push(&unit, &units, "cam-1");
+            if let Ok(Some(samples)) = rt.block_on(async {
+                tokio::time::timeout(Duration::from_millis(100), audio.recv()).await
+            }) {
+                assert!(!samples.is_empty());
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "decoded samples reach the audio queue");
+        assert!(sound.decoder.is_some());
+        // A change of caps rebuilds the decoder; a restart drops it.
+        let other = gstreamer::Caps::builder("audio/x-alaw")
+            .field("rate", 8000i32)
+            .field("channels", 1i32)
+            .build();
+        sound.push(
+            &shared(other, Media::Audio, vec![0xd5; 160], false),
+            &units,
+            "cam-1",
+        );
+        assert!(sound.decoder.is_some());
+        sound.reset();
+        assert!(sound.decoder.is_none());
+    }
+
+    #[test]
+    fn opening_a_stream_the_camera_does_not_have_is_refused() {
+        let mut sub_less = camera("rtsp://127.0.0.1:9/main", None);
+        sub_less.id = "cam-1".into();
+        let mut mjpeg = camera("http://127.0.0.1:9/mjpeg", None);
+        mjpeg.id = "cam-2".into();
+        let state = state_with(vec![sub_less, mjpeg]);
+        let opener = CameraLiveSourceOpener::new(state, Arc::new(StreamCodecs::default()));
+        let (units, _feed) = channel();
+        let refused = |camera: &str, representation| {
+            opener
+                .open(camera, representation, Arc::clone(&units))
+                .err()
+        };
+        assert_eq!(
+            refused("missing", Representation::Main),
+            Some(PublishError::StreamUnavailable)
+        );
+        assert_eq!(
+            refused("cam-1", Representation::Sub),
+            Some(PublishError::StreamUnavailable)
+        );
+        assert_eq!(
+            refused("cam-2", Representation::Main),
+            Some(PublishError::UnsupportedSource)
+        );
+    }
+
+    #[test]
+    fn a_source_for_a_camera_that_vanished_fails_its_publication() {
+        let state = state_with(Vec::new());
+        let (units, feed) = channel();
+        let source = SharedSource {
+            state,
+            codecs: Arc::new(StreamCodecs::default()),
+            camera_id: "gone".into(),
+            representation: Representation::Main,
+            units,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        source.run();
+        assert_eq!(feed.failure(), Some(PublishError::StreamUnavailable));
+    }
+
+    #[test]
+    fn a_source_for_an_unforwardable_stream_fails_its_publication() {
+        let mut mjpeg = camera("http://127.0.0.1:9/mjpeg", None);
+        mjpeg.id = "cam-1".into();
+        let (units, feed) = channel();
+        let source = SharedSource {
+            state: state_with(vec![mjpeg]),
+            codecs: Arc::new(StreamCodecs::default()),
+            camera_id: "cam-1".into(),
+            representation: Representation::Main,
+            units,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        source.run();
+        assert_eq!(feed.failure(), Some(PublishError::UnsupportedSource));
+    }
+
+    #[test]
+    fn a_stopped_source_forwards_nothing() {
+        let (units, feed) = channel();
+        let source = SharedSource {
+            state: state_with(Vec::new()),
+            codecs: Arc::new(StreamCodecs::default()),
+            camera_id: "cam-1".into(),
+            representation: Representation::Main,
+            units,
+            stop: Arc::new(AtomicBool::new(true)),
+        };
+        source.run();
+        assert_eq!(feed.failure(), None);
+    }
+
+    #[test]
+    fn the_shared_connection_feeds_a_publication_and_records_the_codec() {
+        let fixture = CameraFile::new(250);
+        let camera = file_camera(&fixture);
+        let state = state_with(vec![camera.clone()]);
+        let codecs = Arc::new(StreamCodecs::default());
+        let opener = CameraLiveSourceOpener::new(state, Arc::clone(&codecs));
+        let (units, feed) = channel();
+        let run = opener
+            .open("cam-1", Representation::Main, Arc::clone(&units))
+            .unwrap_or_else(|_| panic!("a file stream can be forwarded"));
+        let rt = runtime();
+        let first = rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(20), feed.next()).await })
+            .expect("a picture arrives")
+            .expect("the feed is open");
+        assert!(first.keyframe, "a viewer starts at a keyframe");
+        assert_eq!(first.codec, VideoCodec::H264);
+        assert_eq!((first.width, first.height), (320, 240));
+        assert!(first.payload.starts_with(&[0, 0, 0, 1]));
+        assert_eq!(
+            codecs.live_streams(&camera),
+            vec![(Representation::Main, Some(VideoCodec::H264))]
+        );
+        run.stop();
+    }
+
+    #[test]
+    fn a_dedicated_source_forwards_a_file_until_it_ends() {
+        let fixture = CameraFile::new(25);
+        let camera = file_camera(&fixture);
+        let codecs = Arc::new(StreamCodecs::default());
+        let (units, feed) = channel();
+        let source = DedicatedSource {
+            state: state_with(vec![camera.clone()]),
+            codecs: Arc::clone(&codecs),
+            camera_id: "cam-1".into(),
+            representation: Representation::Main,
+            units,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let (found, url) = source.camera().unwrap();
+        assert_eq!(url, camera.url);
+        assert_eq!(found.url, url);
+        let outcome = source.attempt();
+        assert!(
+            matches!(
+                outcome,
+                Attempt::Failed {
+                    delivered_units: true
+                }
+            ),
+            "the end of the file is a failed connection that delivered"
+        );
+        assert_eq!(
+            codecs.live_streams(&camera),
+            vec![(Representation::Main, Some(VideoCodec::H264))]
+        );
+        let rt = runtime();
+        let first = rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), feed.next()).await })
+            .unwrap()
+            .unwrap();
+        assert!(first.keyframe);
+    }
+
+    #[test]
+    fn a_dedicated_source_stops_or_gives_up_without_retrying() {
+        let stopped = DedicatedSource {
+            state: state_with(Vec::new()),
+            codecs: Arc::new(StreamCodecs::default()),
+            camera_id: "cam-1".into(),
+            representation: Representation::Main,
+            units: channel().0,
+            stop: Arc::new(AtomicBool::new(true)),
+        };
+        assert!(matches!(stopped.attempt(), Attempt::Stopped));
+        stopped.run();
+
+        let (units, feed) = channel();
+        let gone = DedicatedSource {
+            state: state_with(Vec::new()),
+            codecs: Arc::new(StreamCodecs::default()),
+            camera_id: "gone".into(),
+            representation: Representation::Sub,
+            units,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(matches!(
+            gone.attempt(),
+            Attempt::GaveUp(PublishError::StreamUnavailable)
+        ));
+        gone.run();
+        assert_eq!(feed.failure(), Some(PublishError::StreamUnavailable));
+
+        // A source that is no compressed stream at all.
+        let mut mjpeg = camera("http://127.0.0.1:9/mjpeg", None);
+        mjpeg.id = "cam-1".into();
+        let (units, feed) = channel();
+        let unsupported = DedicatedSource {
+            state: state_with(vec![mjpeg]),
+            codecs: Arc::new(StreamCodecs::default()),
+            camera_id: "cam-1".into(),
+            representation: Representation::Main,
+            units,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        unsupported.run();
+        assert_eq!(feed.failure(), Some(PublishError::UnsupportedSource));
+    }
 }

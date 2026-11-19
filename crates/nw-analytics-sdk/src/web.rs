@@ -285,4 +285,220 @@ mod tests {
             )
             .is_err());
     }
+
+    fn request_for(
+        user: &web::SignedUser,
+        path: &str,
+        method: &str,
+        body_b64: &str,
+    ) -> web::Request {
+        web::Request {
+            path: path.into(),
+            method: method.into(),
+            content_type: String::new(),
+            body_b64: body_b64.into(),
+            user: user.clone(),
+        }
+    }
+
+    fn ok(body: Vec<u8>) -> Result<HttpResponse, RpcError> {
+        Ok(HttpResponse {
+            status: 200,
+            content_type: "text/plain".into(),
+            body,
+        })
+    }
+
+    #[test]
+    fn responses_and_paths_have_helpers_and_limits() {
+        let page = HttpResponse::html("<p>hi</p>");
+        assert_eq!(page.status, 200);
+        assert_eq!(page.content_type, "text/html; charset=utf-8");
+        assert_eq!(page.body, b"<p>hi</p>");
+        let data = HttpResponse::json(&serde_json::json!({"a": 1}));
+        assert_eq!(data.content_type, "application/json");
+        assert_eq!(data.body, br#"{"a":1}"#);
+        assert!(valid_path("/ok?x=1"));
+        for bad in [
+            "",
+            "ok",
+            "//host",
+            "/a\\b",
+            "/a\nb",
+            &format!("/{}", "a".repeat(2048)),
+        ] {
+            assert!(!valid_path(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn requests_are_refused_unless_signed_valid_and_within_limits() {
+        let node = SigningKey::from_bytes(&[1; 32]);
+        let plugin = identity::public_key(&SigningKey::from_bytes(&[2; 32]));
+        let public = identity::public_key(&node);
+        let signed = user(&node, &plugin, "viewer-a", vec![]);
+        let mut service = Service::default();
+        let call = |service: &mut Service,
+                    method: &str,
+                    params: serde_json::Value,
+                    now: i64,
+                    reply: Result<HttpResponse, RpcError>| {
+            service.dispatch(method, params, &public, &plugin, now, move |_| reply)
+        };
+        let message = |result: Result<serde_json::Value, RpcError>| {
+            let error = result.unwrap_err();
+            (error.code, error.message)
+        };
+        // Expired viewer context.
+        let (code, _) = message(call(
+            &mut service,
+            "web.request",
+            serde_json::json!(request_for(&signed, "/", "GET", "")),
+            500,
+            ok(vec![]),
+        ));
+        assert_eq!(code, -32602);
+        // Bad path, bad method, bad base64, oversized body.
+        for request in [
+            request_for(&signed, "//x", "GET", ""),
+            request_for(&signed, "/", "TRACE", ""),
+            request_for(&signed, "/", "POST", &"A".repeat(web::CHUNK * 4 / 3 + 5)),
+        ] {
+            let (_, text) = message(call(
+                &mut service,
+                "web.request",
+                serde_json::json!(request),
+                100,
+                ok(vec![]),
+            ));
+            assert_eq!(text, "Invalid HTTP request");
+        }
+        let (_, text) = message(call(
+            &mut service,
+            "web.request",
+            serde_json::json!(request_for(&signed, "/", "POST", "***")),
+            100,
+            ok(vec![]),
+        ));
+        assert_eq!(text, "Invalid request body");
+        // The plugin's own errors pass through; its bad responses are refused.
+        let (code, _) = message(call(
+            &mut service,
+            "web.request",
+            serde_json::json!(request_for(&signed, "/", "GET", "")),
+            100,
+            Err(RpcError::new(-32000, "boom")),
+        ));
+        assert_eq!(code, -32000);
+        for bad in [
+            HttpResponse {
+                status: 99,
+                content_type: "text/plain".into(),
+                body: vec![],
+            },
+            HttpResponse {
+                status: 200,
+                content_type: "text/\nplain".into(),
+                body: vec![],
+            },
+            HttpResponse {
+                status: 200,
+                content_type: "x".repeat(129),
+                body: vec![],
+            },
+            HttpResponse {
+                status: 200,
+                content_type: "t\u{e9}xt".into(),
+                body: vec![],
+            },
+            HttpResponse {
+                status: 200,
+                content_type: "text/plain".into(),
+                body: vec![0; web::MAX_BODY + 1],
+            },
+        ] {
+            let (_, text) = message(call(
+                &mut service,
+                "web.request",
+                serde_json::json!(request_for(&signed, "/", "GET", "")),
+                100,
+                Ok(bad),
+            ));
+            assert_eq!(text, "Plugin response exceeds ingress limits");
+        }
+        // Unknown methods and unreadable parameters.
+        let (code, _) = message(call(
+            &mut service,
+            "web.nope",
+            serde_json::json!({}),
+            100,
+            ok(vec![]),
+        ));
+        assert_eq!(code, -32601);
+        let (code, _) = message(call(
+            &mut service,
+            "web.read",
+            serde_json::json!({}),
+            100,
+            ok(vec![]),
+        ));
+        assert_eq!(code, -32602);
+    }
+
+    #[test]
+    fn stored_pages_are_limited_in_number_and_read_within_bounds() {
+        let node = SigningKey::from_bytes(&[1; 32]);
+        let plugin = identity::public_key(&SigningKey::from_bytes(&[2; 32]));
+        let public = identity::public_key(&node);
+        let signed = user(&node, &plugin, "viewer-a", vec![]);
+        let mut service = Service::default();
+        let mut tokens = Vec::new();
+        for _ in 0..20 {
+            let reply = service
+                .dispatch(
+                    "web.request",
+                    serde_json::json!(request_for(&signed, "/", "GET", "")),
+                    &public,
+                    &plugin,
+                    100,
+                    |_| ok(b"page".to_vec()),
+                )
+                .unwrap();
+            let reply: web::Response = serde_json::from_value(reply).unwrap();
+            assert_eq!(reply.size, 4);
+            tokens.push(reply.token);
+        }
+        assert!(service.bodies.len() <= 16, "at most 16 pages are kept");
+        let read = |service: &mut Service, token: &str, offset: usize| {
+            service.dispatch(
+                "web.read",
+                serde_json::json!(web::Read {
+                    token: token.into(),
+                    offset,
+                    user: signed.clone(),
+                }),
+                &public,
+                &plugin,
+                100,
+                |_| unreachable!(),
+            )
+        };
+        let last = tokens.last().unwrap();
+        let whole = read(&mut service, last, 0).unwrap();
+        assert_eq!(whole["eof"], true);
+        assert_eq!(
+            STANDARD
+                .decode(whole["data_b64"].as_str().unwrap())
+                .unwrap(),
+            b"page"
+        );
+        let tail = read(&mut service, last, 4).unwrap();
+        assert_eq!(tail["eof"], true);
+        assert_eq!(tail["data_b64"], "");
+        assert_eq!(
+            read(&mut service, last, 5).unwrap_err().message,
+            "Invalid body offset"
+        );
+        assert!(read(&mut service, "unknown", 0).is_err());
+    }
 }

@@ -498,4 +498,88 @@ mod tests {
         // The writer observes channel closure asynchronously.
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn prune_keeps_what_the_recordings_still_cover() {
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let history = History::new(db).unwrap();
+        let now_us = crate::events::now_ms() * 1000;
+        assert!(history.offer(record("a", 1_000_000)));
+        assert!(history.offer(record("a", now_us)));
+        assert!(history.offer(record("b", 1_000_000)));
+        assert!(history.offer(record("b", now_us)));
+        assert!(history.flush());
+        // `a` has footage from now on; `b` has none (a day back is kept).
+        let mut earliest = std::collections::HashMap::new();
+        earliest.insert("a".to_owned(), crate::events::now_ms());
+        assert_eq!(history.prune(&earliest).unwrap(), 2);
+        let left = history.list("a", 0, i64::MAX, None, PAGE).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].time_us, now_us);
+        assert_eq!(history.list("b", 0, i64::MAX, None, PAGE).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn oversized_drawings_are_refused_and_other_databases_get_a_sibling_file() {
+        let mut big = record("a", 1);
+        big.layer = "x".repeat(MAX_RECORD_BYTES);
+        let dir = std::env::temp_dir().join(format!("nw-history-other-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let db = Arc::new(Mutex::new(Connection::open(dir.join("other.db")).unwrap()));
+        let history = History::new(db).unwrap();
+        assert!(!history.offer(big));
+        assert!(dir.join("other.overlays.db").is_file());
+        assert!(history.flush());
+    }
+
+    #[test]
+    fn a_sidecar_pages_through_more_rows_than_one_page_and_reports_none() {
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let history = History::new(db).unwrap();
+        let path = std::env::temp_dir().join(format!("nw-drawings-{}.jsonl", uuid::Uuid::new_v4()));
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        // Nothing to export: no file and `false`.
+        assert!(!history
+            .write_sidecar(&path, "a", 0, 10_000, &cancel)
+            .unwrap());
+        assert!(!path.exists());
+        for i in 0..(PAGE as i64 + 5) {
+            while !history.offer(record("a", 1_000_000 + i)) {
+                assert!(history.flush());
+            }
+        }
+        assert!(!history
+            .write_sidecar(&path, "a", 0, 10_000, &cancel)
+            .unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), PAGE + 5 + 2);
+        let footer: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(footer["drawings"], PAGE + 5);
+        assert_eq!(footer["truncated"], false);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn the_earliest_remaining_segment_per_camera_is_reported() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE segments(camera_id TEXT, start_ts INTEGER, local_deleted INTEGER);
+             INSERT INTO segments VALUES ('a', 500, 0), ('a', 300, 0), ('a', 100, 1), ('b', 900, 0);",
+        )
+        .unwrap();
+        let starts = recording_starts(&conn).unwrap();
+        assert_eq!(starts.get("a"), Some(&300));
+        assert_eq!(starts.get("b"), Some(&900));
+    }
+
+    #[test]
+    fn errors_describe_themselves() {
+        assert!(HistoryError::Unavailable
+            .to_string()
+            .contains("unavailable"));
+        assert!(HistoryError::Cancelled.to_string().contains("cancelled"));
+        let io: HistoryError = std::io::Error::other("disk").into();
+        assert!(io.to_string().contains("disk"));
+    }
 }

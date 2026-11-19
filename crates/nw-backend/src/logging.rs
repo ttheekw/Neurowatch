@@ -511,4 +511,145 @@ mod tests {
             path.display()
         );
     }
+
+    #[test]
+    fn tracing_levels_and_env_filters_are_normalized_for_every_spelling() {
+        for (given, wanted) in [
+            ("Warning", "warn"),
+            ("ERR", "error"),
+            (" off ", "off"),
+            ("info", "info"),
+            ("debug", "debug"),
+            ("log", "trace"),
+            ("trace", "trace"),
+            ("0", "0"),
+            ("1", "1"),
+            ("2", "2"),
+            ("3", "3"),
+            ("4", "4"),
+            ("5", "5"),
+            ("unknown", "warn"),
+        ] {
+            assert_eq!(normalize_tracing_level(given), wanted, "{given}");
+        }
+        assert_eq!(normalize_env_filter("info"), "info");
+        assert_eq!(normalize_env_filter("a=err,b=log,c"), "a=error,b=trace,c");
+        for (given, level) in [
+            ("info", gstreamer::DebugLevel::Info),
+            ("trace", gstreamer::DebugLevel::Log),
+            ("log", gstreamer::DebugLevel::Log),
+        ] {
+            assert_eq!(gst_threshold(given), level);
+        }
+    }
+
+    #[test]
+    fn a_single_file_log_replaces_itself_and_numbered_names_append_the_index() {
+        let dir = temp_dir("single");
+        let path = dir.join("x.log");
+        assert_eq!(numbered(&path, 0), path);
+        assert_eq!(numbered(&path, 2), dir.join("x.log.2"));
+        let mut log = RotatingFile::new(path.clone(), 8, 0);
+        assert_eq!(log.files, 1, "at least one file is kept");
+        log.open().expect("open");
+        log.open().expect("opening twice is harmless");
+        log.write(b"1234567\n").expect("write");
+        log.write(b"abc\n").expect("write rotates");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "abc\n");
+        assert!(!numbered(&path, 1).exists());
+
+        // The writer never fails what is logged, even with the file gone.
+        let shared = Arc::new(Mutex::new(log));
+        let mut writer = DebugWriter(Arc::clone(&shared));
+        assert_eq!(writer.write(b"more\n").expect("write"), 5);
+        writer.flush().expect("flush");
+        let _ = writer.make_writer();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(writer.write(b"lost").expect("write"), 4);
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_opened_reports_it() {
+        let dir = temp_dir("blocked");
+        let blocker = dir.join("file");
+        std::fs::write(&blocker, b"x").expect("write");
+        let mut log = RotatingFile::new(blocker.join("logs").join("x.log"), 10, 2);
+        assert!(log.open().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The only test that sets up the process-wide log (it can be set once).
+    #[test]
+    fn extended_debug_logging_switches_on_and_off_at_once() {
+        let dir = temp_dir("init");
+        std::env::set_var("XDG_STATE_HOME", &dir);
+        std::env::set_var("RUST_LOG", "nw_backend=warning");
+        init(&DebugConfig::default());
+        std::env::remove_var("RUST_LOG");
+        if CONTROL.get().is_none() {
+            // Another test installed a subscriber first: nothing to switch.
+            return;
+        }
+        assert!(!extended());
+        let path = debug_log_path();
+        assert!(path.starts_with(&dir));
+        let read = || std::fs::read_to_string(&path).unwrap_or_default();
+
+        let on = DebugConfig {
+            gst_log: "warn".into(),
+            extended: true,
+        };
+        apply(&on);
+        assert!(extended());
+        tracing::debug!("debug line while extended");
+        assert!(
+            read().contains("Extended debug logging is on"),
+            "{}",
+            read()
+        );
+        assert!(read().contains("debug line while extended"));
+        apply(&on); // a repeat does nothing
+
+        // GStreamer's messages join the log once GStreamer is up.
+        gstreamer::init().expect("gstreamer");
+        let category = gstreamer::DebugCategory::new(
+            "nw-logging-test",
+            gstreamer::DebugColorFlags::empty(),
+            Some("logging test"),
+        );
+        let verbose = DebugConfig {
+            gst_log: "trace".into(),
+            extended: true,
+        };
+        apply(&verbose);
+        if std::env::var_os("GST_DEBUG").is_none() {
+            gstreamer::error!(category, "gst error line");
+            gstreamer::warning!(category, "gst warning line");
+            gstreamer::fixme!(category, "gst fixme line");
+            gstreamer::info!(category, "gst info line");
+            gstreamer::debug!(category, "gst debug line");
+            gstreamer::log!(category, "gst log line");
+            let text = read();
+            for line in ["gst error line", "gst warning line", "gst fixme line"] {
+                assert!(text.contains(line), "{line} missing from {text}");
+            }
+            for line in ["gst info line", "gst debug line", "gst log line"] {
+                assert!(text.contains(line), "{line} missing from {text}");
+            }
+        }
+        // An unusable level falls back to warnings.
+        apply(&DebugConfig {
+            gst_log: "nonsense".into(),
+            extended: true,
+        });
+
+        apply(&DebugConfig::default());
+        assert!(!extended());
+        let before = read();
+        tracing::debug!("debug line after switching off");
+        assert_eq!(read(), before, "closed: nothing more is written");
+        apply(&DebugConfig::default()); // repeat while off
+        assert!(read().contains("Extended debug logging is off"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

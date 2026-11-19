@@ -5009,4 +5009,106 @@ mod tests {
         assert_eq!(publisher.consumer.0.load(Ordering::SeqCst), 1);
         assert_eq!(publisher.bridge.0.load(Ordering::SeqCst), 1);
     }
+
+    #[test]
+    fn the_grant_consumer_is_built_only_for_a_public_https_control_plane() {
+        let bearer = || "b".repeat(32);
+        for refused in [
+            "not a url",
+            "http://cloud.example.com/",
+            "https://127.0.0.1/",
+            "https://10.0.0.5/",
+        ] {
+            assert!(
+                matches!(
+                    HttpGrantConsumer::new(refused, bearer()),
+                    Err(PublishError::Unconfigured)
+                ),
+                "{refused} is refused"
+            );
+        }
+        assert!(matches!(
+            HttpGrantConsumer::new("https://cloud.example.com/", "short".into()),
+            Err(PublishError::Unconfigured)
+        ));
+        let consumer = HttpGrantConsumer::new("https://cloud.example.com/api/", bearer())
+            .unwrap_or_else(|_| panic!("a public https endpoint is accepted"));
+        assert_eq!(
+            consumer.url.as_str(),
+            "https://cloud.example.com/api/v1/media/grant-consumptions"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_track_without_a_data_channel_or_audio_has_inert_defaults() {
+        let closes = std::sync::Arc::new(AtomicUsize::new(0));
+        let track = CloseCountingTrack(std::sync::Arc::clone(&closes));
+        assert!(track.frame_timings().is_empty());
+        assert!(!track.take_keyframe_request());
+        assert_eq!(track.viewer_attached(), None);
+        assert_eq!(track.negotiated_codec().await, None);
+        assert!(track.take_messages().is_none());
+        assert_eq!(track.send_data(vec![1]).await, Ok(()));
+        assert_eq!(track.send_topic(OVERLAY_TOPIC, vec![1]).await, Ok(()));
+        assert!(matches!(track.publish_audio().await, Ok(None)));
+        track.close().await;
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_unit_past_the_queue_byte_budget_waits_for_the_next_keyframe() {
+        let (submitter, feed) = encoded_channel();
+        let mut huge = unit(1, true);
+        huge.payload = vec![0; ENCODED_QUEUE_BYTES + 1];
+        assert_eq!(submitter.submit(huge), SubmitOutcome::DroppedQueueFull);
+        assert_eq!(submitter.dropped(), 1);
+        assert_eq!(submitter.last_timestamp_us(), None);
+        // Dependent pictures are dropped until a keyframe fits.
+        assert_eq!(
+            submitter.submit(unit(2, false)),
+            SubmitOutcome::DroppedQueueFull
+        );
+        assert_eq!(submitter.submit(unit(3, true)), SubmitOutcome::Queued);
+        assert_eq!(submitter.last_timestamp_us(), Some(3));
+        assert_eq!(drain(&feed).await, vec![3]);
+        // Empty sound is not queued; sound is, until the feed goes away.
+        submitter.submit_audio(Vec::new());
+        submitter.submit_audio(vec![1, 2]);
+        let mut audio = feed.take_audio().unwrap();
+        assert_eq!(audio.recv().await, Some(vec![1, 2]));
+        assert!(feed.take_audio().is_none(), "taken once");
+        drop(feed);
+        assert_eq!(submitter.submit(unit(4, true)), SubmitOutcome::Closed);
+    }
+
+    #[test]
+    fn packetized_frames_are_matched_to_their_identity_once() {
+        let identity = |seq: u64| nw_core::frame::FrameIdentity {
+            seq,
+            time_us: 1_000 + seq as i64,
+            ..Default::default()
+        };
+        let mut frames = FrameTimings::default();
+        frames.submit(identity(1));
+        frames.submit(identity(2));
+        // An unknown frame is ignored.
+        frames.packetized(5, 9, 90);
+        assert!(frames.sent.is_empty());
+        frames.packetized(1_002, 2, 7_000);
+        assert_eq!(frames.sent.len(), 1);
+        assert_eq!(frames.sent[0].rtp_timestamp, 7_000);
+        assert_eq!(frames.sent[0].identity.seq, 2);
+        // The same one is not matched twice.
+        frames.packetized(1_002, 2, 7_001);
+        assert_eq!(frames.sent.len(), 1);
+        assert_eq!(frames.pending.len(), 1);
+        for seq in 10..700 {
+            frames.submit(identity(seq));
+        }
+        assert_eq!(frames.pending.len(), 512, "pending frames are bounded");
+        for seq in 600..700 {
+            frames.packetized(1_000 + seq, seq as u32, seq as u32);
+        }
+        assert_eq!(frames.sent.len(), 96, "sent frames are bounded");
+    }
 }

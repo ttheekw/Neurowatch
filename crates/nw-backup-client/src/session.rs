@@ -597,4 +597,591 @@ mod tests {
             );
         }
     }
+
+    // ------------------------------------------------------------------
+    // Sessions against a scripted stand-in ingest (TLS over TCP, loopback)
+    // ------------------------------------------------------------------
+
+    use crate::{tls_config, AssignFuture, Backup, Config, Status};
+    use ed25519_dalek::SigningKey;
+    use nw_backup_protocol::{
+        frame::{self, flags, MediaUnit},
+        messages::{
+            Ack, Codec, Move, Refused, TicketAccepted, TrackFormat, TrackKind, TrackOpened,
+            TrackRefusal, TrackRefused, Welcome,
+        },
+        ranges::SeqRange,
+        ALPN,
+    };
+    use std::sync::{atomic::AtomicUsize, Mutex};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// What the stand-in does after a message from the recorder.
+    enum Reply {
+        Send(Vec<ServerMessage>),
+        /// Garbage where a control message belongs.
+        Garbage,
+        /// Hang up.
+        Close,
+        Nothing,
+    }
+
+    /// `(connection number, message)` to what to do.
+    type Script = Arc<dyn Fn(usize, &ClientMessage) -> Reply + Send + Sync>;
+
+    #[derive(Default)]
+    struct Seen {
+        names: Mutex<Vec<String>>,
+        connections: AtomicUsize,
+    }
+
+    impl Seen {
+        fn count(&self, name: &str) -> usize {
+            self.names
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|n| *n == name)
+                .count()
+        }
+    }
+
+    fn welcome() -> ServerMessage {
+        ServerMessage::Welcome(Welcome {
+            session_id: "s".into(),
+            server_time_ms: 1_790_000_000_000,
+            ack_interval_ms: 100,
+            max_tracks: 8,
+            instance_proof: None,
+        })
+    }
+
+    fn opened(track: u32) -> ServerMessage {
+        ServerMessage::TrackOpened(TrackOpened {
+            track,
+            durable: vec![],
+        })
+    }
+
+    fn base64url(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+            for i in 0..=chunk.len() {
+                out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+        }
+        out
+    }
+
+    fn now_ms() -> i64 {
+        now_us() / 1000
+    }
+
+    /// A ticket naming `cam-1` (the stand-in does not check signatures).
+    fn ticket_text(life_ms: i64, retention_s: u32) -> String {
+        let claims = serde_json::json!({
+            "v": 1, "id": "t", "org_id": "org", "node_id": "node",
+            "node_key": "00".repeat(32), "audience": "localhost",
+            "issued_at_ms": now_ms(), "expires_at_ms": now_ms() + life_ms,
+            "cameras": [{"camera_id": "cam-1", "retention_s": retention_s,
+                         "limits": {"max_long_side": 1920, "max_short_side": 1080,
+                                    "max_fps": 30.0, "max_bitrate_bps": 4000000}}]
+        });
+        format!(
+            "{}.{}",
+            base64url(claims.to_string().as_bytes()),
+            "00".repeat(64)
+        )
+    }
+
+    fn h264() -> TrackFormat {
+        TrackFormat {
+            codec: Codec::H264,
+            width: Some(1920),
+            height: Some(1080),
+            sample_rate: None,
+            channels: None,
+            codec_data: None,
+        }
+    }
+
+    fn unit(seq: u64, time_us: i64) -> MediaUnit {
+        MediaUnit {
+            media: MediaKind::Video,
+            flags: if seq == 1 { flags::KEYFRAME } else { 0 },
+            track: 0,
+            seq,
+            time_us,
+            pts_ns: Some(seq * 40_000_000),
+            dts_ns: None,
+            data: vec![0, 0, 0, 1, 0x65, seq as u8],
+        }
+    }
+
+    async fn read_frame(input: &mut (impl AsyncRead + Unpin)) -> Option<Frame> {
+        let mut prefix = [0u8; frame::PREFIX_BYTES];
+        input.read_exact(&mut prefix).await.ok()?;
+        let mut body = vec![0u8; frame::body_length(prefix).ok()?];
+        input.read_exact(&mut body).await.ok()?;
+        frame::decode_body(&body).ok()
+    }
+
+    async fn ingest(script: Script) -> (u16, Vec<u8>, Arc<Seen>) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert = certified.cert.der().to_vec();
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let mut server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone().into()], key)
+        .unwrap();
+        server.alpn_protocols = vec![ALPN.to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Seen::default());
+        let shared = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    continue;
+                };
+                let connection = shared.connections.fetch_add(1, Ordering::SeqCst);
+                let (script, seen) = (Arc::clone(&script), Arc::clone(&shared));
+                tokio::spawn(async move {
+                    let (mut input, mut output) = tokio::io::split(tls);
+                    while let Some(frame) = read_frame(&mut input).await {
+                        let Frame::Message(json) = frame else {
+                            continue;
+                        };
+                        let Ok(message) = messages::decode::<ClientMessage>(&json) else {
+                            continue;
+                        };
+                        let name = serde_json::to_value(&message).unwrap()["type"]
+                            .as_str()
+                            .unwrap_or("?")
+                            .to_owned();
+                        seen.names.lock().unwrap().push(name);
+                        let mut bytes = Vec::new();
+                        match script(connection, &message) {
+                            Reply::Send(replies) => {
+                                for reply in replies {
+                                    frame::encode_message(&mut bytes, &messages::encode(&reply))
+                                        .unwrap();
+                                }
+                            }
+                            Reply::Garbage => {
+                                frame::encode_message(&mut bytes, b"{this is not json").unwrap();
+                            }
+                            Reply::Close => return,
+                            Reply::Nothing => continue,
+                        }
+                        if output.write_all(&bytes).await.is_err() || output.flush().await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, cert, seen)
+    }
+
+    fn script(f: impl Fn(usize, &ClientMessage) -> Reply + Send + Sync + 'static) -> Script {
+        Arc::new(f)
+    }
+
+    /// A script that welcomes and opens tracks, and lets `then` decide the rest.
+    fn friendly(
+        then: impl Fn(usize, &ClientMessage) -> Option<Reply> + Send + Sync + 'static,
+    ) -> Script {
+        Arc::new(move |connection, message| {
+            if let Some(reply) = then(connection, message) {
+                return reply;
+            }
+            match message {
+                ClientMessage::Hello(_) => Reply::Send(vec![welcome()]),
+                ClientMessage::OpenTrack(open) => Reply::Send(vec![opened(open.track)]),
+                ClientMessage::Ping(ping) => Reply::Send(vec![ServerMessage::Pong(ping.clone())]),
+                _ => Reply::Nothing,
+            }
+        })
+    }
+
+    struct Portal {
+        calls: AtomicUsize,
+        answer: Box<dyn Fn(usize) -> Result<crate::Assignment, String> + Send + Sync>,
+    }
+
+    impl crate::Assigner for Portal {
+        fn assign(&self) -> AssignFuture<'_> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let answer = (self.answer)(call);
+            Box::pin(async move { answer })
+        }
+    }
+
+    fn portal(
+        answer: impl Fn(usize) -> Result<crate::Assignment, String> + Send + Sync + 'static,
+    ) -> Arc<Portal> {
+        Arc::new(Portal {
+            calls: AtomicUsize::new(0),
+            answer: Box::new(answer),
+        })
+    }
+
+    fn assignment(port: u16, ticket: String) -> crate::Assignment {
+        crate::Assignment {
+            ticket,
+            server_name: "localhost".into(),
+            quic: None,
+            tcp: Some(format!("127.0.0.1:{port}")),
+            instance_key: None,
+        }
+    }
+
+    fn fixed(port: u16, ticket: impl Fn() -> String + Send + Sync + 'static) -> Arc<Portal> {
+        portal(move |_| Ok(assignment(port, ticket())))
+    }
+
+    fn start(ca: &[u8], portal: Arc<Portal>) -> Backup {
+        Backup::start(
+            Config {
+                node_key: SigningKey::from_bytes(&[7; 32]),
+                recorder: "test".into(),
+                tls: tls_config(Some(ca)).unwrap(),
+                outage_dir: None,
+                memory_bytes_per_track: 1 << 20,
+                disk_bytes_per_track: 0,
+            },
+            portal,
+        )
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    async fn retrying_with(backup: &Backup, text: &str) {
+        until(text, || {
+            let status = backup.status();
+            status.state == "retrying"
+                && status.problem.as_deref().is_some_and(|p| p.contains(text))
+        })
+        .await;
+    }
+
+    #[test]
+    fn refusals_are_explained_and_the_ingests_identity_is_checked() {
+        assert!(refusal_text(RefusalCode::TicketExpired, "x").contains("expired"));
+        assert!(refusal_text(RefusalCode::Busy, "x").contains("busy"));
+        assert_eq!(
+            refusal_text(RefusalCode::BadTicket, "no plan"),
+            "The backup server refused the connection: no plan"
+        );
+        let key = SigningKey::from_bytes(&[3; 32]);
+        let named = |key: Option<String>| crate::Assignment {
+            ticket: "ticket".into(),
+            server_name: "localhost".into(),
+            quic: None,
+            tcp: None,
+            instance_key: key,
+        };
+        let binding = [9u8; 32];
+        let proof = nw_service_protocol::sign_hex(
+            &key,
+            &nw_service_protocol::instance_proof_payload("ticket", &binding),
+        );
+        let public = nw_service_protocol::hex(key.verifying_key().as_bytes());
+        // No key named: the certificate alone identifies the ingest.
+        assert!(proves_instance(&named(None), &binding, None));
+        assert!(proves_instance(
+            &named(Some(public.clone())),
+            &binding,
+            Some(&proof)
+        ));
+        assert!(!proves_instance(
+            &named(Some(public.clone())),
+            &binding,
+            None
+        ));
+        assert!(!proves_instance(
+            &named(Some(public.clone())),
+            &[1u8; 32],
+            Some(&proof)
+        ));
+        assert!(!proves_instance(
+            &named(Some("not hex".into())),
+            &binding,
+            Some(&proof)
+        ));
+    }
+
+    #[tokio::test]
+    async fn problems_before_a_connection_are_reported_in_plain_words() {
+        let (port, ca, _) = ingest(friendly(|_, _| None)).await;
+        // The portal gives no ticket.
+        let backup = start(&ca, portal(|_| Err("portal down".into())));
+        retrying_with(&backup, "No backup ticket: portal down").await;
+        backup.stop().await;
+        // A ticket that cannot be read.
+        let backup = start(&ca, fixed(port, || "garbage".into()));
+        retrying_with(&backup, "could not be read").await;
+        backup.stop().await;
+        // No address to connect to.
+        let backup = start(
+            &ca,
+            portal(|_| {
+                Ok(crate::Assignment {
+                    tcp: None,
+                    ..assignment(1, ticket_text(900_000, 3600))
+                })
+            }),
+        );
+        retrying_with(&backup, "could not be reached").await;
+        backup.stop().await;
+        // Nothing listens at the address.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let backup = start(&ca, fixed(closed, || ticket_text(900_000, 3600)));
+        retrying_with(&backup, "TCP:").await;
+        backup.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_hello_that_is_refused_ignored_or_answered_with_nonsense_fails_the_session() {
+        let ticket = || ticket_text(900_000, 3600);
+        // Hung up on, then answered with garbage, then refused as busy.
+        for (script, expected) in [
+            (script(|_, _| Reply::Close), "did not answer"),
+            (script(|_, _| Reply::Garbage), "did not answer"),
+            (
+                script(|_, _| {
+                    Reply::Send(vec![ServerMessage::Refused(Refused {
+                        code: RefusalCode::Busy,
+                        message: "full".into(),
+                        retry_after_ms: None,
+                    })])
+                }),
+                "busy",
+            ),
+            // A welcome that does not prove the ingest's identity.
+            (
+                script(|_, _| Reply::Send(vec![welcome()])),
+                "prove who it is",
+            ),
+        ] {
+            let (port, ca, _) = ingest(script).await;
+            let backup = start(
+                &ca,
+                portal(move |_| {
+                    let mut named = assignment(port, ticket());
+                    if expected == "prove who it is" {
+                        named.instance_key = Some(nw_service_protocol::hex(
+                            SigningKey::from_bytes(&[5; 32]).verifying_key().as_bytes(),
+                        ));
+                    }
+                    Ok(named)
+                }),
+            );
+            retrying_with(&backup, expected).await;
+            backup.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_track_the_plan_refuses_says_why_and_whether_a_smaller_stream_may_fit() {
+        let script = friendly(|_, message| match message {
+            ClientMessage::OpenTrack(open) => Some(Reply::Send(vec![ServerMessage::TrackRefused(
+                TrackRefused {
+                    track: open.track,
+                    code: TrackRefusal::OverBitrate,
+                    message: "too much data".into(),
+                    retry_after_ms: Some(60_000),
+                },
+            )])),
+            // Messages that need no action of the recorder.
+            ClientMessage::Ping(_) => Some(Reply::Send(vec![
+                ServerMessage::TicketAccepted(TicketAccepted { expires_at_ms: 0 }),
+                ServerMessage::Ack(Ack {
+                    track: 999,
+                    durable: vec![SeqRange(1, 2)],
+                }),
+                ServerMessage::Unknown,
+            ])),
+            _ => None,
+        });
+        let (port, ca, seen) = ingest(script).await;
+        let backup = start(&ca, fixed(port, || ticket_text(900_000, 3600)));
+        let track = backup.track("cam-1", TrackKind::Video, h264());
+        until("the refusal", || track.over_plan()).await;
+        assert_eq!(track.refusal().as_deref(), Some("too much data"));
+        assert_eq!(backup.status().state, "connected");
+        // Not offered again within the retry time.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(seen.count("open_track"), 1);
+        backup.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_ingest_that_moves_the_recorder_gets_a_new_session() {
+        let script = friendly(|connection, message| match message {
+            ClientMessage::OpenTrack(_) if connection == 0 => {
+                Some(Reply::Send(vec![ServerMessage::Move(Move {
+                    reason: "draining".into(),
+                    retry_after_ms: 10,
+                })]))
+            }
+            _ => None,
+        });
+        let (port, ca, seen) = ingest(script).await;
+        let backup = start(&ca, fixed(port, || ticket_text(900_000, 3600)));
+        let _track = backup.track("cam-1", TrackKind::Video, h264());
+        until("connected again", || {
+            backup.status().state == "connected" && seen.count("open_track") >= 2
+        })
+        .await;
+        assert_eq!(backup.status().problem, None);
+        backup.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_ended_by_the_ingest_mid_way_is_retried() {
+        let script = friendly(|connection, message| match message {
+            ClientMessage::OpenTrack(open) if connection == 0 => {
+                // Opens the track, then a refusal ends the session.
+                Some(Reply::Send(vec![
+                    opened(open.track),
+                    ServerMessage::Refused(Refused {
+                        code: RefusalCode::TicketExpired,
+                        message: "old".into(),
+                        retry_after_ms: None,
+                    }),
+                ]))
+            }
+            _ => None,
+        });
+        let (port, ca, seen) = ingest(script).await;
+        let backup = start(&ca, fixed(port, || ticket_text(900_000, 3600)));
+        let _track = backup.track("cam-1", TrackKind::Video, h264());
+        retrying_with(&backup, "expired").await;
+        until("the next session", || seen.count("open_track") >= 2).await;
+        backup.stop().await;
+
+        // A hang-up after opening a track is "the connection was lost".
+        let script = friendly(|_, message| match message {
+            ClientMessage::OpenTrack(open) => Some(Reply::Send(vec![opened(open.track)])),
+            ClientMessage::Ping(_) => Some(Reply::Close),
+            _ => None,
+        });
+        let (port, ca, _) = ingest(script).await;
+        let backup = start(&ca, fixed(port, || ticket_text(900_000, 3600)));
+        let _track = backup.track("cam-1", TrackKind::Video, h264());
+        retrying_with(&backup, "lost").await;
+        backup.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_track_that_goes_away_is_closed_and_units_past_the_window_are_reported_as_a_gap() {
+        let (port, ca, seen) = ingest(friendly(|_, _| None)).await;
+        // Backup window of one second.
+        let backup = start(&ca, fixed(port, || ticket_text(900_000, 1)));
+        let track = backup.track("cam-1", TrackKind::Video, h264());
+        until("the track to open", || seen.count("open_track") == 1).await;
+        track.push(unit(1, now_us() - 120_000_000));
+        until("the gap report", || seen.count("gap") >= 1).await;
+        drop(track);
+        until("the track to close", || seen.count("close_track") == 1).await;
+        backup.stop().await;
+        assert_eq!(seen.count("bye"), 1);
+    }
+
+    #[tokio::test]
+    async fn the_ticket_is_renewed_before_it_expires_on_the_same_ingest() {
+        let script = friendly(|_, message| match message {
+            ClientMessage::Renew(_) => Some(Reply::Send(vec![ServerMessage::TicketAccepted(
+                TicketAccepted { expires_at_ms: 0 },
+            )])),
+            _ => None,
+        });
+        let (port, ca, seen) = ingest(script).await;
+        // A ticket that is about to expire: renewal after the shortest wait.
+        let portal = fixed(port, || ticket_text(1, 3600));
+        let backup = start(&ca, Arc::clone(&portal));
+        until("a renewal", || seen.count("renew") >= 1).await;
+        assert!(portal.calls.load(Ordering::SeqCst) >= 2);
+        assert_eq!(seen.connections.load(Ordering::SeqCst), 1, "no reconnect");
+        backup.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_renewal_that_names_another_ingest_moves_the_session_and_a_failed_one_is_retried() {
+        let (port, ca, seen) = ingest(friendly(|_, _| None)).await;
+        let backup = start(
+            &ca,
+            portal(move |call| {
+                let mut named = assignment(port, ticket_text(1, 3600));
+                if call == 1 {
+                    named.server_name = "elsewhere".into();
+                }
+                Ok(named)
+            }),
+        );
+        // (A session is established once it has pinged: stopping earlier would
+        // go unnoticed until its handshake ends.)
+        until("the move", || seen.count("ping") >= 2).await;
+        backup.stop().await;
+
+        let (port, ca, seen) = ingest(friendly(|_, _| None)).await;
+        let failing = portal(move |call| {
+            if call == 1 {
+                Err("portal busy".into())
+            } else {
+                Ok(assignment(port, ticket_text(1, 3600)))
+            }
+        });
+        let backup = start(&ca, Arc::clone(&failing));
+        until("the failed renewal", || {
+            failing.calls.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            seen.connections.load(Ordering::SeqCst),
+            1,
+            "the session carries on"
+        );
+        assert_eq!(backup.status().state, "connected");
+        backup.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_status_of_a_stopped_backup_keeps_its_last_state() {
+        let (port, ca, _) = ingest(friendly(|_, _| None)).await;
+        let backup = start(&ca, fixed(port, || ticket_text(900_000, 3600)));
+        until("connected", || backup.status().state == "connected").await;
+        let status: Status = backup.status();
+        assert_eq!(status.ingest.as_deref(), Some("localhost"));
+        backup.stop().await;
+    }
 }
