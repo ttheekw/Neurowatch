@@ -100,8 +100,8 @@ jobs:
           if-no-files-found: error
       # Runs after the upload so reports stay available when the gate fails.
       # --fail-under-lines is ignored with --no-report, so enforce it on `report`.
-      - name: Enforce workspace line coverage (>= 80%)
-        run: cargo llvm-cov report --summary-only --fail-under-lines 80
+      - name: Enforce workspace line coverage (>= 85%)
+        run: cargo llvm-cov report --summary-only --fail-under-lines 85
 
   python:
     name: Python — ruff + mypy + pytest

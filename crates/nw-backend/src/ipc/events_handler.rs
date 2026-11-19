@@ -1080,4 +1080,219 @@ mod tests {
         drop(st);
         assert!(handler.onvif_for_test().await.status("cam-1").is_none());
     }
+
+    async fn rejected(handler: &EventsHandler, method: &str, params: Value) -> String {
+        let error = handler.dispatch(method, &params).await.unwrap_err();
+        assert_eq!(error.code, -32602, "{method} {params}: {}", error.message);
+        error.message
+    }
+
+    #[tokio::test]
+    async fn requests_with_badly_typed_parameters_are_refused_with_a_reason() {
+        let (handler, _state, _dir) = handler();
+        for (params, needle) in [
+            (json!({"search": 5}), "'search' must be text"),
+            (json!({"search": "x".repeat(201)}), "'search' must be text"),
+            (json!({"ongoing": "yes"}), "'ongoing' must be a boolean"),
+            (json!({"kinds": "motion"}), "'kinds' must be a list"),
+            (json!({"kinds": [1]}), "'kinds' must be strings"),
+            (json!({"camera_ids": 3}), "'camera_ids' must be a list"),
+            (json!({"before_ms": 5}), "go together"),
+            (json!({"source": 5}), "'source' must be text"),
+            (json!({"source": "nobody"}), "Unknown event source"),
+            (json!({"topic": 5}), "'topic' must be text"),
+            (json!({"topic": "t".repeat(257)}), "'topic' must be text"),
+        ] {
+            let message = rejected(&handler, "events.list", params).await;
+            assert!(message.contains(needle), "{message} / {needle}");
+        }
+        for (method, params, needle) in [
+            ("events.get", json!({}), "Missing 'id'"),
+            ("events.get", json!({"id": 123456}), "Event not found"),
+            ("events.acknowledge", json!({}), "Missing 'ids'"),
+            ("events.delete", json!({"ids": ["a"]}), "must be numbers"),
+            ("events.update_bookmark", json!({}), "Missing 'id'"),
+            (
+                "events.update_bookmark",
+                json!({"id": 1, "kept": "yes"}),
+                "'kept' must be a boolean",
+            ),
+            (
+                "events.update_bookmark",
+                json!({"id": 1, "note": 4}),
+                "'note' must be text",
+            ),
+            (
+                "events.update_bookmark",
+                json!({"id": 999, "note": "x"}),
+                "Bookmark not found",
+            ),
+            (
+                "events.bookmark",
+                json!({"camera_id": 4}),
+                "must be a string",
+            ),
+            ("events.bookmark", json!({"note": 4}), "'note' must be text"),
+            (
+                "events.bookmark",
+                json!({"kept": "x"}),
+                "'kept' must be a boolean",
+            ),
+            ("events.bookmark", json!({"time_ms": -1}), "must be a time"),
+            (
+                "events.bookmark",
+                json!({"time_ms": 1000, "end_ms": 500}),
+                "ends after it starts",
+            ),
+            (
+                "events.bookmark",
+                json!({"time_ms": 1000, "end_ms": 1000 + MAX_BOOKMARK_SPAN_MS + 1}),
+                "within a day",
+            ),
+            ("motion.configure", json!({}), "Missing 'camera_id'"),
+            (
+                "motion.configure",
+                json!({"camera_id": "nope"}),
+                "Camera not found",
+            ),
+            ("camera.onvif.detect", json!({}), "Missing 'id'"),
+            (
+                "camera.onvif.detect",
+                json!({"id": "nope"}),
+                "Camera not found",
+            ),
+            ("snapshot.capture", json!({}), "Missing camera_id"),
+        ] {
+            let message = rejected(&handler, method, params).await;
+            assert!(message.contains(needle), "{method}: {message} / {needle}");
+        }
+        assert_eq!(
+            handler
+                .dispatch("events.nope", &json!({}))
+                .await
+                .unwrap_err()
+                .code,
+            -32601
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_user_may_only_touch_events_of_their_cameras() {
+        use crate::accounts::{Role, Session};
+        let (handler, state, _dir) = handler();
+        {
+            let mut state = state.write().await;
+            let mut other = CameraConfig::new("Back", "rtsp://127.0.0.1:9/back");
+            other.id = "cam-2".into();
+            state.config.cameras.push(other);
+        }
+        let front = handler
+            .dispatch(
+                "events.bookmark",
+                &json!({"camera_id": "cam-1", "time_ms": 10}),
+            )
+            .await
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let back = handler
+            .dispatch(
+                "events.bookmark",
+                &json!({"camera_id": "cam-2", "time_ms": 10}),
+            )
+            .await
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let scoped = Session {
+            username: "ann".into(),
+            role: Role::Operator,
+            cameras: vec!["cam-1".into()],
+        };
+        let everything = Session {
+            cameras: vec![],
+            ..scoped.clone()
+        };
+        let check = |session: &Session, method: &str, params: Value| {
+            let session = session.clone();
+            let method = method.to_owned();
+            let handler = &handler;
+            async move { handler.authorize_ids(&session, &method, &params).await }
+        };
+        check(&scoped, "events.get", json!({"id": front}))
+            .await
+            .unwrap();
+        check(&scoped, "events.thumbnail", json!({"id": front}))
+            .await
+            .unwrap();
+        check(&scoped, "events.delete", json!({"ids": [front]}))
+            .await
+            .unwrap();
+        // An id that does not exist is left to the method itself.
+        check(&scoped, "events.get", json!({"id": 424242}))
+            .await
+            .unwrap();
+        // Methods without ids pass through.
+        check(&scoped, "events.list", json!({})).await.unwrap();
+        for (method, params) in [
+            ("events.get", json!({"id": back})),
+            ("events.update_bookmark", json!({"id": back})),
+            ("events.acknowledge", json!({"ids": [front, back]})),
+            ("events.delete", json!({"ids": [back]})),
+        ] {
+            let denied = check(&scoped, method, params).await.unwrap_err();
+            assert!(denied.message.contains("may not access"), "{method}");
+        }
+        assert!(check(&scoped, "events.get", json!({})).await.is_err());
+        check(&everything, "events.delete", json!({"ids": [back]}))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_event_without_a_picture_has_no_thumbnail_and_open_events_list() {
+        let (handler, _state, _dir) = handler();
+        let mark = handler
+            .dispatch(
+                "events.bookmark",
+                &json!({"camera_id": "cam-1", "time_ms": 10}),
+            )
+            .await
+            .unwrap();
+        let thumb = handler
+            .dispatch("events.thumbnail", &json!({"id": mark["id"]}))
+            .await
+            .unwrap();
+        assert_eq!(thumb, json!({"available": false}));
+        // A span bookmark is still going on until its end is set; one with an
+        // end is not open.
+        let open = handler.dispatch("events.open", &json!({})).await.unwrap();
+        assert!(open["events"].is_array());
+        let waited = handler
+            .dispatch("events.wait", &json!({"timeout_ms": 1}))
+            .await
+            .unwrap();
+        assert!(waited["boot"].is_string() && waited["notices"].is_array());
+    }
+
+    #[tokio::test]
+    async fn motion_status_reports_each_cameras_source_and_active_kinds() {
+        let (handler, _state, _dir) = handler();
+        handler
+            .dispatch(
+                "motion.configure",
+                &json!({"camera_id": "cam-1", "source": "onvif"}),
+            )
+            .await
+            .unwrap();
+        let all = handler.dispatch("motion.status", &json!({})).await.unwrap();
+        assert_eq!(all["cameras"]["cam-1"]["source"], "onvif");
+        assert_eq!(all["cameras"]["cam-1"]["kinds"], json!([]));
+        assert_eq!(all["cameras"]["cam-1"]["active"], json!([]));
+        let none = handler
+            .dispatch("motion.status", &json!({"camera_id": "other"}))
+            .await
+            .unwrap();
+        assert_eq!(none["cameras"], json!({}));
+    }
 }

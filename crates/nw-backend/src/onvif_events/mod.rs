@@ -437,4 +437,101 @@ mod tests {
         cam.motion.source = nw_core::camera::MotionSource::Off;
         assert_ne!(fingerprint(&cam), before);
     }
+
+    #[test]
+    fn percent_escapes_are_decoded_only_when_they_are_whole() {
+        assert_eq!(percent_decode("a%20b%2Fc"), "a b/c");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz%4"), "%zz%4");
+        assert_eq!(percent_decode("%41"), "A");
+        let cam = CameraConfig::new("Cam", "rtsp://onlyuser@10.0.0.2/live");
+        let creds = credentials(&cam).expect("a user without a password");
+        assert_eq!(
+            (creds.username.as_str(), creds.password.as_str()),
+            ("onlyuser", "")
+        );
+        let mut cam = CameraConfig::new("Cam", "rtsp://10.0.0.2/live");
+        cam.username = Some("admin".into());
+        cam.password_b64 = Some("not base64!".into());
+        assert_eq!(
+            credentials(&cam).unwrap().password,
+            "",
+            "an unreadable password is empty"
+        );
+        cam.username = Some(String::new());
+        assert!(
+            credentials(&cam).is_none(),
+            "an empty user falls back to the URL's"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_address_comes_from_the_stream_url_else_the_onvif_service() {
+        let cam = CameraConfig::new("Cam", "rtsp://admin:pw@192.168.7.9:554/live");
+        assert_eq!(
+            camera_address(&cam).await.unwrap(),
+            Ipv4Addr::new(192, 168, 7, 9)
+        );
+        let cam = CameraConfig::new("Cam", "rtsp://localhost/live");
+        assert_eq!(camera_address(&cam).await.unwrap(), Ipv4Addr::LOCALHOST);
+        let mut cam = CameraConfig::new("Cam", "");
+        assert!(matches!(
+            camera_address(&cam).await,
+            Err(OnvifError::Invalid(_))
+        ));
+        cam.onvif = Some(OnvifEndpoint {
+            device_url: "http://10.1.2.3:8080/onvif/device_service".into(),
+            events_url: None,
+            ptz_url: None,
+        });
+        assert_eq!(
+            camera_address(&cam).await.unwrap(),
+            Ipv4Addr::new(10, 1, 2, 3)
+        );
+        // An address with no IPv4 form cannot be pinned.
+        let cam = CameraConfig::new("Cam", "rtsp://[::1]/live");
+        assert!(matches!(
+            camera_address(&cam).await,
+            Err(OnvifError::Unreachable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_camera_nothing_answers_for_is_unreachable() {
+        let free = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let mut cam = CameraConfig::new("Cam", format!("rtsp://127.0.0.1:{free}/live"));
+        cam.onvif = Some(OnvifEndpoint {
+            device_url: format!("http://127.0.0.1:{free}/onvif/device_service"),
+            events_url: None,
+            ptz_url: None,
+        });
+        assert!(matches!(
+            detect(&cam).await,
+            Err(OnvifError::Unreachable(_))
+        ));
+    }
+
+    #[test]
+    fn statuses_are_serialized_for_the_ui_and_start_out_connecting() {
+        let events = OnvifEvents::new();
+        assert!(events.status("cam").is_none());
+        events.update("cam", |status| {
+            status.state = SubscriptionState::Subscribed;
+            status.delivery = Some(Delivery::Push);
+            status
+                .topics
+                .insert("RuleEngine/CellMotionDetector/Motion".into());
+        });
+        let json = serde_json::to_value(events.status("cam").unwrap()).unwrap();
+        assert_eq!(json["state"], "subscribed");
+        assert_eq!(json["delivery"], "push");
+        assert!(json.get("detail").is_none() && json.get("note").is_none());
+        events.forget("cam");
+        assert!(events.status("cam").is_none());
+        assert_eq!(OnvifStatus::default().state, SubscriptionState::Connecting);
+        events.kick();
+    }
 }

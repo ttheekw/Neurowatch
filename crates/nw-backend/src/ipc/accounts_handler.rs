@@ -240,3 +240,277 @@ impl AccountsHandler {
         Ok(Self::view(&self.state.read().await.config.accounts))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::pipeline::hwaccel::HwAccelKind;
+
+    fn handler() -> (AccountsHandler, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("nw-accounts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(RwLock::new(AppState::new(
+            AppConfig::default(),
+            dir.join("config.json"),
+            HwAccelKind::Software,
+        )));
+        (AccountsHandler::new(state), dir)
+    }
+
+    async fn call(h: &AccountsHandler, method: &str, params: Value) -> Result<Value, RpcError> {
+        h.dispatch(method, &params).await
+    }
+
+    fn message(error: &RpcError) -> String {
+        error.message.clone()
+    }
+
+    #[tokio::test]
+    async fn users_are_added_changed_and_removed_without_exposing_hashes() {
+        let (h, dir) = handler();
+        let view = call(&h, "accounts.get", json!({})).await.unwrap();
+        assert_eq!(view["enabled"], false);
+        assert_eq!(view["users"], json!([]));
+
+        // A new user needs a role, a valid password and a valid name.
+        let e = call(&h, "accounts.set_user", json!({"username": "ann"}))
+            .await
+            .unwrap_err();
+        assert!(message(&e).contains("Choose a role"));
+        let e = call(&h, "accounts.set_user", json!({"role": "admin"}))
+            .await
+            .unwrap_err();
+        assert!(message(&e).contains("username"));
+        let e = call(
+            &h,
+            "accounts.set_user",
+            json!({"username": "ann", "role": "admin", "cameras": 5}),
+        )
+        .await
+        .unwrap_err();
+        assert!(message(&e).contains("list of camera ids"));
+        let e = call(
+            &h,
+            "accounts.set_user",
+            json!({"username": "ann", "role": "admin", "password": "short"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(message(&e).contains("at least"));
+        let e = call(
+            &h,
+            "accounts.set_user",
+            json!({"username": "ann", "role": "admin"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(message(&e).contains("needs a password"));
+        let e = call(
+            &h,
+            "accounts.set_user",
+            json!({"username": "bad name!", "role": "admin", "password": "long-enough-1"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(message(&e).contains("invalid or taken"));
+
+        let view = call(
+            &h,
+            "accounts.set_user",
+            json!({"username": " ann ", "role": "admin", "password": "long-enough-1"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view["users"][0]["username"], "ann");
+        assert!(view["users"][0].get("password").is_none());
+        let saved = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        assert!(saved.contains("\"ann\""));
+
+        // Editing keeps the password when none is given and applies the role.
+        let view = call(
+            &h,
+            "accounts.set_user",
+            json!({"username": "ANN", "role": "admin", "cameras": ["c1"], "password": ""}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view["users"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            view["users"][0]["cameras"],
+            json!([]),
+            "admins see every camera"
+        );
+
+        call(
+            &h,
+            "accounts.set_user",
+            json!({"username": "bob", "role": "viewer", "cameras": ["c1"], "password": "another-pass-2"}),
+        )
+        .await
+        .unwrap();
+        let view = call(&h, "accounts.get", json!({})).await.unwrap();
+        assert_eq!(view["users"][1]["cameras"], json!(["c1"]));
+        let e = call(&h, "accounts.remove_user", json!({"username": "zed"}))
+            .await
+            .unwrap_err();
+        assert!(message(&e).contains("user not found"));
+        let e = call(&h, "accounts.remove_user", json!({}))
+            .await
+            .unwrap_err();
+        assert!(message(&e).contains("Missing 'username'"));
+        let view = call(&h, "accounts.remove_user", json!({"username": "BOB"}))
+            .await
+            .unwrap();
+        assert_eq!(view["users"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn sign_in_needs_an_admin_and_sessions_follow_the_user() {
+        let (h, dir) = handler();
+        let e = call(&h, "accounts.set_enabled", json!({}))
+            .await
+            .unwrap_err();
+        assert!(message(&e).contains("Missing 'enabled'"));
+        let e = call(&h, "accounts.set_enabled", json!({"enabled": true}))
+            .await
+            .unwrap_err();
+        assert!(message(&e).contains("at least one admin"));
+        let e = call(
+            &h,
+            "auth.login",
+            json!({"username": "ann", "password": "long-enough-1"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(message(&e).contains("not turned on"));
+
+        call(
+            &h,
+            "accounts.set_user",
+            json!({"username": "ann", "role": "admin", "password": "long-enough-1"}),
+        )
+        .await
+        .unwrap();
+        let on = call(&h, "accounts.set_enabled", json!({"enabled": true}))
+            .await
+            .unwrap();
+        assert_eq!(on["enabled"], true);
+
+        let e = call(&h, "auth.login", json!({"username": "ann"}))
+            .await
+            .unwrap_err();
+        assert!(message(&e).contains("Missing 'password'"));
+        let e = call(
+            &h,
+            "auth.login",
+            json!({"username": "ann", "password": "wrong-password"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(message(&e).contains("wrong user name or password"));
+        let login = call(
+            &h,
+            "auth.login",
+            json!({"username": "Ann", "password": "long-enough-1"}),
+        )
+        .await
+        .unwrap();
+        let token = login["token"].as_str().unwrap().to_owned();
+        assert_eq!(login["user"]["role"], "admin");
+
+        let status = call(&h, "auth.status", json!({"token": token}))
+            .await
+            .unwrap();
+        assert_eq!(status["enabled"], true);
+        assert_eq!(status["user"]["username"], "ann");
+        let status = call(&h, "auth.status", json!({})).await.unwrap();
+        assert!(status["user"].is_null());
+
+        // Changing a password checks the current one and signs sessions out.
+        let e = call(
+            &h,
+            "auth.change_password",
+            json!({"token": token, "current": "long-enough-1", "new": "short"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(message(&e).contains("at least"));
+        let e = call(
+            &h,
+            "auth.change_password",
+            json!({"token": "nope", "current": "long-enough-1", "new": "brand-new-pass"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(message(&e).contains("Sign in again"));
+        let e = call(
+            &h,
+            "auth.change_password",
+            json!({"token": token, "current": "not-it-at-all", "new": "brand-new-pass"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(message(&e).contains("current password is wrong"));
+        call(
+            &h,
+            "auth.change_password",
+            json!({"token": token, "current": "long-enough-1", "new": "brand-new-pass"}),
+        )
+        .await
+        .unwrap();
+        let status = call(&h, "auth.status", json!({"token": token}))
+            .await
+            .unwrap();
+        assert!(status["user"].is_null(), "the old session ended");
+        let login = call(
+            &h,
+            "auth.login",
+            json!({"username": "ann", "password": "brand-new-pass"}),
+        )
+        .await
+        .unwrap();
+        let token = login["token"].as_str().unwrap().to_owned();
+
+        // The last admin cannot be removed while sign-in is on.
+        let e = call(&h, "accounts.remove_user", json!({"username": "ann"}))
+            .await
+            .unwrap_err();
+        assert!(message(&e).contains("at least one admin"));
+        assert_eq!(
+            call(&h, "auth.logout", json!({"token": token}))
+                .await
+                .unwrap(),
+            json!({})
+        );
+        assert_eq!(call(&h, "auth.logout", json!({})).await.unwrap(), json!({}));
+        let status = call(&h, "auth.status", json!({"token": token}))
+            .await
+            .unwrap();
+        assert!(status["user"].is_null());
+        let e = call(&h, "accounts.nope", json!({})).await.unwrap_err();
+        assert_eq!(e.code, -32601);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_leaves_the_accounts_unchanged() {
+        let (h, dir) = handler();
+        // The config path's parent is a file, so saving cannot succeed.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        h.state.write().await.config_path = blocker.join("config.json");
+        let e = call(
+            &h,
+            "accounts.set_user",
+            json!({"username": "ann", "role": "admin", "password": "long-enough-1"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, -32603);
+        let view = call(&h, "accounts.get", json!({})).await.unwrap();
+        assert_eq!(view["users"], json!([]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

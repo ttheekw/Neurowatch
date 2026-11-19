@@ -463,3 +463,320 @@ fn main() -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use nw_analytics_sdk::protocol::{
+        frame::{flags, MediaUnit},
+        messages::Manifest,
+        web::{SignedUser, UserContext},
+    };
+    use std::os::unix::net::UnixStream;
+
+    /// A bridge session over a socket pair whose "plugin" is `cat`: whatever
+    /// the node sends through comes straight back as the plugin's own frame,
+    /// so a node-sent response stands in for the plugin's answer.
+    struct Bridge {
+        node: UnixStream,
+        session: std::thread::JoinHandle<io::Result<()>>,
+        key: Arc<SigningKey>,
+    }
+
+    impl Bridge {
+        fn start() -> Self {
+            let (node, bridge) = UnixStream::pair().unwrap();
+            node.set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            let key = Arc::new(SigningKey::from_bytes(&[9; 32]));
+            let session = {
+                let key = Arc::clone(&key);
+                std::thread::spawn(move || {
+                    session(
+                        Socket::Unix(Arc::new(bridge)),
+                        key,
+                        Arc::new(vec!["cat".to_owned()]),
+                    )
+                })
+            };
+            Self { node, session, key }
+        }
+
+        fn send(&mut self, message: Message) {
+            write_frame(&mut self.node, &Frame::Message(message.to_value())).unwrap();
+        }
+
+        fn next(&mut self) -> Frame {
+            read_frame(&mut self.node).unwrap()
+        }
+
+        fn message(&mut self) -> Message {
+            let Frame::Message(value) = self.next() else {
+                panic!("a message was expected");
+            };
+            Message::from_value(value).unwrap()
+        }
+
+        fn rejection(&mut self) -> (u64, i64, String) {
+            match self.message() {
+                Message::Response {
+                    id,
+                    result: Err(error),
+                } => (id, error.code, error.message),
+                other => panic!("a rejection was expected: {other:?}"),
+            }
+        }
+
+        /// Hello, and the plugin's manifest signed by the bridge.
+        fn greet(&mut self, challenge: &str) -> Manifest {
+            self.send(Message::request(
+                1,
+                method::HELLO,
+                serde_json::json!({
+                    "protocol": 1,
+                    "node": {"name": "Test", "version": "0"},
+                    "challenge": challenge,
+                }),
+            ));
+            let manifest = serde_json::json!({
+                "id": "nw.bridge-test", "name": "Bridge test", "vendor": "Test", "version": "1",
+                "protocol": 1, "permissions": ["video", "decoded_frames"], "locality_proof": "x",
+                "media": {"video": {"stream": "main", "codecs": ["h264"]},
+                          "decoded": {"formats": ["rgb24"], "max_fps": 5, "min_width": 1, "min_height": 1}},
+            });
+            self.send(Message::reply(1, Ok::<_, RpcError>(manifest)));
+            let Message::Response {
+                id: 1,
+                result: Ok(value),
+            } = self.message()
+            else {
+                panic!("the signed manifest was expected");
+            };
+            serde_json::from_value(value).unwrap()
+        }
+
+        fn finish(self) -> io::Result<()> {
+            let _ = self.node.shutdown(std::net::Shutdown::Both);
+            self.session.join().unwrap()
+        }
+    }
+
+    #[test]
+    fn nothing_is_forwarded_before_the_node_proves_itself() {
+        let mut bridge = Bridge::start();
+        bridge.send(Message::request(5, "attach", serde_json::json!({})));
+        let (id, code, text) = bridge.rejection();
+        assert_eq!(
+            (id, code, text.as_str()),
+            (5, error_code::REJECTED, "Authenticate first")
+        );
+        // Notifications before authentication are dropped; a ping is relayed
+        // (and its echo, being no answer, is not passed back).
+        bridge.send(Message::notification("event", serde_json::json!({})));
+        bridge.send(Message::request(6, method::PING, serde_json::json!({})));
+        // An authentication before any hello cannot verify.
+        let forged = identity::authenticate(
+            &SigningKey::from_bytes(&[4; 32]),
+            &identity::challenge().unwrap(),
+            &nw_analytics_sdk::protocol::auth::PluginIdentity {
+                public_key: String::new(),
+                challenge: String::new(),
+                signature: String::new(),
+                channel_binding: String::new(),
+            },
+            None,
+        );
+        bridge.send(Message::request(7, method::AUTHENTICATE, forged));
+        let (id, code, text) = bridge.rejection();
+        assert_eq!(
+            (id, code, text.as_str()),
+            (7, error_code::REJECTED, "Invalid node signature")
+        );
+        bridge.finish().unwrap();
+    }
+
+    #[test]
+    fn hello_is_answered_with_a_manifest_signed_by_the_bridge_without_raw_pictures() {
+        let mut bridge = Bridge::start();
+        let challenge = identity::challenge().unwrap();
+        let manifest = bridge.greet(&challenge);
+        assert!(identity::verify_manifest(&manifest, &challenge, ""));
+        assert_eq!(
+            manifest.identity.as_ref().unwrap().public_key,
+            identity::public_key(&bridge.key)
+        );
+        assert!(manifest.locality_proof.is_none());
+        assert!(manifest.media.decoded.is_none());
+        assert_eq!(manifest.permissions, vec!["video".to_owned()]);
+        // A signature from some other key is refused.
+        let identity_of_plugin = manifest.identity.clone().unwrap();
+        let stranger = identity::authenticate(
+            &SigningKey::from_bytes(&[4; 32]),
+            "00",
+            &identity_of_plugin,
+            None,
+        );
+        bridge.send(Message::request(2, method::AUTHENTICATE, stranger));
+        assert_eq!(bridge.rejection().2, "Invalid node signature");
+        bridge.finish().unwrap();
+    }
+
+    #[test]
+    fn an_authorized_node_reaches_the_plugin_and_only_viewers_signed_by_it_get_pages() {
+        let mut bridge = Bridge::start();
+        let node = SigningKey::from_bytes(&[3; 32]);
+        let challenge = identity::challenge().unwrap();
+        let manifest = bridge.greet(&challenge);
+        let plugin_identity = manifest.identity.clone().unwrap();
+        let authentication = identity::authenticate(&node, &challenge, &plugin_identity, None);
+        bridge.send(Message::request(2, method::AUTHENTICATE, authentication));
+        // The plugin accepts (stood in for by the node's own response).
+        bridge.send(Message::reply(2, Ok::<_, RpcError>(serde_json::json!({}))));
+        assert!(matches!(
+            bridge.message(),
+            Message::Response {
+                id: 2,
+                result: Ok(_)
+            }
+        ));
+
+        // A page request without a node-signed viewer is refused by the bridge.
+        let page =
+            serde_json::json!({"path": "/", "method": "GET", "content_type": "", "body_b64": ""});
+        bridge.send(Message::request(3, "web.request", page.clone()));
+        assert_eq!(bridge.rejection().2, "Invalid viewer context");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let viewer: SignedUser = identity::sign_user(
+            &node,
+            UserContext {
+                user: "ann".into(),
+                role: "viewer".into(),
+                cameras: vec![],
+                plugin_key: identity::public_key(&bridge.key),
+                expires_at: now + 30,
+                nonce: identity::challenge().unwrap(),
+            },
+        );
+        let mut signed = page;
+        signed["user"] = serde_json::json!(viewer);
+        bridge.send(Message::request(4, "web.read", signed.clone()));
+        // Accepted, it reaches the plugin (cat) and comes back as its own request.
+        assert!(matches!(
+            bridge.message(),
+            Message::Request { id: 4, method, .. } if method == "web.read"
+        ));
+        // A viewer meant for another plugin is refused.
+        let mut other = signed;
+        other["user"]["context"]["plugin_key"] = serde_json::json!(identity::public_key(&node));
+        bridge.send(Message::request(5, "web.request", other));
+        assert_eq!(bridge.rejection().2, "Invalid viewer context");
+        // Ordinary requests pass through.
+        bridge.send(Message::request(6, "attach", serde_json::json!({"a": 1})));
+        assert!(matches!(
+            bridge.message(),
+            Message::Request { id: 6, method, .. } if method == "attach"
+        ));
+        // A plugin cannot send camera media: the session ends.
+        let unit = MediaUnit {
+            media: nw_analytics_sdk::protocol::frame::MediaKind::Video,
+            flags: flags::KEYFRAME,
+            binding: 1,
+            seq: 1,
+            time_us: 1,
+            pts_ns: None,
+            dts_ns: None,
+            data: vec![1, 2, 3],
+        };
+        write_frame(&mut bridge.node, &Frame::Media(unit)).unwrap();
+        let ended = bridge.session.join().unwrap().unwrap_err();
+        assert!(ended.to_string().contains("cannot send camera media"));
+    }
+
+    #[test]
+    fn a_second_hello_or_a_bad_challenge_ends_the_session() {
+        let mut bridge = Bridge::start();
+        bridge.send(Message::request(
+            1,
+            method::HELLO,
+            serde_json::json!({"protocol": 1, "node": {"name": "T", "version": "0"}, "challenge": "nothex"}),
+        ));
+        let ended = bridge.session.join().unwrap().unwrap_err();
+        assert!(ended.to_string().contains("invalid challenge"));
+
+        let mut bridge = Bridge::start();
+        let challenge = identity::challenge().unwrap();
+        let hello = || {
+            Message::request(
+                1,
+                method::HELLO,
+                serde_json::json!({"protocol": 1, "node": {"name": "T", "version": "0"}, "challenge": challenge}),
+            )
+        };
+        bridge.send(hello());
+        bridge.send(hello());
+        let ended = bridge.session.join().unwrap().unwrap_err();
+        assert!(ended.to_string().contains("duplicate hello"));
+
+        let mut bridge = Bridge::start();
+        bridge.send(Message::request(
+            1,
+            method::HELLO,
+            serde_json::json!({"nope": 1}),
+        ));
+        let ended = bridge.session.join().unwrap().unwrap_err();
+        assert!(ended.to_string().contains("invalid hello"));
+    }
+
+    #[test]
+    fn a_command_that_cannot_start_fails_the_session() {
+        let (_node, bridge) = UnixStream::pair().unwrap();
+        let result = session(
+            Socket::Unix(Arc::new(bridge)),
+            Arc::new(SigningKey::from_bytes(&[9; 32])),
+            Arc::new(vec!["/nonexistent/nw-plugin".to_owned()]),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn frames_are_read_until_the_stream_ends_and_tagged_by_origin() {
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &Frame::Message(serde_json::json!({"a": 1}))).unwrap();
+        for node in [true, false] {
+            let (tx, rx) = mpsc::sync_channel(4);
+            read(&bytes[..], tx, node);
+            match (rx.recv().unwrap(), node) {
+                (Input::Node(Frame::Message(_)), true)
+                | (Input::Plugin(Frame::Message(_)), false) => {}
+                _ => panic!("frame tagged with the wrong origin"),
+            }
+            assert!(matches!(rx.recv().unwrap(), Input::Closed));
+        }
+        // A reader whose receiver is gone stops quietly.
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(rx);
+        read(&bytes[..], tx, true);
+    }
+
+    #[test]
+    fn tcp_sockets_read_write_and_shut_down() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut near = Socket::Tcp(Arc::new(client));
+        let mut far = Socket::Tcp(Arc::new(server));
+        assert_eq!(near.binding(), "");
+        near.write_all(b"ping").unwrap();
+        near.flush().unwrap();
+        let mut got = [0u8; 4];
+        far.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"ping");
+        near.shutdown();
+        let mut rest = Vec::new();
+        far.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+    }
+}

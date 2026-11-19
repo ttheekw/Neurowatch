@@ -946,3 +946,480 @@ mod export_report_contract {
         std::fs::write(FIXTURE, text).expect("write fixture");
     }
 }
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[derive(Default)]
+    struct Fake {
+        reports: Vec<Value>,
+        report_replies: VecDeque<Value>,
+        pulls: usize,
+        /// Status the export pull answers with (0: 200).
+        pull_status: u16,
+        jobs: Vec<Value>,
+    }
+    type Shared = Arc<Mutex<Fake>>;
+
+    /// Read one HTTP request: its request line and JSON body.
+    async fn read_request(socket: &mut TcpStream) -> Option<(String, Value)> {
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 8192];
+        let end = loop {
+            let n = socket.read(&mut buffer).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            received.extend_from_slice(&buffer[..n]);
+            if let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&received[..end]).to_string();
+        let length: usize = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .unwrap_or(0);
+        while received.len() < end + length {
+            let n = socket.read(&mut buffer).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            received.extend_from_slice(&buffer[..n]);
+        }
+        let line = head.lines().next()?.to_owned();
+        let body = serde_json::from_slice(&received[end..end + length]).unwrap_or(Value::Null);
+        Some((line, body))
+    }
+
+    async fn respond(socket: &mut TcpStream, status: u16, body: &Value) {
+        let reason = match status {
+            200 => "OK",
+            201 => "Created",
+            404 => "Not Found",
+            _ => "Error",
+        };
+        let body = serde_json::to_vec(body).unwrap();
+        let head = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.write_all(head.as_bytes()).await;
+        let _ = socket.write_all(&body).await;
+    }
+
+    async fn serve(mut socket: TcpStream, fake: Shared) {
+        let Some((line, body)) = read_request(&mut socket).await else {
+            return;
+        };
+        if line.contains("/node-auth/challenges") {
+            let operation = body["operation"].as_str().unwrap_or_default();
+            let challenge = json!({
+                "protocol_version": 1, "audience": NODE_AUDIENCE, "operation": operation,
+                "challenge": "challenge-0000000000000001", "expires_at": "2099-01-01T00:01:00Z"
+            });
+            respond(&mut socket, 201, &challenge).await;
+        } else if line.contains("/export-pulls") {
+            let (status, jobs) = {
+                let mut fake = fake.lock().unwrap();
+                fake.pulls += 1;
+                (fake.pull_status, std::mem::take(&mut fake.jobs))
+            };
+            let status = if status == 0 { 200 } else { status };
+            respond(&mut socket, status, &json!({ "exports": jobs })).await;
+        } else if line.contains("/export-reports") {
+            let reply = {
+                let mut fake = fake.lock().unwrap();
+                fake.reports.push(body);
+                fake.report_replies.pop_front().unwrap_or_else(|| json!({}))
+            };
+            respond(&mut socket, 200, &reply).await;
+        } else {
+            respond(&mut socket, 404, &json!({})).await;
+        }
+    }
+
+    async fn fake_cloud(fake: Shared) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(serve(socket, Arc::clone(&fake)));
+            }
+        });
+        format!("http://{address}/")
+    }
+
+    fn linked(endpoint: &str) -> (CloudNode, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("nw-exports-run-{}", uuid::Uuid::new_v4()));
+        let options = super::super::CloudOptions {
+            policy: super::super::EndpointPolicy {
+                allow_loopback_http: true,
+                pinned: None,
+            },
+            ..super::super::CloudOptions::default()
+        };
+        let mut node = CloudNode::open_with_options(dir.clone(), options).unwrap();
+        node.install_linked_for_test(
+            endpoint,
+            "6ba7b811-9dad-11d1-80b4-00c04fd430c8",
+            "6ba7b812-9dad-11d1-80b4-00c04fd430c8",
+            7,
+        )
+        .unwrap();
+        (node, dir)
+    }
+
+    /// An export engine whose segment lookup says `error` or finds nothing.
+    fn source(error: Option<&str>) -> ExportSource {
+        let error = error.map(str::to_owned);
+        ExportSource {
+            service: Arc::new(ExportService::new()),
+            segments: Arc::new(move |_, _, _| {
+                let result = match &error {
+                    Some(error) => Err(error.clone()),
+                    None => Ok(Vec::new()),
+                };
+                Box::pin(async move { result })
+            }),
+        }
+    }
+
+    fn job(id: &str) -> ExportJob {
+        ExportJob {
+            export_id: id.into(),
+            camera_id: "cam-1".into(),
+            start_ms: 1_000,
+            end_ms: 61_000,
+            max_bytes: 10_000_000,
+            timelapse: None,
+        }
+    }
+
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+
+    async fn until(mut done: impl FnMut() -> bool) {
+        for _ in 0..1000 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the condition never held");
+    }
+
+    fn states(fake: &Shared) -> Vec<String> {
+        fake.lock()
+            .unwrap()
+            .reports
+            .iter()
+            .map(|r| r["state"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    fn done_status(size: Option<u64>, path: &Path) -> ExportStatus {
+        ExportStatus {
+            analytics_path: None,
+            analytics_error: None,
+            analytics_truncated: None,
+            job_id: "local".into(),
+            camera_id: "cam-1".into(),
+            state: "done",
+            progress: 1.0,
+            path: path.to_string_lossy().into_owned(),
+            start_ms: 1_000,
+            end_ms: 61_000,
+            created_ms: 0,
+            first_ms: Some(1_000),
+            last_ms: Some(61_000),
+            duration_ms: Some(60_000),
+            size_bytes: size,
+            frames: None,
+            audio: Some(true),
+            audio_copied: None,
+            gaps: None,
+            skipped_files: None,
+            truncated: None,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_job_whose_lookup_fails_is_reported_failed_with_the_reason() {
+        let fake = Shared::default();
+        let (node, dir) = linked(&fake_cloud(Arc::clone(&fake)).await);
+        run_job(&node, &source(Some("database busy")), job(ID)).await;
+        let fake = fake.lock().unwrap();
+        assert_eq!(fake.reports.len(), 1);
+        assert_eq!(fake.reports[0]["state"], "failed");
+        assert_eq!(fake.reports[0]["error"], "database busy");
+        assert_eq!(fake.reports[0]["export_id"], ID);
+        drop(fake);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_job_with_no_recordings_fails_for_clips_and_timelapses() {
+        let fake = Shared::default();
+        let (node, dir) = linked(&fake_cloud(Arc::clone(&fake)).await);
+        run_job(&node, &source(None), job(ID)).await;
+        let mut lapse = job(ID);
+        lapse.timelapse = Some(TimelapseOptions {
+            interval_sec: 10,
+            fps: 30,
+        });
+        run_job(&node, &source(None), lapse).await;
+        assert_eq!(states(&fake), ["failed", "failed"]);
+        assert!(fake.lock().unwrap().reports[0]["error"].is_string());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_job_taken_twice_runs_once_and_is_released_when_it_ends() {
+        let running = RunningExports::default();
+        assert!(running.claim(ID));
+        assert!(!running.claim(ID));
+        assert_eq!(running.len(), 1);
+        running.release(ID);
+        assert_eq!(running.len(), 0);
+
+        let fake = Shared::default();
+        let (node, dir) = linked(&fake_cloud(Arc::clone(&fake)).await);
+        // Already running: nothing starts.
+        assert!(running.claim(ID));
+        start_job(node.shared(), source(None), running.clone(), job(ID));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(fake.lock().unwrap().reports.is_empty());
+        running.release(ID);
+        // Free: it runs, reports, and lets go.
+        start_job(node.shared(), source(None), running.clone(), job(ID));
+        until(|| !states(&fake).is_empty() && running.len() == 0).await;
+        // At the limit nothing more starts.
+        for n in 0..MAX_RUNNING {
+            assert!(running.claim(&format!("{n:032}")));
+        }
+        let before = states(&fake).len();
+        start_job(node.shared(), source(None), running.clone(), job(ID));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(states(&fake).len(), before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_oversized_clip_is_never_uploaded() {
+        let fake = Shared::default();
+        let (node, dir) = linked(&fake_cloud(Arc::clone(&fake)).await);
+        let path = dir.join("clip.mp4");
+        let mut small = job(ID);
+        small.max_bytes = 5_000_000;
+        deliver(&node, ID, &small, &done_status(None, &path), &path).await;
+        deliver(&node, ID, &small, &done_status(Some(0), &path), &path).await;
+        deliver(
+            &node,
+            ID,
+            &small,
+            &done_status(Some(9_000_000), &path),
+            &path,
+        )
+        .await;
+        let reports = fake.lock().unwrap().reports.clone();
+        assert_eq!(states(&fake), ["failed", "failed", "failed"]);
+        assert_eq!(reports[0]["error"], "The clip is empty.");
+        assert!(reports[2]["error"]
+            .as_str()
+            .unwrap()
+            .contains("larger than 5 MB"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_ready_clip_without_a_usable_upload_address_fails_or_stops() {
+        let fake = Shared::default();
+        let (node, dir) = linked(&fake_cloud(Arc::clone(&fake)).await);
+        let path = dir.join("clip.mp4");
+        let status = done_status(Some(4), &path);
+        // No address given.
+        deliver(&node, ID, &job(ID), &status, &path).await;
+        // The portal cancelled meanwhile: nothing more is said.
+        fake.lock()
+            .unwrap()
+            .report_replies
+            .push_back(json!({"cancel": true}));
+        deliver(&node, ID, &job(ID), &status, &path).await;
+        // An address that is not public HTTPS.
+        fake.lock()
+            .unwrap()
+            .report_replies
+            .push_back(json!({"upload_url": "ftp://objects.example.com/x"}));
+        deliver(&node, ID, &job(ID), &status, &path).await;
+        let reports = fake.lock().unwrap().reports.clone();
+        assert_eq!(
+            states(&fake),
+            ["ready", "failed", "ready", "ready", "failed"]
+        );
+        assert_eq!(reports[0]["size_bytes"], 4);
+        assert_eq!(reports[0]["audio"], true);
+        assert_eq!(reports[1]["error"], "No upload address was given.");
+        assert!(reports[4]["error"].as_str().unwrap().contains("HTTPS"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An upload target answering `status` to one PUT.
+    async fn upload_target(status: u16) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut received = Vec::new();
+            let mut buffer = [0u8; 8192];
+            loop {
+                let Ok(n) = socket.read(&mut buffer).await else {
+                    return;
+                };
+                received.extend_from_slice(&buffer[..n]);
+                let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&received[..end]).to_ascii_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length: ")?.trim().parse().ok())
+                    .unwrap_or(0);
+                if n == 0 || received.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            let reason = if status == 200 { "OK" } else { "Forbidden" };
+            let _ = socket
+                .write_all(
+                    format!("HTTP/1.1 {status} {reason}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await;
+        });
+        format!("http://127.0.0.1:{port}/clips/e.mp4?X-Amz-Signature=1")
+    }
+
+    #[tokio::test]
+    async fn a_ready_clip_is_uploaded_and_the_outcome_reported() {
+        for (status, last, error) in [(200u16, "uploaded", None), (403, "failed", Some("403"))] {
+            let fake = Shared::default();
+            let (node, dir) = linked(&fake_cloud(Arc::clone(&fake)).await);
+            let path = dir.join("clip.mp4");
+            std::fs::write(&path, b"clip").unwrap();
+            let url = upload_target(status).await;
+            fake.lock()
+                .unwrap()
+                .report_replies
+                .push_back(json!({ "upload_url": url }));
+            deliver(&node, ID, &job(ID), &done_status(Some(4), &path), &path).await;
+            let seen = states(&fake);
+            assert_eq!(seen.first().map(String::as_str), Some("ready"));
+            assert_eq!(seen.last().map(String::as_str), Some(last), "{seen:?}");
+            if let Some(error) = error {
+                let reports = fake.lock().unwrap().reports.clone();
+                let text = reports.last().unwrap()["error"].as_str().unwrap();
+                assert!(text.contains(error), "{text}");
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lost_local_export_is_reported_failed() {
+        let fake = Shared::default();
+        let (node, dir) = linked(&fake_cloud(Arc::clone(&fake)).await);
+        let outcome = follow_local_job(&node, &source(None), ID, "no-such-job").await;
+        assert!(outcome.is_none());
+        let reports = fake.lock().unwrap().reports.clone();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0]["state"], "failed");
+        assert_eq!(reports[0]["error"], "The export was lost.");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_report_that_cannot_be_delivered_is_dropped_quietly() {
+        // Nothing listens here: the pull fails and the report is not delivered.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let (node, dir) = linked(&endpoint);
+        assert!(report(&node, ID, &cancelled()).await.is_none());
+        assert_eq!(failed("x").state, "failed");
+        assert_eq!(cancelled().state, "cancelled");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_export_loop_pulls_starts_jobs_and_stops_on_request() {
+        let fake = Shared::default();
+        fake.lock().unwrap().jobs = vec![json!({
+            "export_id": ID, "camera_id": "cam-1", "start_ms": 1_000, "end_ms": 61_000,
+            "max_bytes": 1_000_000
+        })];
+        let (node, dir) = linked(&fake_cloud(Arc::clone(&fake)).await);
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_loop(node.shared(), source(None), stopped));
+        // The pulled job ran (no recordings: failed) and was reported.
+        until(|| states(&fake).contains(&"failed".to_owned())).await;
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop stops")
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_cloud_without_export_backs_off_and_still_stops() {
+        let fake = Shared::default();
+        fake.lock().unwrap().pull_status = 404;
+        let (node, dir) = linked(&fake_cloud(Arc::clone(&fake)).await);
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_loop(node.shared(), source(None), stopped));
+        until(|| fake.lock().unwrap().pulls >= 1).await;
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop stops")
+            .unwrap();
+        assert_eq!(fake.lock().unwrap().pulls, 1, "backs off after a 404");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_export_report_body_clamps_progress_and_trims_errors() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let status = CloudStatus {
+            phase: LinkPhase::Linked,
+            endpoint: None,
+            tenant_id: Some("t".into()),
+            node_id: Some("n".into()),
+            auth_epoch: Some(1),
+            last_check_in: None,
+        };
+        let issued = OffsetDateTime::from_unix_timestamp(1_790_000_000).unwrap();
+        let report = ExportProgress {
+            state: "failed",
+            progress: 7.0,
+            error: Some(format!("a\tb{}", "x".repeat(400))),
+            ..ExportProgress::default()
+        };
+        let body = export_report_body(&key, &status, "c", ID, &report, issued).unwrap();
+        assert_eq!(body["progress"], json!(1.0));
+        assert_eq!(body["error"].as_str().unwrap().chars().count(), 300);
+        assert!(!body["error"].as_str().unwrap().contains('\t'));
+        assert_eq!(body["first_at"], Value::Null);
+    }
+}

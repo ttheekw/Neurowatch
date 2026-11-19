@@ -24,7 +24,7 @@ def test_rust_coverage_step_enforces_80_percent_workspace_lines() -> None:
     assert any(
         cmd.startswith("cargo llvm-cov --workspace --all-features --no-report") for cmd in commands
     )
-    assert gated == ["cargo llvm-cov report --summary-only --fail-under-lines 80"]
+    assert gated == ["cargo llvm-cov report --summary-only --fail-under-lines 85"]
 
 
 def test_every_merge_to_main_runs_the_tests_and_summarises_them() -> None:

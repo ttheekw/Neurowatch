@@ -340,3 +340,115 @@ async fn occupied_tcp_port_fails_without_publishing_a_token() {
     .unwrap_err();
     assert!(error.to_string().contains("Cannot bind to TCP listener"));
 }
+
+#[tokio::test]
+async fn tcp_listener_serves_requests_marks_token_holders_protected_and_stops_on_shutdown() {
+    let fixture = Fixture::new();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = probe.local_addr().unwrap().to_string();
+    drop(probe);
+    let (shutdown, stopped) = broadcast::channel(1);
+    let server = tokio::spawn({
+        let addr = addr.clone();
+        let handler = Arc::clone(&fixture.handler);
+        async move { run_tcp(&addr, handler, stopped, IpcMetricsRecorder::new()).await }
+    });
+    let stream = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(stream) = tokio::net::TcpStream::connect(&addr).await {
+                break stream;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("listener must bind");
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut lines = BufReader::new(&mut reader).lines();
+    writer
+        .write_all(b"{\"id\":1,\"method\":\"system.status\"}\n")
+        .await
+        .unwrap();
+    writer
+        .write_all(b"{\"id\":2,\"method\":\"cloud.status\"}\n")
+        .await
+        .unwrap();
+    let first: Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(first["result"]["pid"].is_number());
+    // The token file (when this user has a data directory) marks protected callers.
+    let token_path = token::path_for(&addr);
+    let token = token_path
+        .as_ref()
+        .and_then(|path| std::fs::read_to_string(path).ok());
+    let second: Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        second["error"]["code"], -32601,
+        "cloud methods need the token over TCP"
+    );
+    if let Some(token) = token {
+        let request = json!({"id":3,"method":"cloud.status","auth":token.trim()});
+        writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let third: Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(third["result"].is_object(), "{third}");
+    }
+    // A malformed line only ends that connection.
+    writer.write_all(b"not json\n").await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    shutdown.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    if let Some(path) = token_path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+fn the_default_endpoint_is_a_unix_socket_in_the_runtime_dir_unless_overridden() {
+    let endpoint = ipc_endpoint();
+    match std::env::var("NW_IPC_ENDPOINT") {
+        Ok(set) if set != "unix:/control.sock" => assert_eq!(endpoint, set),
+        _ => {
+            if cfg!(unix) {
+                assert!(
+                    endpoint.starts_with("unix:") && endpoint.ends_with("/neurowatch/control.sock"),
+                    "{endpoint}"
+                );
+            } else {
+                assert_eq!(endpoint, "tcp:127.0.0.1:7676");
+            }
+        }
+    }
+}

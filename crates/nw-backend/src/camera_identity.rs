@@ -449,4 +449,253 @@ mod tests {
             Some("aa:aa:aa:aa:aa:aa")
         );
     }
+
+    /// A loopback ONVIF device answering from `reply(body)`.
+    async fn device(
+        reply: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let reply = Arc::new(reply);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let reply = Arc::clone(&reply);
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let body = loop {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..read]);
+                        let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buffer.len() >= end + 4 + length {
+                            break String::from_utf8_lossy(&buffer[end + 4..end + 4 + length])
+                                .into_owned();
+                        }
+                    };
+                    let (status, text) = reply(&body);
+                    let head = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        text.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(text.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (port, task)
+    }
+
+    fn answers(body: &str) -> (u16, String) {
+        let reply = if body.contains("<tds:GetDeviceInformation") {
+            "<Envelope><Body><GetDeviceInformationResponse><Manufacturer>ACME</Manufacturer><Model>C1</Model><SerialNumber>SN-1</SerialNumber></GetDeviceInformationResponse></Body></Envelope>"
+        } else if body.contains("<tds:GetNetworkInterfaces") {
+            "<Envelope><Body><GetNetworkInterfacesResponse><NetworkInterfaces><Info><HwAddress>BC:BA:C2:01:02:03</HwAddress></Info></NetworkInterfaces></GetNetworkInterfacesResponse></Body></Envelope>"
+        } else {
+            "<Envelope><Body/></Envelope>"
+        };
+        (200, reply.to_owned())
+    }
+
+    fn target_for(port: u16) -> Target {
+        Target {
+            id: "cam".into(),
+            host: "127.0.0.1".into(),
+            device_url: Some(format!("http://127.0.0.1:{port}/onvif/device_service")),
+            credentials: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn hosts_resolve_to_ipv4_only() {
+        assert_eq!(
+            resolve("192.168.1.9").await,
+            Some(Ipv4Addr::new(192, 168, 1, 9))
+        );
+        assert_eq!(resolve("::1").await, None);
+        assert_eq!(resolve("localhost").await, Some(Ipv4Addr::LOCALHOST));
+    }
+
+    #[tokio::test]
+    async fn asking_a_device_gives_its_identity_and_survives_a_missing_interface_list() {
+        let (port, server) = device(answers).await;
+        let url = format!("http://127.0.0.1:{port}/onvif/device_service");
+        let hardware = ask_onvif(&url, None).await.unwrap();
+        assert_eq!(hardware.serial.as_deref(), Some("SN-1"));
+        assert_eq!(hardware.manufacturer.as_deref(), Some("ACME"));
+        assert_eq!(hardware.model.as_deref(), Some("C1"));
+        assert_eq!(hardware.mac.as_deref(), Some("bc:ba:c2:01:02:03"));
+        server.abort();
+
+        // A device without GetNetworkInterfaces still names itself.
+        let (port, server) = device(|body| {
+            if body.contains("<tds:GetNetworkInterfaces") {
+                (500, String::new())
+            } else {
+                answers(body)
+            }
+        })
+        .await;
+        let url = format!("http://127.0.0.1:{port}/onvif/device_service");
+        let hardware = ask_onvif(&url, None).await.unwrap();
+        assert_eq!(hardware.serial.as_deref(), Some("SN-1"));
+        assert_eq!(hardware.mac, None);
+        server.abort();
+
+        // One that refuses everything tells nothing.
+        let (port, server) = device(|_| (500, String::new())).await;
+        assert!(ask_onvif(&format!("http://127.0.0.1:{port}/x"), None)
+            .await
+            .is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_refresh_asks_onvif_once_and_starts_over_when_the_host_changes() {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (port, server) = {
+            let asked = Arc::clone(&asked);
+            device(move |body| {
+                if body.contains("<tds:GetDeviceInformation") {
+                    asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                answers(body)
+            })
+            .await
+        };
+        let identities = CameraIdentities::default();
+        assert!(identities.get("cam").is_none());
+        let camera = target_for(port);
+        refresh(&identities, &camera).await;
+        let hardware = identities.get("cam").unwrap();
+        assert_eq!(hardware.serial.as_deref(), Some("SN-1"));
+        refresh(&identities, &camera).await;
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a fresh answer is reused for ten minutes"
+        );
+        // The same slot at another address is a new camera: asked again.
+        let moved = Target {
+            host: "localhost".into(),
+            ..target_for(port)
+        };
+        refresh(&identities, &moved).await;
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Without ONVIF nothing is learned (and nothing is a hardware).
+        refresh(
+            &identities,
+            &Target {
+                id: "plain".into(),
+                device_url: None,
+                ..target_for(port)
+            },
+        )
+        .await;
+        assert!(identities.get("plain").is_none());
+        server.abort();
+    }
+
+    #[test]
+    fn only_cameras_with_a_readable_address_are_targets() {
+        let mut camera = CameraConfig::new("Cam", "rtsp://user:pw@10.0.0.5:554/live");
+        camera.onvif = Some(nw_core::camera::OnvifEndpoint {
+            device_url: "http://10.0.0.5/onvif/device_service".into(),
+            events_url: None,
+            ptz_url: None,
+        });
+        let found = target(&camera).unwrap();
+        assert_eq!(found.host, "10.0.0.5");
+        assert_eq!(
+            found.device_url.as_deref(),
+            Some("http://10.0.0.5/onvif/device_service")
+        );
+        assert_eq!(found.credentials.unwrap().username, "user");
+        assert!(target(&CameraConfig::new("Bad", "not a url")).is_none());
+        // The learned hardware needs a MAC or a serial to count.
+        let identities = CameraIdentities::default();
+        identities.set(
+            "only-model",
+            CameraHardware {
+                model: Some("M".into()),
+                ..CameraHardware::default()
+            },
+        );
+        assert!(identities.get("only-model").is_none());
+        assert!(!CameraHardware {
+            mac: Some("a".into()),
+            ..Default::default()
+        }
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_run_loop_learns_configured_cameras_forgets_removed_ones_and_stops() {
+        let (port, server) = device(answers).await;
+        let mut config = crate::config::AppConfig::default();
+        let mut camera = CameraConfig::new("Cam", format!("rtsp://127.0.0.1:{port}/live"));
+        camera.id = "cam".into();
+        camera.onvif = Some(nw_core::camera::OnvifEndpoint {
+            device_url: format!("http://127.0.0.1:{port}/onvif/device_service"),
+            events_url: None,
+            ptz_url: None,
+        });
+        config.cameras.push(camera);
+        let dir = std::env::temp_dir().join(format!("nw-ident-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(RwLock::new(AppState::with_database(
+            config,
+            dir.join("config.json"),
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+            crate::db::connection::open_in_memory().unwrap(),
+        )));
+        let identities = Arc::new(CameraIdentities::default());
+        // A camera that has since been removed is dropped from the table.
+        identities.set(
+            "gone",
+            CameraHardware {
+                serial: Some("OLD".into()),
+                ..CameraHardware::default()
+            },
+        );
+        let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(run(
+            Arc::clone(&state),
+            Arc::clone(&identities),
+            shutdown_rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while identities.get("cam").is_none() || identities.get("gone").is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the camera's hardware is learned");
+        assert_eq!(
+            identities.get("cam").unwrap().serial.as_deref(),
+            Some("SN-1")
+        );
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+    }
 }

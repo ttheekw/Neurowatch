@@ -656,4 +656,57 @@ mod tests {
             .expect("shutdown finishes");
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn the_taps_forward_to_the_cloud_hubs() {
+        use crate::taps::{FrameTap, KeyframeSink};
+        gstreamer::init().unwrap();
+        let cloud = Cloud::default();
+        assert!(!FrameTap::wants(&*cloud.preview_hub, "cam"));
+        // No thumbnail request waits: the sample is dropped quietly.
+        let sample = gstreamer::Sample::builder().build();
+        FrameTap::submit_sample(&*cloud.preview_hub, "cam", &sample);
+
+        let caps = gstreamer::Caps::builder("video/x-h264").build();
+        KeyframeSink::record(
+            &*cloud.keyframes,
+            "cam",
+            caps,
+            gstreamer::Buffer::from_slice(vec![1u8, 2, 3]),
+        );
+        assert!(cloud.keyframes.latest("cam").is_some());
+        KeyframeSink::forget(&*cloud.keyframes, "cam");
+        assert!(cloud.keyframes.latest("cam").is_none());
+    }
+
+    #[test]
+    fn a_speaker_client_id_is_bounded_and_plain() {
+        assert_eq!(speaker_client("user-1"), "web-user-1");
+        assert_eq!(speaker_client("a b/c:d_e!"), "web-abcde");
+        let long = "x".repeat(200);
+        assert_eq!(speaker_client(&long).len(), "web-".len() + 56);
+    }
+
+    fn bare_state() -> Arc<RwLock<AppState>> {
+        Arc::new(RwLock::new(AppState::with_database(
+            crate::config::AppConfig::default(),
+            std::env::temp_dir().join("nw-cloud-speaker-config.json"),
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+            crate::db::connection::open_in_memory().unwrap(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn a_speaker_for_an_unknown_camera_is_refused() {
+        use media_publish::TalkSink;
+        let speaker = CameraSpeaker {
+            state: bare_state(),
+        };
+        let refused = speaker.start("missing".into(), "viewer".into()).await;
+        assert_eq!(refused.err().as_deref(), Some("camera not found"));
+        // Renewing or stopping a talk that is not running changes nothing.
+        speaker.renew("viewer");
+        speaker.stop("viewer");
+        tokio::task::yield_now().await;
+    }
 }

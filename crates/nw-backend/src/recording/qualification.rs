@@ -210,3 +210,97 @@ async fn loopback_schedule_transitions_finalize_real_recordings_without_event_mo
         assert_eq!(count, exact, "each real Matroska file has measured timing");
     }
 }
+
+/// The same schedule transitions as the loopback test above, decided without
+/// a camera: the policy, the ingest restarts and the manual overrides are the
+/// production code's; only the RTSP source is absent (the ingest keeps
+/// retrying an address nothing answers on).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn schedule_transitions_follow_the_policy_and_manual_overrides_without_a_source() {
+    gstreamer::init().unwrap();
+    let scratch = Scratch(std::env::temp_dir().join(format!("nw-policy-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir_all(&scratch.0).unwrap();
+    let mut camera = CameraConfig::new("Schedule policy", "rtsp://127.0.0.1:1/none");
+    camera.id = "scheduled".into();
+    camera.recording.local.enabled = true;
+    camera.recording.local.storage_path = Some(scratch.0.display().to_string());
+    let mut config = AppConfig::default();
+    config.cameras.push(camera.clone());
+    let mut app = AppState::with_database(
+        config,
+        scratch.0.join("config.json"),
+        HwAccelKind::Software,
+        crate::db::connection::open_in_memory().unwrap(),
+    );
+    app.set_headless(true);
+    app.spawn_supervisor(&camera);
+    let state = Arc::new(tokio::sync::RwLock::new(app));
+    let rule = |mode| ScheduleRule {
+        days: (0..7).collect(),
+        start: "00:00".into(),
+        end: "00:00".into(),
+        mode,
+    };
+    let ingest = state.read().await.ingest[&camera.id].state_rx.clone();
+    {
+        // An events-only window needs no ingest restart, and with detection
+        // off nothing is ever trimmed.
+        let mut edited = state.read().await.config.cameras[0].clone();
+        edited.recording.weekly_rules = vec![rule(RecordingMode::Events)];
+        let response = handler(Arc::clone(&state))
+            .dispatch(&serde_json::json!({
+                "jsonrpc":"2.0", "id":1, "method":"camera.update", "params":edited
+            }))
+            .await;
+        assert!(response.get("error").is_none(), "{response}");
+        let st = state.read().await;
+        assert!(ingest.same_channel(&st.ingest[&camera.id].state_rx));
+        assert!(st.event_retention_since(&camera.id).is_none());
+        assert!(!st.recording_pipeline_ready(&camera.id), "nothing answers");
+    }
+    {
+        // An Off window stops recording and restarts the ingest to finalize.
+        let mut st = state.write().await;
+        st.config.cameras[0].recording.weekly_rules = vec![rule(RecordingMode::Off)];
+        st.reconcile_recording_policies();
+        assert!(!st.recording.wants_recording(&camera.id));
+        assert!(!ingest.same_channel(&st.ingest[&camera.id].state_rx));
+        assert!(!st.recording.has_manual_override(&camera.id));
+    }
+    {
+        let mut st = state.write().await;
+        st.config.cameras[0].recording.weekly_rules = vec![rule(RecordingMode::Continuous)];
+        st.reconcile_recording_policies();
+        assert!(st.recording.wants_recording(&camera.id));
+    }
+    {
+        // Explicit Stop stays authoritative across schedule changes.
+        let mut st = state.write().await;
+        st.recording.stop(&camera.id);
+        let cam = st.config.cameras[0].clone();
+        st.restart_ingest(&cam);
+        st.reconcile_recording_policies();
+        assert!(st.recording.has_manual_override(&camera.id));
+        assert!(!st.recording.wants_recording(&camera.id));
+        // Explicit Start likewise overrides an Off window.
+        st.config.cameras[0].recording.weekly_rules = vec![rule(RecordingMode::Off)];
+        let cam = st.config.cameras[0].clone();
+        let dir = st.local_recording_output_dir(&cam);
+        st.recording.start(camera.id.clone(), dir);
+        st.restart_ingest(&cam);
+        st.reconcile_recording_policies();
+        assert!(st.recording.wants_recording(&camera.id));
+        assert_eq!(st.active_views(), 0);
+    }
+    let tasks = {
+        let mut st = state.write().await;
+        st.stop_all();
+        st.take_supervisor_tasks()
+    };
+    for task in tasks {
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}

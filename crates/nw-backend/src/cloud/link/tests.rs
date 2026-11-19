@@ -2782,3 +2782,383 @@ async fn export_progress_is_reported_and_the_reply_says_what_next() {
     drop(requests);
     fs::remove_dir_all(dir).unwrap();
 }
+
+type SeenRequests = StdArc<StdMutex<Vec<(String, Value)>>>;
+
+/// A path-aware cloud that answers every request concurrently: challenges
+/// are issued for whatever operation the request names, anything else goes to
+/// `route(path, body)`. Status 204 sends no body.
+fn serve_routes(
+    route: impl Fn(&str, &Value) -> (u16, Value) + Send + Sync + 'static,
+) -> (String, SeenRequests) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    let seen = StdArc::new(StdMutex::new(Vec::new()));
+    let log = StdArc::clone(&seen);
+    let route = StdArc::new(route);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let (route, log) = (StdArc::clone(&route), StdArc::clone(&log));
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                let end = loop {
+                    let Ok(read) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if let Some(at) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&bytes[..end]).to_string();
+                let path = head
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < end + length {
+                    let Ok(read) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buffer[..read]);
+                }
+                let body: Value =
+                    serde_json::from_slice(&bytes[end..end + length]).unwrap_or(Value::Null);
+                let (status, reply) = if path.ends_with("/node-auth/challenges") {
+                    let operation = body["operation"].as_str().unwrap_or_default();
+                    (
+                        201,
+                        export_challenge(operation, "routes-challenge-00000001"),
+                    )
+                } else {
+                    log.lock().unwrap().push((path.clone(), body.clone()));
+                    route(&path, &body)
+                };
+                let payload = if status == 204 {
+                    Vec::new()
+                } else {
+                    serde_json::to_vec(&reply).unwrap()
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&payload).await;
+            });
+        }
+    });
+    (format!("http://{address}/"), seen)
+}
+
+async fn until_seen(seen: &SeenRequests, mut done: impl FnMut(&[(String, Value)]) -> bool) {
+    for _ in 0..2000 {
+        if done(&seen.lock().unwrap()) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the cloud never saw the expected requests");
+}
+
+fn seen_count(seen: &[(String, Value)], part: &str) -> usize {
+    seen.iter().filter(|(path, _)| path.contains(part)).count()
+}
+
+#[tokio::test]
+async fn thumbnail_demand_is_read_and_batches_are_counted() {
+    let (endpoint, seen) = serve_routes(|path, body| {
+        if path.contains("thumbnail-demands") {
+            return (200, json!({"camera_ids": ["cam-a", "cam-a", "cam-b_1"]}));
+        }
+        if path.contains("thumbnail-batches") {
+            let sent = body["images"].as_array().map_or(0, Vec::len);
+            return (200, json!({ "accepted": sent }));
+        }
+        (404, json!({}))
+    });
+    let (node, dir) = linked_export_node(&endpoint, "thumbnail-demand");
+    let demand = node
+        .pull_thumbnail_demands(Duration::from_secs(0), &["cam-a".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(demand, ["cam-a", "cam-b_1"], "duplicates dropped");
+    let images = vec![
+        ThumbnailImage {
+            camera_id: "cam-a".into(),
+            jpeg_b64: "/9g=".into(),
+        },
+        ThumbnailImage {
+            camera_id: "cam-b_1".into(),
+            jpeg_b64: "/9g=".into(),
+        },
+    ];
+    assert_eq!(node.push_thumbnail_batch(images).await.unwrap(), 2);
+    // Nothing to send, or too much at once, never reaches the cloud.
+    assert!(node.push_thumbnail_batch(vec![]).await.is_err());
+    let many = (0..17)
+        .map(|n| ThumbnailImage {
+            camera_id: format!("c{n}"),
+            jpeg_b64: "/9g=".into(),
+        })
+        .collect();
+    assert!(node.push_thumbnail_batch(many).await.is_err());
+    assert_eq!(seen_count(&seen.lock().unwrap(), "thumbnail-demands"), 1);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn bad_thumbnail_replies_are_refused() {
+    let replies = StdArc::new(StdMutex::new(vec![
+        json!({"camera_ids": ["../etc"]}),
+        json!({"camera_ids": [7]}),
+        json!({"nothing": true}),
+        json!({"camera_ids": (0..257).map(|n| format!("c{n}")).collect::<Vec<_>>()}),
+        json!({"accepted": 9}),
+        json!({"accepted": "many"}),
+    ]));
+    let queue = StdArc::clone(&replies);
+    let (endpoint, _) = serve_routes(move |_, _| {
+        let mut queue = queue.lock().unwrap();
+        (200, queue.remove(0))
+    });
+    let (node, dir) = linked_export_node(&endpoint, "thumbnail-bad");
+    for _ in 0..4 {
+        assert!(node
+            .pull_thumbnail_demands(Duration::from_secs(0), &[])
+            .await
+            .is_err());
+    }
+    let one = || {
+        vec![ThumbnailImage {
+            camera_id: "cam-a".into(),
+            jpeg_b64: "/9g=".into(),
+        }]
+    };
+    assert!(node.push_thumbnail_batch(one()).await.is_err());
+    assert!(node.push_thumbnail_batch(one()).await.is_err());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_scheduler_runs_the_portals_thumbnail_settings_diagnostics_and_directive_loops() {
+    let diagnostics_asked = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config_asked = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (asked, pulled) = (
+        StdArc::clone(&diagnostics_asked),
+        StdArc::clone(&config_asked),
+    );
+    let node_id = "6ba7b812-9dad-11d1-80b4-00c04fd430c8";
+    let (endpoint, seen) = serve_routes(move |path, _| {
+        use std::sync::atomic::Ordering::SeqCst;
+        if path.contains("metadata-check-ins") {
+            return (
+                200,
+                json!({"node_id": node_id, "auth_epoch": 7, "checked_in_at": "2099-01-01T00:00:01Z"}),
+            );
+        }
+        if path.contains("thumbnail-demands") {
+            return (200, json!({"camera_ids": ["cam-a"]}));
+        }
+        if path.contains("thumbnail-batches") {
+            return (200, json!({"accepted": 1}));
+        }
+        if path.contains("config-requests/pull") {
+            let requests = if pulled.fetch_add(1, SeqCst) == 0 {
+                json!([{"request_id": "0123456789abcdef0123456789abcdef",
+                    "method": "settings.get", "params": {}}])
+            } else {
+                json!([])
+            };
+            return (200, json!({ "requests": requests }));
+        }
+        if path.contains("config-results") {
+            return (204, Value::Null);
+        }
+        if path.contains("diagnostics-reports") {
+            // A page opens on the first report, and closes after the second.
+            return (200, json!({"wanted": asked.fetch_add(1, SeqCst) == 0}));
+        }
+        if path.contains("publish-directives") {
+            return (
+                200,
+                serde_json::to_value(empty_publish_directive_batch()).unwrap(),
+            );
+        }
+        (404, json!({}))
+    });
+    let (node, dir) = linked_export_node(&endpoint, "scheduler-loops");
+
+    let photographed = StdArc::new(StdMutex::new(Vec::<Vec<String>>::new()));
+    let log = StdArc::clone(&photographed);
+    let preview: PreviewSource = Arc::new(move |cameras| {
+        log.lock().unwrap().push(cameras.clone());
+        Box::pin(async move {
+            cameras
+                .into_iter()
+                .map(|camera_id| ThumbnailImage {
+                    camera_id,
+                    jpeg_b64: "/9g=".into(),
+                })
+                .collect()
+        })
+    });
+    let methods = StdArc::new(StdMutex::new(Vec::<(String, bool)>::new()));
+    let handled = StdArc::clone(&methods);
+    let remote: RemoteConfigHandler = Arc::new(move |method, _params, sealed| {
+        handled.lock().unwrap().push((method, sealed));
+        Box::pin(async { Ok(json!({"applied": true})) })
+    });
+    let diagnostics: DiagnosticsSource = Arc::new(|| Box::pin(async { json!({"cpu": 1}) }));
+    let batches = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = StdArc::clone(&batches);
+    let sink: DirectiveSink = Arc::new(move |_batch| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {})
+    });
+
+    let handle = CloudScheduler::new(
+        node.shared(),
+        Duration::from_secs(3600),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    )
+    .with_preview(preview)
+    .with_remote_config(remote)
+    .with_diagnostics(diagnostics)
+    .with_directives(sink)
+    .spawn();
+    until_seen(&seen, |seen| {
+        seen_count(seen, "thumbnail-batches") >= 1
+            && seen_count(seen, "config-results") >= 1
+            && seen_count(seen, "diagnostics-reports") >= 2
+            && seen_count(seen, "publish-directives") >= 1
+    })
+    .await;
+    handle.shutdown().await;
+
+    assert_eq!(photographed.lock().unwrap()[0], ["cam-a"]);
+    assert_eq!(
+        *methods.lock().unwrap(),
+        [("settings.get".to_owned(), false)]
+    );
+    assert!(batches.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    let seen = seen.lock().unwrap();
+    let result = seen
+        .iter()
+        .find(|(path, _)| path.contains("config-results"))
+        .unwrap();
+    assert_eq!(result.1["request_id"], "0123456789abcdef0123456789abcdef");
+    // The second diagnostics report carried a snapshot; the first did not.
+    let reports: Vec<_> = seen
+        .iter()
+        .filter(|(path, _)| path.contains("diagnostics-reports"))
+        .collect();
+    assert!(reports[0].1["snapshot_json"].is_null());
+    assert!(!reports[1].1["snapshot_json"].is_null(), "{}", reports[1].1);
+    drop(seen);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cloud_without_these_services_is_not_pestered_and_a_failed_batch_is_retried_later() {
+    let (endpoint, seen) = serve_routes(move |path, _| {
+        if path.contains("metadata-check-ins") {
+            return (
+                200,
+                json!({"node_id": "6ba7b812-9dad-11d1-80b4-00c04fd430c8", "auth_epoch": 7,
+                    "checked_in_at": "2099-01-01T00:00:01Z"}),
+            );
+        }
+        if path.contains("thumbnail-demands") {
+            return (200, json!({"camera_ids": ["cam-a"]}));
+        }
+        // Batches are refused; config and diagnostics do not exist here.
+        (404, json!({}))
+    });
+    let (node, dir) = linked_export_node(&endpoint, "scheduler-404");
+    let preview: PreviewSource = Arc::new(|cameras| {
+        Box::pin(async move {
+            cameras
+                .into_iter()
+                .map(|camera_id| ThumbnailImage {
+                    camera_id,
+                    jpeg_b64: "/9g=".into(),
+                })
+                .collect()
+        })
+    });
+    let remote: RemoteConfigHandler = Arc::new(|_, _, _| Box::pin(async { Ok(json!({})) }));
+    let diagnostics: DiagnosticsSource = Arc::new(|| Box::pin(async { json!({}) }));
+    let handle = CloudScheduler::new(
+        node.shared(),
+        Duration::from_secs(3600),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    )
+    .with_preview(preview)
+    .with_remote_config(remote)
+    .with_diagnostics(diagnostics)
+    .spawn();
+    until_seen(&seen, |seen| {
+        seen_count(seen, "thumbnail-batches") >= 1
+            && seen_count(seen, "config-requests/pull") >= 1
+            && seen_count(seen, "diagnostics-reports") >= 1
+    })
+    .await;
+    handle.shutdown().await;
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen_count(&seen, "config-requests/pull"), 1, "backs off");
+    assert_eq!(seen_count(&seen, "diagnostics-reports"), 1, "backs off");
+    drop(seen);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_config_result_is_sent_as_text_unless_it_is_too_large_or_failed() {
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let status = CloudStatus {
+        phase: LinkPhase::Linked,
+        endpoint: None,
+        tenant_id: Some("t".into()),
+        node_id: Some("n".into()),
+        auth_epoch: Some(1),
+        last_check_in: None,
+    };
+    let issued = OffsetDateTime::from_unix_timestamp(1_790_000_000).unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let body = |outcome: std::result::Result<Value, String>| {
+        config_result_body(&key, &status, "c", id, &outcome, issued).unwrap()
+    };
+    let ok = body(Ok(json!({"a": 1})));
+    assert_eq!(
+        (ok["ok"].clone(), ok["result_json"].clone()),
+        (json!(true), json!(r#"{"a":1}"#))
+    );
+    let large = body(Ok(json!("x".repeat(MAX_CONFIG_RESULT_BYTES + 1))));
+    assert_eq!(large["ok"], json!(false));
+    assert_eq!(large["error"], "the answer is too large to send");
+    assert!(large["result_json"].is_null());
+    let refused = body(Err("é".repeat(MAX_CONFIG_ERROR_CHARS + 50)));
+    assert_eq!(
+        refused["error"].as_str().unwrap().chars().count(),
+        MAX_CONFIG_ERROR_CHARS
+    );
+    assert!(!refused["signature"].as_str().unwrap().is_empty());
+}

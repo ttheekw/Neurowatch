@@ -593,4 +593,252 @@ mod tests {
             .expect("joined");
         assert_eq!(code, 0);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_statuses_are_classified_and_every_signal_is_described() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(Outcome::of(ExitStatus::from_raw(0)), Outcome::Stopped);
+        assert_eq!(
+            Outcome::of(ExitStatus::from_raw(RESTART_EXIT_CODE << 8)),
+            Outcome::RestartRequested
+        );
+        match Outcome::of(ExitStatus::from_raw(3 << 8)) {
+            Outcome::Crashed { code, reason } => {
+                assert_eq!(code, 3);
+                assert_eq!(reason, "exit status 3");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Killed by a signal: no exit code, so status 1 and the signal named.
+        match Outcome::of(ExitStatus::from_raw(libc::SIGKILL)) {
+            Outcome::Crashed { code, reason } => {
+                assert_eq!(code, 1);
+                assert!(reason.contains("SIGKILL"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        for (signal, name) in [
+            (libc::SIGABRT, "SIGABRT"),
+            (libc::SIGBUS, "SIGBUS"),
+            (libc::SIGILL, "SIGILL"),
+            (libc::SIGFPE, "SIGFPE"),
+            (libc::SIGTERM, "SIGTERM"),
+        ] {
+            assert!(describe_signal(signal).contains(name), "{signal}");
+        }
+        assert_eq!(describe_signal(63), "signal 63");
+    }
+
+    #[test]
+    fn every_known_windows_crash_code_has_its_meaning() {
+        for (code, meaning) in [
+            (0xC000_0409_u32, "fail-fast"),
+            (0xC000_0374, "heap corruption"),
+            (0xC000_001D, "illegal instruction"),
+            (0xC000_0094, "division by zero"),
+            (0xC000_0017, "out of memory"),
+            (0xC000_012D, "out of memory"),
+            (0xC000_0135, "DLL was not found"),
+            (0xC000_0142, "failed to initialize"),
+            (0xC000_013A, "Ctrl+C"),
+            (0xE06D_7363, "C++ exception"),
+            (0x8000_0003, "breakpoint"),
+            (0x4001_0004, "debugger"),
+        ] {
+            let text = describe_code(code as i32);
+            assert!(text.contains(meaning), "{code:#x}: {text}");
+            assert!(
+                text.starts_with(&format!("exit code {code:#010X}")),
+                "{text}"
+            );
+        }
+        assert_eq!(describe_code(-1), "exit code 0xFFFFFFFF");
+        assert_eq!(describe_code(0), "exit status 0");
+    }
+
+    #[test]
+    fn a_crash_pause_never_runs_past_an_empty_backoff_list() {
+        let mut policy = Policy::new(vec![], Duration::ZERO, Duration::from_secs(60));
+        assert_eq!(
+            policy.next(&crash(), Duration::from_secs(1), false),
+            Next::Restart(Duration::ZERO)
+        );
+        assert_eq!(Policy::default().backoff.len(), BACKOFF.len());
+    }
+
+    #[test]
+    fn the_supervisor_is_not_asked_for_in_a_plain_process() {
+        // The backend process of this test run was not started with `--supervise`.
+        assert!(!requested());
+    }
+
+    /// Run only in the child process of
+    /// [`the_backend_reads_what_its_supervisor_tells_it`].
+    #[test]
+    fn environment_probe() {
+        let Ok(case) = std::env::var("NW_SUPERVISE_PROBE") else {
+            return;
+        };
+        match case.as_str() {
+            "plain" => {
+                assert!(!supervised());
+                assert_eq!(supervisor_pid(), None);
+                assert_eq!(previous_exit(), None);
+            }
+            "supervised" => {
+                assert!(supervised());
+                assert_eq!(supervisor_pid(), Some(4242));
+                assert_eq!(previous_exit(), None, "an empty reason is no reason");
+                assert!(!requested(), "the supervised backend is not the supervisor");
+            }
+            "supervised-bad-pid" => {
+                assert!(supervised());
+                assert_eq!(supervisor_pid(), None);
+            }
+            "crashed" => {
+                assert_eq!(previous_exit(), Some(("signal 11: SIGSEGV".to_owned(), 3)));
+            }
+            "crashed-unnumbered" => {
+                assert_eq!(previous_exit(), Some(("exit status 2".to_owned(), 1)));
+            }
+            "not-supervised" => {
+                assert!(!supervised());
+                assert_eq!(previous_exit(), None);
+                assert_eq!(supervisor_pid(), None);
+            }
+            other => panic!("unknown case {other}"),
+        }
+    }
+
+    #[test]
+    fn the_backend_reads_what_its_supervisor_tells_it() {
+        // Environment variables are process-wide: each case runs in its own
+        // short-lived copy of this test program (waited for here).
+        let exe = std::env::current_exe().expect("the test program");
+        let run = |case: &str, vars: &[(&str, &str)]| {
+            let mut command = std::process::Command::new(&exe);
+            command
+                .args([
+                    "--exact",
+                    "supervise::tests::environment_probe",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env("NW_SUPERVISE_PROBE", case)
+                .env_remove(SUPERVISED_ENV)
+                .env_remove(RESTARTS_ENV)
+                .env_remove(PREVIOUS_EXIT_ENV)
+                .env_remove(SUPERVISOR_PID_ENV);
+            for (key, value) in vars {
+                command.env(key, value);
+            }
+            let output = command.output().expect("run the probe");
+            let text = String::from_utf8_lossy(&output.stdout).into_owned()
+                + &String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{case}: {text}");
+            assert!(text.contains("1 passed"), "{case} did not run: {text}");
+        };
+        run("plain", &[]);
+        run(
+            "supervised",
+            &[
+                (SUPERVISED_ENV, "1"),
+                (SUPERVISOR_PID_ENV, "4242"),
+                (PREVIOUS_EXIT_ENV, ""),
+            ],
+        );
+        run(
+            "supervised-bad-pid",
+            &[(SUPERVISED_ENV, "1"), (SUPERVISOR_PID_ENV, "not a pid")],
+        );
+        run(
+            "crashed",
+            &[
+                (SUPERVISED_ENV, "1"),
+                (PREVIOUS_EXIT_ENV, "signal 11: SIGSEGV"),
+                (RESTARTS_ENV, "3"),
+            ],
+        );
+        run(
+            "crashed-unnumbered",
+            &[
+                (SUPERVISED_ENV, "1"),
+                (PREVIOUS_EXIT_ENV, "exit status 2"),
+                (RESTARTS_ENV, "many"),
+            ],
+        );
+        run(
+            "not-supervised",
+            &[
+                (SUPERVISED_ENV, "0"),
+                (PREVIOUS_EXIT_ENV, "ignored"),
+                (SUPERVISOR_PID_ENV, "1"),
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_backend_that_asks_to_restart_is_started_again_at_once() {
+        let dir =
+            std::env::temp_dir().join(format!("nw-supervise-restart-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runs = dir.join("runs");
+        let script = format!(
+            "echo \"$NW_RESTARTS|$NW_PREVIOUS_EXIT\" >> '{0}'; n=$(wc -l < '{0}'); \
+             [ \"$n\" -ge 2 ] && exit 0; exit {RESTART_EXIT_CODE}",
+            runs.display()
+        );
+        let child = Child {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+        };
+        let (_stop, stop_rx) = watch::channel(false);
+        let code = tokio::time::timeout(
+            Duration::from_secs(20),
+            supervise(&child, Policy::default(), stop_rx),
+        )
+        .await
+        .expect("supervisor finished");
+        assert_eq!(code, 0);
+        let lines = std::fs::read_to_string(&runs).unwrap();
+        assert_eq!(
+            lines.lines().collect::<Vec<_>>(),
+            ["0|", "1|"],
+            "no reason is passed on"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_cannot_be_started_fails_the_start() {
+        let child = Child {
+            program: PathBuf::from("/nonexistent/neurowatch-backend"),
+            args: vec![],
+        };
+        let (_stop, stop_rx) = watch::channel(false);
+        let code = tokio::time::timeout(
+            Duration::from_secs(10),
+            supervise(&child, Policy::default(), stop_rx),
+        )
+        .await
+        .expect("supervisor finished");
+        assert_eq!(code, 1, "a first run failing at once ends the supervisor");
+    }
+
+    #[tokio::test]
+    async fn a_supervisor_with_nothing_to_hear_a_stop_from_waits_for_the_backend() {
+        // Dropping the sender leaves nothing that could ask for a stop.
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        drop(stop_tx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stop_requested(&mut stop_rx))
+                .await
+                .is_err()
+        );
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        stop_tx.send(true).unwrap();
+        stop_requested(&mut stop_rx).await;
+    }
 }

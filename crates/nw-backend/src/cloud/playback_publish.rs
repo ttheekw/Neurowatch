@@ -69,3 +69,49 @@ impl PlaybackRun for ReplayRun {
         OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_state::AppState;
+    use crate::cloud::media_publish::encoded_channel;
+    use crate::config::AppConfig;
+    use crate::pipeline::hwaccel::HwAccelKind;
+    use tokio::sync::RwLock;
+
+    #[test]
+    fn a_replay_run_passes_controls_on_and_reports_no_position_before_a_picture() {
+        let (units, _feed) = encoded_channel();
+        let replay = EncodedReplay::spawn(Vec::new(), 0, 100, true, Arc::new(units));
+        let run = ReplayRun(replay);
+        run.set_speed_percent(200);
+        run.set_playing(false);
+        run.set_playing(true);
+        assert!(run.position().is_none());
+        run.stop();
+    }
+
+    #[tokio::test]
+    async fn playback_of_a_camera_with_no_recordings_is_refused() {
+        let root = std::env::temp_dir().join(format!(
+            "neurowatch-playback-publish-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut config = AppConfig::default();
+        config.recording.storage_path = root.join("rec").to_string_lossy().into_owned();
+        let state = Arc::new(RwLock::new(AppState::new(
+            config,
+            root.join("config.json"),
+            HwAccelKind::Software,
+        )));
+        let opener = RecordedPlaybackOpener::new(PlaybackHandler::new(state));
+        let (units, _feed) = encoded_channel();
+        let position = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let refused = opener
+            .open("missing", position, 100, true, Arc::new(units))
+            .await
+            .err();
+        assert_eq!(refused, Some(PublishError::NoRecording));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

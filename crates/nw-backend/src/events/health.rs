@@ -765,4 +765,117 @@ mod tests {
             vec![HealthChange::End(11)]
         );
     }
+
+    fn app_state(config: crate::config::AppConfig, dir: &std::path::Path) -> Arc<RwLock<AppState>> {
+        Arc::new(RwLock::new(AppState::with_database(
+            config,
+            dir.join("config.json"),
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+            crate::db::connection::open_in_memory().unwrap(),
+        )))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_reports_the_start_and_a_missing_location_until_it_is_back() {
+        use crate::storage_guard::Readiness;
+        let dir = std::env::temp_dir().join(format!("nw-health-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("recordings");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = crate::config::AppConfig::default();
+        config.recording.storage_path = root.to_string_lossy().into_owned();
+        let mut camera = nw_core::camera::CameraConfig::new("Gate", "rtsp://127.0.0.1:9/live");
+        camera.id = "gate".into();
+        camera.recording.local.enabled = true;
+        camera.recording.local.storage_path = Some(root.to_string_lossy().into_owned());
+        config.cameras.push(camera);
+        let state = app_state(config, &dir);
+        let hub = Arc::new(EventHub::new(Arc::new(std::sync::Mutex::new(
+            crate::db::connection::open_in_memory().unwrap(),
+        ))));
+        let (shutdown, shutdown_rx) = broadcast::channel(1);
+        let task = tokio::spawn(run(Arc::clone(&state), Arc::clone(&hub), shutdown_rx));
+
+        tokio::task::yield_now().await;
+        let started = hub.since(0).notices;
+        assert!(
+            started
+                .iter()
+                .any(|n| n.event.kind == EventKind::BackendStarted
+                    && n.event
+                        .detail
+                        .as_deref()
+                        .is_some_and(|d| d.starts_with("NeuroWatch "))),
+            "the start is reported at once: {started:?}"
+        );
+        // The drive is gone: one event with the reason, however many polls pass.
+        state
+            .read()
+            .await
+            .storage
+            .set(&root, Readiness::Missing("unplugged".into()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let open = loop {
+            let open = hub.open_events();
+            if !open.is_empty() {
+                break open;
+            }
+            assert!(std::time::Instant::now() < deadline, "no storage event");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].kind, EventKind::StorageMissing);
+        assert_eq!(open[0].detail.as_deref(), Some("unplugged"));
+        // Back again: the event ends.
+        state.read().await.storage.set(&root, Readiness::Ready);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !hub.open_events().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the event never ended"
+            );
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Long enough for the open-event refresh (every twelfth poll) to run.
+        for _ in 0..14 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_camera_that_stays_down_after_going_offline_and_failures_that_clear_are_tracked() {
+        let mut t = HealthTracker::default();
+        // Unauthorized counts as offline; "streaming" or "recording_ready" ends it.
+        let unauthorized = || {
+            cams(vec![camera(
+                "a",
+                crate::pipeline::supervisor::UNAUTHORIZED,
+                None,
+            )])
+        };
+        assert_eq!(observe(&mut t, unauthorized()).len(), 1);
+        assert!(observe(&mut t, cams(vec![camera("a", "connecting", None)])).is_empty());
+        assert_eq!(
+            observe(&mut t, cams(vec![camera("a", "recording_ready", None)])).len(),
+            1
+        );
+        // A recording that recovers before the second poll never alerts.
+        let mut t = HealthTracker::default();
+        observe(&mut t, cams(vec![camera("b", "streaming", Some("failed"))]));
+        assert!(observe(
+            &mut t,
+            cams(vec![camera("b", "streaming", Some("recording"))])
+        )
+        .is_empty());
+        assert!(
+            observe(&mut t, cams(vec![camera("b", "streaming", Some("failed"))])).is_empty(),
+            "the count starts over"
+        );
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024 / 2), "1.5 GB");
+    }
 }

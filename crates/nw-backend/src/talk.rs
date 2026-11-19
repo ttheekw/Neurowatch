@@ -517,4 +517,196 @@ mod tests {
         });
         assert!(service.status().is_none() && lapsed.load(Ordering::SeqCst));
     }
+
+    /// A camera that answers RTSP `OPTIONS` and `DESCRIBE` with `sdp` (or 404
+    /// when none) and refuses everything else: enough for a backchannel to be
+    /// offered and the session to be abandoned afterwards.
+    fn mock_camera(sdp: Option<&'static str>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    loop {
+                        let mut method = String::new();
+                        let mut cseq = String::from("0");
+                        let mut first = true;
+                        loop {
+                            let mut line = String::new();
+                            match reader.read_line(&mut line) {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => {}
+                            }
+                            let line = line.trim_end();
+                            if line.is_empty() {
+                                break;
+                            }
+                            if first {
+                                method = line.split(' ').next().unwrap_or("").to_owned();
+                                first = false;
+                            } else if let Some(value) = line.strip_prefix("CSeq:") {
+                                cseq = value.trim().to_owned();
+                            }
+                        }
+                        let reply = match (method.as_str(), sdp) {
+                            ("OPTIONS", _) => format!(
+                                "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n"
+                            ),
+                            ("DESCRIBE", Some(sdp)) => format!(
+                                "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Base: rtsp://127.0.0.1:{port}/cam/\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
+                                sdp.len()
+                            ),
+                            ("DESCRIBE", None) => {
+                                format!("RTSP/1.0 404 Not Found\r\nCSeq: {cseq}\r\n\r\n")
+                            }
+                            _ => format!(
+                                "RTSP/1.0 461 Unsupported Transport\r\nCSeq: {cseq}\r\n\r\n"
+                            ),
+                        };
+                        if writer.write_all(reply.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("rtsp://127.0.0.1:{port}/cam")
+    }
+
+    const PCMU_SPEAKER: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Test\r\nt=0 0\r\nm=audio 0 RTP/AVP 0\r\na=control:trackID=1\r\na=rtpmap:0 PCMU/8000\r\na=sendonly\r\n";
+    const PCMA_SPEAKER: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Test\r\nt=0 0\r\nm=audio 0 RTP/AVP 8\r\na=control:trackID=1\r\na=rtpmap:8 PCMA/8000\r\na=sendonly\r\n";
+    const AAC_SPEAKER: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Test\r\nt=0 0\r\nm=audio 0 RTP/AVP 97\r\na=control:trackID=1\r\na=rtpmap:97 MPEG4-GENERIC/16000/1\r\na=sendonly\r\n";
+    const VIDEO_ONLY: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Test\r\nt=0 0\r\nm=video 0 RTP/AVP 96\r\na=control:trackID=1\r\na=rtpmap:96 H264/90000\r\na=recvonly\r\n";
+
+    #[test]
+    fn codecs_have_encoders_and_names_and_sources_describe_themselves() {
+        let back = |encoding: &str| Backchannel {
+            stream: 0,
+            encoding: encoding.into(),
+            payload: 8,
+            rate: 4000,
+        };
+        assert_eq!(encoder(&back("pcma")).unwrap(), "alawenc ! rtppcmapay pt=8");
+        assert!(encoder(&back("OPUS")).is_none());
+        assert_eq!(label("PCMU"), "G.711 µ-law");
+        assert_eq!(label("opus"), "unsupported");
+        // Telephone rates are never sent lower than 8 kHz.
+        let pipeline = sound_pipeline(&TalkSource::Microphone, &back("PCMA")).unwrap();
+        assert!(pipeline.starts_with("autoaudiosrc !") && pipeline.contains("rate=8000"));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let samples = sound_pipeline(&TalkSource::Samples(rx), &back("PCMA")).unwrap();
+        assert!(samples.contains("appsrc name=talk_in") && samples.contains("rate=48000"));
+        assert!(TalkSource::Tone.launch().contains("440"));
+    }
+
+    #[tokio::test]
+    async fn talking_needs_an_rtsp_camera_and_replaces_the_same_clients_session() {
+        let service = Arc::new(TalkService::default());
+        let file = CameraConfig::new("File", "file:///tmp/none.mp4");
+        assert_eq!(
+            TalkService::probe(&file).await.unwrap_err(),
+            "talking needs an RTSP camera"
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        *service.lock() = Some(Active {
+            camera_id: "cam".into(),
+            client_id: "desk".into(),
+            until: Instant::now() + LEASE,
+            stop: Arc::clone(&stop),
+        });
+        let error = service
+            .start(&file, "desk", TalkSource::Tone)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "talking needs an RTSP camera");
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "the old session was ended first"
+        );
+        assert!(service.status().is_none());
+        // Another client's wording does not name a camera it is not using.
+        *service.lock() = Some(Active {
+            camera_id: "other".into(),
+            client_id: "desk".into(),
+            until: Instant::now() + LEASE,
+            stop: Arc::new(AtomicBool::new(false)),
+        });
+        let busy = service
+            .start(
+                &CameraConfig::new("Gate", "rtsp://127.0.0.1:1/x"),
+                "web",
+                TalkSource::Tone,
+            )
+            .await
+            .unwrap_err();
+        assert!(busy.contains("a camera"), "{busy}");
+    }
+
+    #[tokio::test]
+    async fn a_probe_reports_the_speakers_codec_or_why_there_is_none() {
+        let _ = gstreamer::init();
+        for (sdp, expected) in [
+            (Some(PCMU_SPEAKER), Ok("G.711 µ-law")),
+            (Some(PCMA_SPEAKER), Ok("G.711 A-law")),
+        ] {
+            let camera = CameraConfig::new("Gate", mock_camera(sdp));
+            assert_eq!(
+                TalkService::probe(&camera).await.as_deref(),
+                expected,
+                "{sdp:?}"
+            );
+        }
+        let aac = CameraConfig::new("Gate", mock_camera(Some(AAC_SPEAKER)));
+        let error = TalkService::probe(&aac).await.unwrap_err();
+        assert!(error.contains("G.711"), "{error}");
+        let video = CameraConfig::new("Gate", mock_camera(Some(VIDEO_ONLY)));
+        assert!(TalkService::probe(&video).await.is_err());
+        let missing = CameraConfig::new("Gate", mock_camera(None));
+        assert!(TalkService::probe(&missing).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_talk_session_starts_renews_and_stops_on_the_clients_say_so() {
+        let _ = gstreamer::init();
+        let service = Arc::new(TalkService::default());
+        let camera = CameraConfig::new("Gate", mock_camera(Some(PCMU_SPEAKER)));
+        let codec = service
+            .start(&camera, "desk", TalkSource::Tone)
+            .await
+            .unwrap();
+        assert_eq!(codec, "G.711 µ-law");
+        // The mock camera refuses to set the stream up, which may end the
+        // session by itself; renewing is checked only while it holds.
+        if service.status().is_some() {
+            let _ = service.renew("desk");
+        }
+        service.stop("desk");
+        assert!(service.status().is_none());
+        assert!(service.renew("desk").is_err());
+    }
+
+    #[tokio::test]
+    async fn pushed_samples_end_the_session_when_the_sender_closes() {
+        let _ = gstreamer::init();
+        let service = Arc::new(TalkService::default());
+        let camera = CameraConfig::new("Gate", mock_camera(Some(PCMA_SPEAKER)));
+        let (samples, input) = std::sync::mpsc::channel();
+        let codec = service
+            .start(&camera, "web-1", TalkSource::Samples(input))
+            .await
+            .unwrap();
+        assert_eq!(codec, "G.711 A-law");
+        samples.send(vec![0i16; 960]).unwrap();
+        samples.send(vec![100i16; 960]).unwrap();
+        drop(samples);
+        // End of the pushed sound (or the refused stream) ends the session.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while service.status().is_some() {
+            assert!(Instant::now() < deadline, "the session never ended");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }

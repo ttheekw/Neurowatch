@@ -357,4 +357,147 @@ mod tests {
             0
         );
     }
+
+    #[test]
+    fn the_clock_forgets_removed_cameras_and_reports_when_enrollment_began() {
+        let mut clock = EligibilityClock::default();
+        assert_eq!(clock.since("a"), None);
+        clock.observe("a", "p", true, 100);
+        clock.observe("b", "p", true, 200);
+        assert_eq!(clock.since("a"), Some(100));
+        let mut kept = nw_core::camera::CameraConfig::new("B", "rtsp://x/y");
+        kept.id = "b".into();
+        clock.retain_cameras(&[kept]);
+        assert_eq!(clock.since("a"), None);
+        assert_eq!(clock.since("b"), Some(200));
+    }
+
+    #[test]
+    fn pruning_refuses_unsafe_roots_and_skips_unusable_rows() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, SystemTime};
+        let root = std::env::temp_dir().join(format!("nw-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("cam")).unwrap();
+        let db = Arc::new(Mutex::new(crate::db::connection::open_in_memory().unwrap()));
+        let recent = SystemTime::now() + Duration::from_secs(60);
+        // No storage root, no camera folder, or the "camera" is the root itself.
+        assert_eq!(
+            prune_unmarked(&db, "cam", &root.join("missing"), 9, recent).unwrap(),
+            0
+        );
+        assert_eq!(prune_unmarked(&db, "other", &root, 9, recent).unwrap(), 0);
+        assert_eq!(prune_unmarked(&db, ".", &root, 9, recent).unwrap(), 0);
+        // A folder outside the root, reached through a symlink named like the camera.
+        #[cfg(unix)]
+        {
+            let outside = std::env::temp_dir().join(format!("nw-outside-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+            assert_eq!(prune_unmarked(&db, "linked", &root, 9, recent).unwrap(), 0);
+            let _ = std::fs::remove_dir_all(outside);
+        }
+
+        // Rows whose files are gone, are folders, are symlinks or are not
+        // under the camera folder are skipped; the one real file goes.
+        let cam = root.join("cam");
+        let file = cam.join("real.mkv");
+        std::fs::write(&file, b"x").unwrap();
+        let folder = cam.join("folder.mkv");
+        std::fs::create_dir(&folder).unwrap();
+        let mut paths = vec![
+            cam.join("gone.mkv").to_string_lossy().into_owned(),
+            folder.to_string_lossy().into_owned(),
+            file.to_string_lossy().into_owned(),
+        ];
+        #[cfg(unix)]
+        {
+            let target = root.join("target.mkv");
+            std::fs::write(&target, b"x").unwrap();
+            let link = cam.join("link.mkv");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            paths.push(link.to_string_lossy().into_owned());
+        }
+        for (index, path) in paths.iter().enumerate() {
+            db.lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO segments(camera_id,start_ts,end_ts,path,size_bytes,event_retention_eligible,has_event,timing_exact) VALUES('cam',?1,?2,?3,1,1,0,1)",
+                    params![1000 + index as i64, 2000 + index as i64, path],
+                )
+                .unwrap();
+        }
+        let settled = SystemTime::now() + Duration::from_secs(60);
+        assert_eq!(
+            prune_unmarked(&db, "cam", &root, 9_000, settled).unwrap(),
+            1
+        );
+        assert!(!file.exists());
+        assert!(folder.is_dir());
+        let remaining: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM segments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, paths.len() as i64 - 1);
+        // Nothing older than the cutoff is left to trim.
+        assert_eq!(prune_unmarked(&db, "cam", &root, 500, settled).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_poisoned_database_lock_is_an_error_not_a_panic() {
+        use std::sync::{Arc, Mutex};
+        let root = std::env::temp_dir().join(format!("nw-poison-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("cam")).unwrap();
+        let db = Arc::new(Mutex::new(crate::db::connection::open_in_memory().unwrap()));
+        let poisoner = Arc::clone(&db);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        let error = prune_unmarked(&db, "cam", &root, 1, std::time::SystemTime::now()).unwrap_err();
+        assert!(error.to_string().contains("database unavailable"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn event_padding_marks_neighbouring_segments_and_enrolls_only_finished_exact_ones() {
+        let conn = crate::db::connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO segments(camera_id,start_ts,end_ts,path,size_bytes,timing_exact) VALUES
+             ('cam',0,3000,'a.mkv',1,1), ('cam',3000,6000,'b.mkv',1,1),
+             ('cam',6000,9000,'c.mkv',1,1), ('cam',9000,12000,'d.mkv',1,0),
+             ('cam',12000,NULL,'open.mkv',1,1);
+             INSERT INTO events(id,ts,end_ts,last_ts,camera_id,event_type,source)
+               VALUES(1,6500,6500,6500,'cam','motion','builtin'),
+                     (2,100,100,100,'cam','recording_failed','system');",
+        )
+        .unwrap();
+        // One second of padding either side of the motion at 6500 reaches b and c only
+        // (the failed-recording event is not an event worth keeping footage for).
+        refresh_flags(&conn, "cam", Some(3000), 1, 1, 20_000).unwrap();
+        let flags = |path: &str| -> (i64, i64) {
+            conn.query_row(
+                "SELECT has_event,event_retention_eligible FROM segments WHERE path=?1",
+                [path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            flags("a.mkv"),
+            (0, 0),
+            "before the interval began, no event"
+        );
+        assert_eq!(flags("d.mkv").0, 0, "the post-roll ends before it");
+        assert_eq!(flags("b.mkv"), (1, 1), "the pre-roll reaches back into it");
+        assert_eq!(flags("c.mkv"), (1, 1));
+        assert_eq!(flags("d.mkv").1, 0, "unmeasured timing is never enrolled");
+        assert_eq!(
+            flags("open.mkv").1,
+            0,
+            "unfinished files are never enrolled"
+        );
+    }
 }

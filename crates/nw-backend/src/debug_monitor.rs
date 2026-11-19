@@ -421,4 +421,98 @@ mod tests {
         let resources = Resources::read();
         assert!(resources.working_set.is_some() && resources.threads.is_some());
     }
+
+    fn state() -> Arc<RwLock<AppState>> {
+        let mut config = crate::config::AppConfig::default();
+        config
+            .cameras
+            .push(nw_core::camera::CameraConfig::new("A", "rtsp://x/a"));
+        config
+            .cameras
+            .push(nw_core::camera::CameraConfig::new("B", "rtsp://x/b"));
+        Arc::new(RwLock::new(AppState::with_database(
+            config,
+            std::env::temp_dir().join("nw-monitor-config.json"),
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+            crate::db::connection::open_in_memory().unwrap(),
+        )))
+    }
+
+    #[test]
+    fn the_state_is_read_at_once_when_it_is_free_and_after_a_wait_when_it_is_held() {
+        let state = state();
+        assert_eq!(read_state(&state), (0, 2));
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let guard = state.blocking_write();
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                drop(guard);
+            })
+        };
+        locked_rx.recv().unwrap();
+        assert!(state.try_read().is_err());
+        // Let go shortly after the reader starts waiting.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            release_tx.send(()).unwrap();
+        });
+        assert_eq!(read_state(&state), (0, 2));
+        releaser.join().unwrap();
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn durations_are_reported_in_whole_milliseconds_without_overflow() {
+        assert_eq!(millis(Duration::from_micros(2_500)), 2);
+        assert_eq!(millis(Duration::from_secs(3)), 3000);
+        assert_eq!(millis(Duration::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn missing_figures_are_skipped_and_the_summary_fills_in_what_is_there() {
+        assert_eq!(parse_proc_status("Name:\tx\n"), (None, None, None));
+        assert_eq!(parse_proc_status("VmRSS: abc kB\n"), (None, None, None));
+        assert_eq!(parse_meminfo(""), [None; 4]);
+        let full = Resources {
+            working_set: Some(2 * 1024 * 1024),
+            private: Some(1024 * 1024),
+            handles: Some(7),
+            threads: Some(3),
+            memory_total: Some(8 * 1024 * 1024),
+            memory_available: Some(4 * 1024 * 1024),
+            commit: Some(5 * 1024 * 1024),
+            commit_limit: Some(16 * 1024 * 1024),
+        };
+        assert_eq!(
+            full.summary(),
+            "working set 2 MB, private 1 MB, handles 7, threads 3; \
+             system memory 4 of 8 MB free, commit 5 of 16 MB"
+        );
+        assert!(Resources::default()
+            .summary()
+            .contains("working set ?, private ?"));
+        // A shorter stall than the threshold, after one that ended, starts a new one.
+        let mut tracker = StallTracker::new(STALL);
+        assert_eq!(
+            tracker.update(Duration::from_secs(5)),
+            Some(StallEvent::Started(Duration::from_secs(5)))
+        );
+        assert_eq!(
+            tracker.update(Duration::ZERO),
+            Some(StallEvent::Ended(Duration::from_secs(5)))
+        );
+        assert_eq!(tracker.update(STALL), Some(StallEvent::Started(STALL)));
+    }
+
+    #[tokio::test]
+    async fn the_monitor_starts_beating_on_the_runtime_and_watching_on_its_own_thread() {
+        // Quiet while extended logging is off; it ends with the process.
+        spawn(state());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
 }
