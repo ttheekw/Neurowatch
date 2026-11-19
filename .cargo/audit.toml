@@ -1,0 +1,29 @@
+# cargo audit (.github/workflows/audit.yml) reads this file. Every ignored
+# advisory has no fix NeuroWatch can take yet; each group says why it is
+# accepted and what removes it. To see every advisory again, rename this file
+# for a moment and run `cargo audit`; delete an entry as soon as its fix can be
+# taken.
+
+[advisories]
+ignore = [
+    # rustls-webpki 0.102.8: reached only through rumqttc 0.25.1, the newest
+    # rumqttc release, for MQTT brokers over TLS (the MQTT / Home Assistant
+    # service, off unless configured). Fixed in rustls-webpki 0.103, which
+    # rumqttc does not accept yet. Remove when a rumqttc release moves to it.
+    "RUSTSEC-2026-0049", # CRLs not considered authoritative by distribution point
+    "RUSTSEC-2026-0098", # name constraints for URI names accepted
+    "RUSTSEC-2026-0099", # name constraints accepted for wildcard names
+    "RUSTSEC-2026-0104", # reachable panic parsing a certificate revocation list
+    "RUSTSEC-2026-0382", # distrusted intermediates may be accepted
+
+    # zip 0.6.6: a build dependency of LiveKit's webrtc-sys-build, which unpacks
+    # LiveKit's prebuilt libwebrtc while compiling. It is not in any NeuroWatch
+    # binary and never reads an archive at run time. Remove when the LiveKit
+    # SDK (Cargo.toml, livekit rust-sdks rev) updates it.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
+    "RUSTSEC-2026-0545",
+    "RUSTSEC-2026-0548",
+]
