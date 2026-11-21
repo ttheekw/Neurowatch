@@ -8,6 +8,7 @@
 //! state (a line crossed) are events without duration.
 
 use std::collections::{BTreeSet, HashMap};
+use std::time::{Duration, Instant};
 
 use nw_core::event::EventKind;
 
@@ -126,8 +127,19 @@ pub enum Action {
     },
 }
 
+/// Events one camera may open per [`RATE_WINDOW`]. A camera (or whoever
+/// speaks as it) that reports more is ignored until the window ends: each
+/// event is a database row, an alert and plugin work.
+const MAX_EVENTS_PER_WINDOW: u32 = 120;
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Open states kept per camera; a camera naming new sources forever cannot
+/// grow the table without end.
+const MAX_ACTIVE_KEYS: usize = 256;
+
 #[derive(Default)]
 pub struct Tracker {
+    /// Start of the current rate window and what it let through.
+    window: Option<(Instant, u32)>,
     /// Open event key → the states keeping it open (topic + source).
     active: HashMap<String, BTreeSet<String>>,
     /// Topics seen, for `motion.status` (bounded).
@@ -137,7 +149,25 @@ pub struct Tracker {
 const MAX_SEEN_TOPICS: usize = 64;
 
 impl Tracker {
+    /// Whether one more event may open now (counts it when it may).
+    fn allow(&mut self, now: Instant) -> bool {
+        let (started, used) = match self.window {
+            Some((started, used)) if now.duration_since(started) < RATE_WINDOW => (started, used),
+            _ => (now, 0),
+        };
+        if used >= MAX_EVENTS_PER_WINDOW {
+            self.window = Some((started, used));
+            return false;
+        }
+        self.window = Some((started, used + 1));
+        true
+    }
+
     pub fn observe(&mut self, notification: &Notification) -> Vec<Action> {
+        self.observe_at(notification, Instant::now())
+    }
+
+    pub fn observe_at(&mut self, notification: &Notification, now: Instant) -> Vec<Action> {
         let Some(kind) = classify(&notification.topic) else {
             return Vec::new();
         };
@@ -162,15 +192,21 @@ impl Tracker {
         }) else {
             return if notification.operation == Operation::Initialized {
                 Vec::new()
-            } else {
+            } else if self.allow(now) {
                 vec![Action::Instant {
                     kind,
                     topic: notification.topic.clone(),
                     detail: detail(notification),
                 }]
+            } else {
+                Vec::new()
             };
         };
         if on {
+            let known = self.active.contains_key(&key);
+            if !known && (self.active.len() >= MAX_ACTIVE_KEYS || !self.allow(now)) {
+                return Vec::new();
+            }
             let states = self.active.entry(key.clone()).or_default();
             let opened = states.is_empty();
             states.insert(state_key);
@@ -242,6 +278,40 @@ mod tests {
 
     const CELL: &str = "RuleEngine/CellMotionDetector/Motion";
     const ALARM: &str = "VideoSource/MotionAlarm";
+
+    #[test]
+    fn a_camera_cannot_open_unlimited_events() {
+        // Checklist "Recorder local": ONVIF events were unlimited per camera.
+        let mut t = Tracker::default();
+        let now = Instant::now();
+        let crossing = |n: u32| {
+            note(
+                "RuleEngine/LineDetector/Crossed",
+                Operation::None,
+                &[("ObjectId", &n.to_string())],
+            )
+        };
+        let kept = (0..MAX_EVENTS_PER_WINDOW + 50)
+            .map(|n| t.observe_at(&crossing(n), now).len())
+            .sum::<usize>();
+        assert_eq!(kept, MAX_EVENTS_PER_WINDOW as usize);
+        // A new window lets events through again.
+        assert_eq!(t.observe_at(&crossing(0), now + RATE_WINDOW).len(), 1);
+        // Sources that never repeat cannot grow the open table without end.
+        let mut t = Tracker::default();
+        let mut opened = 0;
+        for n in 0..(MAX_ACTIVE_KEYS as u32 + 50) {
+            let at = now + RATE_WINDOW * n;
+            let input = Notification {
+                topic: "Device/Trigger/DigitalInput".into(),
+                operation: Operation::Changed,
+                source: vec![("InputToken".into(), format!("DI{n}"))],
+                data: vec![("LogicalState".into(), "true".into())],
+            };
+            opened += t.observe_at(&input, at).len();
+        }
+        assert_eq!(opened, MAX_ACTIVE_KEYS);
+    }
 
     #[test]
     fn topics_are_classified() {

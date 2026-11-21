@@ -28,7 +28,6 @@ publish      = false
 nw-service-protocol = { path = "crates/nw-service-protocol" }
 # Workspace crates
 nw-core             = { path = "crates/nw-core" }
-nw-backend          = { path = "crates/nw-backend" }
 nw-cloud-protocol   = { path = "crates/nw-cloud-protocol" }
 nw-analytics-protocol = { path = "crates/nw-analytics-protocol" }
 nw-analytics-sdk = { path = "crates/nw-analytics-sdk" }

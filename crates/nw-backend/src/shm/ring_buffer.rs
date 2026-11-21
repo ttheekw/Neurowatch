@@ -252,14 +252,33 @@ mod platform {
             // stays alive (held by the old mmap) while we create a fresh inode at
             // the same path — both supervisors get independent mappings with no
             // truncation involved.
+            //
+            // The file is this user's alone (0600) and always new: with the
+            // umask's mode other OS users could map it and watch the pictures,
+            // and opening a file someone else put at the name (a link, or a
+            // file the sticky /dev/shm would not let us remove) mapped theirs
+            // (vulnerability checklist R5). A name we cannot take is an error:
+            // that camera shows no pictures rather than someone else's file.
+            let open = || {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&path)
+            };
             let _ = std::fs::remove_file(&path);
-
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)?;
+            let file = match open() {
+                // Another writer of this camera created it in between: take
+                // the name over, as before.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = std::fs::remove_file(&path);
+                    open()?
+                }
+                other => other?,
+            };
             file.set_len(TOTAL_BYTES as u64)?;
 
             let inode = file.metadata()?.ino();
@@ -572,7 +591,37 @@ mod tests {
             &[1, 2, 3, 4, 5, 6]
         );
 
+        // Vulnerability checklist R5: the pictures are this user's alone.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("ring").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
+
         drop(writer);
         assert!(std::fs::metadata(&path).is_err());
+    }
+
+    /// A link planted at a camera's ring name is never followed: the writer
+    /// replaces it with its own file (vulnerability checklist R5).
+    #[test]
+    fn a_planted_link_is_replaced_not_followed() {
+        let key = CameraId::from(format!("test-ring-link-{}", std::process::id()));
+        let path = format!("/dev/shm{SHM_PREFIX}{key}");
+        let target = std::env::temp_dir().join(format!("nw-ring-target-{}", std::process::id()));
+        std::fs::write(&target, b"keep").expect("target");
+        let _ = std::fs::remove_file(&path);
+        std::os::unix::fs::symlink(&target, &path).expect("plant link");
+
+        let writer = ShmRingBufferWriter::create(&key).expect("create ring");
+        let meta = std::fs::symlink_metadata(&path).expect("ring");
+        assert!(meta.file_type().is_file(), "the link was replaced");
+        assert_eq!(
+            std::fs::read(&target).expect("target"),
+            b"keep",
+            "nothing written through the link"
+        );
+        drop(writer);
+        let _ = std::fs::remove_file(&target);
     }
 }

@@ -26,6 +26,7 @@ from PySide6.QtGui import QColor, QPainter, QPaintEvent, QPen, QPolygonF
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QWidget
 
 from neurowatch import build_info
+from neurowatch.models.video_decoder import DRIVER_MISSING_CODES
 from neurowatch.utils.network import format_bitrate
 
 _HEIGHT = 24
@@ -246,7 +247,7 @@ class StatusBarWidget(QWidget):
         # Active backend decoder. This reports the accelerator Neurowatch
         # selected, which is distinct from whether utilization counters exist.
         self._accel_lbl = StatusIndicator("Decoder: —", "ring")
-        self._accel_shown: tuple[str, object] | None = None
+        self._accel_shown: tuple[str, object, object] | None = None
         self._accel_lbl.setAccessibleName("Video acceleration unknown")
         self._accel_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self._accel_lbl.setStyleSheet(f"color: {_TEXT}; font-weight: 600;")
@@ -328,7 +329,11 @@ class StatusBarWidget(QWidget):
         its decoder when it starts, and a backend started before sign-in
         restarts itself once the graphics card is available."""
         info = acceleration if isinstance(acceleration, Mapping) else {}
-        shown = (str(info.get("kind", "unknown")).lower(), info.get("reason"))
+        shown = (
+            str(info.get("kind", "unknown")).lower(),
+            info.get("reason"),
+            info.get("reason_code"),
+        )
         if shown == self._accel_shown:
             return  # re-sent every poll: restyling is not free
         self._accel_shown = shown
@@ -359,6 +364,9 @@ class StatusBarWidget(QWidget):
         icon, label, color, tooltip = badges.get(
             kind, ("ring", "Decoder: —", _TEXT, "Video decoder is unknown")
         )
+        if kind == "software" and info.get("reason_code") in DRIVER_MISSING_CODES:
+            # A graphics card that can decode video, without its driver.
+            icon, color = "alert", "#f59e0b"
         self._accel_lbl.setText(label)
         self._accel_lbl.set_mark(icon)
         self._accel_lbl.setAccessibleName(f"Video acceleration: {label}")

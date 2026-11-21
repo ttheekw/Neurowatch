@@ -47,8 +47,34 @@ def _bundle(root: Path, *, portable: bool = True) -> Path:
     return root
 
 
+def _previous_list(root: Path) -> None:
+    """What the 0.1.2 start recorded: its own file list."""
+    (root / leftovers.SEEN).write_text(
+        "\n".join(
+            [
+                "app/",
+                "app/neurowatch-ui/",
+                "app/neurowatch-ui/neurowatch-ui",
+                "app/neurowatch-ui/_internal/",
+                "app/neurowatch-ui/_internal/neurowatch-0.1.2.dist-info/",
+                "app/neurowatch-ui/_internal/neurowatch-0.1.2.dist-info/METADATA",
+                "bin/",
+                "bin/nw-backend",
+                "bin/libold.so",
+                "gstreamer/",
+                "gstreamer/lib/",
+                "gstreamer/lib/gstreamer-1.0/",
+                "gstreamer/lib/gstreamer-1.0/old/",
+                "gstreamer/lib/gstreamer-1.0/old/libgstold.so",
+            ]
+        )
+        + "\n"
+    )
+
+
 def test_a_portable_copy_removes_what_the_old_version_left(tmp_path: Path) -> None:
     root = _bundle(tmp_path)
+    _previous_list(root)
     internal = root / "app/neurowatch-ui/_internal"
     found = sorted(d.version for d in distributions(name="neurowatch", path=[str(internal)]))
     assert found == ["0.1.2", "0.1.4"]  # the window showed 0.1.2
@@ -64,6 +90,40 @@ def test_a_portable_copy_removes_what_the_old_version_left(tmp_path: Path) -> No
     assert (root / "gstreamer/lib/kept-empty").is_dir()  # listed, though empty
     assert (root / "notes.txt").exists()  # outside the program folders
     assert leftovers.clean_portable_copy(root) == 0  # nothing more on the next start
+    assert (root / leftovers.SEEN).read_text() == (root / leftovers.MANIFEST).read_text()
+
+
+def test_a_shared_prefix_loses_only_files_an_earlier_list_named(tmp_path: Path) -> None:
+    root = _bundle(tmp_path)
+    _previous_list(root)
+    (root / "bin/other-program").write_text("not ours")
+    (root / "app/other-app").mkdir()
+    (root / "app/other-app/data").write_text("not ours")
+    (root / "gstreamer/lib/someone-elses.so").write_text("not ours")
+
+    assert leftovers.clean_portable_copy(root) == 3
+    for kept in ("bin/other-program", "app/other-app/data", "gstreamer/lib/someone-elses.so"):
+        assert (root / kept).exists(), kept
+    assert not (root / "bin/libold.so").exists()
+
+
+def test_without_an_earlier_list_bin_and_foreign_folders_are_left_alone(tmp_path: Path) -> None:
+    root = _bundle(tmp_path)
+    (root / "app/other-app").mkdir()
+    (root / "app/other-app/data").write_text("not ours")
+    removed = leftovers.clean_portable_copy(root)
+    assert removed == 2  # the old dist-info file and the old gstreamer plugin
+    assert (root / "bin/libold.so").exists()  # bin may be a shared prefix's
+    assert (root / "app/other-app/data").exists()
+    assert (root / leftovers.SEEN).is_file()  # the next update knows what is ours
+
+
+def test_an_earlier_list_cannot_reach_outside_the_program_folders(tmp_path: Path) -> None:
+    root = _bundle(tmp_path)
+    (root / leftovers.SEEN).write_text("../outside\nnotes.txt\n/etc/passwd\n")
+    (tmp_path.parent / "outside").write_text("x")
+    assert leftovers.clean_portable_copy(root) == 0
+    assert (root / "notes.txt").exists() and (tmp_path.parent / "outside").exists()
 
 
 def test_an_installed_copy_leaves_it_to_its_installer(tmp_path: Path) -> None:

@@ -21,6 +21,30 @@ free entries link to the GitHub Release). The downloads page
 gives unlimited packages only to buyers, as short-lived signed links. The
 smoke checks assert each package's edition (`NW_EXPECT_EDITION`).
 
+## Checking a release
+
+`SHA256SUMS` lists every file attached to the release. The `publish` job signs it
+keylessly with [Sigstore cosign](https://docs.sigstore.dev/cosign/signing/overview/):
+the workflow's GitHub OIDC identity (`id-token: write`, on that job only) gets a
+short-lived certificate, and the signature, certificate and transparency-log proof
+are written to `SHA256SUMS.sigstore.json`, uploaded next to `SHA256SUMS`. No signing
+key or certificate is stored anywhere. Verify, with cosign 2 or newer:
+
+```bash
+sha256sum --ignore-missing -c SHA256SUMS
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/<owner>/<repo>/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+```
+
+The first command proves the downloaded file is the one listed; the second proves
+the list was produced by this repository's release workflow for a `v*` tag. Use the
+exact tag (`...@refs/tags/v1.2.3`) in the identity to pin one release. Only the free
+packages and the checksum list are covered; the unlimited packages are delivered
+through the downloads page. Windows Authenticode signing needs a purchased code-signing
+certificate and is not done: the installer shows an "unknown publisher" warning.
+
 Unlimited packages are never uploaded as public GitHub Actions artifacts.
 The build jobs stage them in the same private bucket under
 `staging/<run id>/<run attempt>/unlimited/`; the publishing job reads them

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import struct
@@ -174,7 +175,7 @@ def test_release_builds_include_the_cloud_with_its_address(workflow: str) -> Non
     link = (ROOT / "crates/nw-backend/src/cloud/link/mod.rs").read_text()
     assert 'pub const NEUROWATCH_CLOUD: &str = "https://neurowatch.app";' in link
     linux = _jobs(workflow)["package-linux"]
-    assert "llvm.sh 21" in linux and "CXX=clang++-21" in linux
+    assert "install_clang21.sh" in linux and "CXX=clang++-21" in linux
 
 
 def test_publish_gathers_artifacts_checksums_and_uploads(workflow: str) -> None:
@@ -186,6 +187,23 @@ def test_publish_gathers_artifacts_checksums_and_uploads(workflow: str) -> None:
     assert job.index("SHA256SUMS") < job.index("gh release create")
     for name in ("package-linux", "package-windows"):
         assert "name: release-" in _jobs(workflow)[name]
+
+
+def test_publish_signs_the_checksums_keylessly_with_cosign(workflow: str) -> None:
+    jobs = _jobs(workflow)
+    job = jobs["publish"]
+    assert "id-token: write" in job
+    # The OIDC token goes to the publishing job only.
+    assert [name for name, body in jobs.items() if "id-token: write" in body] == ["publish"]
+    assert re.search(r"uses: sigstore/cosign-installer@[0-9a-f]{40} # v\d", job)
+    assert "cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS" in job
+    assert job.index("Generate SHA256SUMS") < job.index("cosign sign-blob")
+    assert job.index("cosign sign-blob") < job.index("gh release create")
+    # The bundle is uploaded next to SHA256SUMS (dist/release/*).
+    assert "dist/release/*" in job
+    docs = (ROOT / "docs/releasing.md").read_text()
+    assert "cosign verify-blob" in docs and "token.actions.githubusercontent.com" in docs
+    assert "cosign verify-blob" in (ROOT / "README.md").read_text()
 
 
 # --- package filenames and metadata --------------------------------------------
@@ -480,7 +498,8 @@ def test_every_linux_package_format_has_native_install_coverage(workflow: str) -
     entries = {
         (image, package_format, arch, runner)
         for image, package_format, arch, runner in re.findall(
-            r"\{image: '([^']+)', format: (\w+), arch: (\w+), runner: ([^}]+)\}",
+            r"\{image: '([^']+)', digest: 'sha256:[0-9a-f]{64}', "
+            r"format: (\w+), arch: (\w+), runner: ([^}]+)\}",
             install,
         )
     }
@@ -1118,3 +1137,24 @@ def test_missing_notices_fail_packaging(tmp_path: Path, missing_file: bool) -> N
     assert result.returncode != 0
     assert "did not provide webrtc-sys dependency notices" in result.stderr
     assert not destination.exists()
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+def test_linux_packages_add_only_the_installing_user_to_the_device_groups() -> None:
+    script = ROOT / "scripts/installer/linux/gpu-access.sh"
+    text = script.read_text()
+    assert "getent passwd |" not in text and "UID_MIN" not in text  # not every account
+
+    def users(**env: str) -> list[str]:
+        result = subprocess.run(
+            ["sh", "-c", f'. "{script}"; neurowatch_regular_users'],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={"PATH": os.environ["PATH"], **env},
+        )
+        return result.stdout.split()
+
+    assert users() == []  # nobody invoked it with sudo: no account is added
+    assert users(SUDO_USER="alice") == ["alice"]
+    assert users(SUDO_USER="root") == []

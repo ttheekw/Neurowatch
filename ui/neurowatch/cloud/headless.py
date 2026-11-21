@@ -12,7 +12,9 @@ This module must not import Qt, so it also runs on servers without a display.
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -117,6 +119,47 @@ def _code_problem(text: str) -> str:
     return "its first two parts must be IDs like 1f0e8c2a-…, and the last part a token"
 
 
+#: The environment variable that carries an enrollment code without a process
+#: argument (arguments are visible to every user in the process list).
+CODE_ENV = "NW_CLOUD_ENROLLMENT_CODE"
+_ARGUMENT_WARNING = (
+    "Cloud link: an enrollment code on the command line is visible to other users "
+    "of this computer in the process list. Prefer the prompt, standard input "
+    f"(`--link -`) or the {CODE_ENV} variable."
+)
+
+
+def resolve_code(
+    value: str | None,
+    say: Callable[[str], None],
+    *,
+    stdin: Any = None,
+    environ: Any = None,
+    prompt: Callable[[str], str] = getpass.getpass,
+) -> str:
+    """The enrollment code to use, without it having to be a process argument.
+
+    ``value`` is the argument given: a code (works, with a warning), ``-`` or
+    nothing (read it from the ``NW_CLOUD_ENROLLMENT_CODE`` variable, else a
+    hidden prompt on a terminal, else one line of standard input).
+    """
+    if value not in (None, "", "-"):
+        say(_ARGUMENT_WARNING)
+        return str(value)
+    env = os.environ if environ is None else environ
+    from_env = str(env.get(CODE_ENV, "")).strip()
+    if value in (None, "") and from_env:
+        return from_env
+    stream = sys.stdin if stdin is None else stdin
+    try:
+        interactive = bool(stream.isatty())
+    except (AttributeError, ValueError):
+        interactive = False
+    if interactive:
+        return prompt("Enrollment code: ").strip()
+    return str(stream.readline()).strip()
+
+
 def default_name() -> str:
     return (os.uname().nodename.split(".")[0] or "NeuroWatch")[:64]
 
@@ -194,16 +237,25 @@ def status_line(rpc: Rpc) -> str:
 
 
 def add_monitor_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--link", metavar="CODE", help="link to NeuroWatch Cloud first")
+    parser.add_argument(
+        "--link",
+        metavar="CODE",
+        nargs="?",
+        const="",
+        help=(
+            "link to NeuroWatch Cloud first; without a code (or with -) it is read from "
+            f"{CODE_ENV}, a prompt or standard input"
+        ),
+    )
     parser.add_argument("--name", help="node name shown in the web portal (with --link)")
 
 
 def before_monitor(args: argparse.Namespace, rpc: Rpc, say: Callable[[str], None]) -> int | None:
-    if args.name and not args.link:
+    if args.name and args.link is None:
         say("--name needs --link")
         return 2
-    if args.link:
-        result = link(rpc, args.link, args.name or default_name(), say)
+    if args.link is not None:
+        result = link(rpc, resolve_code(args.link, say), args.name or default_name(), say)
         # Bad input stops at once; a cloud failure must not stop local
         # capture and recording, so the node keeps running unlinked.
         if result == 2:
@@ -216,7 +268,15 @@ def add_commands(subparsers: Any) -> None:
     actions = cloud.add_subparsers(dest="cloud_command", required=True)
     actions.add_parser("status", help="print camera, recording and cloud status once")
     join = actions.add_parser("link", help="link to NeuroWatch Cloud with an enrollment code")
-    join.add_argument("code", help="enrollment code from the web portal (Nodes, Create enrollment)")
+    join.add_argument(
+        "code",
+        nargs="?",
+        help=(
+            "enrollment code from the web portal (Nodes, Create enrollment); leave it out "
+            f"(or give -) to read it from {CODE_ENV}, a prompt or standard input, which "
+            "keeps it out of the process list"
+        ),
+    )
     join.add_argument("--name", help="node name shown in the web portal (default: host name)")
     leave = actions.add_parser("unlink", help="unlink from NeuroWatch Cloud")
     leave.add_argument("--yes", action="store_true", help="confirm unlinking")
@@ -228,5 +288,5 @@ def run_command(args: argparse.Namespace, rpc: Rpc, say: Callable[[str], None]) 
     if args.cloud_command == "status":
         return headless.print_status(rpc, say)
     if args.cloud_command == "link":
-        return link(rpc, args.code, args.name or default_name(), say)
+        return link(rpc, resolve_code(args.code, say), args.name or default_name(), say)
     return unlink(rpc, bool(args.yes), say)

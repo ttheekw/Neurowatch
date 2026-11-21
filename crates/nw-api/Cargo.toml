@@ -18,7 +18,6 @@ name = "nw-api"
 path = "src/main.rs"
 
 [dependencies]
-nw-core            = { workspace = true }
 nw-cloud-protocol  = { workspace = true }
 axum               = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 tokio              = { workspace = true }

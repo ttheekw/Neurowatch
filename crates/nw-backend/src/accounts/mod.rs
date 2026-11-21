@@ -28,7 +28,9 @@ use base64::Engine as _;
 use ring::rand::SecureRandom as _;
 use serde::{Deserialize, Serialize};
 
-const ITERATIONS: u32 = 210_000;
+/// PBKDF2-HMAC-SHA256 rounds for new hashes (OWASP's figure for this PRF).
+/// A stored hash with fewer is replaced when its user next signs in.
+pub const ITERATIONS: u32 = 600_000;
 const SALT_BYTES: usize = 16;
 const HASH_BYTES: usize = 32;
 pub const MIN_PASSWORD: usize = 8;
@@ -37,7 +39,22 @@ pub const MAX_USERS: usize = 50;
 pub const SESSION_IDLE: Duration = Duration::from_secs(12 * 60 * 60);
 /// Wrong passwords in a row before a name must wait.
 const FAILURES: u32 = 5;
+/// The first wait; each further wrong password doubles it, up to
+/// [`MAX_LOCKOUT`].
 const LOCKOUT: Duration = Duration::from_secs(30);
+const MAX_LOCKOUT: Duration = Duration::from_secs(15 * 60);
+/// Failures of names nobody has share one counter, so the table never holds
+/// more than the users plus this.
+const UNKNOWN_NAMES: &str = "";
+
+/// How long a name that failed `count` times in a row must wait.
+fn lockout_for(count: u32) -> Duration {
+    if count < FAILURES {
+        return Duration::ZERO;
+    }
+    let doublings = (count - FAILURES).min(10);
+    LOCKOUT.saturating_mul(1 << doublings).min(MAX_LOCKOUT)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -133,6 +150,26 @@ impl PasswordHash {
             salt: b64(&salt),
             hash: b64(&derive(password, &salt, ITERATIONS)),
             iterations: ITERATIONS,
+        })
+    }
+
+    /// Whether this hash has fewer rounds than new ones get.
+    pub fn needs_upgrade(&self) -> bool {
+        self.iterations < ITERATIONS
+    }
+
+    /// A hash of a password nobody knows, to check a name that does not
+    /// exist against, so an unknown name costs the same time as a wrong
+    /// password.
+    fn decoy() -> &'static Self {
+        static DECOY: std::sync::OnceLock<PasswordHash> = std::sync::OnceLock::new();
+        DECOY.get_or_init(|| {
+            let salt = [0x5a_u8; SALT_BYTES];
+            Self {
+                salt: b64(&salt),
+                hash: b64(&derive("decoy-not-a-password", &salt, ITERATIONS)),
+                iterations: ITERATIONS,
+            }
         })
     }
 
@@ -254,25 +291,42 @@ impl Sessions {
         username: &str,
         password: &str,
     ) -> Result<(String, Session), String> {
-        let key = username.to_ascii_lowercase();
+        // Failures count against a real user's name; every unknown name
+        // shares one counter, so spraying names cannot grow the table.
+        let known = accounts.user(username);
+        let key = match known {
+            Some(user) => user.username.to_ascii_lowercase(),
+            None => UNKNOWN_NAMES.to_owned(),
+        };
         {
             let failures = self.failures.lock().unwrap_or_else(|p| p.into_inner());
             if let Some((count, at)) = failures.get(&key) {
-                if *count >= FAILURES && at.elapsed() < LOCKOUT {
-                    return Err("too many wrong passwords; wait 30 seconds and try again".into());
+                let wait = lockout_for(*count);
+                if let Some(left) = wait.checked_sub(at.elapsed()).filter(|d| !d.is_zero()) {
+                    return Err(format!(
+                        "too many wrong passwords; wait {} seconds and try again",
+                        left.as_secs().max(1)
+                    ));
                 }
             }
         }
-        let user = accounts
-            .user(username)
-            .filter(|user| user.password.verify(password));
+        // Unknown names are checked against a decoy, so the time taken does
+        // not tell a missing name from a wrong password.
+        let user = match known {
+            Some(user) => user.password.verify(password).then_some(user),
+            None => {
+                let _ = PasswordHash::decoy().verify(password);
+                None
+            }
+        };
         let Some(user) = user else {
             let mut failures = self.failures.lock().unwrap_or_else(|p| p.into_inner());
             let entry = failures.entry(key).or_insert((0, Instant::now()));
-            if entry.1.elapsed() >= LOCKOUT {
+            // A name left alone for twice its longest wait starts again.
+            if entry.1.elapsed() >= MAX_LOCKOUT * 2 {
                 *entry = (0, Instant::now());
             }
-            entry.0 += 1;
+            entry.0 = entry.0.saturating_add(1);
             entry.1 = Instant::now();
             tracing::warn!(username, "Wrong user name or password");
             return Err("wrong user name or password".into());
@@ -406,5 +460,52 @@ mod tests {
         assert!(sessions.session(&accounts, &token).is_none());
         sessions.end_user("ROOT");
         assert!(sessions.session(&accounts, &admin_token).is_none());
+    }
+
+    #[test]
+    fn the_wait_grows_with_each_wrong_password_up_to_a_limit() {
+        assert_eq!(lockout_for(4), Duration::ZERO);
+        assert_eq!(lockout_for(5), Duration::from_secs(30));
+        assert_eq!(lockout_for(6), Duration::from_secs(60));
+        assert_eq!(lockout_for(7), Duration::from_secs(120));
+        assert_eq!(lockout_for(1_000_000), MAX_LOCKOUT);
+    }
+
+    #[test]
+    fn names_nobody_has_cannot_grow_the_failure_table_and_cost_a_hash() {
+        let accounts = AccountsConfig {
+            enabled: true,
+            users: vec![user("ana", Role::Operator, "password1")],
+        };
+        let sessions = Sessions::default();
+        let started = Instant::now();
+        let _ = sessions.login(&accounts, "nobody", "whatever1");
+        let unknown = started.elapsed();
+        let started = Instant::now();
+        let _ = sessions.login(&accounts, "ana", "whatever1");
+        let wrong = started.elapsed();
+        assert!(
+            unknown * 4 > wrong,
+            "an unknown name ran no hash: {unknown:?} against {wrong:?}"
+        );
+        for n in 0..20 {
+            let _ = sessions.login(&accounts, &format!("ghost{n}"), "whatever1");
+        }
+        let table = sessions.failures.lock().unwrap().len();
+        assert!(table <= 2, "table holds {table} names");
+    }
+
+    #[test]
+    fn old_hashes_are_marked_for_an_upgrade_and_still_verify() {
+        let salt = [7_u8; SALT_BYTES];
+        let old = PasswordHash {
+            salt: b64(&salt),
+            hash: b64(&derive("password-old", &salt, 210_000)),
+            iterations: 210_000,
+        };
+        assert!(old.verify("password-old") && old.needs_upgrade());
+        let fresh = PasswordHash::new("password-new").unwrap();
+        assert_eq!(fresh.iterations, 600_000);
+        assert!(!fresh.needs_upgrade());
     }
 }

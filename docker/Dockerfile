@@ -6,7 +6,9 @@
 #   gui       the backend and the desktop UI, shown on the host's display (X11
 #             or Wayland socket passed in by `scripts/docker.sh gui`)
 # Ubuntu 24.04: the arm64 packages need glibc 2.39; the x86_64 ones run on it too.
-FROM ubuntu:24.04 AS base
+# Pinned by digest (the multi-architecture index); the tag is for reading.
+# Refresh both together: docker buildx imagetools inspect ubuntu:24.04
+FROM ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289 AS base
 
 # The source label links the GHCR package to the repository.
 LABEL org.opencontainers.image.title="NeuroWatch" \

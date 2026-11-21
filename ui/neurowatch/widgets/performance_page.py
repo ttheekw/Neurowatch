@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from neurowatch.models.video_decoder import acceleration_notice
 from neurowatch.utils.network import format_bitrate
 from neurowatch.utils.threads import Worker
 from neurowatch.widgets.camera_diagnostics import CameraDiagnostics
@@ -47,6 +48,8 @@ _SEVERITY_COLORS = {
     "critical": "#d0453d",
 }
 _DEFAULT_BOTTLENECK_COLOR = "#5a5a80"
+#: A graphics card without its driver: the tray's "problem" amber.
+_DRIVER_MISSING_COLOR = "#f59e0b"
 
 _ACCEL_PRESENTATION = {
     "vaapi": (
@@ -666,21 +669,33 @@ class PerformancePage(QWidget):
                 "#7878a0",
             ),
         )
+        detail_color = "#a0a0c0"
+        notice = acceleration_notice(info)
+        reason = info.get("reason")
+        if notice is not None:
+            # A graphics card that can decode video, without its driver: which
+            # card, what is missing, the packages to install.
+            icon, label, color = "⚠", "CPU Decode — GPU driver missing", _DRIVER_MISSING_COLOR
+            detail_color = _DRIVER_MISSING_COLOR
+            lines = [f"Graphics card: {notice.card}", notice.text]
+            if notice.detail:
+                lines += ["Packages to install:", notice.detail]
+            detail = "\n".join(lines)
+        elif kind == "software" and isinstance(reason, str) and reason:
+            detail = reason  # e.g. the graphics card is not available until sign-in
+        elif kind == "software" and info.get("decoder_preference") == "software":
+            detail = "Video is decoded in software: CPU only is chosen in Settings → Video Wall."
         self._accel_badge_label.setText(f"{icon} {label}")
         self._accel_badge_label.setAccessibleName(f"Video acceleration: {label}")
         self._accel_badge_label.setStyleSheet(
             f"color: {color}; background: transparent; border: none; "
             "font-size: 12px; font-weight: 700; padding: 0 4px;"
         )
-        reason = info.get("reason")
-        if kind == "software" and isinstance(reason, str) and reason:
-            detail = reason  # e.g. the graphics card is not available until sign-in
-        elif kind == "software" and info.get("decoder_preference") == "software":
-            detail = "Video is decoded in software: CPU only is chosen in Settings → Video Wall."
         warning = info.get("decoder_preference_warning")
         if isinstance(warning, str) and warning:
             detail = f"{detail} {warning}"  # the chosen decoder is not on this computer
         self._accel_detail_label.setText(detail)
+        self._accel_detail_label.setStyleSheet(f"font-size: 11px; color: {detail_color};")
 
     def set_camera_names(self, names: dict[str, str]) -> None:
         """Show cameras by name rather than by id."""

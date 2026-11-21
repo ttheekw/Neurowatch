@@ -11,6 +11,7 @@ import socket
 from typing import Any
 
 from neurowatch.ipc.auth import with_auth
+from neurowatch.ipc.peer import same_user
 from neurowatch.service.paths import service_endpoint
 
 
@@ -40,6 +41,8 @@ def request(
         with sock:
             sock.settimeout(timeout)
             sock.connect(address)
+            if isinstance(address, str) and not same_user(sock, address):
+                return None  # another user's listener: not our backend
             sock.sendall(payload.encode() + b"\n")
             buffer = b""
             while b"\n" not in buffer:

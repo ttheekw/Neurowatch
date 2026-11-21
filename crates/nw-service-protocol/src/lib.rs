@@ -168,7 +168,7 @@ impl Trust {
         if list.v != VERSION {
             return Err(TrustError::Version(list.v));
         }
-        if now_ms - CLOCK_SKEW_MS >= list.expires_at_ms {
+        if now_ms.saturating_sub(CLOCK_SKEW_MS) >= list.expires_at_ms {
             return Err(TrustError::Expired);
         }
         if list.keys.is_empty() || list.keys.len() > MAX_LISTED_KEYS {
@@ -207,7 +207,7 @@ impl Trust {
     /// The keys accepted for `purpose` now: none once the list has expired.
     pub fn keys(&self, purpose: &str, now_ms: i64) -> Vec<VerifyingKey> {
         match &self.list {
-            Some(list) if now_ms - CLOCK_SKEW_MS < list.expires_at_ms => list
+            Some(list) if now_ms.saturating_sub(CLOCK_SKEW_MS) < list.expires_at_ms => list
                 .keys
                 .iter()
                 .filter(|key| key.purpose == purpose)
@@ -227,7 +227,7 @@ impl Trust {
         if list.v != VERSION {
             return Err(TrustError::Version(list.v));
         }
-        if now_ms - CLOCK_SKEW_MS >= list.expires_at_ms {
+        if now_ms.saturating_sub(CLOCK_SKEW_MS) >= list.expires_at_ms {
             return Err(TrustError::Expired);
         }
         if list.issued_at_ms > self.revocations_issued_ms {
@@ -267,13 +267,13 @@ impl Trust {
         if ticket.audience != audience {
             return Err(TrustError::Audience);
         }
-        if ticket.expires_at_ms - ticket.issued_at_ms > MAX_TICKET_LIFETIME_MS {
+        if ticket.expires_at_ms.saturating_sub(ticket.issued_at_ms) > MAX_TICKET_LIFETIME_MS {
             return Err(TrustError::TooLong);
         }
-        if now_ms + CLOCK_SKEW_MS < ticket.issued_at_ms {
+        if now_ms.saturating_add(CLOCK_SKEW_MS) < ticket.issued_at_ms {
             return Err(TrustError::NotYetValid);
         }
-        if now_ms - CLOCK_SKEW_MS >= ticket.expires_at_ms {
+        if now_ms.saturating_sub(CLOCK_SKEW_MS) >= ticket.expires_at_ms {
             return Err(TrustError::Expired);
         }
         if ticket.node_key().is_none() {
@@ -432,8 +432,8 @@ mod tests {
             v: 1,
             id: "t".into(),
             kid: "k".into(),
-            service: "nw.vcount".into(),
-            audience: "vcount-1".into(),
+            service: "nw.counter".into(),
+            audience: "counter-1".into(),
             org_id: "org".into(),
             node_id: "node".into(),
             node_key: hex(signer_key.verifying_key().as_bytes()),
@@ -501,28 +501,28 @@ mod tests {
         let trust = trust();
         let node = key(4);
         let good = seal(SERVICE_TICKET_DOMAIN, &ticket(&node), &key(2));
-        let checked = trust.verify_ticket(&good, "nw.vcount", "vcount-1", NOW + 1000);
+        let checked = trust.verify_ticket(&good, "nw.counter", "counter-1", NOW + 1000);
         assert_eq!(checked.map(|t| t.grants.cameras.len()), Ok(2));
         let revocation_key = seal(SERVICE_TICKET_DOMAIN, &ticket(&node), &key(3));
         assert_eq!(
             trust
-                .verify_ticket(&revocation_key, "nw.vcount", "vcount-1", NOW)
+                .verify_ticket(&revocation_key, "nw.counter", "counter-1", NOW)
                 .unwrap_err(),
             TrustError::Signature,
             "a revocations key signs no tickets"
         );
         for (service, audience, now, error) in [
-            ("other", "vcount-1", NOW, TrustError::Service),
-            ("nw.vcount", "vcount-2", NOW, TrustError::Audience),
+            ("other", "counter-1", NOW, TrustError::Service),
+            ("nw.counter", "counter-2", NOW, TrustError::Audience),
             (
-                "nw.vcount",
-                "vcount-1",
+                "nw.counter",
+                "counter-1",
                 NOW + 3_600_000,
                 TrustError::Expired,
             ),
             (
-                "nw.vcount",
-                "vcount-1",
+                "nw.counter",
+                "counter-1",
                 NOW - 3_600_000,
                 TrustError::NotYetValid,
             ),
@@ -537,6 +537,30 @@ mod tests {
     }
 
     #[test]
+    fn extreme_times_are_refused_without_overflow() {
+        let trust = trust();
+        let mut odd = ticket(&key(4));
+        odd.issued_at_ms = i64::MIN;
+        odd.expires_at_ms = i64::MAX;
+        let odd = seal(SERVICE_TICKET_DOMAIN, &odd, &key(2));
+        assert_eq!(
+            trust
+                .verify_ticket(&odd, "nw.counter", "counter-1", NOW)
+                .unwrap_err(),
+            TrustError::TooLong
+        );
+        let good = seal(SERVICE_TICKET_DOMAIN, &ticket(&key(4)), &key(2));
+        for now in [i64::MIN, i64::MAX] {
+            assert!(trust
+                .verify_ticket(&odd, "nw.counter", "counter-1", now)
+                .is_err());
+            assert!(trust
+                .verify_ticket(&good, "nw.counter", "counter-1", now)
+                .is_err());
+        }
+    }
+
+    #[test]
     fn a_long_ticket_is_refused() {
         let trust = trust();
         let mut long = ticket(&key(4));
@@ -544,7 +568,7 @@ mod tests {
         let signed = seal(SERVICE_TICKET_DOMAIN, &long, &key(2));
         assert_eq!(
             trust
-                .verify_ticket(&signed, "nw.vcount", "vcount-1", NOW)
+                .verify_ticket(&signed, "nw.counter", "counter-1", NOW)
                 .unwrap_err(),
             TrustError::TooLong
         );
@@ -567,7 +591,7 @@ mod tests {
         let good = seal(SERVICE_TICKET_DOMAIN, &ticket(&node), &key(2));
         assert_eq!(
             trust
-                .verify_ticket(&good, "nw.vcount", "vcount-1", NOW)
+                .verify_ticket(&good, "nw.counter", "counter-1", NOW)
                 .unwrap_err(),
             TrustError::Revoked
         );
@@ -610,7 +634,7 @@ mod tests {
         trust.accept_revocations(&text("revocations"), now).unwrap();
         assert!(trust.is_revoked(&text("revoked_node_key")));
         let ticket = trust
-            .verify_ticket(&text("ticket"), "nw.vcount", "vcount-1.example.test", now)
+            .verify_ticket(&text("ticket"), "nw.counter", "counter-1.example.test", now)
             .unwrap();
         assert_eq!(ticket.grants.cameras, ["cam-1", "cam-2"]);
         assert!(ticket.grants.allows("cam-2") && !ticket.grants.allows("cam-3"));

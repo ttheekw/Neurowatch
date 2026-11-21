@@ -35,20 +35,19 @@ fn label(entry: &ServiceEntry) -> Option<String> {
         .then(|| label.chars().take(MAX_LABEL).collect())
 }
 
-/// The plugin address of a service entry: only encrypted transports.
-fn address(entry: &ServiceEntry) -> Option<String> {
-    entry
+/// The plugin address of a service entry, only encrypted transports: QUIC
+/// first, with TLS over TCP as its fallback when the portal offers both
+/// (UDP is blocked on some networks); TLS alone otherwise.
+fn address(entry: &ServiceEntry) -> Option<(String, Option<String>)> {
+    let tls = entry
         .endpoint
-        .quic
+        .tls
         .as_ref()
-        .map(|address| format!("quic:{address}"))
-        .or_else(|| {
-            entry
-                .endpoint
-                .tls
-                .as_ref()
-                .map(|address| format!("tls:{address}"))
-        })
+        .map(|address| format!("tls:{address}"));
+    match &entry.endpoint.quic {
+        Some(quic) => Some((format!("quic:{quic}"), tls)),
+        None => tls.map(|tls| (tls, None)),
+    }
 }
 
 /// Make one hosted plugin's bindings match the cameras the portal names.
@@ -103,7 +102,9 @@ pub fn reconcile(
         .filter(|entry| entry.service != BACKUP_SERVICE)
     {
         let id = format!("{SERVER_PREFIX}{}", entry.service);
-        let (Some(address), Some(public_key)) = (address(entry), entry.public_key.clone()) else {
+        let (Some((address, fallback)), Some(public_key)) =
+            (address(entry), entry.public_key.clone())
+        else {
             tracing::warn!(service = %entry.service, "Hosted service has no encrypted address or key");
             continue;
         };
@@ -116,6 +117,7 @@ pub fn reconcile(
             service: entry.service.clone(),
             instance: entry.instance.clone(),
             label: label(entry),
+            fallback,
         };
         let approval = nw_analytics_protocol::auth::Approval {
             public_key,
@@ -273,9 +275,9 @@ mod tests {
 
     #[test]
     fn a_service_becomes_a_managed_server_needing_no_approval() {
-        let next = offered(&PluginsConfig::default(), &[entry("nw.vcount", "v1")]).unwrap();
+        let next = offered(&PluginsConfig::default(), &[entry("nw.counter", "v1")]).unwrap();
         let server = &next.servers[0];
-        assert_eq!(server.id, "hosted.nw.vcount");
+        assert_eq!(server.id, "hosted.nw.counter");
         assert_eq!(server.address, "quic:v1:443");
         assert_eq!(server.managed.as_ref().unwrap().instance, "v1");
         assert_eq!(
@@ -285,15 +287,48 @@ mod tests {
     }
 
     #[test]
+    fn quic_comes_first_with_tls_as_its_fallback() {
+        let both = ServiceEntry {
+            endpoint: ServiceEndpoint {
+                quic: Some("v1:7691".into()),
+                tls: Some("v1:7691".into()),
+                ..Default::default()
+            },
+            ..entry("nw.counter", "v1")
+        };
+        let next = offered(&PluginsConfig::default(), &[both]).unwrap();
+        let server = &next.servers[0];
+        assert_eq!(server.address, "quic:v1:7691");
+        let managed = server.managed.as_ref().unwrap();
+        assert_eq!(managed.fallback.as_deref(), Some("tls:v1:7691"));
+        let cameras = known();
+        assert!(next.validate(cameras.iter().map(String::as_str)).is_ok());
+        let mut wrong = next.clone();
+        wrong.servers[0].managed.as_mut().unwrap().fallback = Some("quic:v1:1".into());
+        assert!(wrong.validate(cameras.iter().map(String::as_str)).is_err());
+
+        let tls_only = ServiceEntry {
+            endpoint: ServiceEndpoint {
+                tls: Some("v1:7691".into()),
+                ..Default::default()
+            },
+            ..entry("nw.counter", "v1")
+        };
+        let next = offered(&PluginsConfig::default(), &[tls_only]).unwrap();
+        assert_eq!(next.servers[0].address, "tls:v1:7691");
+        assert_eq!(next.servers[0].managed.as_ref().unwrap().fallback, None);
+    }
+
+    #[test]
     fn a_hosted_plugin_is_shown_by_its_catalog_name() {
         let named = ServiceEntry {
             label: Some("  Vehicle counting ".into()),
-            ..entry("nw.vcount", "v1")
+            ..entry("nw.counter", "v1")
         };
         let next = offered(&PluginsConfig::default(), std::slice::from_ref(&named)).unwrap();
         assert_eq!(next.servers[0].shown_name(None), "Vehicle counting");
         assert_eq!(
-            next.servers[0].shown_name(Some("nw-vcount")),
+            next.servers[0].shown_name(Some("nw-counter")),
             "Vehicle counting"
         );
         // A renamed plugin follows the portal.
@@ -306,24 +341,24 @@ mod tests {
         // No name, or one unfit to show: the plugin's own, else the id.
         let bad = ServiceEntry {
             label: Some("bad\nname".into()),
-            ..entry("nw.vcount", "v1")
+            ..entry("nw.counter", "v1")
         };
         let next = offered(&next, &[bad]).unwrap();
         assert_eq!(next.servers[0].shown_name(Some("Counting")), "Counting");
-        assert_eq!(next.servers[0].shown_name(None), "hosted.nw.vcount");
+        assert_eq!(next.servers[0].shown_name(None), "hosted.nw.counter");
     }
 
     #[test]
     fn the_same_answer_changes_nothing() {
-        let entries = [entry("nw.vcount", "v1")];
+        let entries = [entry("nw.counter", "v1")];
         let next = offered(&PluginsConfig::default(), &entries).unwrap();
         assert_eq!(offered(&next, &entries), None);
     }
 
     #[test]
     fn a_move_to_another_instance_follows_the_portal() {
-        let next = offered(&PluginsConfig::default(), &[entry("nw.vcount", "v1")]).unwrap();
-        let moved = offered(&next, &[entry("nw.vcount", "v2")]).unwrap();
+        let next = offered(&PluginsConfig::default(), &[entry("nw.counter", "v1")]).unwrap();
+        let moved = offered(&next, &[entry("nw.counter", "v2")]).unwrap();
         assert_eq!(moved.servers[0].address, "quic:v2:443");
     }
 
@@ -337,14 +372,14 @@ mod tests {
 
     #[test]
     fn a_service_withdrawn_is_removed_but_bound_cameras_keep_their_settings() {
-        let mut config = offered(&PluginsConfig::default(), &[entry("nw.vcount", "v1")]).unwrap();
+        let mut config = offered(&PluginsConfig::default(), &[entry("nw.counter", "v1")]).unwrap();
         let unbound = offered(&config, &[]).unwrap();
         assert!(unbound.servers.is_empty());
-        config.bindings.push(binding("hosted.nw.vcount"));
+        config.bindings.push(binding("hosted.nw.counter"));
         let kept = offered(&config, &[]).unwrap();
         assert!(!kept.servers[0].enabled);
         assert_eq!(kept.bindings.len(), 1);
-        let back = offered(&kept, &[entry("nw.vcount", "v1")]).unwrap();
+        let back = offered(&kept, &[entry("nw.counter", "v1")]).unwrap();
         assert!(back.servers[0].enabled);
     }
 
@@ -368,7 +403,7 @@ mod tests {
     fn for_cameras(cameras: &[&str]) -> ServiceEntry {
         ServiceEntry {
             cameras: cameras.iter().map(|camera| (*camera).to_owned()).collect(),
-            ..entry("nw.vcount", "v1")
+            ..entry("nw.counter", "v1")
         }
     }
 
@@ -387,8 +422,8 @@ mod tests {
         assert_eq!(
             bound,
             [
-                ("hosted.nw.vcount", "cam-1", true),
-                ("hosted.nw.vcount", "cam-2", true)
+                ("hosted.nw.counter", "cam-1", true),
+                ("hosted.nw.counter", "cam-2", true)
             ]
         );
     }

@@ -36,6 +36,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const REFUSED_RETRY: Duration = Duration::from_secs(30);
+/// With a fallback to try next, QUIC gives up on its handshake this soon.
+const QUIC_BEFORE_FALLBACK: Duration = Duration::from_secs(4);
+/// On the fallback (TLS over TCP), try the preferred transport again this often.
+const PREFERRED_RETRY: Duration = Duration::from_secs(10 * 60);
 const PUMP_RETRY: Duration = Duration::from_secs(10);
 const RECONCILE_EVERY: Duration = Duration::from_millis(500);
 const OUTBOX_FRAMES: usize = 256;
@@ -48,7 +52,11 @@ const MAX_TEXT: usize = 200;
 
 pub(crate) struct Context {
     pub server_id: String,
+    /// The transport tried first; `run` swaps it with `fallback` while the
+    /// fallback is the one that gets through.
     pub address: Address,
+    /// Another way to the same plugin (a hosted plugin's TLS over TCP).
+    pub fallback: Option<Address>,
     pub node: NodeInfo,
     pub streams: Arc<StreamHubs>,
     pub events: Arc<EventHub>,
@@ -80,11 +88,18 @@ impl Context {
 
 /// The session thread: connects, serves, and reconnects with backoff until
 /// `stop`.
-pub(crate) fn run(context: Context, desired: Arc<Mutex<Desired>>, stop: Arc<AtomicBool>) {
+pub(crate) fn run(mut context: Context, desired: Arc<Mutex<Desired>>, stop: Arc<AtomicBool>) {
     let mut failures = 0usize;
+    // Since when the fallback has been tried first (it got through when the
+    // preferred transport did not).
+    let mut on_fallback: Option<Instant> = None;
     while !stop.load(Ordering::Acquire) {
+        if on_fallback.is_some_and(|since| since.elapsed() >= PREFERRED_RETRY) {
+            swap_transports(&mut context);
+            on_fallback = None;
+        }
         context.update(|s| s.state = "connecting");
-        let (result, served) = match Conn::connect(&context.address) {
+        let (result, served) = match connect(&mut context, &mut on_fallback) {
             Ok(conn) => session(&context, conn, &desired, &stop),
             Err(error) => (Err(format!("Could not connect: {error}")), false),
         };
@@ -109,6 +124,40 @@ pub(crate) fn run(context: Context, desired: Arc<Mutex<Desired>>, stop: Arc<Atom
         while Instant::now() < until && !stop.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+}
+
+/// Connect by `context.address`, else at once by its fallback; a fallback
+/// that got through is tried first from then on (`on_fallback`).
+fn connect(context: &mut Context, on_fallback: &mut Option<Instant>) -> Result<Conn, String> {
+    let Some(fallback) = context.fallback.clone() else {
+        return Conn::connect(&context.address).map_err(|error| error.to_string());
+    };
+    let first = match Conn::connect_before_fallback(&context.address) {
+        Ok(conn) => return Ok(conn),
+        Err(error) => error,
+    };
+    match Conn::connect_before_fallback(&fallback) {
+        Ok(conn) => {
+            tracing::info!(plugin = %context.server_id, from = %context.address, to = %fallback, reason = %first,
+                "Analytics plugin reached over its other transport");
+            swap_transports(context);
+            *on_fallback = match on_fallback {
+                Some(_) => None,
+                None => Some(Instant::now()),
+            };
+            Ok(conn)
+        }
+        Err(second) => Err(format!(
+            "{}: {first}; {fallback}: {second}",
+            context.address
+        )),
+    }
+}
+
+fn swap_transports(context: &mut Context) {
+    if let Some(fallback) = context.fallback.as_mut() {
+        std::mem::swap(&mut context.address, fallback);
     }
 }
 
@@ -1624,6 +1673,17 @@ impl Conn {
             }
         }
     }
+    /// As `connect`, with a short QUIC handshake: another transport follows.
+    fn connect_before_fallback(address: &Address) -> io::Result<Self> {
+        match address {
+            Address::Quic { host, port } => {
+                nw_analytics_sdk::quic::QuicIo::connect_within(host, *port, QUIC_BEFORE_FALLBACK)
+                    .map(Self::Quic)
+            }
+            other => Self::connect(other),
+        }
+    }
+
     fn connect(address: &Address) -> io::Result<Self> {
         match address {
             Address::Tls { host, port } => {

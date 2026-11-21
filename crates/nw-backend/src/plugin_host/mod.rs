@@ -470,9 +470,16 @@ impl PluginHost {
                         continue;
                     }
                 };
+                // A hosted plugin's TLS address, for when QUIC can't get through.
+                let fallback = server
+                    .managed
+                    .as_ref()
+                    .and_then(|managed| managed.fallback.as_deref())
+                    .and_then(|fallback| Address::parse(fallback).ok());
                 let context = session::Context {
                     server_id: id.to_owned(),
                     address,
+                    fallback,
                     node: node.clone(),
                     streams: Arc::clone(&streams),
                     events: Arc::clone(&events),

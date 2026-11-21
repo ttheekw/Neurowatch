@@ -598,6 +598,7 @@ impl DiscoveryService {
                     device_url: device_url.clone(),
                     events_url: None,
                     ptz_url: None,
+                    allow_password_text: false,
                 });
         Ok(camera)
     }

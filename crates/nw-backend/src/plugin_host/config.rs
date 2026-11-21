@@ -47,6 +47,10 @@ pub struct Managed {
     /// The name customers know it by, from the portal's catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// `tls:host:port`, tried when the server's QUIC `address` can't be
+    /// reached (UDP blocked on the way): the same plugin over TLS on TCP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
 }
 
 impl PluginServer {
@@ -139,6 +143,14 @@ impl PluginsConfig {
                 && !matches!(address, Address::Quic { .. } | Address::Tls { .. })
             {
                 return Err("A hosted service must use an encrypted address".into());
+            }
+            if let Some(fallback) = server.managed.as_ref().and_then(|m| m.fallback.as_deref()) {
+                if !matches!(Address::parse(fallback), Ok(Address::Tls { .. })) {
+                    return Err(format!(
+                        "Plugin {:?}: its fallback must be a tls: address",
+                        server.id
+                    ));
+                }
             }
             if let Some(id) = &server.plugin_id {
                 if !valid_id(id) {

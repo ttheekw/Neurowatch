@@ -209,6 +209,9 @@ cmd_run() {
         --network host
         --user "$(id -u):$(id -g)"
         --stop-timeout 30
+        # Nothing here needs a Linux capability or to gain privileges.
+        --cap-drop ALL
+        --security-opt no-new-privileges
         --volume "$(cd "$data" && pwd):/data"
         --volume "$(cd "$recordings" && pwd):/recordings"
     )

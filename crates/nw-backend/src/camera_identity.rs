@@ -620,6 +620,7 @@ mod tests {
             device_url: "http://10.0.0.5/onvif/device_service".into(),
             events_url: None,
             ptz_url: None,
+            allow_password_text: false,
         });
         let found = target(&camera).unwrap();
         assert_eq!(found.host, "10.0.0.5");
@@ -656,6 +657,7 @@ mod tests {
             device_url: format!("http://127.0.0.1:{port}/onvif/device_service"),
             events_url: None,
             ptz_url: None,
+            allow_password_text: false,
         });
         config.cameras.push(camera);
         let dir = std::env::temp_dir().join(format!("nw-ident-{}", uuid::Uuid::new_v4()));

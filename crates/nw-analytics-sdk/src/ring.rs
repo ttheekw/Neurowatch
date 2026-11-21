@@ -312,6 +312,20 @@ impl RingReader {
                 return Err(RingError::Invalid);
             }
         }
+        // A peer that kept a writable descriptor could shrink an unsealed file
+        // under the mapping and fault this reader (SIGBUS): only a descriptor
+        // sealed against shrinking is mapped.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+            if seals < 0
+                || seals & (libc::F_SEAL_SHRINK | libc::F_SEAL_GROW)
+                    != libc::F_SEAL_SHRINK | libc::F_SEAL_GROW
+            {
+                return Err(RingError::Invalid);
+            }
+        }
         // Descriptor is read-only, regular, bounded, and has a full immutable header.
         let map = unsafe { MmapOptions::new().map(&file) }?;
         let layout = RawLayout {
@@ -380,6 +394,39 @@ mod tests {
             time_us: 1_700_000_000_123_456,
             pts_ns: Some(123_000),
         }
+    }
+
+    /// A descriptor whose file its owner could still shrink is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unsealed_file_is_never_mapped() {
+        use std::io::Write;
+        let dir = directory("unsealed");
+        let layout = RawLayout {
+            width: 2,
+            height: 2,
+            format: RawFormat::Gray8,
+            color: None,
+        };
+        let sealed = RingWriter::create(&dir, layout).unwrap();
+        let mut bytes = vec![0u8; HEADER + 4];
+        bytes[..8].copy_from_slice(MAGIC);
+        bytes[8..24].copy_from_slice(&[7; 16]);
+        bytes[56..60].copy_from_slice(&2u32.to_le_bytes());
+        bytes[60..64].copy_from_slice(&2u32.to_le_bytes());
+        bytes[64..68].copy_from_slice(&3u32.to_le_bytes());
+        bytes[68..72].copy_from_slice(&4u32.to_le_bytes());
+        let path = dir.join("plain");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&bytes).unwrap();
+        drop(file);
+        let plain = File::open(&path).unwrap();
+        assert!(RingReader::open(plain, &token(&[7; 16]), bytes.len() as u64).is_err());
+        assert!(
+            RingReader::open(sealed.descriptor().unwrap(), sealed.id(), sealed.bytes()).is_ok()
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir(dir);
     }
 
     #[test]

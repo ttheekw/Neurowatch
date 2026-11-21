@@ -217,6 +217,12 @@ async fn store_endpoint(state: &Arc<RwLock<AppState>>, camera_id: &str, endpoint
     let Some(cam) = st.config.cameras.iter_mut().find(|c| c.id == camera_id) else {
         return;
     };
+    // The user's own choice is not something the camera's answer decides.
+    let mut endpoint = endpoint;
+    endpoint.allow_password_text = cam
+        .onvif
+        .as_ref()
+        .is_some_and(|saved| saved.allow_password_text);
     if cam.onvif.as_ref() == Some(&endpoint) {
         return;
     }
@@ -229,6 +235,10 @@ async fn store_endpoint(state: &Arc<RwLock<AppState>>, camera_id: &str, endpoint
 
 /// The camera's credentials: its username and password, else any in its URL.
 pub fn credentials(cam: &CameraConfig) -> Option<Credentials> {
+    let allow_password_text = cam
+        .onvif
+        .as_ref()
+        .is_some_and(|endpoint| endpoint.allow_password_text);
     if let Some(username) = cam.username.as_deref().filter(|u| !u.is_empty()) {
         let password = cam
             .password_b64
@@ -239,6 +249,7 @@ pub fn credentials(cam: &CameraConfig) -> Option<Credentials> {
         return Some(Credentials {
             username: username.to_owned(),
             password,
+            allow_password_text,
         });
     }
     let (_, rest) = cam.url.split_once("://")?;
@@ -248,6 +259,7 @@ pub fn credentials(cam: &CameraConfig) -> Option<Credentials> {
     Some(Credentials {
         username: percent_decode(username),
         password: percent_decode(password),
+        allow_password_text,
     })
 }
 
@@ -369,6 +381,7 @@ pub async fn detect(cam: &CameraConfig) -> Result<Detected, OnvifError> {
                 device_url: url,
                 events_url: services.events_url.clone(),
                 ptz_url: services.ptz_url.clone(),
+                allow_password_text: false,
             },
             services,
             address,
@@ -432,10 +445,81 @@ mod tests {
             device_url: "http://10.0.0.2/onvif/device_service".into(),
             events_url: None,
             ptz_url: None,
+            allow_password_text: false,
         });
         assert_eq!(fingerprint(&cam), before);
         cam.motion.source = nw_core::camera::MotionSource::Off;
         assert_ne!(fingerprint(&cam), before);
+    }
+
+    #[test]
+    fn the_cameras_own_password_text_setting_reaches_its_credentials() {
+        let mut cam = CameraConfig::new("Cam", "rtsp://admin:pw@10.0.0.2/live");
+        assert!(!credentials(&cam).expect("from url").allow_password_text);
+        cam.onvif = Some(OnvifEndpoint {
+            device_url: "http://10.0.0.2/onvif/device_service".into(),
+            events_url: None,
+            ptz_url: None,
+            allow_password_text: true,
+        });
+        assert!(credentials(&cam).expect("from url").allow_password_text);
+        cam.username = Some("admin".into());
+        assert!(credentials(&cam).expect("from fields").allow_password_text);
+    }
+
+    #[test]
+    fn the_setting_defaults_off_and_is_not_written_when_off() {
+        let endpoint: OnvifEndpoint =
+            serde_json::from_str(r#"{"device_url":"http://10.0.0.2/onvif/device_service"}"#)
+                .expect("old config");
+        assert!(!endpoint.allow_password_text);
+        assert!(!serde_json::to_string(&endpoint)
+            .expect("json")
+            .contains("allow_password_text"));
+        let on = OnvifEndpoint {
+            allow_password_text: true,
+            ..endpoint
+        };
+        assert!(serde_json::to_string(&on)
+            .expect("json")
+            .contains(r#""allow_password_text":true"#));
+    }
+
+    #[tokio::test]
+    async fn a_found_endpoint_keeps_the_users_password_text_choice() {
+        let mut cam = CameraConfig::new("Cam", "rtsp://10.0.0.2/live");
+        cam.onvif = Some(OnvifEndpoint {
+            device_url: "http://10.0.0.2/onvif/device_service".into(),
+            events_url: None,
+            ptz_url: None,
+            allow_password_text: true,
+        });
+        let id = cam.id.clone();
+        let mut config = crate::config::AppConfig::default();
+        config.cameras.push(cam);
+        let dir = std::env::temp_dir().join(format!("nw-onvif-keep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let state = Arc::new(RwLock::new(crate::app_state::AppState::new(
+            config,
+            dir.join("config.json"),
+            crate::pipeline::hwaccel::HwAccelKind::Software,
+        )));
+        store_endpoint(
+            &state,
+            &id,
+            OnvifEndpoint {
+                device_url: "http://10.0.0.2/onvif/device_service".into(),
+                events_url: Some("http://10.0.0.2/onvif/events".into()),
+                ptz_url: None,
+                allow_password_text: false,
+            },
+        )
+        .await;
+        let stored = state.read().await.config.cameras[0].onvif.clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        let stored = stored.expect("stored");
+        assert!(stored.events_url.is_some());
+        assert!(stored.allow_password_text);
     }
 
     #[test]
@@ -483,6 +567,7 @@ mod tests {
             device_url: "http://10.1.2.3:8080/onvif/device_service".into(),
             events_url: None,
             ptz_url: None,
+            allow_password_text: false,
         });
         assert_eq!(
             camera_address(&cam).await.unwrap(),
@@ -507,6 +592,7 @@ mod tests {
             device_url: format!("http://127.0.0.1:{free}/onvif/device_service"),
             events_url: None,
             ptz_url: None,
+            allow_password_text: false,
         });
         assert!(matches!(
             detect(&cam).await,

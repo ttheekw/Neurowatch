@@ -382,6 +382,28 @@ fn gpu_collector_reports_available_when_probe_returns_csv() {
 }
 
 #[test]
+fn gpu_collector_does_not_call_a_driverless_va_api_card_available() {
+    struct Stub;
+    impl GpuProbe for Stub {
+        fn nvidia_smi_csv(&self) -> Option<String> {
+            None
+        }
+        fn vaapi_present(&self) -> bool {
+            true
+        }
+        fn vaapi_driver_missing(&self) -> bool {
+            true
+        }
+    }
+    match GpuCollector::new(Stub).snapshot() {
+        GpuStatus::Unavailable { reason } => {
+            assert_eq!(reason, super::gpu::VAAPI_DRIVER_MISSING_REASON);
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}
+
+#[test]
 fn gpu_collector_reports_unavailable_with_reason_when_nothing_detected() {
     struct Stub;
     impl GpuProbe for Stub {

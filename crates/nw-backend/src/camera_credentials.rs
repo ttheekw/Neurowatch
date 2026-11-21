@@ -24,6 +24,77 @@ fn without_userinfo(url: &str) -> String {
     format!("{}{}", &url[..range.start], &url[range.end..])
 }
 
+/// Every address a camera's settings name (`url`, `sub_url`, stream and ONVIF
+/// addresses: any `url` or `*_url` field), as lower-case `host[:port]`
+/// without userinfo. Local paths and devices have no host and are left out.
+pub(crate) fn hosts(camera: &Value) -> std::collections::BTreeSet<String> {
+    fn visit(value: &Value, found: &mut std::collections::BTreeSet<String>) {
+        match value {
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    if let (true, Value::String(url)) =
+                        (key == "url" || key.ends_with("_url"), value)
+                    {
+                        if let Some(host) = authority(url) {
+                            found.insert(host);
+                        }
+                    } else {
+                        visit(value, found);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| visit(item, found)),
+            _ => {}
+        }
+    }
+    let mut found = std::collections::BTreeSet::new();
+    visit(camera, &mut found);
+    found
+}
+
+fn authority(url: &str) -> Option<String> {
+    let start = url.find("://")? + 3;
+    let end = url[start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |index| start + index);
+    let authority = &url[start..end];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Whether applying `changes` to `current` sends the camera's stored
+/// username and password to an address they were not entered for: a host
+/// not among the camera's addresses before, with no credentials supplied
+/// alongside. A remote editor must not be able to point a camera at a host
+/// of theirs and receive its password (security review 2026-11-20, finding 6).
+pub(crate) fn moves_stored_credentials(current: &Value, merged: &Value, changes: &Value) -> bool {
+    let stored = ["username", "password_b64"].iter().any(|key| {
+        current
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    });
+    // Entered again means a password typed for the new address. A key that is
+    // only present (`"password": ""`, `"username": "admin"`, a null, a field
+    // the camera does not have) kept the stored password, which then went to
+    // the new host (vulnerability checklist R2). A camera stored with a user
+    // name and no password needs only its user name again.
+    let nonempty = |key: &str| {
+        changes
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    let stored_password = current
+        .get("password_b64")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    let supplied = nonempty("password_b64") || (!stored_password && nonempty("username"));
+    stored && !supplied && !hosts(merged).is_subset(&hosts(current))
+}
+
 /// Leave the portal's editable username, but never return a password or
 /// URL userinfo. Return whether any password was stored. Local non-admin
 /// callers also remove the username field; the portal exposes only this flag.

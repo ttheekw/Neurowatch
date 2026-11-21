@@ -90,10 +90,23 @@ fn named_cameras(method: &str, params: &Value) -> Vec<String> {
             ids.extend(list.iter().filter_map(Value::as_str).map(str::to_owned));
         }
     }
-    // camera.* methods name their camera as `id`.
-    if method.starts_with("camera.") {
+    // camera.* and recording.* methods name their camera as `id`; reading
+    // only camera.* let a camera-limited operator stop recording on any
+    // camera (vulnerability checklist R4).
+    if method.starts_with("camera.") || method.starts_with("recording.") {
         if let Some(id) = params.get("id").and_then(Value::as_str) {
             ids.push(id.to_owned());
+        }
+    }
+    // camera.set_positions takes a list of {id, wall_position}.
+    if method == "camera.set_positions" {
+        if let Some(entries) = params.as_array() {
+            ids.extend(
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+                    .map(str::to_owned),
+            );
         }
     }
     ids
@@ -217,6 +230,16 @@ pub fn filter_result(session: &Session, method: &str, mut result: Value) -> Resu
                         .and_then(Value::as_str)
                         .is_some_and(|id| session.sees(id))
                 });
+            }
+        }
+        "talk.status" => {
+            // Who is talking on a camera the user may not see stays unsaid.
+            let hidden = result
+                .get("camera_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !session.sees(id));
+            if hidden {
+                return Ok(Value::Null);
             }
         }
         "alerts.desktop" => {

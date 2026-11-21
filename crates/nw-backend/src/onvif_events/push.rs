@@ -22,6 +22,10 @@ const MAX_REQUEST: usize = 256 * 1024;
 const READ_DEADLINE: Duration = Duration::from_secs(5);
 /// Deliveries queued per subscription before more are dropped.
 const QUEUE: usize = 64;
+/// Connections served at once. The port faces the LAN: without a limit any
+/// peer could hold thousands open (5 s each) and use up the recorder's file
+/// handles (vulnerability checklist R6). Cameras send one delivery at a time.
+const MAX_CONNECTIONS: usize = 32;
 const PATH_PREFIX: &str = "/onvif-events/";
 
 struct Route {
@@ -70,6 +74,7 @@ impl PushListener {
             routes: Mutex::new(HashMap::new()),
         });
         let accepting = Arc::clone(&this);
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         tokio::spawn(async move {
             loop {
                 let (stream, peer) = match listener.accept().await {
@@ -80,10 +85,19 @@ impl PushListener {
                         continue;
                     }
                 };
+                // Only a camera with a subscription may deliver, and only so
+                // many at once: anything else is closed unread.
+                if !accepting.expects(peer.ip()) {
+                    continue;
+                }
+                let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                    continue;
+                };
                 let this = Arc::clone(&accepting);
                 tokio::spawn(async move {
                     let _ =
                         tokio::time::timeout(READ_DEADLINE, this.serve(stream, peer.ip())).await;
+                    drop(slot);
                 });
             }
         });
@@ -92,6 +106,14 @@ impl PushListener {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Whether some subscription's camera has this address.
+    fn expects(&self, peer: IpAddr) -> bool {
+        let peer = canonical(peer);
+        self.routes
+            .lock()
+            .is_ok_and(|routes| routes.values().any(|route| canonical(route.camera) == peer))
     }
 
     /// A new address for one camera's subscription, reachable from `camera`
@@ -286,6 +308,11 @@ mod tests {
             .await
             .starts_with("HTTP/1.1 403"));
 
+        // Gone with its route: while another subscription expects this
+        // address it answers 404, and with none it is closed unread.
+        let _again = listener
+            .route(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .expect("route");
         drop(route);
         assert!(
             post(port, &path, "x").await.starts_with("HTTP/1.1 404"),
@@ -297,6 +324,9 @@ mod tests {
     async fn oversized_and_malformed_requests_are_refused() {
         let listener = PushListener::start(0).await.expect("listening");
         let port = listener.port();
+        let _route = listener
+            .route(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .expect("route");
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         stream
             .write_all(b"POST /onvif-events/x HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n")
@@ -311,6 +341,51 @@ mod tests {
         let mut reply = String::new();
         stream.read_to_string(&mut reply).await.unwrap();
         assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+    }
+
+    /// Vulnerability checklist R6: a peer no subscription expects is closed
+    /// unread, and connections beyond the limit are refused, so the LAN
+    /// cannot use up the recorder's file handles through this port.
+    #[tokio::test]
+    async fn unexpected_peers_and_extra_connections_are_closed() {
+        let listener = PushListener::start(0).await.expect("listening");
+        let port = listener.port();
+        let closed_unread = |mut stream: TcpStream| async move {
+            let mut reply = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut reply))
+                .await
+                .expect("closed at once")
+                .ok();
+            reply.is_empty()
+        };
+        // No subscription for this address yet.
+        let stranger = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert!(closed_unread(stranger).await, "no route: closed unread");
+
+        let route = listener
+            .route(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .expect("route");
+        let path = route
+            .url
+            .split_once(&format!(":{port}"))
+            .unwrap()
+            .1
+            .to_owned();
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            held.push(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let extra = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert!(
+            closed_unread(extra).await,
+            "beyond the limit: closed unread"
+        );
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(post(port, &path, "<Notify/>")
+            .await
+            .starts_with("HTTP/1.1 200"));
     }
 
     #[test]

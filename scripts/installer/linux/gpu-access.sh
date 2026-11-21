@@ -10,7 +10,9 @@
 # the Raspberry Pi's, and USB cameras) only once signed in (logind), so a
 # recorder started earlier decodes on the CPU until it restarts, and cannot
 # record a USB camera. Membership of these groups gives them from boot
-# (upstream systemd makes render nodes accessible to everyone anyway). The
+# (upstream systemd makes render nodes accessible to everyone anyway). Only the
+# user who runs the installation (SUDO_USER, PKEXEC_UID) is added; others add
+# themselves with `sudo usermod -aG render,video USER`. The
 # memberships added here are recorded ("user group" lines), so removing the
 # package takes back only those.
 
@@ -18,11 +20,10 @@ NEUROWATCH_GPU_STATE=/var/lib/neurowatch/device-group-users
 NEUROWATCH_GPU_GROUPS="render video"
 
 neurowatch_regular_users() {
-    uid_min=$(awk '$1 == "UID_MIN" { print $2 }' /etc/login.defs 2>/dev/null || true)
-    uid_max=$(awk '$1 == "UID_MAX" { print $2 }' /etc/login.defs 2>/dev/null || true)
-    getent passwd | awk -F: -v min="${uid_min:-1000}" -v max="${uid_max:-60000}" \
-        '$3 >= min && $3 <= max && $7 !~ /(nologin|false)$/ { print $1 }'
-    # Whoever ran the installer (sudo, pkexec), even outside that range.
+    # Only whoever ran the installer (sudo, pkexec): the packages never add
+    # every account on the computer to these groups. Anyone else signing in at
+    # the console gets the devices from logind; for a recorder that must work
+    # from boot, add them yourself: sudo usermod -aG render,video USER
     if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != root ]; then
         echo "$SUDO_USER"
     fi

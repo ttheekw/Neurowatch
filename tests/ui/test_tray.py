@@ -103,6 +103,29 @@ def test_problems_that_raise_the_badge() -> None:
     assert found == (Problem("Memory running low", "Memory running low: memory high at 87%"),)
 
 
+def test_a_graphics_card_without_its_driver_is_a_problem() -> None:
+    acceleration = {
+        "kind": "software",
+        "reason": "This PC has AMD graphics that can decode video, but …",
+        "reason_code": "VAAPI_DRIVER_MISSING",
+        "gpu": {"vendor": "AMD"},
+    }
+    found = find_problems(
+        cameras=1, online=1, recording={}, performance=None, acceleration=acceleration
+    )
+    assert found == (
+        Problem(
+            "Hardware video decoding unavailable",
+            "Hardware video decoding unavailable: AMD GPU driver missing (see Diagnostics)",
+        ),
+    )
+    pending = {"kind": "software", "reason": "not yet", "reason_code": "GPU_NOT_ACCESSIBLE"}
+    assert (
+        find_problems(cameras=1, online=1, recording={}, performance=None, acceleration=pending)
+        == ()
+    ), "a card not open yet switches over by itself"
+
+
 def test_the_tooltip_names_two_problems_and_the_menu_all() -> None:
     status = ServiceStatus(
         running=True,

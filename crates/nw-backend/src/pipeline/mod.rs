@@ -12,6 +12,7 @@ use self::hwaccel::HwAccelKind;
 
 pub mod audio;
 pub mod builder;
+pub mod decoder_driver;
 pub mod encoded;
 pub mod hwaccel;
 pub mod ingest;
@@ -157,7 +158,13 @@ pub async fn probe_url(url: &str, _hwaccel: HwAccelKind) -> anyhow::Result<Probe
 /// scheme `uridecodebin` cannot resolve is never sent through file URI
 /// handling. RTSP/HTTP/file inputs keep the existing `uridecodebin` behavior.
 fn probe_pipeline_str(url: &str) -> String {
-    if url.starts_with("rtmp://") {
+    // The address is quoted like every other source's: unquoted, an address
+    // holding a `"` ended the property and the rest was read as more pipeline
+    // (other files read or written by the recorder).
+    let quoted = builder::gst_quote(url);
+    let raw = url;
+    let url = quoted.as_str();
+    if raw.starts_with("rtmp://") {
         return format!(
             "rtmpsrc location=\"{url}\" ! \
              flvdemux ! decodebin ! \
@@ -165,7 +172,7 @@ fn probe_pipeline_str(url: &str) -> String {
              appsink name=probe_sink max-buffers=1 drop=true sync=false"
         );
     }
-    if url.starts_with("/dev/video") {
+    if raw.starts_with("/dev/video") {
         return format!(
             "v4l2src device=\"{url}\" ! \
              videoconvert ! video/x-raw,format=RGB ! \
@@ -173,11 +180,11 @@ fn probe_pipeline_str(url: &str) -> String {
         );
     }
 
-    let uri = if url.starts_with("rtsp://")
-        || url.starts_with("rtsps://")
-        || url.starts_with("http://")
-        || url.starts_with("https://")
-        || url.starts_with("file://")
+    let uri = if raw.starts_with("rtsp://")
+        || raw.starts_with("rtsps://")
+        || raw.starts_with("http://")
+        || raw.starts_with("https://")
+        || raw.starts_with("file://")
     {
         url.to_owned()
     } else {
@@ -302,6 +309,53 @@ mod tests {
             !pipeline.contains("file:///dev/video0"),
             "device path must not be wrapped as a file:// uri: {pipeline}"
         );
+    }
+
+    /// Vulnerability checklist 2026-11-20, item 4: an address is one
+    /// property value, whatever it holds.
+    #[test]
+    fn an_address_cannot_add_elements_to_the_probe_pipeline() {
+        use gstreamer::prelude::*;
+        gstreamer::init().unwrap();
+        let elements = |address: &str| {
+            let pipeline = gstreamer::parse::launch(&probe_pipeline_str(address))
+                .unwrap()
+                .downcast::<gstreamer::Pipeline>()
+                .unwrap();
+            let mut names: Vec<String> = pipeline
+                .children()
+                .iter()
+                .filter_map(|e| e.factory().map(|f| f.name().to_string()))
+                .collect();
+            names.sort();
+            names
+        };
+        let plain = elements("rtsp://example.test/stream");
+        for hostile in [
+            "rtsp://example.test/\" filesrc location=\"/etc/hostname\" ! filesink location=\"/tmp/nw-probe-copy\" uridecodebin uri=\"rtsp://example.test/",
+            "/tmp/a\" filesrc location=\"/etc/hostname\" ! fakesink uridecodebin uri=\"file:///tmp/b",
+            "rtsp://example.test/\\\" ! fakesink name=\"x",
+        ] {
+            assert_eq!(elements(hostile), plain, "{hostile}");
+        }
+        for (hostile, source) in [
+            (
+                "rtmp://example.test/\" ! fakesink filesrc location=\"/etc/hostname",
+                "rtmpsrc",
+            ),
+            (
+                "/dev/video0\" ! fakesink filesrc location=\"/etc/hostname",
+                "v4l2src",
+            ),
+        ] {
+            let text = probe_pipeline_str(hostile);
+            assert!(text.starts_with(source), "{text}");
+            assert_eq!(text.matches("filesrc").count(), 1, "{text}");
+            assert!(
+                text.contains("\\\" ! fakesink"),
+                "the quote is escaped: {text}"
+            );
+        }
     }
 
     #[test]

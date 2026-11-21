@@ -298,13 +298,16 @@ pub fn verify(
     if ticket.audience != audience {
         return Err(TicketError::Audience);
     }
-    if ticket.expires_at_ms - ticket.issued_at_ms > MAX_LIFETIME_MS {
+    // The times come from the ticket (and the clock): extreme values must
+    // end in a refusal, not an overflow (a panic in debug builds, a wrapped
+    // and so valid-looking window in release ones).
+    if ticket.expires_at_ms.saturating_sub(ticket.issued_at_ms) > MAX_LIFETIME_MS {
         return Err(TicketError::TooLong);
     }
-    if now_ms + CLOCK_SKEW_MS < ticket.issued_at_ms {
+    if now_ms.saturating_add(CLOCK_SKEW_MS) < ticket.issued_at_ms {
         return Err(TicketError::NotYetValid);
     }
-    if now_ms - CLOCK_SKEW_MS >= ticket.expires_at_ms {
+    if now_ms.saturating_sub(CLOCK_SKEW_MS) >= ticket.expires_at_ms {
         return Err(TicketError::Expired);
     }
     if ticket.node_key().is_none() {
@@ -564,6 +567,22 @@ mod tests {
         assert_eq!(
             verify(&issue(&long, &portal), &keys, aud, NOW),
             Err(TicketError::TooLong)
+        );
+        // Extreme times: refused, never an overflow.
+        let mut extreme = ticket(&node);
+        extreme.issued_at_ms = i64::MIN;
+        extreme.expires_at_ms = i64::MAX;
+        assert_eq!(
+            verify(&issue(&extreme, &portal), &keys, aud, NOW),
+            Err(TicketError::TooLong)
+        );
+        let mut backwards = ticket(&node);
+        backwards.issued_at_ms = i64::MAX;
+        backwards.expires_at_ms = i64::MIN;
+        assert!(verify(&issue(&backwards, &portal), &keys, aud, i64::MIN).is_err());
+        assert_eq!(
+            verify(&issue(&ticket(&node), &portal), &keys, aud, i64::MAX),
+            Err(TicketError::Expired)
         );
         let mut keyless = ticket(&node);
         keyless.node_key = "00".into();

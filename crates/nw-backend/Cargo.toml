@@ -79,12 +79,6 @@ aes-gcm            = "0.10"
 # constraints instead of a floating registry mix. Pinned to the tag's exact commit -- `rev` and
 # not `tag`, so the checkout cannot move if the tag is ever repointed.
 livekit            = { git = "https://github.com/livekit/rust-sdks", rev = "5a656c4bc4bc5c4f7fad17ab69044db3b487dfeb" }
-# `media_publish.rs` mints the node's own participant token, so only the access-token half of
-# the server SDK is needed. The 0.9 client no longer depends on `livekit-api` at all, so this
-# stays on the crates.io 0.8.0 that nw-api resolves to. Its own (registry, prost 0.12)
-# `livekit-protocol` copy is a separate tree from the Git client's, which is harmless because
-# only `access_token` is enabled and no protocol type crosses between the two.
-livekit-api        = { version = "0.8.0", default-features = false, features = ["access-token"] }
 
 # Windows frame rings use named pagefile-backed sections (no /dev/shm); the
 # performance readings use the CPU time, memory and network adapter counters.
@@ -97,6 +91,12 @@ embed-resource = "2.5.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# The node no longer mints LiveKit tokens (the control plane sends `publisher_token`); the
+# `media_publish.rs` tests mint their own for a local LiveKit server, so only the access-token
+# half of the server SDK, on the crates.io 0.8.0 that nw-api resolves to. Its own (registry,
+# prost 0.12) `livekit-protocol` copy is a separate tree from the Git client's, which is harmless
+# because only `access_token` is enabled and no protocol type crosses between the two.
+livekit-api  = { version = "0.8.0", default-features = false, features = ["access-token"] }
 time = { workspace = true, features = ["formatting"] }
 rcgen        = "0.13"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

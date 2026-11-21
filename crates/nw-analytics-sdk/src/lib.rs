@@ -7,6 +7,7 @@ pub mod identity;
 #[cfg(unix)]
 pub mod local;
 pub mod locality;
+pub mod peer;
 pub mod pictures;
 #[cfg(windows)]
 pub mod pipe;

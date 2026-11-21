@@ -257,6 +257,9 @@ pub fn device_url_candidates(device: Ipv4Addr, port: Option<u16>) -> Vec<String>
 pub struct Credentials {
     pub username: String,
     pub password: String,
+    /// The camera's own setting (`OnvifEndpoint::allow_password_text`): send
+    /// the password unencrypted over plain HTTP when the digest fails.
+    pub allow_password_text: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +273,41 @@ enum Auth {
     None,
     Digest,
     Text,
+}
+
+/// Environment switch (every camera) for the few cameras that accept only a
+/// clear-text WS-Security password: they are sent one over plain HTTP only
+/// when this is `1` or the camera's own `onvif.allow_password_text` is on.
+const PASSWORD_TEXT_ENV: &str = "NW_ONVIF_PASSWORD_TEXT";
+
+/// The ways to present `creds` to `url`, in the order tried. The digest
+/// never reveals the password; the clear-text form does, so a request that is
+/// not encrypted (plain HTTP) never carries it unless the user opted in.
+fn auth_methods(url: &str, creds: Option<&Credentials>) -> Vec<Auth> {
+    auth_methods_with(
+        url,
+        creds,
+        creds.is_some_and(|c| c.allow_password_text)
+            || std::env::var(PASSWORD_TEXT_ENV).is_ok_and(|value| value == "1"),
+    )
+}
+
+fn auth_methods_with(url: &str, creds: Option<&Credentials>, opted_in: bool) -> Vec<Auth> {
+    match creds {
+        Some(c) if !c.username.is_empty() => {
+            let mut methods = vec![Auth::None, Auth::Digest];
+            if opted_in
+                || url
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("https://")
+            {
+                methods.push(Auth::Text);
+            }
+            methods
+        }
+        _ => vec![Auth::None],
+    }
 }
 
 fn xml_escape(text: &str) -> String {
@@ -582,10 +620,7 @@ impl SoapClient {
         options: &CallOptions,
         retry_refusals: bool,
     ) -> Result<String, OnvifError> {
-        let auths: &[Auth] = match creds {
-            Some(c) if !c.username.is_empty() => &[Auth::None, Auth::Digest, Auth::Text],
-            _ => &[Auth::None],
-        };
+        let auths = auth_methods(url, creds);
         let mut attempts: Vec<(SoapVersion, Auth)> = [SoapVersion::V12, SoapVersion::V11]
             .into_iter()
             .flat_map(|version| auths.iter().map(move |auth| (version, *auth)))
@@ -855,6 +890,39 @@ pub fn dahua_profiles(device: Ipv4Addr) -> Vec<(MediaProfile, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_clear_text_password_goes_only_over_https_or_when_opted_in() {
+        let creds = Credentials {
+            username: "admin".into(),
+            password: "secret".into(),
+            allow_password_text: false,
+        };
+        let plain = auth_methods_with("http://192.0.2.4/onvif/device_service", Some(&creds), false);
+        assert_eq!(plain, vec![Auth::None, Auth::Digest]);
+        let tls = auth_methods_with(
+            "HTTPS://192.0.2.4/onvif/device_service",
+            Some(&creds),
+            false,
+        );
+        assert!(tls.contains(&Auth::Text));
+        let opted = auth_methods_with("http://192.0.2.4/onvif", Some(&creds), true);
+        assert!(opted.contains(&Auth::Text));
+        assert_eq!(auth_methods_with("http://x/", None, true), vec![Auth::None]);
+    }
+
+    #[test]
+    fn a_camera_that_allows_it_gets_the_clear_text_password_over_plain_http() {
+        let mut creds = Credentials {
+            username: "admin".into(),
+            password: "secret".into(),
+            allow_password_text: false,
+        };
+        let url = "http://192.0.2.4/onvif/device_service";
+        assert!(!auth_methods(url, Some(&creds)).contains(&Auth::Text));
+        creds.allow_password_text = true;
+        assert!(auth_methods(url, Some(&creds)).contains(&Auth::Text));
+    }
+
     use super::*;
 
     const DEVICE: Ipv4Addr = Ipv4Addr::new(10, 0, 10, 23);

@@ -280,6 +280,7 @@ async fn run() -> anyhow::Result<()> {
                 let lapsed = {
                     let mut st = state.write().await;
                     st.reconcile_always_decoders();
+                    st.expire_playback_sessions(std::time::Instant::now());
                     st.expire_view_demand(std::time::Instant::now())
                 };
                 for client in lapsed {

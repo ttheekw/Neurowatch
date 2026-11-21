@@ -33,6 +33,11 @@ const DECODE_TIMEOUT: gstreamer::ClockTime = gstreamer::ClockTime::from_seconds(
 const GRAB_TIMEOUT: Duration = Duration::from_secs(8);
 /// Camera connections opened for thumbnails at the same time.
 pub const MAX_CONCURRENT_GRABS: usize = 4;
+/// Keyframes decoded for thumbnails at the same time (each is a decoder and
+/// a blocking thread); other requests wait their turn.
+pub const MAX_CONCURRENT_DECODES: usize = 2;
+/// Longest a thumbnail request waits for its turn to decode.
+const DECODE_QUEUE_LIMIT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct Keyframe {
@@ -82,6 +87,7 @@ pub struct Thumbnails {
     keyframes: std::sync::Arc<KeyframeStore>,
     snapshots: CameraSnapshots,
     grabs: tokio::sync::Semaphore,
+    decodes: tokio::sync::Semaphore,
 }
 
 impl Thumbnails {
@@ -90,7 +96,22 @@ impl Thumbnails {
             keyframes,
             snapshots: CameraSnapshots::default(),
             grabs: tokio::sync::Semaphore::new(MAX_CONCURRENT_GRABS),
+            decodes: tokio::sync::Semaphore::new(MAX_CONCURRENT_DECODES),
         }
+    }
+
+    /// Run `work` (a keyframe decode) on a blocking thread, at most
+    /// [`MAX_CONCURRENT_DECODES`] at a time; `None` when its turn does not
+    /// come within [`DECODE_QUEUE_LIMIT`].
+    async fn decode_capped<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> Option<T> + Send + 'static,
+    ) -> Option<T> {
+        let _turn = tokio::time::timeout(DECODE_QUEUE_LIMIT, self.decodes.acquire())
+            .await
+            .ok()?
+            .ok()?;
+        tokio::task::spawn_blocking(work).await.ok().flatten()
     }
 
     /// A JPEG thumbnail (base64) for `camera`, or `None`: its recording's
@@ -103,22 +124,20 @@ impl Thumbnails {
         streams: &crate::streams::StreamHubs,
     ) -> Option<String> {
         if let Some((caps, buffer)) = self.keyframes.latest(&camera.id) {
-            let decoded = tokio::task::spawn_blocking(move || decode_keyframe(&caps, &buffer))
-                .await
-                .ok()
-                .flatten();
+            let decoded = self
+                .decode_capped(move || decode_keyframe(&caps, &buffer))
+                .await;
             if decoded.is_some() {
                 return decoded;
             }
         }
         let open = (streams.clone(), camera.clone());
-        let decoded = tokio::task::spawn_blocking(move || {
-            let (caps, buffer) = open.0.open_keyframe(&open.1, Duration::from_secs(2))?;
-            decode_keyframe(&caps, &buffer)
-        })
-        .await
-        .ok()
-        .flatten();
+        let decoded = self
+            .decode_capped(move || {
+                let (caps, buffer) = open.0.open_keyframe(&open.1, Duration::from_secs(2))?;
+                decode_keyframe(&caps, &buffer)
+            })
+            .await;
         if decoded.is_some() {
             return decoded;
         }
@@ -136,13 +155,11 @@ impl Thumbnails {
             camera.username.as_deref(),
             camera.password_b64.as_deref(),
         );
-        tokio::task::spawn_blocking(move || {
+        self.decode_capped(move || {
             let (caps, buffer) = grab_keyframe(&url)?;
             decode_keyframe(&caps, &buffer)
         })
         .await
-        .ok()
-        .flatten()
     }
 }
 
@@ -241,6 +258,36 @@ mod tests {
         }
         pipeline.set_state(gstreamer::State::Null).unwrap();
         units
+    }
+
+    #[tokio::test]
+    async fn thumbnail_decodes_run_a_few_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let thumbnails = std::sync::Arc::new(Thumbnails::new(std::sync::Arc::new(
+            KeyframeStore::default(),
+        )));
+        let now = std::sync::Arc::new(AtomicUsize::new(0));
+        let most = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let (thumbnails, now, most) = (thumbnails.clone(), now.clone(), most.clone());
+            tasks.push(tokio::spawn(async move {
+                thumbnails
+                    .decode_capped(move || {
+                        let running = now.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(running, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(30));
+                        now.fetch_sub(1, Ordering::SeqCst);
+                        Some(())
+                    })
+                    .await
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.unwrap().is_some());
+        }
+        assert!(most.load(Ordering::SeqCst) <= 2, "at most two at once");
+        assert!(most.load(Ordering::SeqCst) >= 1);
     }
 
     #[test]

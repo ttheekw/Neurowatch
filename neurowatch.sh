@@ -308,11 +308,9 @@ install_system() {
     git lfs install
     if ! command -v clang++-21 >/dev/null 2>&1; then
         printf '%s\n' '==> Installing clang 21 from apt.llvm.org (the backend links libwebrtc)'
-        local llvm_script
-        llvm_script="$(mktemp)"
-        curl -fsSL https://apt.llvm.org/llvm.sh -o "$llvm_script"
-        sudo bash "$llvm_script" 21
-        rm -f "$llvm_script"
+        # Adds the apt.llvm.org repository after checking its signing key against a
+        # pinned fingerprint (never runs a downloaded script as root).
+        bash "$ROOT/scripts/install_clang21.sh"
     fi
 }
 

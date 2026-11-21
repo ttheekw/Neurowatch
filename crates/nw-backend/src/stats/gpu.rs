@@ -27,7 +27,17 @@ pub trait GpuProbe: Send + Sync {
     /// but it justifies naming the GPU vendor rather than reporting
     /// `Unavailable` when the caller does have VAAPI hardware.
     fn vaapi_present(&self) -> bool;
+
+    /// Return `true` when the VA-API card has no driver that decodes (the
+    /// startup probe found it missing): the node alone proves nothing then.
+    fn vaapi_driver_missing(&self) -> bool {
+        false
+    }
 }
+
+/// The GPU telemetry's reason for a VA-API card whose driver is missing.
+pub const VAAPI_DRIVER_MISSING_REASON: &str =
+    "VA-API graphics found, but its driver is missing: no hardware decoding";
 
 /// Real production probe.
 #[derive(Debug, Default)]
@@ -61,6 +71,12 @@ impl GpuProbe for SystemGpuProbe {
         }
         false
     }
+
+    fn vaapi_driver_missing(&self) -> bool {
+        crate::pipeline::hwaccel::missing_driver().is_some_and(|missing| {
+            missing.reason_code == crate::pipeline::decoder_driver::VAAPI_DRIVER_MISSING
+        })
+    }
 }
 
 pub struct GpuCollector<P: GpuProbe> {
@@ -89,6 +105,11 @@ impl<P: GpuProbe> GpuMetricsSource for GpuCollector<P> {
                     }
                 }
             }
+        }
+        if self.probe.vaapi_present() && self.probe.vaapi_driver_missing() {
+            return GpuStatus::Unavailable {
+                reason: VAAPI_DRIVER_MISSING_REASON.into(),
+            };
         }
         if self.probe.vaapi_present() {
             // Device availability and live utilization counters are separate

@@ -79,7 +79,14 @@ fn credentials(camera: &CameraConfig) -> Option<Credentials> {
         .and_then(|b64| STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .unwrap_or_default();
-    Some(Credentials { username, password })
+    Some(Credentials {
+        username,
+        password,
+        allow_password_text: camera
+            .onvif
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.allow_password_text),
+    })
 }
 
 /// Find the snapshot URL of the camera's smallest profile.
@@ -237,6 +244,7 @@ mod tests {
         let creds = Credentials {
             username: "Mufasa".into(),
             password: "Circle Of Life".into(),
+            allow_password_text: false,
         };
         let header = digest_authorization(challenge, &creds, "GET", "/dir/index.html").unwrap();
         assert!(header.contains(r#"opaque="5ccc069c403ebaf9f0171e9517f40e41""#));
@@ -348,6 +356,7 @@ mod tests {
         Credentials {
             username: "admin".into(),
             password: "secret".into(),
+            allow_password_text: false,
         }
     }
 

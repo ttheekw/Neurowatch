@@ -178,6 +178,7 @@ fn creds(password: &str) -> Option<Credentials> {
     Some(Credentials {
         username: "admin".into(),
         password: password.into(),
+        allow_password_text: false,
     })
 }
 

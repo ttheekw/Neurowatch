@@ -61,7 +61,7 @@ jobs:
             runner: ubuntu-24.04-arm
             formats: portable,deb,rpm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -77,13 +77,14 @@ jobs:
             rpm libarchive-tools zstd dpkg-dev
       - name: Install clang 21 (the cloud's libwebrtc needs it)
         run: |
-          curl -fsSL https://apt.llvm.org/llvm.sh -o llvm.sh
-          sudo bash llvm.sh 21
+          bash scripts/install_clang21.sh
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: '3.12'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
       - name: Build packages
         env:
           PYTHON: python
@@ -99,7 +100,7 @@ jobs:
         env:
           NW_EXPECT_EDITION: ${{ matrix.edition }}
         run: python scripts/smoke_release.py build/release-linux-${{ matrix.arch }}/bundle/neurowatch
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: matrix.edition == 'free'
         with:
           name: release-linux-${{ matrix.arch }}-${{ matrix.edition }}
@@ -139,7 +140,7 @@ jobs:
       matrix:
         edition: [free, unlimited]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # The Visual Studio developer environment (cl, link, INCLUDE, LIB) for
       # x64, as ilammy/msvc-dev-cmd did (it still runs on the retired Node 20):
       # only the variables VsDevCmd changes are exported.
@@ -188,10 +189,12 @@ jobs:
           echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" >> $env:GITHUB_ENV
           echo "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" >> $env:GITHUB_ENV
           echo "$gstRoot\bin" >> $env:GITHUB_PATH
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: '3.12'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
       - name: Build Windows installer and zip
         shell: pwsh
         env:
@@ -202,7 +205,7 @@ jobs:
         env:
           NW_EXPECT_EDITION: ${{ matrix.edition }}
         run: ./scripts/smoke_windows_installer.ps1 -OutDir dist/release
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: matrix.edition == 'free'
         with:
           name: release-windows-x86_64-${{ matrix.edition }}
@@ -243,24 +246,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {image: 'ubuntu:22.04', format: deb, arch: x86_64, runner: ubuntu-24.04}
-          - {image: 'ubuntu:24.04', format: deb, arch: x86_64, runner: ubuntu-24.04}
-          - {image: 'debian:12', format: deb, arch: x86_64, runner: ubuntu-24.04}
-          - {image: 'debian:13', format: deb, arch: x86_64, runner: ubuntu-24.04}
-          - {image: 'fedora:43', format: rpm, arch: x86_64, runner: ubuntu-24.04}
-          - {image: 'archlinux:base', format: arch, arch: x86_64, runner: ubuntu-24.04}
-          - {image: 'ubuntu:24.04', format: deb, arch: arm64, runner: ubuntu-24.04-arm}
-          - {image: 'debian:13', format: deb, arch: arm64, runner: ubuntu-24.04-arm}
-          - {image: 'fedora:43', format: rpm, arch: arm64, runner: ubuntu-24.04-arm}
+          - {image: 'ubuntu:22.04', digest: 'sha256:f64b2ffc2f10ab8f8505aa56b2664bd846cbb9df87c7e2532e30f7667021c0e6', format: deb, arch: x86_64, runner: ubuntu-24.04}
+          - {image: 'ubuntu:24.04', digest: 'sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289', format: deb, arch: x86_64, runner: ubuntu-24.04}
+          - {image: 'debian:12', digest: 'sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8', format: deb, arch: x86_64, runner: ubuntu-24.04}
+          - {image: 'debian:13', digest: 'sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6', format: deb, arch: x86_64, runner: ubuntu-24.04}
+          - {image: 'fedora:43', digest: 'sha256:f01112b9a1f1d0504ad962d9adfa401425033f8ab067e0a821904ebdde5b8ca5', format: rpm, arch: x86_64, runner: ubuntu-24.04}
+          - {image: 'archlinux:base', digest: 'sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899', format: arch, arch: x86_64, runner: ubuntu-24.04}
+          - {image: 'ubuntu:24.04', digest: 'sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289', format: deb, arch: arm64, runner: ubuntu-24.04-arm}
+          - {image: 'debian:13', digest: 'sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6', format: deb, arch: arm64, runner: ubuntu-24.04-arm}
+          - {image: 'fedora:43', digest: 'sha256:f01112b9a1f1d0504ad962d9adfa401425033f8ab067e0a821904ebdde5b8ca5', format: rpm, arch: arm64, runner: ubuntu-24.04-arm}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-linux-${{ matrix.arch }}-free
           path: dist/release
       - name: Install and exercise packaged application in a clean distribution
         env:
-          IMAGE: ${{ matrix.image }}
+          # The tag is for reading; the digest (the multi-architecture index)
+          # is what is pulled. Refresh both together.
+          IMAGE: ${{ matrix.image }}@${{ matrix.digest }}
           FORMAT: ${{ matrix.format }}
         run: |
           docker run --rm -v "$PWD:/work:ro" "$IMAGE" \
@@ -292,8 +297,8 @@ jobs:
             runner: ubuntu-24.04-arm
             platform: arm64
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-linux-${{ matrix.arch }}-free
           path: dist/release
@@ -335,9 +340,12 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      # Keyless signing of SHA256SUMS (Sigstore, GitHub's OIDC token). Only
+      # this job gets it.
+      id-token: write
     steps:
       - name: Gather the free packages
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: release-*-free
           path: dist/release
@@ -374,6 +382,17 @@ jobs:
         run: |
           find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort | xargs sha256sum > SHA256SUMS
           cat SHA256SUMS
+      # SHA256SUMS lists every package, so one signature covers them all. The
+      # certificate names this workflow and the release tag; nothing to keep
+      # secret. How to check it: docs/releasing.md.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: Sign SHA256SUMS (keyless)
+        working-directory: dist/release
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+          test -s SHA256SUMS.sigstore.json
       - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -462,9 +481,9 @@ jobs:
       S3_ENDPOINT: ${{ secrets.DOWNLOADS_S3_ENDPOINT }}
       S3_BUCKET: ${{ secrets.DOWNLOADS_S3_BUCKET }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Gather the free packages
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: release-*-free
           path: dist/free

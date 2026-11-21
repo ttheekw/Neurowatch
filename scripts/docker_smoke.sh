@@ -41,6 +41,7 @@ in_container() {
 args=(
     --detach --name "$NAME"
     --user "$(id -u):$(id -g)"
+    --cap-drop ALL --security-opt no-new-privileges
     --volume "$WORK/data:/data"
     --volume "$WORK/recordings:/recordings"
 )

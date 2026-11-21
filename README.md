@@ -230,7 +230,7 @@ On Ubuntu, Debian, Linux Mint and Fedora you can **double-click** the downloaded
 
 | System | Download | Install |
 |---|---|---|
-| Windows 10/11 (64-bit) | [Installer (.exe)](https://neurowatch.app/downloads?version=latest&platform=windows&arch=x86_64&kind=installer) | Run the installer, then open NeuroWatch from Start. Windows may warn that the installer is unrecognised: choose **More info → Run anyway**. |
+| Windows 10/11 (64-bit) | [Installer (.exe)](https://neurowatch.app/downloads?version=latest&platform=windows&arch=x86_64&kind=installer) | Run the installer, then open NeuroWatch from Start. Windows may warn that the installer is unrecognised: choose **More info → Run anyway** ([why](#windows-protected-your-pc)). |
 | Windows 10/11 (portable) | [.zip](https://neurowatch.app/downloads?version=latest&platform=windows&arch=x86_64&kind=portable) | Extract it, then run `neurowatch.cmd` |
 | Ubuntu, Debian, Linux Mint (64-bit PC) | [.deb](https://neurowatch.app/downloads?version=latest&platform=linux&arch=x86_64&kind=deb) | Double-click → **Install**, or `sudo apt install ./neurowatch*_amd64.deb` |
 | Ubuntu 24.04+, Debian 13+ (ARM64) | [.deb](https://neurowatch.app/downloads?version=latest&platform=linux&arch=arm64&kind=deb) | Double-click → **Install**, or `sudo apt install ./neurowatch*_arm64.deb` |
@@ -241,9 +241,11 @@ On Ubuntu, Debian, Linux Mint and Fedora you can **double-click** the downloaded
 
 Double-clicking opens the package in your software centre (App Center on Ubuntu 24.04 and later, Software on Fedora), which asks for your password and installs the system libraries NeuroWatch needs as well; then open **NeuroWatch** from your applications. If double-clicking opens another program (for example on Ubuntu 22.04), use the terminal command instead, with the `./` so the required libraries are installed too. Downloads include the video components NeuroWatch needs; you don't have to install any yourself. Motion detection is a separate plugin: download [NeuroWatch Motion](https://github.com/ttheekw/Neurowatch-Motion#download) and add it in **Plugins** (see [Motion detection](#motion-detection)).
 
-On Linux the packages also add regular user accounts to the `render` and `video` groups where those groups exist, so recording can access the graphics card, hardware video decoder and USB cameras before sign-in. Sign out and in again, or restart, for group changes to take effect. With the portable download, add your account to the device groups your distribution uses; if both exist, run `sudo usermod -aG render,video "$USER"`. Windows starts NeuroWatch when you sign in.
+On Linux the packages also add the account that runs the installation (through `sudo` or `pkexec`) to the `render` and `video` groups where those groups exist, so recording can access the graphics card, hardware video decoder and USB cameras before sign-in. Sign out and in again, or restart, for group changes to take effect. Other accounts, and the portable download, add themselves to the device groups their distribution uses; if both exist, run `sudo usermod -aG render,video "$USER"`. Windows starts NeuroWatch when you sign in.
 
 The Windows installer installs for your account and adds a Start Menu shortcut. Uninstalling stops the service and removes its startup entry; your configuration and recordings are preserved. Before removing a Linux package, run `neurowatch service stop` and `neurowatch service uninstall` from your own account.
+
+<a id="windows-protected-your-pc"></a>**"Windows protected your PC" (SmartScreen).** Windows shows this blue warning, with "Unknown publisher", for programs that are not signed with a paid code-signing certificate, until many people have downloaded them. NeuroWatch's Windows downloads are not signed that way yet: such a certificate costs hundreds of US dollars a year, which this free beta does not pay for yet. The warning means only that Windows does not know who made the file; it does not mean anything was found in it. To install, choose **More info**, then **Run anyway**. Some antivirus programs warn about unsigned programs too; download only from [neurowatch.app/downloads](https://neurowatch.app/downloads) or the [Releases page](https://github.com/ttheekw/Neurowatch/releases). To make sure the file is the one we published, compare it with `SHA256SUMS` (see [Checking a download](#checking-a-download)); on Windows, `Get-FileHash .\neurowatch-*-setup.exe` in PowerShell prints the value to compare. If Windows blocks `neurowatch.cmd` from the portable version, right-click the downloaded `.zip` → **Properties** → tick **Unblock** → **OK**, then extract it again.
 
 **System requirements**
 - **64-bit PC (x86_64):** Ubuntu 22.04 or newer, Debian 12 or newer, or a similarly recent distribution; or Windows 10/11.
@@ -257,7 +259,15 @@ The Windows installer installs for your account and adds a Start Menu shortcut. 
   not supported. See [system requirements](docs/system-requirements.md) for the
   minimum version of each distribution.
 
-**Checking a download (optional).** Each release includes a `SHA256SUMS` file. Put it next to your download and run `sha256sum --ignore-missing -c SHA256SUMS` (Linux).
+<a id="checking-a-download"></a>**Checking a download (optional).** Each release includes a `SHA256SUMS` file. Put it next to your download and run `sha256sum --ignore-missing -c SHA256SUMS` (Linux). `SHA256SUMS` is signed without a certificate of ours (Sigstore, from the release workflow's GitHub identity): download `SHA256SUMS.sigstore.json` too and check it with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/):
+
+```
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/<owner>/<repo>/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+```
+
+Replace `<owner>/<repo>` with this repository's name on GitHub. Windows installers are not Authenticode-signed yet, so Windows may show an "unknown publisher" warning ([why, and what to do](#windows-protected-your-pc)).
 
 ---
 
@@ -361,6 +371,7 @@ mkdir -p ~/neurowatch/data ~/neurowatch/recordings
 ```bash
 docker run -d --name neurowatch --restart unless-stopped --network host \
   --user "$(id -u):$(id -g)" --stop-timeout 30 \
+  --cap-drop ALL --security-opt no-new-privileges \
   -v ~/neurowatch/data:/data -v ~/neurowatch/recordings:/recordings \
   ghcr.io/ttheekw/neurowatch:latest
 ```
@@ -377,6 +388,7 @@ docker exec --user "$(id -u):$(id -g)" neurowatch neurowatch-docker cloud link C
 xhost +SI:localuser:$(id -un)
 docker run -d --name neurowatch-gui --network host \
   --user "$(id -u):$(id -g)" --stop-timeout 30 --shm-size 1g \
+  --cap-drop ALL --security-opt no-new-privileges \
   -e DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
   -v ~/neurowatch/data:/data -v ~/neurowatch/recordings:/recordings \
   ghcr.io/ttheekw/neurowatch:gui

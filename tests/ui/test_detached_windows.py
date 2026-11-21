@@ -645,7 +645,7 @@ def _counting(count: str = "5"):
     from neurowatch.models.analytics import CameraPlugin, Figure
 
     return CameraPlugin(
-        "vcount",
+        "counter",
         "Counting",
         "running",
         wall_layers=frozenset({"lines"}),
@@ -659,7 +659,7 @@ def _named_area(camera: str):
     from neurowatch.models.analytics import Drawing
 
     area = {"type": "polygon", "points": [[0, 0], [1, 0], [1, 1]], "label": "Lane 1"}
-    return Drawing(camera, "vcount", "lines", (area,), time.monotonic() + 60)
+    return Drawing(camera, "counter", "lines", (area,), time.monotonic() + 60)
 
 
 def _click(cell, name: str, qtbot) -> None:
@@ -848,7 +848,7 @@ def test_counts_stay_on_their_own_tile_and_the_plugins_page_shares_the_choice(
 
     # The Plugins page's Show counts is that camera's same choice, both ways.
     view = window._plugins_view
-    view._selection = ("vcount", "door")
+    view._selection = ("counter", "door")
     view.refresh_counts_choice()
     assert view.figures_shown.isChecked()
     window._toggle_tile_counts("door")

@@ -2070,6 +2070,7 @@ impl<C: GrantConsumer, B: MediaBridge> LiveKitPublisher<C, B> {
         directive
             .validate_with(self.config.endpoint_policy)
             .map_err(|_| PublishError::InvalidDirective)?;
+        check_signaling_host(&directive.sfu.signaling_url, self.config.endpoint_policy)?;
         if directive.sfu.region_id != self.config.region_id
             || directive.sfu.signaling_url != self.config.signaling_url
         {
@@ -2196,6 +2197,64 @@ fn spawn_publication_lease(
     })
 }
 
+/// The signalling URL's host, judged as the URL parser reads it (not as it
+/// is spelled): case, a trailing dot, numeric spellings of addresses
+/// (`2130706433`, `0x7f.1`), internationalised names and ports are all
+/// normalised first. Beyond the protocol crate's text rules, a public policy
+/// refuses any address literal and the names that only mean this machine or
+/// a local network. A development policy that accepts loopback signalling
+/// accepts only a loopback address.
+pub(crate) fn check_signaling_host(
+    url: &str,
+    policy: nw_cloud_protocol::media_session::EndpointPolicy,
+) -> Result<(), PublishError> {
+    use reqwest::Url;
+    let parsed = Url::parse(url).map_err(|_| PublishError::InvalidDirective)?;
+    if !matches!(parsed.scheme(), "https" | "wss" | "http" | "ws")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(PublishError::InvalidDirective);
+    }
+    let host = parsed.host_str().unwrap_or("");
+    let allowed = if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        policy.allow_loopback_signaling
+            && inner
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok_and(|address| address.is_loopback())
+    } else if let Ok(address) = host.parse::<std::net::Ipv4Addr>() {
+        policy.allow_loopback_signaling && address.is_loopback()
+    } else {
+        let name = host.trim_end_matches('.').to_ascii_lowercase();
+        let local = name.is_empty()
+            || name == "localhost"
+            || !name.contains('.')
+            || [
+                ".localhost",
+                ".local",
+                ".localdomain",
+                ".internal",
+                ".lan",
+                ".home",
+                ".home.arpa",
+                ".intranet",
+                ".corp",
+                ".private",
+            ]
+            .iter()
+            .any(|suffix| name.ends_with(suffix));
+        !local
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(PublishError::InvalidDirective)
+    }
+}
+
+/// Finished publications whose last status is kept for `status()`.
+const MAX_STATUS_ENTRIES: usize = 64;
+
 impl PublisherSupervisor {
     /// `endpoint_policy`: which signalling URLs a directive may name (the
     /// cloud link's policy). Nothing else is configured on the node.
@@ -2266,6 +2325,7 @@ impl PublisherSupervisor {
         directive
             .validate_with(self.endpoint_policy)
             .map_err(|_| PublishError::InvalidDirective)?;
+        check_signaling_host(&directive.sfu.signaling_url, self.endpoint_policy)?;
         let grant = read_grant(&directive.grant)?;
         // A live directive carries no playback control; a playback directive
         // must, and needs a playback engine on this node.
@@ -2365,6 +2425,7 @@ impl PublisherSupervisor {
                     playback: playback.clone(),
                 },
             );
+        self.make_room_for_status();
         self.status
             .lock()
             .expect("publisher status poisoned")
@@ -2462,6 +2523,23 @@ impl PublisherSupervisor {
         self.wait_until_inactive(&stopping).await;
     }
 
+    /// Keep the status table small: past [`MAX_STATUS_ENTRIES`], the entries
+    /// of publications that are no longer running are dropped (one is added
+    /// for every session ever started, and nothing else removed it).
+    fn make_room_for_status(&self) {
+        let running: HashSet<String> = self
+            .active
+            .lock()
+            .expect("publisher active map poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        let mut status = self.status.lock().expect("publisher status poisoned");
+        if status.len() >= MAX_STATUS_ENTRIES {
+            status.retain(|session_id, _| running.contains(session_id));
+        }
+    }
+
     pub fn status(&self) -> HashMap<String, String> {
         self.status
             .lock()
@@ -2477,7 +2555,7 @@ mod tests {
     #[test]
     fn figures_reach_viewers_beside_the_drawings() {
         let figure = crate::plugin_host::overlays::ShownFigure {
-            plugin: "vcount".into(),
+            plugin: "counter".into(),
             label: "Total today".into(),
             value: "15".into(),
             icon: Some("total".into()),
@@ -2488,7 +2566,7 @@ mod tests {
         assert_eq!(message["overlays"], serde_json::json!([]));
         assert_eq!(
             message["figures"],
-            serde_json::json!([{"plugin": "vcount", "label": "Total today", "value": "15",
+            serde_json::json!([{"plugin": "counter", "label": "Total today", "value": "15",
                 "icon": "total", "style": "series3"}])
         );
     }
@@ -2646,6 +2724,57 @@ mod tests {
 
     /// The shape of the SFU token the control plane mints; never a real one.
     const PUBLISHER_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJub2RlIn0.c2lnbmF0dXJl";
+
+    #[test]
+    fn the_status_table_forgets_finished_publications_when_it_grows() {
+        let supervisor = PublisherSupervisor::new(EndpointPolicy::PUBLIC);
+        {
+            let mut status = supervisor.status.lock().unwrap();
+            for n in 0..MAX_STATUS_ENTRIES * 4 {
+                status.insert(format!("old-{n}"), "closed".into());
+            }
+        }
+        supervisor.make_room_for_status();
+        assert!(supervisor.status().is_empty());
+        supervisor
+            .status
+            .lock()
+            .unwrap()
+            .insert("few".into(), "closed".into());
+        supervisor.make_room_for_status();
+        assert_eq!(supervisor.status().len(), 1, "small tables are left alone");
+    }
+
+    #[test]
+    fn the_signalling_host_is_judged_as_parsed_not_as_spelled() {
+        let public = EndpointPolicy::PUBLIC;
+        for bad in [
+            "wss://localhost./room",
+            "wss://LocalHost:7880",
+            "wss://media.local./x",
+            "wss://2130706433/x",
+            "wss://0x7f.1/x",
+            "wss://[::1]:7880",
+            "wss://[::ffff:127.0.0.1]/",
+            "wss://10.0.0.5/",
+            "wss://router/",
+            "wss://sfu.internal./",
+            "wss://user:pw@sfu.example.com/",
+            "wss://127.0.0.1:7880",
+        ] {
+            assert!(check_signaling_host(bad, public).is_err(), "{bad}");
+        }
+        for good in [
+            "wss://sfu.example.com",
+            "wss://SFU.Example.COM.:443/x",
+            "https://eu.sfu.example.org/",
+        ] {
+            assert!(check_signaling_host(good, public).is_ok(), "{good}");
+        }
+        let dev = EndpointPolicy::DEVELOPMENT_LOOPBACK;
+        assert!(check_signaling_host("ws://127.0.0.1:7880", dev).is_ok());
+        assert!(check_signaling_host("ws://10.0.0.5:7880", dev).is_err());
+    }
 
     #[tokio::test]
     async fn directives_are_published_only_for_the_linked_node_and_a_trusted_sfu() {

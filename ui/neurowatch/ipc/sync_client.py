@@ -13,7 +13,8 @@ import socket
 from typing import Any
 
 from neurowatch.ipc.auth import with_auth
-from neurowatch.service.paths import login_runtime_dir
+from neurowatch.ipc.peer import same_user
+from neurowatch.service.paths import login_runtime_dir, tmp_fallback_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ class SyncIpcClient:
             if login_runtime is not None:
                 candidates.append(f"unix:{login_runtime}/neurowatch/control.sock")
         candidates.append("unix:/tmp/neurowatch/control.sock")
+        candidates.append(tmp_fallback_endpoint())
         candidates.append(DEFAULT_ENDPOINT)
 
         unique_candidates = list(dict.fromkeys(candidates))
@@ -188,5 +190,9 @@ class SyncIpcClient:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(5.0)
         sock.connect(path)
+        if not same_user(sock, path):
+            # Another user's listener (a planted /tmp socket): nothing is sent.
+            sock.close()
+            raise PermissionError(f"{endpoint} belongs to another user")
         logger.debug("IPC socket connected to %s", endpoint)
         return sock

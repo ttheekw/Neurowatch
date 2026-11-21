@@ -84,7 +84,7 @@ pub fn parse_backup_reply(reply: &Value) -> Result<Option<BackupAssignment>> {
         .into_iter()
         .flatten()
     {
-        if !host_port(address) {
+        if !usable_address(address) {
             return Err(invalid("ingest address"));
         }
     }
@@ -104,6 +104,82 @@ pub(super) fn valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+}
+
+/// An address the portal may hand out for a hosted service (a backup ingest,
+/// a hosted plugin): `host:port` naming a public host. Addresses of this
+/// machine, a local network or a link (`127.0.0.1`, `10.x`, `169.254.x`,
+/// `[::1]`, `localhost`, `printer.local`, a name without a dot) are refused,
+/// so a hosted-service entry cannot aim the recorder, with its tickets, at
+/// something inside the site. Debug builds also take local addresses (the
+/// development ingest, as for the development CA).
+pub(super) fn usable_address(address: &str) -> bool {
+    host_port(address) && (cfg!(debug_assertions) || public_host(address))
+}
+
+/// Whether the host of a valid `host:port` is a public one.
+pub(super) fn public_host(address: &str) -> bool {
+    let Some((host, _)) = address.rsplit_once(':') else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return public_ip(ip);
+    }
+    let name = host.trim_end_matches('.').to_ascii_lowercase();
+    // A dotted-number spelling that is not a plain address (`127.1`,
+    // `0x7f.0.0.1`, `2130706433`) is never a hosted name.
+    let numeric_only = name
+        .split('.')
+        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit() || b == b'x'));
+    !(name.is_empty()
+        || !name.contains('.')
+        || numeric_only
+        || [
+            ".localhost",
+            ".local",
+            ".localdomain",
+            ".internal",
+            ".lan",
+            ".home",
+            ".home.arpa",
+            ".intranet",
+            ".corp",
+            ".private",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix)))
+}
+
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || (a == 100 && (64..128).contains(&b))
+                || a == 0
+                || a >= 240)
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return public_ip(std::net::IpAddr::V4(mapped));
+            }
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || first & 0xfe00 == 0xfc00
+                || first & 0xffc0 == 0xfe80)
+        }
+    }
 }
 
 /// `host:port` (a name or IPv4, or `[IPv6]`), port 1–65535.
@@ -226,5 +302,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.ingest.ca_pem.is_some(), cfg!(debug_assertions));
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_service_addresses_must_name_public_hosts() {
+        for local in [
+            "127.0.0.1:443",
+            "10.1.2.3:443",
+            "192.168.0.7:7691",
+            "172.16.0.1:1",
+            "169.254.169.254:80",
+            "100.64.0.1:443",
+            "0.0.0.0:443",
+            "[::1]:443",
+            "[fe80::1]:443",
+            "[fd00::1]:443",
+            "[::ffff:10.0.0.1]:443",
+            "localhost:443",
+            "LOCALHOST.:443",
+            "nas.local:7691",
+            "intranet:7691",
+            "x.internal:443",
+            "127.1:443",
+            "2130706433:443",
+        ] {
+            assert!(
+                host_port(local) || local.contains(".."),
+                "{local} is well formed"
+            );
+            assert!(!public_host(local), "{local}");
+        }
+        for public in [
+            "ingest.example.com:443",
+            "Eu-1.Ingest.Example.org.:7691",
+            "93.184.216.34:443",
+            "[2606:4700::1111]:443",
+        ] {
+            assert!(public_host(public), "{public}");
+        }
     }
 }

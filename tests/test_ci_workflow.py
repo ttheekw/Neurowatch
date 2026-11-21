@@ -122,8 +122,85 @@ def test_workflows_use_actions_that_run_on_node_24() -> None:
         text = workflow.read_text()
         assert "uses: ilammy/msvc-dev-cmd" not in text, workflow.name  # still Node 20
         for action, minimum in retired.items():
-            for major in re.findall(rf"uses: {re.escape(action)}@v(\d+)", text):
+            for major in re.findall(rf"uses: {re.escape(action)}@[0-9a-f]{{40}} # v(\d+)", text):
                 assert int(major) >= minimum, f"{workflow.name}: {action}@v{major}"
         # setup-uv publishes no moving major tags (no "v10"): only exact versions.
-        for ref in re.findall(r"uses: astral-sh/setup-uv@(\S+)", text):
+        for ref in re.findall(r"uses: astral-sh/setup-uv@[0-9a-f]{40} # (\S+)", text):
             assert re.fullmatch(r"v\d+\.\d+\.\d+", ref), f"{workflow.name}: setup-uv@{ref}"
+
+
+def test_every_action_is_pinned_to_a_commit() -> None:
+    # Vulnerability checklist R15: a tag or branch (`dtolnay/rust-toolchain@stable`)
+    # can be moved to other code, which then runs in the jobs that build the
+    # releases and hold the downloads bucket's keys. Each action names a commit,
+    # its version in a comment beside it.
+    for workflow in (ROOT / ".github/workflows").glob("*.yml"):
+        for line in workflow.read_text().splitlines():
+            if "uses:" in line and "uses: ./" not in line:
+                assert re.search(r"uses: [\w.-]+/[\w./-]+@[0-9a-f]{40} # \S+$", line), (
+                    f"{workflow.name}: {line.strip()}"
+                )
+
+
+def test_clang_comes_from_the_apt_llvm_repository_with_a_pinned_key() -> None:
+    """No workflow, and not the bootstrap, runs a downloaded llvm.sh as root: they use
+    scripts/install_clang21.sh, which adds the repository only after the signing
+    key matches a pinned fingerprint."""
+    script = (ROOT / "scripts/install_clang21.sh").read_text()
+    assert 'LLVM_KEY_FINGERPRINT="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"' in script
+    assert "Signed-By:" in script and "verify_key" in script
+    for path in (
+        ROOT / ".github/workflows/ci.yml",
+        ROOT / ".github/workflows/release.yml",
+    ):
+        text = path.read_text()
+        assert "llvm.sh" not in text, path
+        assert "bash scripts/install_clang21.sh" in text, path
+    bootstrap = (ROOT / "neurowatch.sh").read_text()
+    assert "llvm.sh" not in bootstrap
+    assert "scripts/install_clang21.sh" in bootstrap
+
+
+def test_the_clang_install_refuses_a_key_with_another_fingerprint(tmp_path: Path) -> None:
+    import os
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if shutil.which("gpg") is None or shutil.which("bash") is None:
+        pytest.skip("needs gpg and bash")
+    home = tmp_path / "gnupg"
+    home.mkdir(mode=0o700)
+    env = {**os.environ, "GNUPGHOME": str(home)}
+    generate = [
+        "gpg", "--batch", "--pinentry-mode", "loopback", "--passphrase", "",
+        "--quick-generate-key", "intruder <x@example.org>", "ed25519", "sign", "1d",
+    ]  # fmt: skip
+    try:
+        subprocess.run(generate, env=env, check=True, capture_output=True, timeout=60)
+        key = tmp_path / "key.asc"
+        key.write_bytes(
+            subprocess.run(
+                ["gpg", "--armor", "--export", "intruder"], env=env, check=True, capture_output=True
+            ).stdout
+        )
+        result = subprocess.run(
+            ["bash", str(ROOT / "scripts/install_clang21.sh"), "--verify-only"],
+            env={**env, "NW_LLVM_KEY_FILE": str(key)},
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0 and "not the pinned" in result.stderr
+        garbage = tmp_path / "garbage"
+        garbage.write_text("not a key")
+        result = subprocess.run(
+            ["bash", str(ROOT / "scripts/install_clang21.sh"), "--verify-only"],
+            env={**env, "NW_LLVM_KEY_FILE": str(garbage)},
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0 and "not a readable OpenPGP key" in result.stderr
+    finally:
+        # Making the key started a gpg-agent for this home: stop it.
+        subprocess.run(["gpgconf", "--kill", "gpg-agent"], env=env, capture_output=True, timeout=30)

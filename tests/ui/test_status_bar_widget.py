@@ -105,6 +105,25 @@ def test_the_badge_follows_a_backend_that_restarted_once_the_gpu_was_available(q
     assert bar._accel_lbl.text() == "VA-API"
 
 
+def test_a_graphics_card_without_its_driver_turns_the_badge_into_a_warning(qtbot):
+    bar = status_mod.StatusBarWidget()
+    qtbot.addWidget(bar)
+    reason = "This PC has Intel graphics that can decode video, but its VA-API driver is missing."
+    bar.set_video_acceleration({"kind": "software", "hardware": False, "reason": reason})
+    assert bar._accel_lbl.mark() == "ring", "a reason alone: plain CPU decode"
+    bar.set_video_acceleration(
+        {
+            "kind": "software",
+            "hardware": False,
+            "reason": reason,
+            "reason_code": "VAAPI_DRIVER_MISSING",
+        }
+    )
+    assert (bar._accel_lbl.text(), bar._accel_lbl.mark()) == ("CPU Decode", "alert")
+    assert bar._accel_lbl.toolTip() == reason
+    assert "#f59e0b" in bar._accel_lbl.styleSheet()
+
+
 def test_every_reading_is_centred_the_same_way(qtbot):
     """A style sheet without a selector gave every label the bar's top border
     (text a pixel low) and the decoder badge its own padding (another height)."""

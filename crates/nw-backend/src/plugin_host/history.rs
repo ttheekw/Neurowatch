@@ -82,6 +82,9 @@ impl History {
                 } else {
                     path.with_extension("overlays.db")
                 };
+                // Drawings name cameras and what was seen there: owner only.
+                crate::db::connection::make_private_db(&destination)
+                    .map_err(|_| HistoryError::Unavailable)?;
                 let conn = Connection::open(destination)?;
                 conn.pragma_update(None, "max_page_count", MAX_DATABASE_PAGES)?;
                 conn.pragma_update(None, "journal_size_limit", 4 * 1024 * 1024)?;
@@ -471,6 +474,15 @@ mod tests {
         ));
         let history = History::new(Arc::clone(&db)).unwrap();
         assert!(dir.join("overlays.db").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("overlays.db"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "drawings are owner-only");
+        }
         assert_eq!(
             history
                 .db
