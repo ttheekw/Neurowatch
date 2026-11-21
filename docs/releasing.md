@@ -28,7 +28,8 @@ keylessly with [Sigstore cosign](https://docs.sigstore.dev/cosign/signing/overvi
 the workflow's GitHub OIDC identity (`id-token: write`, on that job only) gets a
 short-lived certificate, and the signature, certificate and transparency-log proof
 are written to `SHA256SUMS.sigstore.json`, uploaded next to `SHA256SUMS`. No signing
-key or certificate is stored anywhere. Verify, with cosign 2 or newer:
+key or certificate is stored anywhere. Verify with cosign 3 or newer (the bundle is Sigstore's
+v0.3 format, which cosign 2.4 cannot read without `--new-bundle-format`):
 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS

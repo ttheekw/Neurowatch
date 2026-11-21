@@ -259,7 +259,7 @@ The Windows installer installs for your account and adds a Start Menu shortcut. 
   not supported. See [system requirements](docs/system-requirements.md) for the
   minimum version of each distribution.
 
-<a id="checking-a-download"></a>**Checking a download (optional).** Each release includes a `SHA256SUMS` file. Put it next to your download and run `sha256sum --ignore-missing -c SHA256SUMS` (Linux). `SHA256SUMS` is signed without a certificate of ours (Sigstore, from the release workflow's GitHub identity): download `SHA256SUMS.sigstore.json` too and check it with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/):
+<a id="checking-a-download"></a>**Checking a download (optional).** Each release includes a `SHA256SUMS` file. Put it next to your download and run `sha256sum --ignore-missing -c SHA256SUMS` (Linux). `SHA256SUMS` is signed without a certificate of ours (Sigstore, from the release workflow's GitHub identity): download `SHA256SUMS.sigstore.json` too and check it with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3 or newer:
 
 ```
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
