@@ -760,7 +760,7 @@ def test_a_plugins_detection_areas_are_drawn_on_the_desktop_with_its_other_shape
     manifest = Manifest.from_dict(
         {
             **MANIFEST,
-            "id": "nw.vcount",
+            "id": "nw.counter",
             "config_schema": {
                 "type": "object",
                 "properties": {
@@ -784,13 +784,13 @@ def test_a_plugins_detection_areas_are_drawn_on_the_desktop_with_its_other_shape
         "kind": "exclude",
         "points": [[0, 0], [0.5, 0], [0.5, 0.5]],
     }
-    existing = PluginBinding("vcount", "c2", True, {"lanes": [lane], "detection_areas": [ignored]})
+    existing = PluginBinding("counter", "c2", True, {"lanes": [lane], "detection_areas": [ignored]})
     editor = BindingEditor(manifest, [Camera("c2", "Road", {})], existing)
     qtbot.addWidget(editor)
     assert editor.shapes is not None
     editor.shapes.tabs.set_value("detection_areas")
     assert any(label.text() == described for label in editor.findChildren(QLabel))
-    saved = editor.binding("vcount").config
+    saved = editor.binding("counter").config
     assert saved["lanes"] == [lane]
     assert saved["detection_areas"][0]["kind"] == "exclude"
     assert saved["detection_areas"][0]["points"] == ignored["points"]
@@ -804,7 +804,7 @@ def test_figures_are_read_for_showing_beside_the_picture() -> None:
             "cameras": {
                 "c1": [
                     {
-                        "plugin": "vcount",
+                        "plugin": "counter",
                         "figures": [
                             {"label": "Total today", "value": "15"},
                             {"value": "no label"},
@@ -825,13 +825,13 @@ def test_figures_stay_hidden_until_asked_for(qtbot) -> None:
 
     view = _view(qtbot, FakeRecorder())
     assert view.figures_shown.isHidden(), "nothing to offer yet"
-    view._selection = ("vcount", "c1")
+    view._selection = ("counter", "c1")
     figures = (
         Figure("Cars", "1200", "car", "series1"),
         Figure("Total today", "1205", "total"),
         Figure("Lane 1", "91"),
     )
-    view.set_analytics({"c1": [CameraPlugin("vcount", "Counting", "running", figures=figures)]})
+    view.set_analytics({"c1": [CameraPlugin("counter", "Counting", "running", figures=figures)]})
     assert not view.figures_shown.isHidden(), "offered once the plugin reports some"
     assert not view.figures_shown.isChecked()
     assert view.live_figures.summary() == [], "no numbers until asked for"
@@ -890,7 +890,7 @@ def _named_areas(camera: str = "c1", until: float = 100.0) -> Any:
     points = [[0, 0], [1, 0], [1, 1]]
     return Drawing(
         camera,
-        "vcount",
+        "counter",
         "lines",
         (
             {"type": "polygon", "points": points, "label": "Lane 1", "style": "success"},
@@ -1227,13 +1227,13 @@ def test_the_plugins_page_shows_the_key_for_the_layers_it_draws(qtbot) -> None:
     from neurowatch.models.analytics import CameraPlugin, Layer
 
     view = _view(qtbot, FakeRecorder())
-    view._selection = ("vcount", "c1")
+    view._selection = ("counter", "c1")
     layer = Layer("lines", "Lines")
-    view.set_analytics({"c1": [CameraPlugin("vcount", "Counting", "running", layers=(layer,))]})
+    view.set_analytics({"c1": [CameraPlugin("counter", "Counting", "running", layers=(layer,))]})
     far = time.monotonic() + 60
     view.set_drawings({"c1": [_named_areas(until=far)]})
     assert view.live_figures.key() == ["Lane 1", "Ignored: Parking"]
-    view._toggle_layer(("vcount", "lines"), False)
+    view._toggle_layer(("counter", "lines"), False)
     assert view.live_figures.key() == [], "switched off: out of the key at once"
 
 
@@ -1265,7 +1265,7 @@ def _boxes(seq: int):
     box = {"type": "box", "rect": [0.1, 0.2, 0.3, 0.4], "style": "series1"}
     return Drawing(
         "c1",
-        "vcount",
+        "counter",
         "detections",
         (box,),
         time.monotonic() + 30,
@@ -1331,8 +1331,8 @@ def test_a_settings_choice_shows_its_label_and_saves_its_value(qtbot) -> None:
         "auto": "Automatic",
         "software": "CPU (software)",
     }, "a plugin's schema is not trusted: only text"
-    manifest = Manifest.from_dict({"id": "nw.vcount", "config_schema": schema})
-    binding = PluginBinding("vcount", "c1", True, {"decoder": "software"})
+    manifest = Manifest.from_dict({"id": "nw.counter", "config_schema": schema})
+    binding = PluginBinding("counter", "c1", True, {"decoder": "software"})
     editor = BindingEditor(manifest, [Camera("c1", "Road", {})], binding)
     qtbot.addWidget(editor)
     combo = editor._inputs["decoder"]
@@ -1355,7 +1355,7 @@ def test_a_settings_choice_shows_its_label_and_saves_its_value(qtbot) -> None:
 def test_a_plugin_without_events_has_no_output_and_says_nothing_about_events(qtbot) -> None:
     from neurowatch.models.plugins import Manifest, PluginServer
 
-    counting = Manifest.from_dict({"id": "nw.vcount", "permissions": ["video", "overlays"]})
+    counting = Manifest.from_dict({"id": "nw.counter", "permissions": ["video", "overlays"]})
     motion = Manifest.from_dict({"id": "nw.motion", "permissions": ["video", "events"]})
     older = Manifest.from_dict({"id": "nw.other"})
     assert counting is not None and not counting.reports_events
@@ -1363,7 +1363,7 @@ def test_a_plugin_without_events_has_no_output_and_says_nothing_about_events(qtb
     assert older is not None and older.reports_events, "no list: it may send them"
 
     view = _view(qtbot, FakeRecorder())
-    plugin_id = "vcount"
+    plugin_id = "counter"
     view._server = lambda _plugin: PluginServer(plugin_id, "unix:/x.sock")
     for part in ("_fill_layer_boxes", "_fill_settings", "_refresh_status"):
         setattr(view, part, lambda: None)
@@ -1447,12 +1447,12 @@ def test_a_count_changing_reads_the_cameras_plugins_at_once(monkeypatch):
 
 def test_a_hosted_plugin_says_who_provides_it_and_offers_no_controls(qtbot) -> None:
     view = _view(qtbot, FakeRecorder())
-    plugin_id = "hosted.nw.vcount"
-    managed = {"service": "nw.vcount", "instance": "vcount-1.example.test"}
+    plugin_id = "hosted.nw.counter"
+    managed = {"service": "nw.counter", "instance": "counter-1.example.test"}
 
     def provided(enabled: bool) -> QLabel:
         view._server = lambda _plugin: PluginServer(
-            plugin_id, "quic:vcount-1.example.test:443", enabled=enabled, managed=managed
+            plugin_id, "quic:counter-1.example.test:443", enabled=enabled, managed=managed
         )
         view._refresh_status = lambda: None
         view._show_plugin(plugin_id)
@@ -1461,7 +1461,7 @@ def test_a_hosted_plugin_says_who_provides_it_and_offers_no_controls(qtbot) -> N
         assert "Remove…" not in buttons, "the portal decides"
         assert not [box for box in page.findChildren(QCheckBox) if box.text() == "On"]
         texts = [label.text() for label in page.findChildren(QLabel)]
-        assert not [text for text in texts if "vcount-1.example.test" in text], (
+        assert not [text for text in texts if "counter-1.example.test" in text], (
             "its address is not shown"
         )
         return page.findChild(QLabel, "pluginProvided")
@@ -1490,8 +1490,8 @@ def test_a_camera_a_hosted_plugin_no_longer_covers_says_so() -> None:
 
 
 def test_a_hosted_plugin_round_trips_its_marker() -> None:
-    managed = {"service": "nw.vcount", "instance": "v1"}
-    assert PluginServer("hosted.nw.vcount", "quic:v1:443", managed=managed).managed == managed
+    managed = {"service": "nw.counter", "instance": "v1"}
+    assert PluginServer("hosted.nw.counter", "quic:v1:443", managed=managed).managed == managed
 
 
 def test_a_hosted_plugin_is_shown_by_its_catalog_name() -> None:
@@ -1499,10 +1499,10 @@ def test_a_hosted_plugin_is_shown_by_its_catalog_name() -> None:
         {
             "servers": [
                 {
-                    "id": "hosted.nw.vcount",
+                    "id": "hosted.nw.counter",
                     "address": "quic:v1:443",
                     "managed": {
-                        "service": "nw.vcount",
+                        "service": "nw.counter",
                         "instance": "v1",
                         "label": "Vehicle counting",
                     },
@@ -1512,9 +1512,9 @@ def test_a_hosted_plugin_is_shown_by_its_catalog_name() -> None:
     )
     server = hosted.servers[0]
     assert server.shown_name() == "Vehicle counting"
-    assert server.shown_name("nw-vcount") == "Vehicle counting"
+    assert server.shown_name("nw-counter") == "Vehicle counting"
     statuses = parse_status(
-        {"plugins": [{"id": "hosted.nw.vcount", "state": "unreachable", "detail": "timed out"}]}
+        {"plugins": [{"id": "hosted.nw.counter", "state": "unreachable", "detail": "timed out"}]}
     )
     [notice] = connection_notices(hosted, statuses)
     assert notice.text.startswith("Vehicle counting unavailable")
@@ -1528,10 +1528,10 @@ def test_a_hosted_plugin_no_longer_provided_is_not_listed() -> None:
         {
             "servers": [
                 {
-                    "id": "hosted.nw.vcount",
+                    "id": "hosted.nw.counter",
                     "address": "quic:v1:443",
                     "enabled": False,
-                    "managed": {"service": "nw.vcount", "instance": "v1"},
+                    "managed": {"service": "nw.counter", "instance": "v1"},
                 },
                 {"id": "motion", "address": "unix:/tmp/m.sock", "enabled": False},
             ],
@@ -1552,10 +1552,10 @@ def test_a_hosted_plugin_goes_back_to_the_recorder_as_it_came() -> None:
     raw = {
         "servers": [
             {
-                "id": "hosted.nw.vcount",
+                "id": "hosted.nw.counter",
                 "address": "quic:v1.example.test:443",
                 "enabled": False,
-                "managed": {"service": "nw.vcount", "instance": "v1"},
+                "managed": {"service": "nw.counter", "instance": "v1"},
             },
             {"id": "motion", "address": "unix:/tmp/m.sock"},
         ]
@@ -1563,3 +1563,33 @@ def test_a_hosted_plugin_goes_back_to_the_recorder_as_it_came() -> None:
     config = PluginsConfig.from_dict(raw)
     sent = config.without_server("motion").to_dict()["servers"]
     assert sent == [raw["servers"][0]], "the hidden hosted plugin goes back unchanged"
+
+
+def test_plugin_supplied_text_is_shown_as_written(qtbot) -> None:
+    # Security review 2026-11-20, finding 13: a plugin's name and maker come
+    # from the plugin, before approval; Qt rendered HTML-looking text as rich
+    # text (links, remote images).
+    from PySide6.QtCore import Qt
+
+    recorder = FakeRecorder()
+    server = {"id": "motion", "address": "unix:/tmp/m.sock", "enabled": True}
+    recorder.config["servers"].append(server)
+    hostile = '<a href="https://example.test">Click</a><img src="https://example.test/x.png">'
+    plugins_view_manifest = {**MANIFEST, "name": hostile, "vendor": hostile}
+    original = MANIFEST.copy()
+    MANIFEST.update(plugins_view_manifest)
+    try:
+        view = _view(qtbot, recorder)
+        view._show_plugin("motion")
+        page = view.plugin_page.widget()
+        labels = page.findChildren(QLabel) + view.findChildren(QLabel)
+        rich = [
+            (label.objectName(), label.text()[:40])
+            for label in labels
+            if label.textFormat() != Qt.TextFormat.PlainText
+        ]
+        assert labels and not rich, rich
+        assert any(hostile in label.text() for label in page.findChildren(QLabel))
+    finally:
+        MANIFEST.clear()
+        MANIFEST.update(original)

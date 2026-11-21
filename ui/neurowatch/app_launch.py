@@ -32,6 +32,7 @@ from neurowatch.service import probe
 from neurowatch.service.lock import InstanceLock
 from neurowatch.service.manager import DESKTOP, ServiceController, ServiceError, running_mode
 from neurowatch.service.paths import IS_WINDOWS, dev_mode, lock_path, log_path, python_command
+from neurowatch.utils.private_files import open_private
 from neurowatch.utils.threads import Worker
 
 logger = logging.getLogger(__name__)
@@ -172,7 +173,7 @@ def start_tray() -> bool:
     kwargs: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
-        "stderr": open(log_path("tray"), "ab"),  # the child keeps its own copy
+        "stderr": open_private(log_path("tray")),  # owner only; the child keeps its own copy
         "close_fds": True,
     }
     if IS_WINDOWS:

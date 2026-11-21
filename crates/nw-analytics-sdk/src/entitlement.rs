@@ -89,8 +89,8 @@ mod tests {
         (
             EntitlementGate {
                 trust: Arc::new(RwLock::new(trust)),
-                service: "nw.vcount".into(),
-                audience: "vcount-1".into(),
+                service: "nw.counter".into(),
+                audience: "counter-1".into(),
             },
             tickets,
         )
@@ -103,8 +103,8 @@ mod tests {
                 v: 1,
                 id: "t".into(),
                 kid: "t".into(),
-                service: "nw.vcount".into(),
-                audience: "vcount-1".into(),
+                service: "nw.counter".into(),
+                audience: "counter-1".into(),
                 org_id: "org".into(),
                 node_id: "node".into(),
                 node_key: hex(node.verifying_key().as_bytes()),

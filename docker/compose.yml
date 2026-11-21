@@ -15,6 +15,9 @@ x-neurowatch: &neurowatch
   user: "${NW_UID:-1000}:${NW_GID:-1000}"
   network_mode: host  # camera discovery (multicast) and the camera event port 7681
   stop_grace_period: 30s
+  cap_drop: [ALL]  # nothing here needs a Linux capability
+  security_opt:
+    - no-new-privileges:true
   volumes:
     - ${NW_DATA:-./neurowatch-data}:/data
     - ${NW_RECORDINGS:-./neurowatch-recordings}:/recordings

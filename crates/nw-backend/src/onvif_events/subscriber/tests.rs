@@ -345,6 +345,7 @@ fn camera_for(port: u16) -> CameraConfig {
         device_url: format!("http://127.0.0.1:{port}/onvif/device_service"),
         events_url: None,
         ptz_url: None,
+        allow_password_text: false,
     });
     cam
 }

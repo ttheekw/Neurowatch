@@ -488,7 +488,7 @@ fn copy_verified(
     name.push(".part");
     let part = target.with_file_name(name);
     let result = (|| {
-        let mut out = std::fs::File::create(&part).map_err(|e| failed("create", &part, e))?;
+        let mut out = create_part(&part).map_err(|e| failed("create", &part, e))?;
         let (hash, copied) = stream(source, bytes_per_sec, archive, |chunk| out.write_all(chunk))?;
         out.sync_all().map_err(|e| failed("flush", &part, e))?;
         drop(out);
@@ -511,6 +511,26 @@ fn copy_verified(
         let _ = std::fs::remove_file(&part);
     }
     result
+}
+
+/// A new file at `part`, never through a link: a `.part` left by an earlier
+/// pass (or a link someone planted at that name, which would send the copy
+/// anywhere) is removed first, and the file is created exclusively without
+/// following links.
+fn create_part(part: &Path) -> std::io::Result<std::fs::File> {
+    match std::fs::remove_file(part) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(part)
 }
 
 /// The copy is verified: delete the original and point its row at the copy,
@@ -739,6 +759,22 @@ mod tests {
         assert_eq!(outcome.moved, 1);
         assert!(!source.exists());
         assert_eq!(fx.rows()[0].1, ARCHIVE_TIER);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_at_the_part_name_is_replaced_not_written_through() {
+        let fx = Fixture::new();
+        let source = fx.recording("cam-l", "2026-10-01", "cam-l_1.mkv", 1000, 1_000_000);
+        let target = fx.dir.join("archive/cam-l/2026-10-01/cam-l_1.mkv");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let victim = fx.dir.join("victim");
+        std::fs::write(&victim, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, target.with_file_name("cam-l_1.mkv.part")).unwrap();
+        let outcome = move_due(&fx.db, &fx.plan(5_000_000), &Archive::default());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert_eq!(outcome.moved, 1, "{:?}", outcome.error);
+        assert!(!source.exists() && target.exists());
     }
 
     #[test]

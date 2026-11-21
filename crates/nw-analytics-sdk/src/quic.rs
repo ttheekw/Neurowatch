@@ -562,6 +562,13 @@ impl QuicIo {
         })
     }
     pub fn connect(host: &str, port: u16) -> io::Result<Self> {
+        Self::connect_within(host, port, Duration::from_secs(10))
+    }
+
+    /// As [`Self::connect`], giving up on the handshake after `limit`: a
+    /// caller with another transport to try (TLS over TCP, where UDP is
+    /// blocked) need not wait the full 10 s.
+    pub fn connect_within(host: &str, port: u16, limit: Duration) -> io::Result<Self> {
         let remote = (host, port)
             .to_socket_addrs()?
             .next()
@@ -593,13 +600,11 @@ impl QuicIo {
         config.transport_config(Arc::new(transport()));
         endpoint.set_default_client_config(config);
         let (connection, send, recv) = runtime.block_on(async {
-            let connection = tokio::time::timeout(
-                Duration::from_secs(10),
-                endpoint.connect(remote, host).map_err(error)?,
-            )
-            .await
-            .map_err(error)?
-            .map_err(error)?;
+            let connection =
+                tokio::time::timeout(limit, endpoint.connect(remote, host).map_err(error)?)
+                    .await
+                    .map_err(error)?
+                    .map_err(error)?;
             let (send, recv) = connection.open_bi().await.map_err(error)?;
             Ok::<_, io::Error>((connection, send, recv))
         })?;
@@ -607,6 +612,10 @@ impl QuicIo {
     }
     pub fn peer_key(&self) -> Option<&str> {
         self.shared.peer_key.as_deref()
+    }
+    /// Who connected (their validated address).
+    pub fn peer(&self) -> crate::peer::Peer {
+        crate::peer::Peer::from_socket(self.shared.connection.remote_address())
     }
     pub fn channel_binding(&self) -> &str {
         &self.shared.binding
@@ -889,9 +898,17 @@ impl Write for QuicIo {
         Ok(())
     }
 }
+/// Handshakes run at once; more are refused at once (vulnerability checklist
+/// R11: one silent peer used to hold up every recorder).
+const MAX_HANDSHAKES: usize = 32;
+/// Finished sessions waiting for `accept`.
+const READY: usize = 16;
+type Accepted = (Connection, SendStream, RecvStream);
 pub struct Listener {
     runtime: Arc<Runtime>,
     endpoint: Endpoint,
+    ready: tokio::sync::Mutex<mpsc::Receiver<Accepted>>,
+    task: tokio::task::JoinHandle<()>,
 }
 impl Listener {
     pub fn bind(address: SocketAddr, key: &SigningKey) -> io::Result<Self> {
@@ -900,40 +917,27 @@ impl Listener {
             let _guard = runtime.enter();
             Endpoint::server(server_config(key)?, address)?
         };
-        Ok(Self { runtime, endpoint })
+        let (tx, ready) = mpsc::channel(READY);
+        let task = runtime.spawn(accept_loop(endpoint.clone(), tx));
+        Ok(Self {
+            runtime,
+            endpoint,
+            ready: tokio::sync::Mutex::new(ready),
+            task,
+        })
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.endpoint.local_addr()
     }
+    /// The next connection whose handshake and control stream finished.
     pub fn accept(&self) -> io::Result<QuicIo> {
         let (connection, send, recv) = self.runtime.block_on(async {
-            loop {
-                let incoming = self
-                    .endpoint
-                    .accept()
-                    .await
-                    .ok_or_else(|| error("listener closed"))?;
-                if !incoming.remote_address_validated() {
-                    let _ = incoming.retry();
-                    continue;
-                }
-                let connection = match tokio::time::timeout(Duration::from_secs(10), incoming).await
-                {
-                    Ok(Ok(connection)) => connection,
-                    _ => continue,
-                };
-                let (send, recv) =
-                    match tokio::time::timeout(Duration::from_secs(10), connection.accept_bi())
-                        .await
-                    {
-                        Ok(Ok(streams)) => streams,
-                        _ => {
-                            connection.close(1u32.into(), b"control stream timeout");
-                            continue;
-                        }
-                    };
-                break Ok::<_, io::Error>((connection, send, recv));
-            }
+            self.ready
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| error("listener closed"))
         })?;
         QuicIo::new(
             Arc::clone(&self.runtime),
@@ -943,6 +947,40 @@ impl Listener {
             recv,
             true,
         )
+    }
+}
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+/// Hand each incoming connection to its own handshake task, up to
+/// [`MAX_HANDSHAKES`] at once, so a peer that stalls delays only itself.
+async fn accept_loop(endpoint: Endpoint, ready: mpsc::Sender<Accepted>) {
+    let slots = Arc::new(Semaphore::new(MAX_HANDSHAKES));
+    while let Some(incoming) = endpoint.accept().await {
+        if !incoming.remote_address_validated() {
+            let _ = incoming.retry();
+            continue;
+        }
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            incoming.refuse();
+            continue;
+        };
+        let ready = ready.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let Ok(Ok(connection)) = tokio::time::timeout(Duration::from_secs(10), incoming).await
+            else {
+                return;
+            };
+            match tokio::time::timeout(Duration::from_secs(10), connection.accept_bi()).await {
+                Ok(Ok((send, recv))) => {
+                    let _ = ready.send((connection, send, recv)).await;
+                }
+                _ => connection.close(1u32.into(), b"control stream timeout"),
+            }
+        });
     }
 }
 
@@ -984,6 +1022,31 @@ mod tests {
             Message::notification(method::STREAM_FORMAT, format).to_value(),
         ));
         (node, plugin)
+    }
+    #[test]
+    fn a_silent_connection_does_not_hold_up_others() {
+        let key = SigningKey::from_bytes(&[15; 32]);
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &key).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let io = listener.accept().unwrap();
+            let _ = tx.send(io);
+        });
+        // Connects, opens its control stream, says nothing.
+        let _silent = QuicIo::connect_within("127.0.0.1", port, Duration::from_secs(3)).unwrap();
+        let mut node = QuicIo::connect_within("127.0.0.1", port, Duration::from_secs(3)).unwrap();
+        frame::write_frame(
+            &mut node,
+            &Frame::Message(Message::request(1, method::PING, serde_json::json!({})).to_value()),
+        )
+        .unwrap();
+        let mut plugin = rx.recv_timeout(Duration::from_secs(4)).unwrap();
+        assert_eq!(
+            plugin.peer(),
+            crate::peer::Peer::Ip(std::net::Ipv4Addr::LOCALHOST.into())
+        );
+        assert!(frame::read_frame(&mut plugin).is_ok());
     }
     fn unit(seq: u64, keyframe: bool, size: usize) -> MediaUnit {
         MediaUnit {

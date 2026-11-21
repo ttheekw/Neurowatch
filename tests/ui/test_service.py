@@ -1148,13 +1148,39 @@ def test_endpoint_without_xdg_runtime_dir_is_the_login_runtime_folder(no_runtime
 
 
 @_linux_only
-def test_endpoint_without_any_runtime_folder_stays_in_tmp(monkeypatch) -> None:
+def test_endpoint_without_any_runtime_folder_stays_in_tmp(monkeypatch, tmp_path) -> None:
     from neurowatch.service import paths
 
     monkeypatch.delenv("NW_IPC_ENDPOINT", raising=False)
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     monkeypatch.setattr(paths, "login_runtime_dir", lambda: None)
-    assert paths.service_endpoint() == "unix:/tmp/neurowatch/control.sock"
+    original = paths.tmp_fallback_endpoint
+    monkeypatch.setattr(paths, "tmp_fallback_endpoint", lambda: original(str(tmp_path)))
+    assert paths.service_endpoint() == f"unix:{tmp_path}/neurowatch-{os.geteuid()}/control.sock"
+
+
+@_linux_only
+def test_tmp_fallback_never_trusts_a_shared_neurowatch_folder(tmp_path) -> None:
+    """Round 3: another user can create /tmp/neurowatch first. It is used
+    only when it is a real folder of ours nobody else can write; otherwise
+    the endpoint is a per-user name."""
+    from neurowatch.service import paths
+
+    uid = os.geteuid()
+    private = f"unix:{tmp_path}/neurowatch-{uid}/control.sock"
+    assert paths.tmp_fallback_endpoint(str(tmp_path)) == private, "nothing there yet"
+
+    shared = tmp_path / "neurowatch"
+    shared.mkdir(mode=0o700)
+    assert paths.tmp_fallback_endpoint(str(tmp_path)) == f"unix:{shared}/control.sock", (
+        "existing install"
+    )
+    shared.chmod(0o777)
+    assert paths.tmp_fallback_endpoint(str(tmp_path)) == private, "others can write it"
+    shared.rmdir()
+    (tmp_path / "elsewhere").mkdir()
+    shared.symlink_to(tmp_path / "elsewhere")
+    assert paths.tmp_fallback_endpoint(str(tmp_path)) == private, "a planted link"
 
 
 @_linux_only
@@ -1170,6 +1196,48 @@ def test_a_service_already_on_the_tmp_endpoint_keeps_it(no_runtime_env, monkeypa
     unit.parent.mkdir(parents=True)
     unit.write_text(systemd_unit(service_command(legacy)))
     assert paths.service_endpoint() == legacy, "registered on it: the unit stays the user's"
+
+
+@_linux_only
+def test_only_a_socket_of_this_user_in_a_private_folder_counts(tmp_path) -> None:
+    """Vulnerability checklist R9: any local user can create /tmp/neurowatch
+    and a socket in it; such a socket must not decide the endpoint."""
+    import socket as sockets
+
+    from neurowatch.service import paths
+
+    folder = tmp_path / "neurowatch"
+    folder.mkdir(mode=0o700)
+    path = folder / "control.sock"
+    endpoint = f"unix:{path}"
+    assert not paths._socket_exists(endpoint), "nothing there"
+    path.write_text("")
+    assert not paths._socket_exists(endpoint), "a plain file is not a socket"
+    path.unlink()
+    server = sockets.socket(sockets.AF_UNIX, sockets.SOCK_STREAM)
+    server.bind(str(path))
+    try:
+        assert paths._socket_exists(endpoint), "ours, in our private folder"
+        folder.chmod(0o777)
+        assert not paths._socket_exists(endpoint), "a folder others can change"
+        folder.chmod(0o700)
+        real_lstat = os.lstat
+        stranger = os.geteuid() + 1
+
+        def as_stranger(target, *args, **kwargs):
+            found = real_lstat(target, *args, **kwargs)
+            if str(target) == str(path):
+                values = list(found)
+                values[4] = stranger  # st_uid
+                return os.stat_result(values)
+            return found
+
+        import unittest.mock
+
+        with unittest.mock.patch.object(paths.os, "lstat", as_stranger):
+            assert not paths._socket_exists(endpoint), "another user's socket"
+    finally:
+        server.close()
 
 
 @_linux_only

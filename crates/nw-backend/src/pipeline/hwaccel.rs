@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::config::VideoDecoder;
+use crate::pipeline::decoder_driver::{self, MissingDriver};
 
 const VA_UPDATE_REQUIRED: &str =
     "local live view requires a GStreamer VA plugin with the 1.24.6 DMA-BUF fix or later";
@@ -29,6 +30,8 @@ pub const GPU_NOT_ACCESSIBLE: &str = "The graphics card is not available to Neur
      render,video $USER.";
 /// The decoder devices that could not be opened when the backend started.
 static GPU_PENDING: OnceLock<Vec<PathBuf>> = OnceLock::new();
+/// A graphics card that can decode video, without the driver to do it.
+static DRIVER_MISSING: OnceLock<MissingDriver> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HwAccelKind {
@@ -463,8 +466,60 @@ fn probe_automatic() -> HwAccelKind {
         );
         return HwAccelKind::Software;
     }
+    if let Some(missing) = find_missing_driver() {
+        tracing::warn!(
+            vendor = missing.vendor.name(),
+            kernel_driver = %missing.kernel_driver,
+            render_node = %missing.render_node.display(),
+            va_driver = missing.va_driver,
+            cause = missing.cause.id(),
+            deb = ?missing.packages.deb,
+            rpm = ?missing.packages.rpm,
+            arch = ?missing.packages.arch,
+            "Hardware acceleration: Software (avdec_h264): this graphics card can decode video \
+             but its driver is missing; `vainfo` (or `nvidia-smi`) shows what the driver reports"
+        );
+        let _ = DRIVER_MISSING.set(missing);
+        return HwAccelKind::Software;
+    }
     tracing::info!("Hardware acceleration: Software (avdec_h264)");
     HwAccelKind::Software
+}
+
+/// A graphics card that can decode video, with no decoder registered for
+/// it: its VA-API driver (or NVIDIA's decode library) is missing. Read from
+/// sysfs, the registry and the libva driver folders (Linux; none elsewhere).
+fn find_missing_driver() -> Option<MissingDriver> {
+    let gpus = decoder_driver::read_render_gpus(
+        Path::new(decoder_driver::DRM_SYSFS),
+        &render_nodes(Path::new(DRI_DIR)),
+        openable,
+    );
+    if gpus.is_empty() {
+        return None;
+    }
+    let registry = gstreamer::Registry::get();
+    let available = available_families();
+    let installed = decoder_driver::installed_va_drivers(&decoder_driver::va_driver_dirs(
+        std::env::var_os("LIBVA_DRIVERS_PATH"),
+    ));
+    decoder_driver::classify(&decoder_driver::Facts {
+        gpus: &gpus,
+        nodes_blocked: false, // probe_automatic waits for those first
+        live_view_blocked: live_view_block_reason().is_some(),
+        vaapi_decodes: available.contains(&DecoderFamily::VaApi),
+        nvdec_decodes: available.contains(&DecoderFamily::NvDec),
+        va_plugin: registry.find_plugin("va").is_some(),
+        nvcodec_plugin: registry.find_plugin("nvcodec").is_some(),
+        installed_va_drivers: &installed,
+    })
+}
+
+/// The graphics card that could decode video but has no driver to, found
+/// when the backend started on software decoding (Auto, or a choice not on
+/// this computer); None otherwise.
+pub fn missing_driver() -> Option<&'static MissingDriver> {
+    DRIVER_MISSING.get()
 }
 
 const DRI_DIR: &str = "/dev/dri";

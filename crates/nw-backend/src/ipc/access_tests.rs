@@ -201,3 +201,89 @@ async fn security_export_jobs_are_filtered_and_authorized_by_their_stored_camera
     );
     teardown(&state, &path).await;
 }
+
+#[tokio::test]
+async fn security_recording_and_wall_methods_respect_the_camera_limit() {
+    // Vulnerability checklist R4: these name their camera as `id` (or in a
+    // list), which the camera limit did not read.
+    let (state, handler, path) = security_handler("recording-camera-limit");
+    let operator = security_login(&handler, "operator").await;
+    let viewer = security_login(&handler, "viewer").await;
+    for (token, method, params) in [
+        (&operator, "recording.stop", json!({"id": "cam-2"})),
+        (&operator, "recording.start", json!({"id": "cam-2"})),
+        (&viewer, "recording.list_segments", json!({"id": "cam-2"})),
+        (
+            &operator,
+            "camera.set_positions",
+            json!([{"id": "cam-1", "wall_position": {"page": 0, "row": 0, "col": 0}},
+                   {"id": "cam-2", "wall_position": {"page": 0, "row": 0, "col": 1}}]),
+        ),
+    ] {
+        let denied = security_call(&handler, token, method, params).await;
+        assert_eq!(denied["error"]["code"], NOT_ALLOWED, "{method}: {denied}");
+    }
+    assert!(
+        state.read().await.config.cameras[1].wall_position.is_none(),
+        "the other camera was not moved"
+    );
+    let own = security_call(&handler, &viewer, "recording.list_segments", json!({"id": "cam-1"})).await;
+    assert!(own.get("error").is_none(), "{own}");
+    let placed = security_call(
+        &handler,
+        &operator,
+        "camera.set_positions",
+        json!([{"id": "cam-1", "wall_position": {"page": 0, "row": 0, "col": 0}}]),
+    )
+    .await;
+    assert!(placed.get("error").is_none(), "{placed}");
+    teardown(&state, &path).await;
+}
+
+#[tokio::test]
+async fn security_talk_and_status_reads_respect_the_camera_limit() {
+    // Checklist "Recorder local": talk.status/stop skipped the camera limit,
+    // and status reads (open without sign-in) were never filtered.
+    let (state, handler, path) = security_handler("talk-status-limit");
+    let operator = security_login(&handler, "operator").await;
+    let talk = Arc::clone(&state.read().await.talk);
+    talk.pretend_talking("cam-2", "someone");
+    let status = security_call(&handler, &operator, "talk.status", json!({})).await;
+    assert!(status["result"].is_null(), "{status}");
+    let stop = security_call(&handler, &operator, "talk.stop", json!({"client_id": "someone"})).await;
+    assert_eq!(stop["error"]["code"], NOT_ALLOWED, "{stop}");
+    assert!(talk.status().is_some(), "the other camera's talk went on");
+    talk.pretend_talking("cam-1", "mine");
+    let status = security_call(&handler, &operator, "talk.status", json!({})).await;
+    assert_eq!(status["result"]["camera_id"], "cam-1");
+    let stop = security_call(&handler, &operator, "talk.stop", json!({"client_id": "mine"})).await;
+    assert!(stop.get("error").is_none(), "{stop}");
+
+    {
+        let mut st = state.write().await;
+        st.pretend_camera_state("cam-1", "streaming");
+        st.pretend_camera_state("cam-2", "streaming");
+    }
+    let all = security_call(&handler, &operator, "camera.status_all", json!({})).await;
+    let cameras = all["result"].as_object().cloned().unwrap_or_default();
+    assert!(cameras.contains_key("cam-1") && !cameras.contains_key("cam-2"), "{all}");
+    let anonymous = dispatch(&handler, "camera.status_all", json!({})).await;
+    assert!(anonymous["result"].as_object().is_some_and(|m| m.contains_key("cam-2")), "{anonymous}");
+    teardown(&state, &path).await;
+}
+
+#[tokio::test]
+async fn security_an_operator_exports_only_to_the_default_folder() {
+    let (state, handler, path) = security_handler("export-path");
+    let operator = security_login(&handler, "operator").await;
+    let admin = security_login(&handler, "admin").await;
+    let outside = std::env::temp_dir().join("nw-operator-chosen.mp4");
+    let params = json!({"camera_id": "cam-1", "start_ms": 0, "end_ms": 5,
+        "path": outside.to_string_lossy()});
+    let denied = security_call(&handler, &operator, "export.start", params.clone()).await;
+    assert_eq!(denied["error"]["code"], NOT_ALLOWED, "{denied}");
+    // An administrator's own path passes the gate (then finds no recordings).
+    let admin_call = security_call(&handler, &admin, "export.start", params).await;
+    assert_ne!(admin_call["error"]["code"], NOT_ALLOWED, "{admin_call}");
+    teardown(&state, &path).await;
+}

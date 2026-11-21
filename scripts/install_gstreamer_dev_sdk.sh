@@ -55,11 +55,18 @@ else
         libglib2.0-dev liborc-0.4-dev libopus-dev libpulse-dev libasound2-dev
         libva-dev libdrm-dev libgudev-1.0-dev libjpeg-dev librtmp-dev
         libx11-dev libx11-xcb-dev libxext-dev libxv-dev libgl-dev libegl-dev libgles-dev"
+    # The Ubuntu releases the project builds on are pinned by digest (the
+    # multi-architecture index); another host version uses its moving tag.
+    base_image="ubuntu:$os_version"
+    case "$os_version" in
+        22.04) base_image="$base_image@sha256:f64b2ffc2f10ab8f8505aa56b2664bd846cbb9df87c7e2532e30f7667021c0e6" ;;
+        24.04) base_image="$base_image@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289" ;;
+    esac
     docker run --rm \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -e SDK="$SDK" -e WORK="$WORK" \
         -e PACKAGES="$packages" \
         -v "$ROOT:$ROOT:ro" -v "$ROOT/.cache:$ROOT/.cache" \
-        "ubuntu:$os_version" bash -c '
+        "$base_image" bash -c '
             set -euo pipefail
             trap "chown -R \"\$HOST_UID:\$HOST_GID\" \"\$SDK\" \"\$WORK\" 2>/dev/null || true" EXIT
             export DEBIAN_FRONTEND=noninteractive

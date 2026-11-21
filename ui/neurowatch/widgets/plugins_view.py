@@ -153,6 +153,16 @@ def output_counts(events: list[Event], now: float) -> tuple[int, int, int]:
     return hour, today, week
 
 
+def _plain_labels(root: QWidget) -> None:
+    """Every label under `root` shows its text as written. Plugin names, makers
+    and details come from the plugin, before it is approved: Qt would otherwise
+    render text that looks like HTML (links, images) as rich text (security
+    review 2026-11-20, finding 13). `plain_text.install` does the same for the
+    whole app, tooltips included; this holds wherever the page is used."""
+    for widget in root.findChildren(QLabel):
+        widget.setTextFormat(Qt.TextFormat.PlainText)
+
+
 class PluginsView(QWidget):
     """Plugins and their cameras. ``set_cameras`` gives the cameras (for the
     live picture); the window passes the analytics feed on with
@@ -266,6 +276,7 @@ class PluginsView(QWidget):
         self._timer.setInterval(_POLL_MS)
         self._timer.timeout.connect(self._poll)
         self.setStyleSheet(plugins_stylesheet())
+        _plain_labels(self)
 
     def apply_theme(self, theme_name: str | None = None) -> None:
         """Follow the app's theme (startup and Settings changes)."""
@@ -978,6 +989,7 @@ class PluginsView(QWidget):
             address_body.addWidget(where)
             layout.addWidget(address)
         layout.addStretch(1)
+        _plain_labels(page)
         self.plugin_page.setWidget(page)
         self._refresh_status()
         if manifest is not None and manifest.reports_events:

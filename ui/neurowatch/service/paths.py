@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+
+from neurowatch.utils.private_files import private_dir
 
 #: systemd user unit (Linux) and startup entry (Windows) name.
 SERVICE_NAME = "neurowatch-backend"
@@ -34,12 +37,13 @@ def source_root() -> Path | None:
 
     ``NW_SOURCE_ROOT`` overrides the detection (for example to test packaged
     behaviour from a checkout: point it at a directory without ``crates``).
+    An installed (frozen) build is never a checkout and ignores the override.
     """
+    if is_frozen():
+        return None
     override = os.environ.get("NW_SOURCE_ROOT")
     if override is not None:
         root = Path(override)
-    elif is_frozen():
-        return None
     else:
         root = Path(__file__).resolve().parents[3]  # ui/neurowatch/service/paths.py
     if (root / "Cargo.toml").is_file() and (root / "crates" / "nw-backend").is_dir():
@@ -71,7 +75,7 @@ def service_endpoint() -> str:
     legacy = _unix_endpoint("/tmp")
     login_runtime = login_runtime_dir()
     if login_runtime is None:
-        return legacy
+        return tmp_fallback_endpoint()
     endpoint = _unix_endpoint(str(login_runtime))
     if _socket_exists(legacy) and not _socket_exists(endpoint):
         return legacy
@@ -84,8 +88,50 @@ def _unix_endpoint(runtime: str) -> str:
     return f"unix:{runtime}/neurowatch/control.sock"
 
 
+def tmp_fallback_endpoint(tmp: str = "/tmp") -> str:
+    """The last resort without a runtime folder (the backend's
+    ``tmp_fallback_endpoint`` makes the same choice). ``/tmp`` is shared, so
+    another user can create ``/tmp/neurowatch`` first: it stays in use only
+    when it is a real folder of this user that nobody else can write
+    (existing installs); otherwise the endpoint is
+    ``/tmp/neurowatch-<uid>/control.sock``, a folder the backend creates 0700
+    and refuses to use unless it is this user's own."""
+    legacy = f"{tmp}/neurowatch"
+    try:
+        info = os.lstat(legacy)
+    except OSError:
+        info = None
+    uid = os.geteuid()
+    if (
+        info is not None
+        and stat.S_ISDIR(info.st_mode)
+        and info.st_uid == uid
+        and stat.S_IMODE(info.st_mode) & 0o022 == 0
+    ):
+        return f"unix:{legacy}/control.sock"
+    return f"unix:{tmp}/neurowatch-{uid}/control.sock"
+
+
 def _socket_exists(endpoint: str) -> bool:
-    return os.path.exists(endpoint.removeprefix("unix:"))
+    """A socket of this user's in a folder only this user can change. The
+    legacy `/tmp/neurowatch` folder is shared: a socket another user put
+    there made the service manager adopt their endpoint, hand them the link
+    code, and register a unit the backend then refused to start with
+    (vulnerability checklist R9)."""
+    path = endpoint.removeprefix("unix:")
+    try:
+        found = os.lstat(path)
+        folder = os.lstat(os.path.dirname(path) or ".")
+    except OSError:
+        return False
+    uid = os.geteuid()
+    return (
+        stat.S_ISSOCK(found.st_mode)
+        and found.st_uid == uid
+        and stat.S_ISDIR(folder.st_mode)
+        and folder.st_uid == uid
+        and stat.S_IMODE(folder.st_mode) & 0o022 == 0
+    )
 
 
 def login_runtime_dir(uid: int | None = None, root: Path = Path("/run/user")) -> Path | None:
@@ -173,13 +219,12 @@ def state_dir() -> Path:
     else:
         base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
         path = base / "neurowatch"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    # Logs name cameras and their addresses: owner only.
+    return private_dir(path)
 
 
 def log_path(name: str) -> Path:
-    logs = state_dir() / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
+    logs = private_dir(state_dir() / "logs")
     return logs / f"{name}.log"
 
 
@@ -188,8 +233,14 @@ def lock_path(name: str) -> Path:
 
 
 def packaged_backend() -> Path | None:
-    """The backend binary of a release bundle, or ``NW_BACKEND_BIN``."""
-    override = os.environ.get("NW_BACKEND_BIN")
+    """The backend binary of a release bundle.
+
+    A frozen (installed) build runs only the backend bundled with it: neither
+    ``NW_BACKEND_BIN`` nor ``PATH`` can substitute another program for the
+    service. Other runs (a checkout) keep ``NW_BACKEND_BIN`` and ``PATH``.
+    """
+    frozen = is_frozen()
+    override = None if frozen else os.environ.get("NW_BACKEND_BIN")
     if override:
         return Path(override)
     name = "nw-backend.exe" if IS_WINDOWS else "nw-backend"
@@ -198,6 +249,8 @@ def packaged_backend() -> Path | None:
         candidate = base / "bin" / name
         if candidate.is_file():
             return candidate
+    if frozen:
+        return None
     found = shutil.which(name)
     return Path(found) if found else None
 

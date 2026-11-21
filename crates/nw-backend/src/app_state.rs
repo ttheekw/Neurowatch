@@ -662,6 +662,41 @@ impl AppState {
         }
     }
 
+    /// A camera that reports `state` without a running supervisor (tests of
+    /// what status reads show).
+    #[cfg(test)]
+    pub(crate) fn pretend_camera_state(&mut self, id: &str, state: &str) {
+        let (stop_tx, _) = watch::channel(false);
+        let (_, state_rx) = watch::channel(state.to_owned());
+        let (_, info_rx) = watch::channel(StreamInfo::default());
+        self.ingest.insert(
+            id.to_owned(),
+            IngestHandle {
+                stop_tx,
+                state_rx,
+                info_rx,
+            },
+        );
+    }
+
+    /// Stop and drop playback sessions no client has used for too long (a
+    /// crashed UI never closes its own); returns their ids.
+    pub fn expire_playback_sessions(&mut self, now: Instant) -> Vec<String> {
+        let idle: Vec<String> = self
+            .playback_sessions
+            .iter()
+            .filter(|(_, session)| session.expired(now))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &idle {
+            if let Some(session) = self.playback_sessions.remove(id) {
+                session.stop();
+                tracing::info!(session_id = %id, "Playback session expired (no client used it)");
+            }
+        }
+        idle
+    }
+
     /// Drop leases not renewed by `now`; returns the clients that lapsed.
     pub fn expire_view_demand(&mut self, now: Instant) -> Vec<String> {
         let lapsed: Vec<String> = self

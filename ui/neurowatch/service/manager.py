@@ -68,6 +68,7 @@ from neurowatch.service.paths import (
     ui_command,
 )
 from neurowatch.service.startup import StartupPrefs, load_prefs, save_prefs
+from neurowatch.utils.private_files import open_private
 
 logger = logging.getLogger(__name__)
 
@@ -381,12 +382,12 @@ def systemd_unit(command: ServiceCommand) -> str:
         "",
         "[Service]",
         "Type=simple",
-        f"ExecStart={shlex.join(command.argv)}",
+        f"ExecStart={_unit_exec(command.argv)}",
     ]
     if command.cwd is not None:
-        lines.append(f"WorkingDirectory={command.cwd}")
+        lines.append(f"WorkingDirectory={_unit_escape(_one_line(str(command.cwd), 'directory'))}")
     for name, value in sorted(command.env.items()):
-        lines.append(f'Environment="{name}={_unit_escape(value)}"')
+        lines.append(f'Environment="{_unit_escape(_one_line(f"{name}={value}", "variable"))}"')
     lines += [
         "Restart=on-failure",
         "RestartSec=3",
@@ -399,8 +400,41 @@ def systemd_unit(command: ServiceCommand) -> str:
     return "\n".join(lines)
 
 
+def _one_line(value: str, what: str) -> str:
+    """``value``, refused when it has a line break: in a unit or a desktop entry
+    it would start a new setting."""
+    if any(ch in value for ch in "\r\n\x00"):
+        raise ServiceError(f"The {what} contains a line break, which a startup file cannot hold")
+    return value
+
+
 def _unit_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+
+
+def _unit_exec(argv: Sequence[str]) -> str:
+    """An ``ExecStart=`` line value: quoted, with systemd's own escapes undone
+    (``%`` specifiers, ``$`` variables and backslash sequences)."""
+    text = shlex.join(_one_line(str(arg), "command") for arg in argv)
+    return text.replace("\\", "\\\\").replace("%", "%%").replace("$", "$$")
+
+
+_DESKTOP_SAFE = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./:=+@,")
+
+
+def _desktop_exec(argv: Sequence[str]) -> str:
+    """An ``Exec=`` value of a desktop entry: arguments quoted per the spec
+    (reserved characters backslash-escaped inside double quotes), ``%`` doubled
+    so no field code is expanded, then the string-value escape for backslashes."""
+    parts: list[str] = []
+    for raw in argv:
+        arg = _one_line(str(raw), "command")
+        if arg and all(ch in _DESKTOP_SAFE for ch in arg):
+            parts.append(arg)
+            continue
+        quoted = "".join("\\" + ch if ch in '"`$\\' else ch for ch in arg)
+        parts.append('"' + quoted.replace("%", "%%") + '"')
+    return " ".join(parts).replace("\\", "\\\\")
 
 
 def tray_desktop_entry(argv: Sequence[str]) -> str:
@@ -411,7 +445,7 @@ def tray_desktop_entry(argv: Sequence[str]) -> str:
             "Type=Application",
             "Name=NeuroWatch",
             "Comment=NeuroWatch background service status",
-            f"Exec={shlex.join(argv)}",
+            f"Exec={_desktop_exec(argv)}",
             "Icon=video-display",
             "Terminal=false",
             "X-GNOME-Autostart-enabled=true",
@@ -646,7 +680,7 @@ class LoginItems:
 def spawn_detached(command: ServiceCommand, log_file: Path) -> subprocess.Popen[Any]:
     """Start ``command`` so it outlives this process and its terminal."""
     env = {**os.environ, **command.env}
-    log = open(log_file, "ab")  # the child keeps its own copy
+    log = open_private(log_file)  # owner only; the child keeps its own copy
     kwargs: dict[str, Any] = {
         "cwd": str(command.cwd) if command.cwd else None,
         "env": env,

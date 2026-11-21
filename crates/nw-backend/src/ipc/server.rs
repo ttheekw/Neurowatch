@@ -22,7 +22,7 @@ mod tests;
 use tokio::net::UnixListener;
 
 #[cfg(unix)]
-const FALLBACK_UNIX_RUNTIME_DIR: &str = "/tmp";
+const FALLBACK_UNIX_TMP_DIR: &str = "/tmp";
 
 pub fn ipc_endpoint() -> String {
     match std::env::var("NW_IPC_ENDPOINT") {
@@ -33,9 +33,48 @@ pub fn ipc_endpoint() -> String {
 
 #[cfg(unix)]
 fn default_endpoint() -> String {
-    let runtime_dir =
-        std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| FALLBACK_UNIX_RUNTIME_DIR.to_owned());
-    format!("unix:{runtime_dir}/neurowatch/control.sock")
+    let configured = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .or_else(|| login_runtime_dir().map(|dir| dir.to_string_lossy().into_owned()));
+    match configured {
+        Some(runtime_dir) => format!("unix:{runtime_dir}/neurowatch/control.sock"),
+        None => tmp_fallback_endpoint(std::path::Path::new(FALLBACK_UNIX_TMP_DIR), unsafe {
+            libc::geteuid()
+        }),
+    }
+}
+
+/// The last resort without a runtime folder. `/tmp` is shared, so a name in
+/// it can be taken by another user first. An existing `/tmp/neurowatch` stays
+/// in use when it is a real folder of this user that nobody else can write
+/// (installs made before this rule); otherwise the endpoint is
+/// `/tmp/neurowatch-<uid>/control.sock`, a folder `run_unix` creates 0700 and
+/// refuses to use unless it is this user's own private folder.
+#[cfg(unix)]
+fn tmp_fallback_endpoint(tmp: &std::path::Path, uid: u32) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let legacy = tmp.join("neurowatch");
+    let usable = std::fs::symlink_metadata(&legacy).is_ok_and(|info| {
+        info.file_type().is_dir() && info.uid() == uid && info.mode() & 0o022 == 0
+    });
+    if usable {
+        format!("unix:{}/control.sock", legacy.display())
+    } else {
+        format!("unix:{}/neurowatch-{uid}/control.sock", tmp.display())
+    }
+}
+
+/// `/run/user/<uid>` when it is this user's own folder, for a session started
+/// without `XDG_RUNTIME_DIR` (the same choice the desktop app makes). The
+/// shared `/tmp` is the last resort (see `tmp_fallback_endpoint`).
+#[cfg(unix)]
+fn login_runtime_dir() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::geteuid() };
+    let path = std::path::PathBuf::from(format!("/run/user/{uid}"));
+    let info = std::fs::metadata(&path).ok()?;
+    (info.is_dir() && info.uid() == uid).then_some(path)
 }
 
 #[cfg(not(unix))]
@@ -103,7 +142,12 @@ async fn run_unix(
             || metadata.permissions().mode() & 0o077 != 0
             || metadata.uid() != unsafe { libc::geteuid() }
         {
-            anyhow::bail!("IPC Unix socket directory must be private and owner-controlled");
+            anyhow::bail!(
+                "IPC Unix socket directory must be private and owner-controlled: {} is not a \
+                 private folder of this user (another user may have created it); set \
+                 XDG_RUNTIME_DIR or NW_IPC_ENDPOINT to a folder of your own",
+                parent.display()
+            );
         }
     }
 
@@ -117,8 +161,21 @@ async fn run_unix(
     loop {
         tokio::select! {
             accept = listener.accept() => {
-                let (stream, _) = accept.context("Accept failed")?;
-                let credentials = stream.peer_cred().context("Cannot authenticate IPC peer")?;
+                // One failed accept (out of file handles, a peer gone before
+                // it was taken) is not a reason to stop the recorder: that
+                // shut the whole backend down (vulnerability checklist R6).
+                let stream = match accept {
+                    Ok((stream, _)) => stream,
+                    Err(error) => {
+                        tracing::warn!(%error, "IPC accept failed; going on");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+                let Ok(credentials) = stream.peer_cred() else {
+                    tracing::warn!("Cannot authenticate IPC peer; closed");
+                    continue;
+                };
                 if credentials.uid() != unsafe { libc::geteuid() } {
                     tracing::warn!(peer_uid = credentials.uid(), "Rejected unauthorized IPC peer");
                     continue;
@@ -168,7 +225,14 @@ async fn run_tcp(
     loop {
         tokio::select! {
             accept = listener.accept() => {
-                let (stream, peer) = accept.context("Accept failed")?;
+                let (stream, peer) = match accept {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(%error, "IPC accept failed; going on");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
                 let handler = Arc::clone(&handler);
                 let conn_metrics = metrics.handle();
                 let token = token.clone();
@@ -190,6 +254,47 @@ async fn run_tcp(
     Ok(())
 }
 
+/// The longest request line a client may send. Requests carry settings and
+/// pictures of figures, never footage; a peer that never ends its line would
+/// otherwise grow the buffer until memory runs out.
+const MAX_REQUEST_LINE: usize = 8 * 1024 * 1024;
+
+/// One line (without its newline) of at most `limit` bytes; `None` at the end
+/// of the stream. A longer line is an error and the caller closes the peer.
+async fn read_request_line<R>(reader: &mut R, limit: usize) -> anyhow::Result<Option<String>>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let (take, found) = match chunk.iter().position(|b| *b == b'\n') {
+            Some(at) => (at, true),
+            None => (chunk.len(), false),
+        };
+        if line.len() + take > limit {
+            anyhow::bail!("IPC request line longer than {limit} bytes");
+        }
+        line.extend_from_slice(&chunk[..take]);
+        reader.consume(take + usize::from(found));
+        if found {
+            break;
+        }
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    Ok(Some(
+        String::from_utf8(line).context("IPC request is not UTF-8")?,
+    ))
+}
+
 async fn handle_connection<S>(
     stream: S,
     handler: Arc<RpcHandler>,
@@ -201,9 +306,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
 
-    while let Some(line) = lines.next_line().await? {
+    while let Some(line) = read_request_line(&mut reader, MAX_REQUEST_LINE).await? {
         if line.is_empty() {
             continue;
         }

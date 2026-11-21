@@ -255,6 +255,10 @@ fn forward_gstreamer(
     let Some(text) = message.get() else {
         return;
     };
+    // GStreamer prints stream addresses (with their user and password),
+    // headers and properties as it works: nothing secret reaches the log.
+    let text = sanitize_gstreamer_text(&text);
+    let text = text.as_ref();
     let category = category.name();
     let object = object.map(|object| object.to_string()).unwrap_or_default();
     let at = format_args!("{file}:{line} {function}");
@@ -274,6 +278,88 @@ fn forward_gstreamer(
         _ => tracing::trace!(target: "gstreamer", category, object = %object, at = %at, "{text}"),
     }
 }
+
+/// `text` with credentials removed: the user and password of any address
+/// (`scheme://user:password@host` becomes `scheme://host`), the value of an
+/// `Authorization`-style header, and the value of `password=`-like fields.
+pub(crate) fn sanitize_gstreamer_text(text: &str) -> std::borrow::Cow<'_, str> {
+    let lower = text.to_ascii_lowercase();
+    let has_userinfo = lower.contains("://");
+    let has_marker = [
+        "authorization",
+        "password",
+        "passwd",
+        "pwd=",
+        "secret",
+        "token=",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if !has_userinfo && !has_marker {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    // `to_ascii_lowercase` keeps every byte offset, so `lower` indexes `text`.
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < text.len() {
+        let rest_lower = &lower[at..];
+        let url = rest_lower.find("://");
+        let field = SECRET_FIELDS
+            .iter()
+            .filter_map(|field| rest_lower.find(field).map(|index| (index, field.len())))
+            .min();
+        match (url, field) {
+            (Some(scheme), field) if field.is_none_or(|(index, _)| scheme < index) => {
+                let authority = at + scheme + 3;
+                let end = text[authority..]
+                    .find(|c: char| {
+                        matches!(c, '/' | '?' | '#') || c.is_whitespace() || "\"'<>)]}".contains(c)
+                    })
+                    .map_or(text.len(), |index| authority + index);
+                out.push_str(&text[at..authority]);
+                let userinfo_end = text[authority..end].rfind('@').map(|i| authority + i + 1);
+                out.push_str(&text[userinfo_end.unwrap_or(authority)..end]);
+                at = end;
+            }
+            (_, Some((index, length))) => {
+                let value_start = at + index + length;
+                // A header's value runs to the end of its line; another
+                // field's to the next space, quote, `&`, `;` or `,`.
+                let whole_line = lower[at + index..value_start].contains("authorization");
+                let value_end = text[value_start..]
+                    .find(|c: char| {
+                        if whole_line {
+                            c == '\n' || c == '\r'
+                        } else {
+                            c.is_whitespace() || "&;,\"'".contains(c)
+                        }
+                    })
+                    .map_or(text.len(), |i| value_start + i);
+                out.push_str(&text[at..value_start]);
+                out.push_str("<hidden>");
+                at = value_end;
+            }
+            (_, None) => {
+                out.push_str(&text[at..]);
+                break;
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Field openings whose value is secret; the value follows directly.
+const SECRET_FIELDS: &[&str] = &[
+    "authorization: ",
+    "authorization=",
+    "password=",
+    "passwd=",
+    "pwd=",
+    "user-pw=",
+    "token=",
+    "\"password\":\"",
+    "password:",
+];
 
 fn normalize_tracing_level(level: &str) -> &'static str {
     match level.trim().to_ascii_lowercase().as_str() {
@@ -334,12 +420,23 @@ impl RotatingFile {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        self.written = file.metadata().map(|m| m.len()).unwrap_or(0);
-        self.file = Some(file);
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            // Debug logs show camera addresses and timings: owner only, and a
+            // log made loose by an earlier version is tightened.
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let log = options.open(&self.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = log.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        self.written = log.metadata().map(|m| m.len()).unwrap_or(0);
+        self.file = Some(log);
         Ok(())
     }
 
@@ -461,6 +558,68 @@ mod tests {
         assert_eq!(gst_threshold("error"), DebugLevel::Error);
         assert_eq!(gst_threshold("debug"), DebugLevel::Debug);
         assert_eq!(gst_threshold("?"), DebugLevel::Warning);
+    }
+
+    #[test]
+    fn gstreamer_messages_lose_credentials_before_they_are_logged() {
+        let cases = [
+            (
+                "Connecting to rtsp://admin:hunter2@192.0.2.5:554/live?x=1 now",
+                "Connecting to rtsp://192.0.2.5:554/live?x=1 now",
+            ),
+            (
+                "url rtsp://u:p@ss@cam.example/s and http://a:b@h/",
+                "url rtsp://cam.example/s and http://h/",
+            ),
+            (
+                ">Authorization: Digest username=\"a\", response=\"abc\"\r\nCSeq: 3",
+                ">Authorization: <hidden>\r\nCSeq: 3",
+            ),
+            (
+                "set user-id=admin password=hunter2 ok",
+                "set user-id=admin password=<hidden> ok",
+            ),
+            (
+                "no secrets, only ünïcode and rtsp://cam/x",
+                "no secrets, only ünïcode and rtsp://cam/x",
+            ),
+        ];
+        for (input, expected) in cases {
+            let shown = sanitize_gstreamer_text(input);
+            assert_eq!(shown, expected, "{input}");
+            assert!(
+                !shown.contains("hunter2") && !shown.contains("u:p"),
+                "{shown}"
+            );
+        }
+        assert!(matches!(
+            sanitize_gstreamer_text("plain line"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_debug_log_is_made_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("log-mode");
+        let path = dir.join("backend-debug.log");
+        std::fs::write(&path, b"old line\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut log = RotatingFile::new(path.clone(), 1000, 2);
+        log.open().unwrap();
+        log.write(b"new line\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Rotation makes a new file: also private.
+        log.rotate().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

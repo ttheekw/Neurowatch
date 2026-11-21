@@ -627,7 +627,7 @@ def test_playback_lists_the_areas_drawn_in_a_key_under_the_pictures(qtbot) -> No
     qtbot.addWidget(view)
 
     area = {"type": "polygon", "points": [[0, 0], [1, 0], [1, 1]], "label": "Lane 1"}
-    drawing = Drawing("c1", "vcount", "lines", (area,), float("inf"))
+    drawing = Drawing("c1", "counter", "lines", (area,), float("inf"))
 
     class _Cell:
         def set_drawings(self, _drawings: list[Drawing]) -> None:

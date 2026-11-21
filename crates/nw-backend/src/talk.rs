@@ -111,6 +111,17 @@ impl TalkService {
         self.active.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// A talker without a camera connection (tests of who may stop whom).
+    #[cfg(test)]
+    pub(crate) fn pretend_talking(&self, camera_id: &str, client_id: &str) {
+        *self.lock() = Some(Active {
+            camera_id: camera_id.into(),
+            client_id: client_id.into(),
+            until: Instant::now() + LEASE,
+            stop: Arc::new(AtomicBool::new(false)),
+        });
+    }
+
     /// The current talker: (camera, client), if their lease holds.
     pub fn status(&self) -> Option<(String, String)> {
         let mut active = self.lock();

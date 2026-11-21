@@ -69,6 +69,16 @@ pub struct OnvifEndpoint {
     /// PTZ service, from the device's capabilities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ptz_url: Option<String>,
+    /// Allow the camera's ONVIF password to be sent unencrypted (WS-Security
+    /// `PasswordText`) over plain HTTP, for older cameras that accept nothing
+    /// else. Off by default; `NW_ONVIF_PASSWORD_TEXT=1` allows it for every
+    /// camera.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_password_text: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Stream selectors that name a role rather than a listed stream.

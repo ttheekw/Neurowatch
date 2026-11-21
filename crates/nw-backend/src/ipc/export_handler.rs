@@ -21,6 +21,22 @@ use crate::app_state::AppState;
 use crate::export::{self, ExportError, ExportRequest};
 use crate::playback::handler::PlaybackHandler;
 
+/// Whether `path` would be written inside the default export folder (links
+/// resolved; a folder that does not exist yet does not count).
+fn inside_export_folder(path: &std::path::Path) -> bool {
+    inside_folder(path, &export::default_export_dir())
+}
+
+fn inside_folder(path: &std::path::Path, folder: &std::path::Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let (Ok(parent), Ok(base)) = (parent.canonicalize(), folder.canonicalize()) else {
+        return false;
+    };
+    path.is_absolute() && parent.starts_with(base)
+}
+
 pub struct ExportHandler {
     state: Arc<RwLock<AppState>>,
     /// Finds (and indexes) the recordings in a range.
@@ -53,6 +69,19 @@ impl ExportHandler {
         method: &str,
         params: &Value,
     ) -> Result<(), RpcError> {
+        if method == "export.start" && session.role < crate::accounts::Role::Admin {
+            if let Some(path) = params["path"].as_str().filter(|p| !p.trim().is_empty()) {
+                if !inside_export_folder(std::path::Path::new(path)) {
+                    return Err(RpcError {
+                        code: super::handler::NOT_ALLOWED as i32,
+                        message:
+                            "Only an administrator may export outside the default export folder"
+                                .into(),
+                        data: None,
+                    });
+                }
+            }
+        }
         if session.cameras.is_empty() || !matches!(method, "export.status" | "export.cancel") {
             return Ok(());
         }
@@ -264,5 +293,20 @@ mod tests {
                 .code,
             -32601
         );
+    }
+
+    #[test]
+    fn only_a_file_directly_in_the_export_folder_counts() {
+        let root =
+            std::env::temp_dir().join(format!("nw-export-in-{}", uuid::Uuid::new_v4().simple()));
+        let folder = root.join("exports");
+        std::fs::create_dir_all(&folder).unwrap();
+        assert!(inside_folder(&folder.join("a.mp4"), &folder));
+        assert!(inside_folder(&folder.join("../exports/a.mp4"), &folder));
+        assert!(!inside_folder(&root.join("a.mp4"), &folder));
+        assert!(!inside_folder(&folder.join("../a.mp4"), &folder));
+        assert!(!inside_folder(std::path::Path::new("a.mp4"), &folder));
+        assert!(!inside_folder(&folder.join("missing/a.mp4"), &folder));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

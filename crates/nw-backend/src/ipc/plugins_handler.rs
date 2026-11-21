@@ -532,8 +532,8 @@ mod tests {
         // removing another plugin failed with "Two plugins are named …".
         let (handler, _path) = handler();
         let hosted: crate::plugin_host::PluginServer = serde_json::from_value(json!({
-            "id": "hosted.nw.vcount", "address": "quic:v1.example.test:443", "enabled": false,
-            "managed": {"service": "nw.vcount", "instance": "v1.example.test"}}))
+            "id": "hosted.nw.counter", "address": "quic:v1.example.test:443", "enabled": false,
+            "managed": {"service": "nw.counter", "instance": "v1.example.test"}}))
         .unwrap();
         handler
             .state
@@ -544,7 +544,7 @@ mod tests {
             .servers
             .push(hosted);
         let sent = json!({"servers": [
-            {"id": "hosted.nw.vcount", "address": "quic:v1.example.test:443", "enabled": false}
+            {"id": "hosted.nw.counter", "address": "quic:v1.example.test:443", "enabled": false}
         ]});
         let saved = handler.dispatch("plugins.set", &sent).await.unwrap();
         let servers = saved["servers"].as_array().unwrap();
@@ -559,8 +559,8 @@ mod tests {
     async fn a_hosted_plugin_cannot_be_changed_through_the_settings() {
         let (handler, _path) = handler();
         let hosted: crate::plugin_host::PluginServer = serde_json::from_value(json!({
-            "id": "hosted.nw.vcount", "address": "quic:v1.example.test:443",
-            "managed": {"service": "nw.vcount", "instance": "v1.example.test"}}))
+            "id": "hosted.nw.counter", "address": "quic:v1.example.test:443",
+            "managed": {"service": "nw.counter", "instance": "v1.example.test"}}))
         .unwrap();
         handler
             .state
@@ -571,7 +571,7 @@ mod tests {
             .servers
             .push(hosted.clone());
         let forged = json!({"servers": [
-            {"id": "hosted.nw.vcount", "address": "quic:evil.example.test:443", "managed": {"service": "x", "instance": "y"}},
+            {"id": "hosted.nw.counter", "address": "quic:evil.example.test:443", "managed": {"service": "x", "instance": "y"}},
             {"id": "other", "address": "quic:evil.example.test:444", "managed": {"service": "x", "instance": "y"}},
             {"id": "motion", "address": "unix:/tmp/nw-motion-test.sock"}
         ]});
@@ -581,13 +581,13 @@ mod tests {
         assert!(servers.iter().any(|s| s["id"] == "motion"));
         let kept = servers
             .iter()
-            .find(|s| s["id"] == "hosted.nw.vcount")
+            .find(|s| s["id"] == "hosted.nw.counter")
             .unwrap();
         assert_eq!(kept["address"], "quic:v1.example.test:443");
         let refused = handler
             .dispatch(
                 "plugins.credentials",
-                &json!({"server": "hosted.nw.vcount", "credential": "x"}),
+                &json!({"server": "hosted.nw.counter", "credential": "x"}),
             )
             .await;
         assert!(refused.is_err());
@@ -692,7 +692,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             writer.put_figures(
                 "cam-1",
-                "vcount",
+                "counter",
                 vec![nw_analytics_protocol::messages::Figure {
                     label: "Cars".into(),
                     value: "7".into(),
@@ -711,7 +711,7 @@ mod tests {
             .unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(counted["figures"]["cam-1"][0]["value"], "7");
-        assert_eq!(counted["figures"]["cam-1"][0]["plugin"], "vcount");
+        assert_eq!(counted["figures"]["cam-1"][0]["plugin"], "counter");
         assert!(handler
             .dispatch("plugins.overlays", &json!({"camera_ids": "cam-1"}))
             .await
@@ -806,8 +806,8 @@ mod tests {
             .unwrap_err();
         assert!(e.message.contains("signed manifest"), "{}", e.message);
         let hosted: crate::plugin_host::PluginServer = serde_json::from_value(json!({
-            "id": "hosted.nw.vcount", "address": "quic:v1.example.test:443",
-            "managed": {"service": "nw.vcount", "instance": "v1.example.test"}}))
+            "id": "hosted.nw.counter", "address": "quic:v1.example.test:443",
+            "managed": {"service": "nw.counter", "instance": "v1.example.test"}}))
         .unwrap();
         handler
             .state
@@ -820,7 +820,7 @@ mod tests {
         let e = handler
             .dispatch(
                 "plugins.approve",
-                &json!({"server": "hosted.nw.vcount", "public_key": "abc"}),
+                &json!({"server": "hosted.nw.counter", "public_key": "abc"}),
             )
             .await
             .unwrap_err();

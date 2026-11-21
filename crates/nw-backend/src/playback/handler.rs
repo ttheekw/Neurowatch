@@ -74,6 +74,12 @@ impl PlaybackHandler {
     }
 
     pub async fn dispatch(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+        // Any request that names a session keeps it from expiring.
+        if let Some(id) = params["session_id"].as_str() {
+            if let Some(session) = self.state.read().await.playback_sessions.get(id) {
+                session.touch();
+            }
+        }
         match method {
             "playback.get_timeline" => self.get_timeline(params).await,
             "playback.open" => self.open(params).await,
@@ -1122,6 +1128,52 @@ mod tests {
         let reopened = st.playback_sessions.get("s-audio").expect("session");
         assert!(reopened.audio_enabled(), "its audio stays on");
         assert!(reopened.is_playing());
+    }
+
+    #[tokio::test]
+    async fn sessions_nobody_uses_expire_and_use_keeps_them() {
+        let (mut config, root) = isolated_config("session-expiry");
+        config.cameras.push(camera("cam-a"));
+        let fx = fixture(config, &root);
+        for (id, playing) in [
+            ("idle-paused", false),
+            ("idle-playing", true),
+            ("used", false),
+        ] {
+            let session = PlaybackSession::spawn_with(
+                id.into(),
+                "cam-a".into(),
+                Vec::new(),
+                0,
+                PlaybackOutput::Shm {
+                    key: format!("pb_{id}"),
+                },
+                1.0,
+                playing,
+            );
+            fx.state
+                .write()
+                .await
+                .playback_sessions
+                .insert(id.into(), session);
+        }
+        let later = std::time::Instant::now() + crate::playback::session::PAUSED_IDLE_LIMIT;
+        // A client still using "used" (status calls) is never idle.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        fx.handler
+            .dispatch("playback.status", &json!({"session_id": "used"}))
+            .await
+            .unwrap();
+        let mut st = fx.state.write().await;
+        assert!(st.playback_sessions["idle-paused"].expired(later));
+        assert!(!st.playback_sessions["idle-playing"].expired(later));
+        let way_later = std::time::Instant::now() + crate::playback::session::ANY_IDLE_LIMIT;
+        assert!(st.playback_sessions["idle-playing"].expired(way_later));
+        // Expiry removes the sessions and keeps the rest.
+        let gone = st.expire_playback_sessions(later);
+        assert_eq!(gone, vec!["idle-paused".to_owned()]);
+        assert!(!st.playback_sessions.contains_key("idle-paused"));
+        assert!(st.playback_sessions.contains_key("idle-playing"));
     }
 
     #[tokio::test]

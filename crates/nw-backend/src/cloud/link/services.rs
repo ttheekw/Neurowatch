@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use time::Duration as TimeDuration;
 
-use super::backup::{host_port, valid_name};
+use super::backup::{usable_address, valid_name};
 use super::{
     fmt_time, sign_value, without_signature, CloudError, CloudNode, LinkPhase, Result,
     NODE_AUDIENCE,
@@ -85,7 +85,7 @@ pub fn parse_services_reply(reply: &Value) -> Result<Vec<ServiceEntry>> {
             &entry.endpoint.tls,
         ];
         if addresses.iter().all(|address| address.is_none())
-            || addresses.into_iter().flatten().any(|a| !host_port(a))
+            || addresses.into_iter().flatten().any(|a| !usable_address(a))
         {
             return Err(invalid("address"));
         }
@@ -166,8 +166,8 @@ mod tests {
         json!({"services": [entry]})
     }
     fn entry() -> Value {
-        json!({"service": "nw.vcount", "instance": "vcount-1.example.test",
-               "endpoint": {"quic": "vcount-1.example.test:443"}, "public_key": "ab".repeat(32), "ticket": "a.b"})
+        json!({"service": "nw.counter", "instance": "counter-1.example.test",
+               "endpoint": {"quic": "counter-1.example.test:443"}, "public_key": "ab".repeat(32), "ticket": "a.b"})
     }
 
     #[test]
@@ -183,7 +183,7 @@ mod tests {
         let got = parse_services_reply(&reply(good)).unwrap();
         assert_eq!(
             got[0].endpoint.quic.as_deref(),
-            Some("vcount-1.example.test:443")
+            Some("counter-1.example.test:443")
         );
         assert_eq!(
             parse_services_reply(&json!({"services": []})).unwrap(),

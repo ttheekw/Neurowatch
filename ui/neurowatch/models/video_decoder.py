@@ -5,7 +5,8 @@ decoder it finds, a hardware family (``nvdec``, ``d3d11``, …) is used
 whenever the computer has it, ``software`` decodes on the CPU only. It reports
 the families it found and the decoder in use in ``system.status``
 ``video_acceleration`` (``available_decoders``, ``label``,
-``decoder_preference_warning``). No Qt here.
+``decoder_preference_warning``), and why a graphics card that can decode
+video does not (``reason_code``, see :func:`acceleration_notice`). No Qt here.
 """
 
 from __future__ import annotations
@@ -39,6 +40,93 @@ _ACTIVE_LABELS: dict[str, str] = {
     "v4l2_m2m": "V4L2",
     "software": "the CPU (software)",
 }
+
+
+#: ``video_acceleration.reason_code`` values meaning "this PC has a graphics
+#: card that can decode video, but its driver or software is missing".
+DRIVER_MISSING_CODES: frozenset[str] = frozenset({"VAAPI_DRIVER_MISSING", "NVDEC_LIBRARY_MISSING"})
+
+#: The package families of ``video_acceleration.suggested_packages``, as shown.
+_PACKAGE_FAMILIES: tuple[tuple[str, str], ...] = (
+    ("deb", "Debian/Ubuntu"),
+    ("rpm", "Fedora"),
+    ("arch", "Arch"),
+)
+
+#: The title of the startup message and the tray's problem.
+DRIVER_MISSING_TITLE = "Hardware video decoding unavailable"
+
+
+@dataclass(frozen=True)
+class AccelerationNotice:
+    """A graphics card that can decode video, decoding on the CPU because
+    its driver (or software) is missing: what the user is told."""
+
+    #: The recorder's ``reason_code`` (``VAAPI_DRIVER_MISSING``, …).
+    code: str
+    #: The plain-language reason: what is missing, what to install.
+    text: str
+    #: "Intel", "AMD", "NVIDIA", or "" when not reported.
+    vendor: str = ""
+    #: The card's kernel driver (``i915``, ``amdgpu``), "" when not reported.
+    kernel_driver: str = ""
+    #: Its render node (``/dev/dri/renderD128``), "" when not reported.
+    render_node: str = ""
+    #: The packages to install per family: (family label, packages).
+    packages: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+    @property
+    def detail(self) -> str:
+        """One line per package family: ``Debian/Ubuntu: a b``."""
+        return "\n".join(f"{label}: {' '.join(names)}" for label, names in self.packages)
+
+    @property
+    def card(self) -> str:
+        """``Intel (i915, /dev/dri/renderD128)``, as Diagnostics names it."""
+        where = ", ".join(part for part in (self.kernel_driver, self.render_node) if part)
+        name = self.vendor or "Unknown"
+        return f"{name} ({where})" if where else name
+
+    @property
+    def short(self) -> str:
+        """The status-bar notice's text."""
+        return f"{self.vendor} GPU driver missing" if self.vendor else "GPU driver missing"
+
+
+def acceleration_notice(info: object) -> AccelerationNotice | None:
+    """The notice for a ``video_acceleration`` (from ``system.status`` or
+    ``stats.get_performance``) that reports a graphics card without its
+    driver; None otherwise, and for an older recorder."""
+    if not isinstance(info, Mapping):
+        return None
+    code = info.get("reason_code")
+    reason = info.get("reason")
+    if code not in DRIVER_MISSING_CODES or not isinstance(reason, str) or not reason:
+        return None
+    gpu = info.get("gpu")
+    gpu = gpu if isinstance(gpu, Mapping) else {}
+
+    def text(key: str) -> str:
+        value = gpu.get(key)
+        return value if isinstance(value, str) else ""
+
+    suggested = info.get("suggested_packages")
+    packages: list[tuple[str, tuple[str, ...]]] = []
+    if isinstance(suggested, Mapping):
+        for key, label in _PACKAGE_FAMILIES:
+            names = suggested.get(key)
+            if isinstance(names, list):
+                listed = tuple(name for name in names if isinstance(name, str) and name)
+                if listed:
+                    packages.append((label, listed))
+    return AccelerationNotice(
+        code=str(code),
+        text=reason,
+        vendor=text("vendor"),
+        kernel_driver=text("kernel_driver"),
+        render_node=text("render_node"),
+        packages=tuple(packages),
+    )
 
 
 def decoder_from_config(config: object) -> str:
@@ -80,10 +168,14 @@ class DecoderStatus:
         if kind == "blocked":
             active = str(info.get("label") or "")
         warning = info.get("decoder_preference_warning")
+        warnings = [warning] if isinstance(warning, str) and warning else []
+        notice = acceleration_notice(info)
+        if notice is not None:
+            warnings.append(notice.text)  # the graphics card's driver is missing
         return cls(
             available=tuple(available),
             active=active,
-            warning=warning if isinstance(warning, str) else "",
+            warning=" ".join(warnings),
         )
 
 

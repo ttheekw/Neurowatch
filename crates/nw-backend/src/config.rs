@@ -84,6 +84,28 @@ mod recording_policy_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod private_file_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_saved_config_is_readable_only_by_its_owner_whatever_the_umask() {
+        let dir = std::env::temp_dir().join(format!("nw-private-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        // A loose leftover temp file and a link planted at the temp name.
+        let elsewhere = dir.join("elsewhere");
+        std::fs::write(&elsewhere, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.join("config.json.tmp")).unwrap();
+        AppConfig::default().save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod video_config_tests {
     use super::*;
@@ -810,6 +832,29 @@ impl Default for AppConfig {
     }
 }
 
+/// Write `bytes` to a new file only its owner can read (the config holds
+/// camera addresses and obfuscated passwords). A leftover file or link at
+/// `path` is removed first, never written through, and the mode does not
+/// depend on the umask.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
 impl AppConfig {
     /// Load from disk, or return default config if the file does not exist yet.
     pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
@@ -880,7 +925,7 @@ impl AppConfig {
         }
         let text = serde_json::to_string_pretty(self).context("Failed to serialize config")?;
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-        std::fs::write(&tmp, &text)
+        write_private(&tmp, text.as_bytes())
             .with_context(|| format!("Cannot write temp config: {}", tmp.display()))?;
         std::fs::rename(&tmp, path).with_context(|| {
             format!(

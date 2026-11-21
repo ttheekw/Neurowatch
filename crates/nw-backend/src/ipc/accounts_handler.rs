@@ -135,11 +135,47 @@ impl AccountsHandler {
             }
             (st.config.accounts.clone(), Arc::clone(&st.sessions))
         };
+        let upgrade_from = accounts
+            .user(&username)
+            .filter(|user| user.password.needs_upgrade())
+            .map(|user| {
+                (
+                    user.username.clone(),
+                    user.password.clone(),
+                    password.clone(),
+                )
+            });
         let (token, session) =
             tokio::task::spawn_blocking(move || sessions.login(&accounts, &username, &password))
                 .await
                 .map_err(|e| RpcError::internal(e.to_string()))?
                 .map_err(RpcError::invalid_params)?;
+        // The password was right and is in hand: store it with today's rounds.
+        if let Some((name, old, password)) = upgrade_from {
+            match hash(password).await {
+                Ok(fresh) => {
+                    let upgraded = self
+                        .change(move |accounts| {
+                            if let Some(user) = accounts
+                                .users
+                                .iter_mut()
+                                .find(|u| u.username.eq_ignore_ascii_case(&name))
+                                .filter(|u| u.password == old)
+                            {
+                                user.password = fresh;
+                            }
+                            Ok(())
+                        })
+                        .await;
+                    if let Err(error) = upgraded {
+                        tracing::warn!(error = %error.message, "Could not store the upgraded password hash");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error.message, "Could not upgrade the password hash");
+                }
+            }
+        }
         Ok(json!({"token": token, "user": {
             "username": session.username, "role": session.role, "cameras": session.cameras
         }}))
@@ -264,6 +300,67 @@ mod tests {
 
     fn message(error: &RpcError) -> String {
         error.message.clone()
+    }
+
+    #[tokio::test]
+    async fn a_password_stored_with_fewer_rounds_is_upgraded_at_sign_in() {
+        let (h, dir) = handler();
+        call(
+            &h,
+            "accounts.set_user",
+            json!({"username": "ann", "role": "admin", "password": "long-enough-1"}),
+        )
+        .await
+        .unwrap();
+        // Make her stored hash an old one (210,000 rounds).
+        {
+            let mut st = h.state.write().await;
+            let salt = [3_u8; 16];
+            let engine = base64::engine::general_purpose::STANDARD_NO_PAD;
+            let mut out = [0_u8; 32];
+            ring::pbkdf2::derive(
+                ring::pbkdf2::PBKDF2_HMAC_SHA256,
+                std::num::NonZeroU32::new(210_000).unwrap(),
+                &salt,
+                b"long-enough-1",
+                &mut out,
+            );
+            let old = PasswordHash {
+                salt: base64::Engine::encode(&engine, salt),
+                hash: base64::Engine::encode(&engine, out),
+                iterations: 210_000,
+            };
+            st.config.accounts.users[0].password = old;
+            st.config.accounts.enabled = true;
+        }
+        // A wrong password changes nothing.
+        let _ = call(
+            &h,
+            "auth.login",
+            json!({"username": "ann", "password": "wrong-password"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            h.state.read().await.config.accounts.users[0]
+                .password
+                .iterations,
+            210_000
+        );
+        let login = call(
+            &h,
+            "auth.login",
+            json!({"username": "ann", "password": "long-enough-1"}),
+        )
+        .await
+        .unwrap();
+        assert!(login["token"].is_string());
+        let st = h.state.read().await;
+        let stored = &st.config.accounts.users[0].password;
+        assert_eq!(stored.iterations, 600_000);
+        assert!(stored.verify("long-enough-1"), "the new hash still opens");
+        drop(st);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

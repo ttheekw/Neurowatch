@@ -88,10 +88,15 @@ impl MqttConfig {
     /// `changes` checked, with a password left as [`KEPT_SECRET`] taken from
     /// these (stored) settings.
     pub fn replaced_by(&self, mut changes: MqttConfig) -> Result<MqttConfig, String> {
+        changes.host = changes.host.trim().to_owned();
         if changes.password == KEPT_SECRET {
+            // The stored password goes only to the broker it was entered for
+            // (security review 2026-11-20, finding 6).
+            if !self.password.is_empty() && !changes.host.eq_ignore_ascii_case(self.host.trim()) {
+                return Err("Enter the broker's password again for the new address".into());
+            }
             changes.password = self.password.clone();
         }
-        changes.host = changes.host.trim().to_owned();
         changes.topic_prefix = changes.topic_prefix.trim().to_owned();
         changes.discovery_prefix = changes.discovery_prefix.trim().to_owned();
         changes.validate()?;
@@ -165,6 +170,29 @@ mod tests {
             password: "s3cret".into(),
             ..MqttConfig::default()
         }
+    }
+
+    #[test]
+    fn a_kept_password_never_goes_to_another_broker() {
+        // Security review 2026-11-20, finding 6.
+        let stored = enabled();
+        let moved = MqttConfig {
+            host: "broker.attacker.example".into(),
+            ..stored.masked()
+        };
+        let refused = stored.replaced_by(moved).unwrap_err();
+        assert!(refused.contains("again for the new address"), "{refused}");
+        let retyped = MqttConfig {
+            host: "broker.attacker.example".into(),
+            password: "typed".into(),
+            ..stored.masked()
+        };
+        assert_eq!(stored.replaced_by(retyped).unwrap().password, "typed");
+        let same = MqttConfig {
+            host: " BROKER.local ".into(),
+            ..stored.masked()
+        };
+        assert_eq!(stored.replaced_by(same).unwrap().password, "s3cret");
     }
 
     #[test]

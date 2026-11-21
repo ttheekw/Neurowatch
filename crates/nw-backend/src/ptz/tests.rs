@@ -148,6 +148,7 @@ async fn device() -> Device {
         device_url: format!("http://127.0.0.1:{port}/device"),
         events_url: None,
         ptz_url: None,
+        allow_password_text: false,
     });
     Device {
         camera,

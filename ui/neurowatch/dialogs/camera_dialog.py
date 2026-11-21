@@ -242,8 +242,10 @@ class _StreamsWorker(Worker):
         port: int,
         username: str,
         password: str,
+        allow_password_text: bool = False,
     ) -> None:
         super().__init__()
+        self._allow_password_text = allow_password_text
         self._endpoint = endpoint
         self._candidate_id = candidate_id
         self._host = host
@@ -264,6 +266,8 @@ class _StreamsWorker(Worker):
             if self._username:
                 params["username"] = self._username
                 params["password_b64"] = _password_b64(self._password)
+                if self._allow_password_text:
+                    params["allow_password_text"] = True
             self.done.emit(client.call("camera.discovery.profiles", params))
         except Exception as e:
             self.done.emit(e)
@@ -1397,6 +1401,14 @@ class AddEditCameraDialog(QDialog):
         self._pass.setEchoMode(QLineEdit.EchoMode.Password)
         self._pass.setPlaceholderText("••••••••")
         form.addRow("Password:", self._pass)
+        self._allow_password_text = QCheckBox(
+            "Allow sending the password unencrypted (for older cameras on plain HTTP)"
+        )
+        self._allow_password_text.setToolTip(
+            "Only for cameras that reject every other way of signing in. Anyone on the "
+            "network between this computer and the camera could read the password."
+        )
+        form.addRow("", self._allow_password_text)
 
         mode_row = QWidget()
         mode_layout = QHBoxLayout(mode_row)
@@ -1992,6 +2004,7 @@ class AddEditCameraDialog(QDialog):
             self._a_protocol.setCurrentIndex(idx)
         host, _port = _url_host_port(url)
         self._s_host.setText(host)
+        self._allow_password_text.setChecked(bool((cam.onvif or {}).get("allow_password_text")))
         onvif_url = (cam.onvif or {}).get("device_url")
         onvif_port = _url_host_port(onvif_url)[1] if isinstance(onvif_url, str) else None
         if onvif_port:
@@ -2056,6 +2069,7 @@ class AddEditCameraDialog(QDialog):
             host,
             port,
             *self._onvif_credentials(),
+            self._allow_password_text.isChecked(),
         )
         worker.done.connect(self._on_discover_done)
         worker.finished.connect(worker.deleteLater)
@@ -2376,7 +2390,25 @@ class AddEditCameraDialog(QDialog):
 
     def _onvif_endpoint(self, main_url: str) -> dict | None:
         """Where the camera answers ONVIF, for its events: the address and port
-        typed for Load Streams, else what was saved (unless the camera moved)."""
+        typed for Load Streams, else what was saved (unless the camera moved).
+        Carries the "allow the password unencrypted" choice when it is on, or
+        was (so an edit can switch it off: the backend keeps a setting a
+        request leaves out)."""
+        endpoint = self._located_onvif_endpoint(main_url)
+        allow = self._allow_password_text.isChecked()
+        if endpoint is None and allow:
+            host = _url_host_port(main_url)[0]
+            if host:
+                endpoint = {"device_url": f"http://{host}/onvif/device_service"}
+        if endpoint is None:
+            return None
+        endpoint = dict(endpoint)
+        was_set = isinstance(self._onvif, dict) and "allow_password_text" in self._onvif
+        if allow or was_set:
+            endpoint["allow_password_text"] = allow
+        return endpoint
+
+    def _located_onvif_endpoint(self, main_url: str) -> dict | None:
         host, port = self._s_host.text().strip(), self._s_port.value()
         saved = self._onvif
         saved_url = saved.get("device_url") if isinstance(saved, dict) else None

@@ -121,6 +121,33 @@ async fn connection_frames_multiple_requests_and_records_only_nonempty_lines() {
 }
 
 #[tokio::test]
+async fn a_request_line_without_an_end_is_refused_at_its_limit() {
+    // Checklist "Recorder local": IPC lines were unbounded.
+    let mut short: &[u8] = b"abc\ndef";
+    assert_eq!(
+        read_request_line(&mut short, 8).await.unwrap().as_deref(),
+        Some("abc")
+    );
+    assert_eq!(
+        read_request_line(&mut short, 8).await.unwrap().as_deref(),
+        Some("def")
+    );
+    assert!(read_request_line(&mut short, 8).await.unwrap().is_none());
+    let mut exact: &[u8] = b"12345678\n";
+    assert_eq!(
+        read_request_line(&mut exact, 8).await.unwrap().as_deref(),
+        Some("12345678")
+    );
+    let mut long: &[u8] = b"123456789";
+    assert!(read_request_line(&mut long, 8).await.is_err());
+    let endless = vec![b'x'; MAX_REQUEST_LINE + 10];
+    let mut endless: &[u8] = &endless;
+    assert!(read_request_line(&mut endless, MAX_REQUEST_LINE)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn malformed_json_closes_the_connection_and_releases_the_request_span() {
     let fixture = Fixture::new();
     let (replies, metrics, result) = fixture
@@ -443,7 +470,7 @@ fn the_default_endpoint_is_a_unix_socket_in_the_runtime_dir_unless_overridden() 
         _ => {
             if cfg!(unix) {
                 assert!(
-                    endpoint.starts_with("unix:") && endpoint.ends_with("/neurowatch/control.sock"),
+                    endpoint.starts_with("unix:") && endpoint.ends_with("/control.sock"),
                     "{endpoint}"
                 );
             } else {
@@ -451,4 +478,93 @@ fn the_default_endpoint_is_a_unix_socket_in_the_runtime_dir_unless_overridden() 
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn tmp_fallback_root() -> PathBuf {
+    let root = std::env::temp_dir().join(format!("nw-fallback-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+#[cfg(unix)]
+#[test]
+fn the_tmp_fallback_is_a_per_user_folder_when_the_shared_name_is_not_safe() {
+    use std::os::unix::fs::PermissionsExt;
+    let uid = unsafe { libc::geteuid() };
+    let root = tmp_fallback_root();
+
+    // Nothing there yet: a new install takes its own name.
+    assert_eq!(
+        tmp_fallback_endpoint(&root, uid),
+        format!("unix:{}/neurowatch-{uid}/control.sock", root.display())
+    );
+
+    // A folder of ours nobody else can write stays in use (existing installs).
+    let legacy = root.join("neurowatch");
+    std::fs::create_dir(&legacy).unwrap();
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        tmp_fallback_endpoint(&root, uid),
+        format!("unix:{}/neurowatch/control.sock", root.display())
+    );
+
+    // Writable by others: not trusted.
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(tmp_fallback_endpoint(&root, uid).contains("/neurowatch-"));
+
+    // Owned by someone else (pretend we are another user): not trusted.
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(tmp_fallback_endpoint(&root, uid.wrapping_add(1)).contains("/neurowatch-"));
+
+    // A symlink another user planted is not a folder of ours.
+    std::fs::remove_dir(&legacy).unwrap();
+    let target = root.join("elsewhere");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &legacy).unwrap();
+    assert!(tmp_fallback_endpoint(&root, uid).contains("/neurowatch-"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_per_user_fallback_folder_is_created_private_and_refused_when_shared() {
+    use std::os::unix::fs::PermissionsExt;
+    let uid = unsafe { libc::geteuid() };
+    let root = tmp_fallback_root();
+    let endpoint = tmp_fallback_endpoint(&root, uid);
+    let path = endpoint.strip_prefix("unix:").unwrap().to_owned();
+    let (tx, rx) = broadcast::channel(1);
+    let fixture = Fixture::new();
+    let server = tokio::spawn(run_unix(
+        Box::leak(path.clone().into_boxed_str()),
+        Arc::clone(&fixture.handler),
+        rx,
+        IpcMetricsRecorder::new(),
+    ));
+    let folder = std::path::Path::new(&path).parent().unwrap().to_owned();
+    for _ in 0..100 {
+        if std::path::Path::new(&path).exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mode = std::fs::metadata(&folder).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    let _ = tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), server).await;
+
+    // A pre-made folder others can use is refused with an explanation.
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let (_tx, rx) = broadcast::channel(1);
+    let error = run_unix(
+        Box::leak(path.into_boxed_str()),
+        Arc::clone(&fixture.handler),
+        rx,
+        IpcMetricsRecorder::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("private"), "{error}");
+    let _ = std::fs::remove_dir_all(&root);
 }

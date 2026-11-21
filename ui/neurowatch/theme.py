@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from neurowatch import plain_text
+
 _ICONS = Path(__file__).resolve().parent / "resources" / "icons"
 
 BUTTON_VARIANTS: tuple[str, ...] = ("primary", "secondary", "danger", "ghost")
@@ -1554,6 +1556,9 @@ def style_calendar(calendar: QCalendarWidget) -> None:
 def apply_app_theme(app: QApplication, theme_name: str = "dark") -> None:
     """Apply a real Fusion light/dark palette and shared popup rules."""
     global _active_theme
+    # Every Qt process of the app (window, tray) comes through here once
+    # before it shows anything: text from outside is never read as HTML.
+    plain_text.install(app)
     _active_theme = normalize_theme(theme_name)
     colors = active_colors()
     sheet = app_stylesheet(_active_theme)

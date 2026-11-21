@@ -229,19 +229,49 @@ impl ChannelTarget {
         }
     }
 
-    /// Put back secrets a client left as [`KEPT_SECRET`] (same channel, same kind).
-    fn restore(&mut self, stored: Option<&Self>) {
+    /// Put back secrets a client left as [`KEPT_SECRET`] (same channel, same
+    /// kind, same destination). A kept secret never goes to a new address:
+    /// otherwise anyone allowed to edit a channel, a remote manager included,
+    /// could point it elsewhere and receive the stored secret (security
+    /// review 2026-11-20, finding 6). Telegram's address is fixed.
+    fn restore(&mut self, stored: Option<&Self>) -> Result<(), String> {
         let keep = |secret: &mut String, old: Option<&String>| {
             if secret == KEPT_SECRET {
                 *secret = old.cloned().unwrap_or_default();
             }
         };
+        let moved = |secret: &String, what: &str| -> Result<(), String> {
+            if secret == KEPT_SECRET {
+                Err(format!("Enter the {what} again for the new address"))
+            } else {
+                Ok(())
+            }
+        };
         match (self, stored) {
-            (Self::Webhook { secret, .. }, Some(Self::Webhook { secret: old, .. })) => {
+            (
+                Self::Webhook { url, secret },
+                Some(Self::Webhook {
+                    url: old_url,
+                    secret: old,
+                }),
+            ) => {
+                if url.trim() != old_url.trim() {
+                    return moved(secret, "webhook's secret");
+                }
                 keep(secret, Some(old))
             }
             (Self::Webhook { secret, .. }, _) => keep(secret, None),
-            (Self::Ntfy { token, .. }, Some(Self::Ntfy { token: old, .. })) => {
+            (
+                Self::Ntfy { server, token, .. },
+                Some(Self::Ntfy {
+                    server: old_server,
+                    token: old,
+                    ..
+                }),
+            ) => {
+                if server.trim().trim_end_matches('/') != old_server.trim().trim_end_matches('/') {
+                    return moved(token, "ntfy access token");
+                }
                 keep(token, Some(old))
             }
             (Self::Ntfy { token, .. }, _) => keep(token, None),
@@ -251,6 +281,7 @@ impl ChannelTarget {
             (Self::Telegram { bot_token, .. }, _) => keep(bot_token, None),
             (Self::Desktop, _) => {}
         }
+        Ok(())
     }
 }
 
@@ -347,7 +378,7 @@ impl AlertsConfig {
                 .iter()
                 .find(|old| old.id == channel.id)
                 .map(|old| &old.target);
-            channel.target.restore(stored);
+            channel.target.restore(stored)?;
         }
         changes.validate()?;
         Ok(changes)
@@ -433,6 +464,30 @@ mod tests {
             *raw.pointer_mut(path).unwrap() = value.clone();
             let config: AlertsConfig = serde_json::from_value(raw).unwrap();
             assert!(config.validate().is_err(), "{path} = {value}");
+        }
+    }
+
+    #[test]
+    fn a_kept_secret_never_goes_to_a_new_address() {
+        // Security review 2026-11-20, finding 6: a channel pointed elsewhere
+        // with the kept-secret marker must not carry the stored secret.
+        let mut raw = serde_json::to_value(sample()).unwrap();
+        raw["channels"][3]["secret"] = json!("hook_secret_value");
+        let stored: AlertsConfig = serde_json::from_value(raw).unwrap();
+        for (index, field, value) in [
+            (3, "url", "https://attacker.example/hook"),
+            (0, "server", "https://ntfy.attacker.example"),
+        ] {
+            let mut raw = serde_json::to_value(stored.masked()).unwrap();
+            raw["channels"][index][field] = json!(value);
+            let changes: AlertsConfig = serde_json::from_value(raw.clone()).unwrap();
+            let refused = stored.replaced_by(changes).unwrap_err();
+            assert!(refused.contains("again for the new address"), "{refused}");
+            // Typing the secret again for the new address is fine.
+            let secret = if field == "url" { "secret" } else { "token" };
+            raw["channels"][index][secret] = json!("tk_new_secret_value");
+            let changes: AlertsConfig = serde_json::from_value(raw).unwrap();
+            assert!(stored.replaced_by(changes).is_ok());
         }
     }
 

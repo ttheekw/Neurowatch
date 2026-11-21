@@ -33,6 +33,15 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 /// A refused track is offered again after this (its plan may have changed).
 const REFUSAL_RETRY: Duration = Duration::from_secs(300);
+/// The longest the ingest may make this recorder wait (before offering a
+/// refused track again, or reconnecting after a move): `u32::MAX` ms would
+/// be 49 days of silence.
+const MAX_SERVER_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// A wait the ingest asked for, at most [`MAX_SERVER_WAIT`].
+fn server_wait(ms: u32) -> Duration {
+    Duration::from_millis(u64::from(ms)).min(MAX_SERVER_WAIT)
+}
 /// A sound run is cut into runs this long (every sound unit is a keyframe).
 const SOUND_RUN_US: i64 = 2_000_000;
 
@@ -291,7 +300,7 @@ async fn connected_session(
                             tracing::info!(camera = %track.camera_id, message = %refused.message, "cloud backup: track refused");
                             *lock(&track.refused) = Some((Some(refused.code), refused.message.clone()));
                         }
-                        let wait = refused.retry_after_ms.map_or(REFUSAL_RETRY, |ms| Duration::from_millis(u64::from(ms)));
+                        let wait = refused.retry_after_ms.map_or(REFUSAL_RETRY, server_wait);
                         retry_at.insert(refused.track, Instant::now() + wait);
                     }
                     ServerMessage::Ack(ack) => {
@@ -301,7 +310,7 @@ async fn connected_session(
                     }
                     ServerMessage::Move(moving) => {
                         tracing::info!(reason = %moving.reason, "cloud backup: asked to move");
-                        return Ended::Moved(Duration::from_millis(u64::from(moving.retry_after_ms)));
+                        return Ended::Moved(server_wait(moving.retry_after_ms));
                     }
                     ServerMessage::Refused(refused) => {
                         return Ended::Failed(refusal_text(refused.code, &refused.message));
@@ -558,6 +567,12 @@ fn proves_instance(assignment: &crate::Assignment, binding: &[u8], proof: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ingest_cannot_make_a_recorder_wait_for_weeks() {
+        assert_eq!(server_wait(10), Duration::from_millis(10));
+        assert_eq!(server_wait(u32::MAX), MAX_SERVER_WAIT);
+    }
 
     fn ticket(issued_at_ms: i64, expires_at_ms: i64) -> Ticket {
         Ticket {

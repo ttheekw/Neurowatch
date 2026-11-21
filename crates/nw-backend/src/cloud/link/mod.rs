@@ -2837,9 +2837,38 @@ async fn post_json(
     if !r.status().is_success() {
         return Err(http_error(r.status()));
     }
-    r.json()
+    read_capped_json(r, MAX_ANSWER_BYTES).await
+}
+
+/// The largest answer read from the cloud (enrollment, check-ins, tickets,
+/// pulls): a misbehaving or impersonated server must not make the recorder
+/// buffer an endless body.
+pub(super) const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
+
+/// A JSON answer of at most `limit` bytes: refused by its announced length
+/// when that is already too large, else counted as it arrives.
+pub(super) async fn read_capped_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<T> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(CloudError::Network("the answer is too large".into()));
+    }
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| CloudError::Network(e.to_string()))
+        .map_err(|e| CloudError::Network(e.to_string()))?
+    {
+        if body.len() + chunk.len() > limit {
+            return Err(CloudError::Network("the answer is too large".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|e| CloudError::Network(e.to_string()))
 }
 async fn post_typed<T: serde::de::DeserializeOwned>(
     clock: &CloudClock,
@@ -2851,9 +2880,7 @@ async fn post_typed<T: serde::de::DeserializeOwned>(
     if !r.status().is_success() {
         return Err(http_error(r.status()));
     }
-    r.json()
-        .await
-        .map_err(|e| CloudError::Network(e.to_string()))
+    read_capped_json(r, MAX_ANSWER_BYTES).await
 }
 async fn post_no_content(
     clock: &CloudClock,

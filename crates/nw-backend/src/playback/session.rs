@@ -12,6 +12,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use gstreamer::prelude::*;
 use gstreamer_video::VideoFrameExt;
@@ -153,6 +154,9 @@ pub struct PlaybackSession {
     speed_state: StdMutex<f64>,
     playing_state: AtomicBool,
     audio: Arc<AudioState>,
+    /// Milliseconds after [`clock_base`] of the last request that used the
+    /// session (see [`Self::idle_for`]).
+    last_used_ms: AtomicU64,
 }
 
 /// The session's audio: whether it is wanted, whether the recording has it,
@@ -165,6 +169,20 @@ pub struct AudioState {
     audible: AtomicBool,
     /// `f64` bits of the playback rate.
     rate_bits: AtomicU64,
+}
+
+/// A paused session nobody has touched for this long is closed.
+pub const PAUSED_IDLE_LIMIT: Duration = Duration::from_secs(30 * 60);
+/// Any session nobody has touched for this long is closed, playing or not.
+pub const ANY_IDLE_LIMIT: Duration = Duration::from_secs(6 * 3600);
+
+fn clock_base() -> Instant {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    *BASE.get_or_init(Instant::now)
+}
+
+fn millis_since_base(at: Instant) -> u64 {
+    u64::try_from(at.saturating_duration_since(clock_base()).as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Rates at which audio plays (pitch kept); muted outside.
@@ -251,7 +269,28 @@ impl PlaybackSession {
             speed_state: StdMutex::new(speed),
             playing_state: AtomicBool::new(playing),
             audio,
+            last_used_ms: AtomicU64::new(millis_since_base(Instant::now())),
         }
+    }
+
+    /// Note that a client used the session now.
+    pub fn touch(&self) {
+        self.last_used_ms
+            .store(millis_since_base(Instant::now()), AtomicOrdering::Relaxed);
+    }
+
+    /// How long no request has used the session.
+    pub fn idle_for(&self, now: Instant) -> Duration {
+        let last = self.last_used_ms.load(AtomicOrdering::Relaxed);
+        Duration::from_millis(millis_since_base(now).saturating_sub(last))
+    }
+
+    /// Whether nobody has used the session for so long that its client is
+    /// gone (a paused one after [`PAUSED_IDLE_LIMIT`], any after
+    /// [`ANY_IDLE_LIMIT`]): a crashed UI never sends `playback.close`.
+    pub fn expired(&self, now: Instant) -> bool {
+        let idle = self.idle_for(now);
+        idle >= ANY_IDLE_LIMIT || (!self.is_playing() && idle >= PAUSED_IDLE_LIMIT)
     }
 
     /// Hear (or mute) this session's recorded audio.

@@ -15,6 +15,7 @@ still show the status at the top of the menu.
 
 from __future__ import annotations
 
+import html
 import logging
 import subprocess
 import sys
@@ -31,6 +32,7 @@ from neurowatch.ipc.alert_feed import AlertFeedWorker
 from neurowatch.models.backup_status import backup_problems, backup_summary
 from neurowatch.models.camera import connection_status
 from neurowatch.models.plugins import offline_plugin_names
+from neurowatch.models.video_decoder import DRIVER_MISSING_TITLE, acceleration_notice
 from neurowatch.service import probe
 from neurowatch.service.lock import InstanceLock
 from neurowatch.service.manager import ServiceController
@@ -40,6 +42,14 @@ from neurowatch.utils.threads import Worker
 from neurowatch.widgets.centered_prompt import CenteredPrompt
 
 logger = logging.getLogger(__name__)
+
+
+def notification_body(text: str) -> str:
+    """``text`` as a notification body. The Linux notification service reads the
+    body as markup (links, images, bold), so a camera or plugin name must not
+    be able to carry any: escape it there. Windows and macOS show plain text."""
+    return text if IS_WINDOWS or sys.platform == "darwin" else html.escape(text, quote=False)
+
 
 POLL_MS = 3000
 #: At login the tray may start before the desktop's tray host.
@@ -174,10 +184,13 @@ def find_problems(
     recording: Mapping[str, Any],
     performance: Any,
     plugins_offline: Sequence[str] = (),
+    acceleration: object = None,
 ) -> tuple[Problem, ...]:
     """What needs attention: cameras offline, recordings that failed,
-    analytics plugins that stopped answering (by name), and diagnostics
-    warnings. The cloud adds its own (see ``read_status``)."""
+    analytics plugins that stopped answering (by name), diagnostics
+    warnings, and a graphics card that cannot decode for want of its driver
+    (``acceleration``: ``system.status`` ``video_acceleration``). The cloud
+    adds its own (see ``read_status``)."""
     problems: list[Problem] = []
     offline = cameras - online
     if offline > 0:
@@ -194,6 +207,11 @@ def find_problems(
             label += " (critical)"
         explanation = str(bottleneck.get("explanation") or "")
         problems.append(Problem(label, f"{label}: {explanation}" if explanation else ""))
+    notice = acceleration_notice(acceleration)
+    if notice is not None:
+        # The menu line stays short: Diagnostics has the reason and packages.
+        detail = f"{DRIVER_MISSING_TITLE}: {notice.short} (see Diagnostics)"
+        problems.append(Problem(DRIVER_MISSING_TITLE, detail))
     return tuple(problems)
 
 
@@ -239,6 +257,7 @@ def read_status(
             recording=recording,
             performance=performance,
             plugins_offline=plugins_offline,
+            acceleration=acceleration,
         )
         + tuple(extra_problems),
     )
@@ -391,7 +410,7 @@ class TrayApp(QObject):
         """A desktop alert from the recorder, as a system notification."""
         self.icon.showMessage(
             str(alert.get("title") or "NeuroWatch alert"),
-            str(alert.get("message") or ""),
+            notification_body(str(alert.get("message") or "")),
             QSystemTrayIcon.MessageIcon.Information,
             10_000,
         )

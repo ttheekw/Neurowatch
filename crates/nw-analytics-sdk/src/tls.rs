@@ -27,6 +27,7 @@ struct Shared {
     closed: Arc<AtomicBool>,
     binding: String,
     peer: Option<String>,
+    address: Option<std::net::SocketAddr>,
     worker: std::thread::Thread,
 }
 impl Drop for Shared {
@@ -63,6 +64,7 @@ impl TlsIo {
         )
     }
     fn new(mut socket: TcpStream, mut tls: rustls::Connection, plugin: bool) -> io::Result<Self> {
+        let address = socket.peer_addr().ok();
         socket.set_nodelay(true)?;
         socket.set_read_timeout(Some(Duration::from_secs(1)))?;
         socket.set_write_timeout(Some(Duration::from_secs(1)))?;
@@ -122,6 +124,7 @@ impl TlsIo {
             closed,
             binding: identity::hex(&binding),
             peer,
+            address,
             worker: worker.thread().clone(),
         })))
     }
@@ -130,6 +133,12 @@ impl TlsIo {
     }
     pub fn peer_key(&self) -> Option<&str> {
         self.0.peer.as_deref()
+    }
+    /// Who connected (their address; [`Peer::Unknown`] when the system did not say).
+    pub fn peer(&self) -> crate::peer::Peer {
+        self.0
+            .address
+            .map_or(crate::peer::Peer::Unknown, crate::peer::Peer::from_socket)
     }
     pub fn shutdown(&self) {
         self.0.closed.store(true, Ordering::Release);
@@ -274,27 +283,97 @@ impl Write for TlsIo {
         Ok(())
     }
 }
+/// Handshakes run at once. Each runs on its own thread: run one after another
+/// inside `accept`, a single peer that connected and sent nothing every few
+/// seconds kept every recorder out (vulnerability checklist R11).
+const MAX_HANDSHAKES: usize = 32;
+/// Finished sessions waiting for `accept`.
+const READY: usize = 16;
+
 pub struct Listener {
-    socket: TcpListener,
-    config: Arc<rustls::ServerConfig>,
+    address: SocketAddr,
+    ready: Mutex<Receiver<TlsIo>>,
+    stop: Arc<AtomicBool>,
 }
 impl Listener {
     pub fn bind(address: SocketAddr, key: &SigningKey) -> io::Result<Self> {
+        let socket = TcpListener::bind(address)?;
+        let address = socket.local_addr()?;
+        socket.set_nonblocking(true)?;
+        let config = Arc::new(crate::quic::server_tls(key)?);
+        let (tx, ready) = mpsc::sync_channel(READY);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name("tls-accept".into())
+            .spawn(move || accept_loop(&socket, &config, &tx, &stopping))?;
         Ok(Self {
-            socket: TcpListener::bind(address)?,
-            config: Arc::new(crate::quic::server_tls(key)?),
+            address,
+            ready: Mutex::new(ready),
+            stop,
         })
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
+        Ok(self.address)
     }
+    /// The next connection whose handshake finished.
     pub fn accept(&self) -> io::Result<TlsIo> {
-        loop {
-            let (socket, _) = self.socket.accept()?;
-            let tls = rustls::ServerConnection::new(Arc::clone(&self.config)).map_err(error)?;
-            if let Ok(io) = TlsIo::new(socket, tls.into(), true) {
-                return Ok(io);
+        self.ready
+            .lock()
+            .map_err(|_| error("TLS listener poisoned"))?
+            .recv()
+            .map_err(|_| error("TLS listener stopped"))
+    }
+}
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Accept connections and hand each to a handshake thread, up to
+/// [`MAX_HANDSHAKES`] at once (more are closed at once). An accept error
+/// (no file handles left) waits and goes on: it no longer ends the listener.
+fn accept_loop(
+    socket: &TcpListener,
+    config: &Arc<rustls::ServerConfig>,
+    ready: &SyncSender<TlsIo>,
+    stop: &AtomicBool,
+) {
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    while !stop.load(Ordering::Relaxed) {
+        let socket = match socket.accept() {
+            Ok((socket, _)) => socket,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
             }
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        };
+        if in_flight.load(Ordering::Relaxed) >= MAX_HANDSHAKES
+            || socket.set_nonblocking(false).is_err()
+        {
+            continue;
+        }
+        let Ok(tls) = rustls::ServerConnection::new(Arc::clone(config)) else {
+            continue;
+        };
+        in_flight.fetch_add(1, Ordering::Relaxed);
+        let counted = Arc::clone(&in_flight);
+        let ready = ready.clone();
+        let started = std::thread::Builder::new()
+            .name("tls-handshake".into())
+            .spawn(move || {
+                if let Ok(io) = TlsIo::new(socket, tls.into(), true) {
+                    let _ = ready.send(io);
+                }
+                counted.fetch_sub(1, Ordering::Relaxed);
+            });
+        if started.is_err() {
+            in_flight.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -310,6 +389,10 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             let mut plugin = listener.accept().unwrap();
+            assert_eq!(
+                plugin.peer(),
+                crate::peer::Peer::Ip(std::net::Ipv4Addr::LOCALHOST.into())
+            );
             tx.send(plugin.channel_binding().to_owned()).unwrap();
             let mut bytes = [0];
             assert_eq!(plugin.read(&mut bytes).unwrap(), 0);
@@ -328,5 +411,35 @@ mod tests {
         );
         node.shutdown();
         thread.join().unwrap();
+    }
+
+    /// Vulnerability checklist R11: a connection that never says anything
+    /// does not keep a recorder from connecting.
+    #[test]
+    fn a_silent_connection_does_not_hold_up_others() {
+        let key = SigningKey::from_bytes(&[14; 32]);
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &key).unwrap();
+        let address = listener.local_addr().unwrap();
+        let silent: Vec<TcpStream> = (0..3)
+            .map(|_| TcpStream::connect(address).unwrap())
+            .collect();
+        std::thread::sleep(Duration::from_millis(100));
+        let (tx, rx) = mpsc::channel();
+        let accepting = std::thread::spawn(move || {
+            let plugin = listener.accept().unwrap();
+            tx.send(()).unwrap();
+            plugin
+        });
+        let started = Instant::now();
+        let node = TlsIo::connect("127.0.0.1", address.port()).unwrap();
+        rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        node.shutdown();
+        drop(accepting.join().unwrap());
+        drop(silent);
     }
 }

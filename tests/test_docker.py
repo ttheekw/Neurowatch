@@ -7,7 +7,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-
 from test_release_packaging import RELEASE_WORKFLOW, _jobs
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,7 +18,10 @@ SMOKE_SCRIPT = ROOT / "scripts/docker_smoke.sh"
 
 def _stages(text: str) -> dict[str, str]:
     parts = re.split(r"^FROM (\S+) AS (\S+)$", text, flags=re.MULTILINE)
-    return {name: f"FROM {base}\n{body}" for base, name, body in zip(*[iter(parts[1:])] * 3)}
+    return {
+        name: f"FROM {base}\n{body}"
+        for base, name, body in zip(*[iter(parts[1:])] * 3, strict=False)
+    }
 
 
 @pytest.fixture(scope="module")
@@ -32,7 +34,7 @@ def test_images_install_the_release_package_with_headless_as_the_default_target(
     stages = _stages(text)
     assert list(stages) == ["base", "gui", "headless"]  # headless last: plain `docker build`
     # The arm64 packages need glibc 2.39.
-    assert stages["base"].startswith("FROM ubuntu:24.04")
+    assert stages["base"].startswith("FROM ubuntu:24.04@sha256:")
     assert "/tmp/neurowatch.deb" in stages["base"] and "tini" in stages["base"]
     assert stages["gui"].startswith("FROM base") and stages["headless"].startswith("FROM base")
     assert 'CMD ["headless"]' in stages["headless"] and 'CMD ["gui"]' in stages["gui"]
@@ -131,7 +133,10 @@ def test_run_script_gives_containers_what_they_need() -> None:
 def test_readme_gives_docker_run_commands_for_both_images_and_gpus() -> None:
     readme = (ROOT / "README.md").read_text()
     section = readme[readme.index("## Running in Docker") : readme.index("## Troubleshooting")]
-    assert "ghcr.io/ttheekw/neurowatch:latest" in section and "ghcr.io/ttheekw/neurowatch:gui" in section
+    assert (
+        "ghcr.io/ttheekw/neurowatch:latest" in section
+        and "ghcr.io/ttheekw/neurowatch:gui" in section
+    )
     assert section.count("docker run -d --name") == 2
     assert '--device /dev/dri --group-add "$(stat -c %g /dev/dri/renderD128)"' in section
     assert "`--gpus all`" in section
@@ -159,3 +164,45 @@ def test_release_builds_smoke_tests_and_publishes_both_images(workflow: str) -> 
         assert tag in publish, tag
     writers = [name for name, job in jobs.items() if "packages: write" in job]
     assert sorted(writers) == ["docker", "publish-docker"]
+
+
+def test_containers_run_without_capabilities_and_cannot_gain_privileges() -> None:
+    for path in (RUN_SCRIPT, SMOKE_SCRIPT):
+        text = path.read_text()
+        assert "--cap-drop ALL" in text and "--security-opt no-new-privileges" in text, path
+    compose = (ROOT / "docker/compose.yml").read_text()
+    assert "cap_drop: [ALL]" in compose and "no-new-privileges:true" in compose
+    for path in (ROOT / "docs/docker.md", ROOT / "README.md"):
+        runs = re.findall(r"docker run -d.*?(?=\n\S|\n```)", path.read_text(), re.DOTALL)
+        assert runs and all("--cap-drop ALL" in run for run in runs), path
+
+
+_DIGEST = re.compile(r"@sha256:[0-9a-f]{64}\b")
+
+
+def test_every_base_image_is_pinned_by_digest() -> None:
+    """A moving tag can change under a release build; the tag stays for
+    reading, the digest of the multi-architecture index is what is pulled."""
+    external = [
+        line.split()[1]
+        for line in DOCKERFILE.read_text().splitlines()
+        if line.startswith("FROM ") and line.split()[1] not in _stages(DOCKERFILE.read_text())
+    ]
+    assert external, "the Dockerfile builds on an external base"
+    for image in external:
+        assert ":" in image.split("@")[0] and _DIGEST.search(image), image
+    # The release workflow's install matrix, by name, tag and digest.
+    matrix = re.findall(
+        r"\{image: '([^']+)', digest: '(sha256:[0-9a-f]{64})'", RELEASE_WORKFLOW.read_text()
+    )
+    assert len(matrix) == 9
+    assert "${{ matrix.image }}@${{ matrix.digest }}" in RELEASE_WORKFLOW.read_text()
+    assert not re.search(r"\{image: '[^']+', format", RELEASE_WORKFLOW.read_text())
+    # No other workflow or script runs an unpinned distribution image.
+    for path in [
+        *(ROOT / ".github/workflows").glob("*.yml"),
+        ROOT / "scripts/install_gstreamer_dev_sdk.sh",
+    ]:
+        for line in path.read_text().splitlines():
+            if re.search(r"^\s*(container|image):\s*['\"]?\w", line) and "matrix" not in line:
+                assert _DIGEST.search(line), f"{path.name}: {line.strip()}"

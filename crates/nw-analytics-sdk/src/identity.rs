@@ -1,6 +1,6 @@
 //! Ed25519 session authentication, independent of any transport or recorder.
 pub use ed25519_dalek::SigningKey;
-use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
 use nw_analytics_protocol::{
     auth::{Authenticate, PluginIdentity},
     messages::Manifest,
@@ -163,7 +163,7 @@ fn verify(public: &str, signature: &str, bytes: &[u8]) -> bool {
         return false;
     };
     VerifyingKey::from_bytes(&public).is_ok_and(|key| {
-        key.verify(bytes, &Signature::from_bytes(&signature))
+        key.verify_strict(bytes, &Signature::from_bytes(&signature))
             .is_ok()
     })
 }
@@ -219,5 +219,16 @@ mod tests {
         assert!(!verify_authenticate(&auth, &challenge().unwrap(), plugin));
         manifest.permissions.push("decoded_frames".into());
         assert!(!verify_manifest(&manifest, &nonce, "tls-a"));
+    }
+
+    #[test]
+    fn a_weak_key_signs_nothing() {
+        // The identity point is a small-order key: with plain `verify` the
+        // signature (R = identity, s = 0) holds for every message.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut signature = [0u8; 64];
+        signature[0] = 1;
+        assert!(!verify(&hex(&identity), &hex(&signature), b"any message"));
     }
 }

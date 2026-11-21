@@ -74,6 +74,7 @@ fn a_plugin_receives_the_cameras_video_and_its_events_reach_the_hub() {
     let host = PluginHost::default();
     let hubs = Arc::new(StreamHubs::default());
     let context = Context {
+        fallback: None,
         managed: false,
         tickets: Default::default(),
         server_id: "fake".into(),
@@ -347,6 +348,7 @@ fn an_unreachable_plugin_is_reported_and_retried() {
     let dir = std::env::temp_dir().join(format!("nw-plugin-{}", uuid::Uuid::new_v4().simple()));
     let host = PluginHost::default();
     let context = Context {
+        fallback: None,
         managed: false,
         tickets: Default::default(),
         server_id: "gone".into(),
@@ -420,6 +422,7 @@ fn an_unapproved_or_changed_key_gets_no_camera_bindings_or_credentials() {
         let listener = UnixListener::bind(&path).unwrap();
         let host = PluginHost::default();
         let context = Context {
+            fallback: None,
             managed: false,
             tickets: Default::default(),
             server_id: "test".into(),
@@ -516,6 +519,7 @@ fn unsigned_legacy_and_invalid_signed_plugins_are_refused_before_authorization()
         let host = PluginHost::default();
         let key = nw_analytics_sdk::identity::SigningKey::from_bytes(&[3; 32]);
         let context = Context {
+            fallback: None,
             managed: false,
             tickets: Default::default(),
             server_id: "test".into(),
@@ -826,6 +830,7 @@ fn a_hosted_plugin_gets_the_ticket_before_any_camera() {
         .and_then(|store| store.load_or_generate())
         .unwrap();
     let context = Context {
+        fallback: None,
         managed: true,
         tickets: Arc::clone(&host.tickets),
         server_id: "hosted".into(),
@@ -934,5 +939,77 @@ fn a_hosted_plugin_gets_the_ticket_before_any_camera() {
     assert!(ended);
     stop.store(true, Ordering::Release);
     drop(plugin);
+    thread.join().unwrap();
+}
+
+#[test]
+fn a_hosted_plugin_unreachable_over_quic_is_reached_over_its_fallback_at_once() {
+    let dir = std::env::temp_dir().join(format!(
+        "nw-plugin-fallback-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Nothing answers QUIC here: a UDP port bound and never read.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    let path = dir.join("p.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let host = PluginHost::default();
+    let context = Context {
+        fallback: Some(Address::Unix(path.clone())),
+        managed: false,
+        tickets: Default::default(),
+        server_id: "two-ways".into(),
+        address: Address::Quic {
+            host: "127.0.0.1".into(),
+            port,
+        },
+        node: NodeInfo {
+            name: "Test".into(),
+            version: "0".into(),
+        },
+        streams: Arc::new(StreamHubs::default()),
+        events: Arc::new(EventHub::new(Arc::new(Mutex::new(
+            crate::db::connection::open_in_memory().unwrap(),
+        )))),
+        status: Arc::clone(&host.status),
+        overlays: Arc::clone(&host.overlays),
+        approval: None,
+        config_path: dir.join("config.json"),
+        queries: Arc::clone(&host.queries),
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || session::run(context, Arc::default(), stop))
+    };
+    let started = Instant::now();
+    listener.set_nonblocking(true).unwrap();
+    let mut accepted = 0;
+    // The first attempt gives QUIC a few seconds, then takes the fallback in
+    // the same pass; later ones go to the fallback first.
+    while accepted < 2 && started.elapsed() < Duration::from_secs(20) {
+        match listener.accept() {
+            Ok((conn, _)) => {
+                accepted += 1;
+                if accepted == 1 {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(8),
+                        "no backoff before the fallback"
+                    );
+                }
+                drop(conn);
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    assert_eq!(accepted, 2);
+    let status = host.status.lock().unwrap();
+    assert_eq!(
+        status["two-ways"].address,
+        format!("unix:{}", path.display())
+    );
+    drop(status);
+    stop.store(true, Ordering::Release);
     thread.join().unwrap();
 }

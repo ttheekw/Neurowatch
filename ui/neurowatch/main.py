@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import signal
 import sys
 import time
@@ -78,7 +77,7 @@ from neurowatch.models.edition import CAMERA_LIMIT_REACHED, Edition, limit_messa
 from neurowatch.models.events import ACTIVITY_KINDS, SYSTEM_KINDS, ActivityTracker, Event
 from neurowatch.models.plugins import offline_plugin_names
 from neurowatch.models.preview_fps import PreviewFps
-from neurowatch.models.video_decoder import restart_reply
+from neurowatch.models.video_decoder import DRIVER_MISSING_TITLE, restart_reply
 from neurowatch.models.wall_layout import Placement
 from neurowatch.models.window_session import saved_windows
 from neurowatch.service.leftovers import clean_portable_copy, leftovers_message
@@ -86,11 +85,18 @@ from neurowatch.service.manager import ServiceController
 from neurowatch.service.paths import service_endpoint
 from neurowatch.service.startup import StartupPrefs, load_prefs
 from neurowatch.theme import app_icon, apply_app_theme, icon_path
+from neurowatch.utils.private_files import (
+    PrivateRotatingFileHandler,
+    copy_private,
+    open_private,
+    private_dir,
+)
 from neurowatch.utils.threads import Worker, retire, wait_for_retired
 from neurowatch.widgets.alert_toasts import AlertToasts
 from neurowatch.widgets.backup_notice import BackupIndicator
 from neurowatch.widgets.camera_panel import CameraPanel
 from neurowatch.widgets.compact_bar import CompactTitleBar
+from neurowatch.widgets.decoder_notice import DecoderDriverNotice
 from neurowatch.widgets.detached_wall import DEFAULT_CYCLE_INTERVAL, DetachedWallWindow
 from neurowatch.widgets.edition_notice import EditionNotice, open_unlimited
 from neurowatch.widgets.events_view import EventsView
@@ -582,6 +588,12 @@ class MainWindow(QMainWindow):
         self._plugin_notice = PluginOfflineNotice()
         self._plugin_notice.clicked.connect(lambda: self._title_bar.select_tab("plugins"))
         self.add_status_indicator(self._plugin_notice)
+        # A graphics card that can decode video without its driver: amber,
+        # a click opens Diagnostics (which says what to install).
+        self._decoder_notice = DecoderDriverNotice()
+        self._decoder_notice.clicked.connect(lambda: self._title_bar.select_tab("diagnostics"))
+        self.add_status_indicator(self._decoder_notice)
+        self._decoder_notice_shown = False  # the startup message, once per app start
         self._poll_worker.system.connect(self._on_system_status)
         self._poll_worker.start()
 
@@ -690,7 +702,9 @@ class MainWindow(QMainWindow):
 
         logger.info("Camera list loaded from backend: %d camera(s)", len(self._cameras))
         if isinstance(backend_status, dict):
-            self._status_bar.set_video_acceleration(backend_status.get("video_acceleration", {}))
+            acceleration = backend_status.get("video_acceleration", {})
+            self._status_bar.set_video_acceleration(acceleration)
+            self._decoder_notice.set_acceleration(acceleration)
         self._set_edition(Edition.from_status(backend_status))
         self._apply_settings()
         self._refresh_all()
@@ -703,10 +717,29 @@ class MainWindow(QMainWindow):
             show_message(self, title, message, kind="warning")
 
     def report_startup_error(self) -> None:
-        """Show a load error deferred from construction, once startup is done."""
+        """Show a load error deferred from construction, once startup is done;
+        without one, say once when the graphics card's driver is missing."""
         error, self._startup_load_error = self._startup_load_error, None
         if error is not None:
             self._show_load_error(error)
+            return
+        # Once the main loop runs: a modal dialog inside startup would hold it.
+        QTimer.singleShot(0, self._report_decoder_notice)
+
+    def _report_decoder_notice(self) -> None:
+        """Once per app start: this PC has a graphics card that can decode
+        video, but its driver or software is missing (from the
+        ``system.status`` the window loaded; no backend call here)."""
+        notice = self._decoder_notice.notice
+        if notice is None or self._decoder_notice_shown:
+            return
+        self._decoder_notice_shown = True
+        detail = notice.detail
+        if detail:
+            detail = f"Packages to install:\n{detail}\n\nDiagnostics (≡ menu) shows this again."
+        else:
+            detail = "Diagnostics (≡ menu) shows this again."
+        show_message(self, DRIVER_MISSING_TITLE, notice.text, kind="warning", detail=detail)
 
     # ------------------------------------------------------------------
     # Camera management
@@ -2249,7 +2282,10 @@ class MainWindow(QMainWindow):
             return
         config_path = _active_config_path()
         if os.path.exists(config_path):
-            shutil.copy(config_path, path)
+            try:
+                copy_private(config_path, path)
+            except OSError as e:
+                show_message(self, "Export Failed", str(e), kind="warning")
         else:
             show_message(
                 self,
@@ -2288,7 +2324,7 @@ class MainWindow(QMainWindow):
         config_path = _active_config_path()
         try:
             os.makedirs(os.path.dirname(config_path), exist_ok=True)
-            shutil.copy(path, config_path)
+            copy_private(path, config_path)
         except OSError as e:
             show_message(self, "Import Failed", str(e), kind="warning")
             return
@@ -2330,6 +2366,8 @@ class MainWindow(QMainWindow):
         from neurowatch.ipc.auth import may
 
         self._plugin_notice.set_offline(offline_plugin_names(status), can_open=may("admin"))
+        if isinstance(status, dict):
+            self._decoder_notice.set_acceleration(status.get("video_acceleration"))
         self._backup_indicator.set_status(status)
         # Each wall tile of a camera with a plan shows its backup symbol too.
         marks = backup_tile_marks(status)
@@ -2496,7 +2534,9 @@ def _configure_logging() -> None:
     else:
         data_dir = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     log_dir = os.path.join(data_dir, "neurowatch")
-    os.makedirs(log_dir, exist_ok=True)
+    # The log names cameras and their addresses: owner only (the folder too,
+    # which also holds the recording index).
+    private_dir(log_dir)
     log_file = os.path.join(log_dir, "neurowatch.log")
 
     root = logging.getLogger()
@@ -2511,7 +2551,7 @@ def _configure_logging() -> None:
     root.addHandler(stream_handler)
 
     # rotating file — DEBUG and above (max 5 MB × 3 files)
-    file_handler = logging.handlers.RotatingFileHandler(
+    file_handler = PrivateRotatingFileHandler(
         log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
     )
     file_handler.setLevel(logging.DEBUG)
@@ -2554,7 +2594,7 @@ def _capture_crashes(log_dir: str) -> None:
     from PySide6.QtCore import QtMsgType, qInstallMessageHandler
 
     try:
-        _crash_log = open(os.path.join(log_dir, "crash.log"), "a", encoding="utf-8")
+        _crash_log = open_private(os.path.join(log_dir, "crash.log"), "a", encoding="utf-8")
         faulthandler.enable(file=_crash_log, all_threads=True)
     except OSError as e:
         logger.warning("Crash log unavailable: %s", e)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import struct
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,10 @@ class _DummySocket:
 
     def connect(self, addr):
         self.connected = addr
+
+    def getsockopt(self, level, option, size):
+        # The backend runs as this user.
+        return struct.pack("3i", os.getpid(), os.geteuid(), os.getegid())
 
     def close(self):
         pass
@@ -88,6 +93,9 @@ def test_resolve_endpoints_prefers_explicit_endpoint(monkeypatch):
 def test_resolve_endpoints_uses_env_override(monkeypatch):
     monkeypatch.setenv("NW_IPC_ENDPOINT", "unix:/tmp/from-env.sock")
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    # Not this computer's own runtime folder: a socket left there by the
+    # developer's recorder would be tried first.
+    monkeypatch.setattr("neurowatch.ipc.sync_client.login_runtime_dir", lambda: None)
     client = SyncIpcClient()
     assert client._endpoints[0] == "unix:/tmp/from-env.sock"
     assert "unix:/tmp/neurowatch/control.sock" in client._endpoints
@@ -190,3 +198,58 @@ def test_call_waits_for_a_longer_reply_only_when_asked(monkeypatch):
 
     assert client.call("example.slow", timeout=300.0) == {"ok": True}
     assert sock.timeout_during_recv == 300.0
+
+
+def test_a_listener_of_another_user_is_never_sent_anything(monkeypatch, tmp_path):
+    """Vulnerability checklist R9: another local user can create the shared
+    /tmp/neurowatch socket; the client must not send it passwords or codes."""
+    sent: list[bytes] = []
+
+    class StrangerSocket(_DummySocket):
+        def getsockopt(self, level, option, size):
+            return struct.pack("3i", 1, os.geteuid() + 1, 1)
+
+        def sendall(self, payload):
+            sent.append(payload)
+
+    monkeypatch.setattr(socket, "socket", lambda *args: StrangerSocket())
+    client = SyncIpcClient(endpoint="unix:/tmp/neurowatch/control.sock")
+    with pytest.raises(BackendOfflineError):
+        client.call("auth.login", {"username": "admin", "password": "secret"})
+    assert sent == []
+
+
+def test_a_real_socket_of_this_user_is_accepted(tmp_path):
+    import threading
+
+    path = str(tmp_path / "control.sock")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    server.listen(1)
+
+    def answer():
+        conn, _ = server.accept()
+        with conn:
+            conn.recv(65536)
+            conn.sendall(b'{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n')
+
+    thread = threading.Thread(target=answer)
+    thread.start()
+    try:
+        assert SyncIpcClient(endpoint=f"unix:{path}").call("system.status") == {"ok": True}
+    finally:
+        thread.join(5)
+        server.close()
+
+
+def test_the_per_user_tmp_folder_is_a_candidate_without_a_runtime_dir(monkeypatch, tmp_path):
+    """Round 3: a service that could not use a shared /tmp/neurowatch listens in
+    /tmp/neurowatch-<uid>; the client looks there too."""
+    monkeypatch.delenv("NW_IPC_ENDPOINT", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr("neurowatch.ipc.sync_client.login_runtime_dir", lambda: None)
+    monkeypatch.setattr(
+        "neurowatch.ipc.sync_client.tmp_fallback_endpoint",
+        lambda: f"unix:{tmp_path}/neurowatch-1/control.sock",
+    )
+    assert f"unix:{tmp_path}/neurowatch-1/control.sock" in SyncIpcClient()._endpoints

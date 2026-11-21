@@ -113,6 +113,19 @@ impl<'a> Bits<'a> {
     }
 }
 
+/// `size` less the crop offsets (each counted in units of `unit`). The
+/// offsets come straight from the stream, so every step is checked: a huge
+/// value ends in `None`, never a wrapped (or panicking) subtraction.
+fn cropped(
+    size: (u32, u32),
+    unit: (u32, u32),
+    (left, right, top, bottom): (u32, u32, u32, u32),
+) -> Option<(u32, u32)> {
+    let across = unit.0.checked_mul(left.checked_add(right)?)?;
+    let down = unit.1.checked_mul(top.checked_add(bottom)?)?;
+    Some((size.0.checked_sub(across)?, size.1.checked_sub(down)?))
+}
+
 /// H.264 SPS (7.3.2.1.1) → cropped picture size.
 fn h264_size(nal: &[u8]) -> Option<(u32, u32)> {
     let data = rbsp(nal);
@@ -176,10 +189,11 @@ fn h264_size(nal: &[u8]) -> Option<(u32, u32)> {
             2 => (2, 1),
             _ => (1, 1),
         };
-        let crop_x = sub_width;
-        let crop_y = sub_height * (2 - frame_mbs_only);
-        width = width.checked_sub(crop_x * left.checked_add(right)?)?;
-        height = height.checked_sub(crop_y * top.checked_add(bottom)?)?;
+        (width, height) = cropped(
+            (width, height),
+            (sub_width, sub_height * (2 - frame_mbs_only)),
+            (left, right, top, bottom),
+        )?;
     }
     (width > 0 && height > 0).then_some((width, height))
 }
@@ -272,8 +286,11 @@ pub fn hevc_sps(nal: &[u8]) -> Option<HevcSps> {
             2 => (2, 1),
             _ => (1, 1),
         };
-        width = width.checked_sub(sub_width * left.checked_add(right)?)?;
-        height = height.checked_sub(sub_height * top.checked_add(bottom)?)?;
+        (width, height) = cropped(
+            (width, height),
+            (sub_width, sub_height),
+            (left, right, top, bottom),
+        )?;
     }
     let bit_depth_luma_minus8 = bits.ue()?;
     let bit_depth_chroma_minus8 = bits.ue()?;
@@ -292,6 +309,20 @@ pub fn hevc_sps(nal: &[u8]) -> Option<HevcSps> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crop_offsets_from_the_stream_never_wrap_or_panic() {
+        assert_eq!(
+            cropped((1920, 1088), (2, 2), (0, 0, 0, 4)),
+            Some((1920, 1080))
+        );
+        assert_eq!(cropped((16, 16), (2, 2), (8, 0, 0, 0)), Some((0, 16)));
+        assert_eq!(cropped((16, 16), (2, 2), (9, 0, 0, 0)), None);
+        // Each of these overflowed a u32 before the subtraction.
+        assert_eq!(cropped((16, 16), (2, 2), (u32::MAX, 1, 0, 0)), None);
+        assert_eq!(cropped((16, 16), (2, 4), (0, 0, u32::MAX / 2, 0)), None);
+        assert_eq!(cropped((16, 16), (2, 2), (u32::MAX, u32::MAX, 0, 0)), None);
+    }
 
     fn unhex(text: &str) -> Vec<u8> {
         (0..text.len())

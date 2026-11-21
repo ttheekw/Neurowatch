@@ -2129,7 +2129,6 @@ dependencies = [
  "hmac",
  "livekit-api",
  "nw-cloud-protocol",
- "nw-core",
  "reqwest",
  "rusqlite",
  "serde",

@@ -220,3 +220,54 @@ def test_the_onvif_address_and_port_typed_are_saved_for_camera_events(qtbot):
     edited._set_mode("urls")
     edited._a_url.setText("rtsp://10.0.0.99/main")
     assert edited.get_config().onvif is None
+
+
+def test_the_password_text_choice_is_off_by_default_and_saved_with_the_onvif_service(qtbot):
+    dlg = AddEditCameraDialog(camera=_searched_camera())
+    qtbot.addWidget(dlg)
+    box = dlg._allow_password_text
+    assert "unencrypted" in box.text() and not box.isChecked()
+    assert "allow_password_text" not in (dlg.get_config().onvif or {})
+
+    box.setChecked(True)
+    assert dlg.get_config().onvif == {
+        "device_url": "http://10.0.0.5:8080/onvif/device_service",
+        "allow_password_text": True,
+    }
+
+
+def test_a_saved_password_text_choice_shows_and_can_be_switched_off(qtbot):
+    camera = _searched_camera()
+    camera.onvif = {
+        "device_url": "http://10.0.0.5:8080/onvif/device_service",
+        "allow_password_text": True,
+    }
+    dlg = AddEditCameraDialog(camera=camera)
+    qtbot.addWidget(dlg)
+    assert dlg._allow_password_text.isChecked()
+    assert dlg.get_config().onvif["allow_password_text"] is True
+    dlg._allow_password_text.setChecked(False)
+    # Spelled out as off: the backend keeps a setting a request leaves out.
+    assert dlg.get_config().onvif["allow_password_text"] is False
+
+
+def test_load_streams_passes_the_password_text_choice_to_the_backend(qtbot, monkeypatch):
+    from neurowatch.dialogs import camera_dialog
+
+    calls: list[tuple[str, dict]] = []
+
+    class Client:
+        def __init__(self, endpoint=None) -> None:
+            pass
+
+        def call(self, method, params=None):
+            calls.append((method, params))
+            return {}
+
+    monkeypatch.setattr(camera_dialog, "SyncIpcClient", Client)
+    worker = camera_dialog._StreamsWorker(None, "cand", "10.0.0.5", 80, "admin", "pw", True)
+    worker.run()
+    assert calls[0][1]["allow_password_text"] is True
+    calls.clear()
+    camera_dialog._StreamsWorker(None, "cand", "10.0.0.5", 80, "admin", "pw").run()
+    assert "allow_password_text" not in calls[0][1]

@@ -121,6 +121,16 @@ fn backup_summary(st: &AppState) -> Value {
     json!({"state": state, "cameras": report.cameras.len(), "failing": failing, "states": states})
 }
 
+/// A camera id names folders, shared-memory rings and sockets, so it is a
+/// short plain token (the portal path applies the same rule).
+pub(crate) fn valid_camera_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 impl RpcHandler {
     pub fn new(
         state: Arc<RwLock<AppState>>,
@@ -285,9 +295,17 @@ impl RpcHandler {
         }
         let id = req["id"].clone();
         let refuse = |code: i64, message: String| json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}});
+        // Status reads need no sign-in (the tray shows them), but a signed-in
+        // camera-limited user sees only their own cameras in them.
+        let mut status_viewer = None;
         let session = {
             let st = self.state.read().await;
-            if !st.config.accounts.enabled || access::open(&method) {
+            if st.config.accounts.enabled && access::open(&method) {
+                status_viewer = req["session"]
+                    .as_str()
+                    .and_then(|token| st.sessions.session(&st.config.accounts, token));
+                None
+            } else if !st.config.accounts.enabled {
                 None
             } else {
                 match req["session"]
@@ -305,7 +323,13 @@ impl RpcHandler {
             return refuse(-32602, "Plugin page parameters must be an object".into());
         }
         let Some(session) = session else {
-            return self.dispatch_from(&req, transport).await;
+            let mut response = self.dispatch_from(&req, transport).await;
+            if let (Some(viewer), Some(result)) = (status_viewer, response.get_mut("result")) {
+                if let Ok(filtered) = access::filter_result(&viewer, &method, result.take()) {
+                    *result = filtered;
+                }
+            }
+            return response;
         };
         if session.role < access::required_role(&method) {
             tracing::info!(username = %session.username, method = %method, "Refused: role");
@@ -316,6 +340,17 @@ impl RpcHandler {
         }
         if let Err(message) = access::check_cameras(&session, &method, &mut req["params"]) {
             return refuse(NOT_ALLOWED, message);
+        }
+        if matches!(method.as_str(), "talk.stop" | "talk.renew") && !session.cameras.is_empty() {
+            // The session being stopped or renewed belongs to a camera: a
+            // limited user may touch only talks on their own cameras.
+            let talk = Arc::clone(&self.state.read().await.talk);
+            let client = req["params"]["client_id"].as_str().unwrap_or("");
+            if let Some((camera_id, talker)) = talk.status() {
+                if talker == client && !session.sees(&camera_id) {
+                    return refuse(NOT_ALLOWED, format!("you may not use camera '{camera_id}'"));
+                }
+            }
         }
         if let Err(error) = self
             .events
@@ -514,6 +549,11 @@ impl RpcHandler {
     /// under the config write lock, before any side effect.
     async fn add_camera(&self, mut cam: CameraConfig) -> Result<Value, RpcError> {
         cam.normalize_stream_ids();
+        if !valid_camera_id(&cam.id) {
+            return Err(RpcError::invalid_params(
+                "camera id must be 1 to 64 letters, digits, '-' or '_'",
+            ));
+        }
         let mut st = self.state.write().await;
         if st
             .config
@@ -757,6 +797,12 @@ impl RpcHandler {
             crate::onvif_events::url_host(&old.url) == crate::onvif_events::url_host(&cam.url);
         if params.get("onvif").is_none() && same_host {
             cam.onvif = old.onvif.clone();
+        } else if let (Some(endpoint), Some(saved)) = (cam.onvif.as_mut(), old.onvif.as_ref()) {
+            // Clients that do not know the setting (older desktops, portals)
+            // send an `onvif` object without it: they keep the user's choice.
+            if params["onvif"].get("allow_password_text").is_none() {
+                endpoint.allow_password_text = saved.allow_password_text;
+            }
         }
         // Clients that do not know it (older desktops and portals) keep it.
         if params.get("always_decode").is_none() {
@@ -1115,6 +1161,7 @@ impl RpcHandler {
                 let credentials = text("username").map(|username| discovery::onvif::Credentials {
                     username: username.to_owned(),
                     password: decode_password(params["password_b64"].as_str()),
+                    allow_password_text: params["allow_password_text"].as_bool() == Some(true),
                 });
                 let cameras = self.state.read().await.config.cameras.clone();
                 let (candidate, streams, main, sub) = self
@@ -1187,27 +1234,64 @@ fn decode_password(password_b64: Option<&str>) -> String {
 }
 
 pub fn acceleration_json(kind: crate::pipeline::hwaccel::HwAccelKind) -> Value {
-    let mut value = if let Some(reason) = crate::pipeline::hwaccel::live_view_block_reason() {
-        json!({
+    use crate::pipeline::hwaccel;
+    let mut value = acceleration_value(
+        kind,
+        hwaccel::live_view_block_reason(),
+        hwaccel::waiting_for_gpu_access(),
+        hwaccel::missing_driver(),
+    );
+    add_decoder_choice(&mut value);
+    value
+}
+
+/// `video_acceleration` from what the probe found: the decoder in use and,
+/// when that is the CPU although a graphics card is there, why (`reason`,
+/// with a stable `reason_code`). A missing driver also names the card and
+/// the packages that bring the driver (additive: older UIs show `reason`).
+fn acceleration_value(
+    kind: crate::pipeline::hwaccel::HwAccelKind,
+    live_view_blocked: Option<&str>,
+    gpu_pending: bool,
+    missing_driver: Option<&crate::pipeline::decoder_driver::MissingDriver>,
+) -> Value {
+    if let Some(reason) = live_view_blocked {
+        return json!({
             "kind": "blocked",
             "label": "Live view blocked — update GStreamer",
             "hardware": false,
             "available": false,
             "reason": reason,
-        })
-    } else {
-        let mut value = json!({
-            "kind": kind.wire_kind(),
-            "label": kind.to_string(),
-            "hardware": kind.is_hardware(),
-            "available": true,
         });
-        if !kind.is_hardware() && crate::pipeline::hwaccel::waiting_for_gpu_access() {
-            value["reason"] = json!(crate::pipeline::hwaccel::GPU_NOT_ACCESSIBLE);
-        }
-        value
-    };
-    add_decoder_choice(&mut value);
+    }
+    let mut value = json!({
+        "kind": kind.wire_kind(),
+        "label": kind.to_string(),
+        "hardware": kind.is_hardware(),
+        "available": true,
+    });
+    if kind.is_hardware() {
+        return value;
+    }
+    if gpu_pending {
+        value["reason"] = json!(crate::pipeline::hwaccel::GPU_NOT_ACCESSIBLE);
+        value["reason_code"] = json!("GPU_NOT_ACCESSIBLE");
+    } else if let Some(missing) = missing_driver {
+        value["reason"] = json!(missing.reason);
+        value["reason_code"] = json!(missing.reason_code);
+        value["cause"] = json!(missing.cause.id());
+        value["gpu"] = json!({
+            "vendor": missing.vendor.name(),
+            "kernel_driver": missing.kernel_driver,
+            "render_node": missing.render_node.display().to_string(),
+            "va_driver": missing.va_driver,
+        });
+        value["suggested_packages"] = json!({
+            "deb": missing.packages.deb,
+            "rpm": missing.packages.rpm,
+            "arch": missing.packages.arch,
+        });
+    }
     value
 }
 
@@ -1736,6 +1820,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn camera_add_refuses_ids_that_are_not_plain_tokens() {
+        let (state, handler, cfg_path) = handler_with_config("bad-id", AppConfig::default());
+        for bad in ["../../etc", "a/b", "", "has space", &"x".repeat(65)] {
+            let mut camera = nw_core::camera::CameraConfig::new("Gate", "rtsp://10.0.0.5/live");
+            camera.id = bad.to_string();
+            let reply = dispatch(
+                &handler,
+                "camera.add",
+                serde_json::to_value(&camera).unwrap(),
+            )
+            .await;
+            assert!(reply.get("error").is_some(), "{bad}: {reply}");
+        }
+        let count = state.read().await.config.cameras.len();
+        teardown(&state, &cfg_path).await;
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
     async fn camera_add_refuses_the_same_stream_twice_whatever_the_credentials() {
         let (state, handler, cfg_path) = handler_with_config("dup-add", AppConfig::default());
         let mut first = nw_core::camera::CameraConfig::new("Gate", "rtsp://admin:a@10.0.0.5/live");
@@ -2019,6 +2122,7 @@ mod tests {
             device_url: "http://192.0.2.1/onvif/device_service".into(),
             events_url: None,
             ptz_url: None,
+            allow_password_text: false,
         });
         let (state, handler, cfg_path) = handler_with_config("keep", config);
         let mut edited = serde_json::to_value(&state.read().await.config.cameras[0]).unwrap();
@@ -2033,6 +2137,42 @@ mod tests {
         assert_eq!(cam.name, "Renamed");
         assert_eq!(cam.motion.source, nw_core::camera::MotionSource::Onvif);
         assert!(cam.onvif.is_some());
+    }
+
+    #[tokio::test]
+    async fn camera_update_keeps_the_password_text_choice_unless_the_request_sets_it() {
+        let mut config = config_with_camera("cam-pt", "rtsp://192.0.2.1/a");
+        config.cameras[0].onvif = Some(nw_core::camera::OnvifEndpoint {
+            device_url: "http://192.0.2.1/onvif/device_service".into(),
+            events_url: None,
+            ptz_url: None,
+            allow_password_text: true,
+        });
+        let (state, handler, cfg_path) = handler_with_config("pt", config);
+        let stored = serde_json::to_value(&state.read().await.config.cameras[0]).unwrap();
+
+        // An older client sends the onvif object without the setting.
+        let mut older = stored.clone();
+        older["onvif"] = json!({"device_url": "http://192.0.2.1/onvif/device_service"});
+        older["name"] = json!("Older");
+        let reply = dispatch(&handler, "camera.update", older).await;
+        assert!(reply["result"].is_object(), "{reply}");
+        let kept = state.read().await.config.cameras[0].onvif.clone().unwrap();
+
+        // The desktop sets it off explicitly.
+        let mut cleared = stored.clone();
+        cleared["onvif"] = json!({
+            "device_url": "http://192.0.2.1/onvif/device_service",
+            "allow_password_text": false
+        });
+        cleared["name"] = json!("Cleared");
+        let reply = dispatch(&handler, "camera.update", cleared).await;
+        assert!(reply["result"].is_object(), "{reply}");
+        let off = state.read().await.config.cameras[0].onvif.clone().unwrap();
+        teardown(&state, &cfg_path).await;
+
+        assert!(kept.allow_password_text, "omitted: kept");
+        assert!(!off.allow_password_text, "set off: off");
     }
 
     #[tokio::test]
@@ -2720,6 +2860,81 @@ mod tests {
         assert_eq!(tcp["error"]["code"], -32601, "never over plain TCP");
         assert_eq!(error_code(&without_cloud), -32601);
         assert_eq!(error_code(&unknown), -32601);
+    }
+}
+
+#[cfg(test)]
+mod acceleration_tests {
+    use std::path::PathBuf;
+
+    use serde_json::json;
+
+    use super::acceleration_value;
+    use crate::pipeline::decoder_driver::{
+        classify, Facts, RenderGpu, Vendor, VAAPI_DRIVER_MISSING,
+    };
+    use crate::pipeline::hwaccel::{HwAccelKind, GPU_NOT_ACCESSIBLE};
+
+    fn intel_without_driver() -> crate::pipeline::decoder_driver::MissingDriver {
+        let gpus = [RenderGpu {
+            node: PathBuf::from("/dev/dri/renderD128"),
+            vendor: Some(Vendor::Intel),
+            kernel_driver: Some("i915".into()),
+            openable: true,
+        }];
+        classify(&Facts {
+            gpus: &gpus,
+            va_plugin: true,
+            ..Facts::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_missing_driver_names_the_card_and_the_packages() {
+        let missing = intel_without_driver();
+        let value = acceleration_value(HwAccelKind::Software, None, false, Some(&missing));
+        assert_eq!(value["kind"], "software", "older UIs still read the reason");
+        assert_eq!(value["hardware"], false);
+        assert_eq!(value["reason_code"], VAAPI_DRIVER_MISSING);
+        assert_eq!(value["reason"], json!(missing.reason));
+        assert_eq!(value["cause"], "driver_not_installed");
+        assert_eq!(
+            value["gpu"],
+            json!({
+                "vendor": "Intel",
+                "kernel_driver": "i915",
+                "render_node": "/dev/dri/renderD128",
+                "va_driver": "iHD",
+            })
+        );
+        assert_eq!(
+            value["suggested_packages"],
+            json!({
+                "deb": ["intel-media-va-driver"],
+                "rpm": ["libva-intel-media-driver"],
+                "arch": ["intel-media-driver"],
+            })
+        );
+    }
+
+    #[test]
+    fn gpu_access_pending_and_hardware_decoding_say_no_missing_driver() {
+        let missing = intel_without_driver();
+        let pending = acceleration_value(HwAccelKind::Software, None, true, Some(&missing));
+        assert_eq!(pending["reason"], GPU_NOT_ACCESSIBLE);
+        assert_eq!(pending["reason_code"], "GPU_NOT_ACCESSIBLE");
+        assert!(pending.get("suggested_packages").is_none());
+        let hardware = acceleration_value(HwAccelKind::VaApi, None, false, Some(&missing));
+        assert_eq!(hardware["kind"], "vaapi");
+        assert!(hardware.get("reason").is_none() && hardware.get("reason_code").is_none());
+        let plain = acceleration_value(HwAccelKind::Software, None, false, None);
+        assert!(plain.get("reason").is_none() && plain.get("reason_code").is_none());
+        let blocked = acceleration_value(HwAccelKind::Software, Some("update"), false, None);
+        assert_eq!(
+            (blocked["kind"].clone(), blocked["reason"].clone()),
+            (json!("blocked"), json!("update"))
+        );
     }
 }
 

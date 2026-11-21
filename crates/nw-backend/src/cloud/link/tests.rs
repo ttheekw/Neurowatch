@@ -333,6 +333,76 @@ fn serve_json_sequence(responses: Vec<Value>) -> (String, thread::JoinHandle<()>
     (format!("http://{address}/"), task)
 }
 
+/// One answer of `body` bytes (announced length, or chunked without one).
+fn serve_raw_body(body: Vec<u8>, announce: bool) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0_u8; 4096];
+        let mut bytes = Vec::new();
+        while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).unwrap();
+            if read == 0 {
+                return;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        if announce {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+        } else {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+            );
+        }
+        // The peer may hang up once it has seen enough.
+        let _ = stream.write_all(&body);
+    });
+    (format!("http://{address}/"), task)
+}
+
+#[tokio::test]
+async fn an_answer_larger_than_the_limit_is_refused_not_buffered() {
+    let clock = CloudClock::new();
+    let client = reqwest::Client::new();
+    let mut big = b"{\"pad\":\"".to_vec();
+    big.extend(std::iter::repeat_n(b'a', MAX_ANSWER_BYTES + 10));
+    big.extend_from_slice(b"\"}");
+    for announce in [true, false] {
+        let (url, task) = serve_raw_body(big.clone(), announce);
+        let outcome = post_json(
+            &clock,
+            &client,
+            reqwest::Url::parse(&url).unwrap(),
+            &serde_json::json!({}),
+        )
+        .await;
+        let error = outcome.unwrap_err().to_string();
+        assert!(error.contains("too large"), "announce={announce}: {error}");
+        // Joining blocks: let the runtime close the refused connection first.
+        let _ = tokio::task::spawn_blocking(move || task.join()).await;
+    }
+    let (url, task) = serve_raw_body(b"{\"ok\":true}".to_vec(), false);
+    let answer = post_json(
+        &clock,
+        &client,
+        reqwest::Url::parse(&url).unwrap(),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer["ok"], true);
+    tokio::task::spawn_blocking(move || task.join())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 fn serve_scripted(
     responses: Vec<(u16, Option<Value>)>,
 ) -> (String, StdArc<StdMutex<Vec<Value>>>, thread::JoinHandle<()>) {

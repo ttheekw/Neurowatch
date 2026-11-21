@@ -298,11 +298,73 @@ impl Drop for Track {
     }
 }
 
+/// The outage folder holds at most this many tracks' disk budgets in all:
+/// tracks of removed cameras and of earlier runs must not fill the disk.
+const OUTAGE_FOLDER_TRACKS: u64 = 8;
+
+/// Removes whole tracks (every file named after one epoch), least recently
+/// written first, until the folder's own files fit in `max_bytes`. Files it
+/// did not write, links and folders are never touched.
+fn trim_outage_folder(dir: &std::path::Path, max_bytes: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut tracks: std::collections::HashMap<
+        String,
+        (std::time::SystemTime, u64, Vec<std::path::PathBuf>),
+    > = std::collections::HashMap::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(epoch) = name.get(..16).filter(|e| {
+            e.bytes().all(|b| b.is_ascii_hexdigit())
+                && (name[16..].starts_with('-') || name[16..].starts_with('.'))
+        }) else {
+            continue;
+        };
+        // `DirEntry::metadata` does not follow links.
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        let track =
+            tracks
+                .entry(epoch.to_owned())
+                .or_insert((std::time::UNIX_EPOCH, 0, Vec::new()));
+        track.0 = track.0.max(modified);
+        track.1 = track.1.saturating_add(meta.len());
+        track.2.push(entry.path());
+    }
+    let mut total: u64 = tracks.values().map(|t| t.1).fold(0, u64::saturating_add);
+    let mut oldest_first: Vec<_> = tracks.into_values().collect();
+    oldest_first.sort_by_key(|t| t.0);
+    for (_, bytes, files) in oldest_first {
+        if total <= max_bytes {
+            break;
+        }
+        tracing::warn!(
+            bytes,
+            "cloud backup: the outage folder is full; dropping its oldest track"
+        );
+        for file in files {
+            let _ = std::fs::remove_file(file);
+        }
+        total = total.saturating_sub(bytes);
+    }
+}
+
 /// Tracks a previous run left in the outage folder, as backlog.
 fn recover(shared: &Shared) {
     let Some(dir) = shared.config.outage_dir.clone() else {
         return;
     };
+    trim_outage_folder(
+        &dir,
+        shared
+            .config
+            .disk_bytes_per_track
+            .saturating_mul(OUTAGE_FOLDER_TRACKS),
+    );
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
@@ -375,4 +437,44 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_outage_folder_drops_its_oldest_tracks_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for (i, epoch) in [1u64, 2, 3, 4].iter().enumerate() {
+            for name in [
+                format!("{epoch:016x}-0.spill"),
+                format!("{epoch:016x}.track.json"),
+            ] {
+                let path = dir.path().join(name);
+                std::fs::write(&path, vec![0u8; 512]).unwrap();
+                let file = std::fs::File::options().write(true).open(&path).unwrap();
+                file.set_modified(start + std::time::Duration::from_secs(60 * i as u64))
+                    .unwrap();
+            }
+        }
+        std::fs::write(dir.path().join("notes.txt"), vec![0u8; 4096]).unwrap();
+        trim_outage_folder(dir.path(), 2048);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "0000000000000003-0.spill",
+                "0000000000000003.track.json",
+                "0000000000000004-0.spill",
+                "0000000000000004.track.json",
+                "notes.txt",
+            ]
+        );
+    }
 }

@@ -30,6 +30,7 @@ mkdir -p ~/neurowatch/data ~/neurowatch/recordings
 # headless
 docker run -d --name neurowatch --restart unless-stopped --network host \
   --user "$(id -u):$(id -g)" --stop-timeout 30 \
+  --cap-drop ALL --security-opt no-new-privileges \
   -v ~/neurowatch/data:/data -v ~/neurowatch/recordings:/recordings \
   ghcr.io/ttheekw/neurowatch:latest
 docker exec --user "$(id -u):$(id -g)" neurowatch neurowatch-docker cloud link CODE --name "Head Office"
@@ -37,6 +38,7 @@ docker exec --user "$(id -u):$(id -g)" neurowatch neurowatch-docker cloud link C
 xhost +SI:localuser:$(id -un)
 docker run -d --name neurowatch-gui --network host \
   --user "$(id -u):$(id -g)" --stop-timeout 30 --shm-size 1g \
+  --cap-drop ALL --security-opt no-new-privileges \
   -e DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
   -v ~/neurowatch/data:/data -v ~/neurowatch/recordings:/recordings \
   ghcr.io/ttheekw/neurowatch:gui
@@ -55,6 +57,9 @@ docker run -d --name neurowatch-gui --network host \
 - **User:** the container runs as you (`--user $(id -u):$(id -g)`), so the
   files are yours, and `exec` uses the same user (the IPC socket accepts only
   its own user).
+- **Privileges:** `--cap-drop ALL --security-opt no-new-privileges`: the
+  recorder needs no Linux capability and cannot gain privileges. Keep both on
+  your own `docker run` lines (`docker/compose.yml` sets them too).
 - **Network:** host networking, for ONVIF discovery (multicast) and the
   camera event port 7681.
 - **GPU:** `/dev/dri` with its device groups (VA-API decoding, OpenGL video
@@ -109,6 +114,7 @@ or the card can't be opened:
 # headless
 docker run -d --name neurowatch --restart unless-stopped --network host \
   --user "$(id -u):$(id -g)" --stop-timeout 30 \
+  --cap-drop ALL --security-opt no-new-privileges \
   --device /dev/dri --group-add "$(stat -c %g /dev/dri/renderD128)" \
   -v ~/neurowatch/data:/data -v ~/neurowatch/recordings:/recordings \
   ghcr.io/ttheekw/neurowatch:latest
@@ -117,6 +123,7 @@ docker run -d --name neurowatch --restart unless-stopped --network host \
 xhost +SI:localuser:$(id -un)
 docker run -d --name neurowatch-gui --network host \
   --user "$(id -u):$(id -g)" --stop-timeout 30 --shm-size 1g \
+  --cap-drop ALL --security-opt no-new-privileges \
   --device /dev/dri --group-add "$(stat -c %g /dev/dri/renderD128)" \
   -e DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
   -v ~/neurowatch/data:/data -v ~/neurowatch/recordings:/recordings \
@@ -152,6 +159,7 @@ is needed:
 # headless
 docker run -d --name neurowatch --restart unless-stopped --network host \
   --user "$(id -u):$(id -g)" --stop-timeout 30 \
+  --cap-drop ALL --security-opt no-new-privileges \
   --gpus all \
   -v ~/neurowatch/data:/data -v ~/neurowatch/recordings:/recordings \
   ghcr.io/ttheekw/neurowatch:latest
@@ -160,6 +168,7 @@ docker run -d --name neurowatch --restart unless-stopped --network host \
 xhost +SI:localuser:$(id -un)
 docker run -d --name neurowatch-gui --network host \
   --user "$(id -u):$(id -g)" --stop-timeout 30 --shm-size 1g \
+  --cap-drop ALL --security-opt no-new-privileges \
   --gpus all \
   -e DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
   -v ~/neurowatch/data:/data -v ~/neurowatch/recordings:/recordings \

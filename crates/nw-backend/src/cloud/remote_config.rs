@@ -9,6 +9,8 @@
 //!
 //! * a recording location is only ever one of this node's drives
 //!   (`storage.select`), never a path from the request;
+//! * a camera address is a network address (`rtsp`, `rtsps`, `rtmp`, `http`,
+//!   `https` with a host), never a local file, capture device or other scheme;
 //! * stored camera passwords are never sent back (`has_password` instead), and
 //!   an update that leaves the password out keeps it;
 //! * cloud, playback, viewer and debug settings are not reachable;
@@ -681,6 +683,7 @@ impl RemoteConfig {
             camera.insert("id".into(), uuid::Uuid::new_v4().to_string().into());
         }
         check_camera_id(&camera["id"])?;
+        check_network_addresses(&Value::Object(camera.clone()))?;
         if local_storage_path(&camera).is_some() {
             return Err(not_remote("a per-camera recording folder"));
         }
@@ -705,6 +708,9 @@ impl RemoteConfig {
             crate::onvif_events::validate_settings(motion)?;
         }
         let id = id_of(params)?;
+        // Only what the request sets: a camera the desktop gave a local
+        // source keeps it when the portal edits something else.
+        check_network_addresses(&Value::Object(params.clone()))?;
         let current = {
             let st = self.state.read().await;
             let camera = st
@@ -743,6 +749,16 @@ impl RemoteConfig {
                 }
             }
             camera.insert(key.clone(), value.clone());
+        }
+        if crate::camera_credentials::moves_stored_credentials(
+            &current,
+            &Value::Object(camera.clone()),
+            &Value::Object(changes.clone()),
+        ) {
+            return Err(
+                "To use a new camera address, enter the camera's username and password again"
+                    .into(),
+            );
         }
         // The recording folder of a camera is local configuration only.
         if local_storage_path(&camera)
@@ -911,6 +927,51 @@ fn carries_secret(value: &Value) -> bool {
             .any(|(key, value)| SECRET.contains(&key.as_str()) || carries_secret(value)),
         Value::Array(items) => items.iter().any(carries_secret),
         _ => false,
+    }
+}
+
+/// Every address a portal camera request sets (`url`, `sub_url`, stream and
+/// ONVIF addresses: any `url` or `*_url` field) must be a network address. A
+/// path made the recorder open that file or capture device and report whether
+/// it exists, and a thumbnail decoded it for the portal (vulnerability
+/// checklist R3). An empty value (no sub stream) is allowed.
+fn check_network_addresses(value: &Value) -> Result<(), String> {
+    const SCHEMES: [&str; 5] = ["rtsp", "rtsps", "rtmp", "http", "https"];
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if key == "url" || key.ends_with("_url") {
+                    let Some(url) = value.as_str() else {
+                        continue;
+                    };
+                    if url.is_empty() {
+                        continue;
+                    }
+                    let network = url.split_once("://").is_some_and(|(scheme, rest)| {
+                        let host = rest
+                            .split(['/', '?', '#'])
+                            .next()
+                            .unwrap_or_default()
+                            .rsplit('@')
+                            .next()
+                            .unwrap_or_default();
+                        SCHEMES.contains(&scheme.to_ascii_lowercase().as_str())
+                            && !host.is_empty()
+                            && !url.chars().any(|c| c.is_control() || c.is_whitespace())
+                    });
+                    if !network {
+                        return Err(
+                            "Use a network address for a camera added from the web portal (rtsp://, rtmp:// or http://)".into(),
+                        );
+                    }
+                } else {
+                    check_network_addresses(value)?;
+                }
+            }
+            Ok(())
+        }
+        Value::Array(items) => items.iter().try_for_each(check_network_addresses),
+        _ => Ok(()),
     }
 }
 
@@ -1549,6 +1610,151 @@ mod tests {
         assert_eq!(stored.password_b64.as_deref(), Some("c2VjcmV0"));
         assert!(repath.is_err());
         assert_eq!(stored.recording.local.storage_path, None);
+    }
+
+    #[tokio::test]
+    async fn security_a_new_address_never_takes_the_stored_password_with_it() {
+        // Security review 2026-11-20, finding 6: pointing a camera (or its
+        // ONVIF service) at another host without entering the credentials
+        // again must not send the stored ones there.
+        let (remote, state, path) = remote("moved-credentials");
+        let id = remote
+            .execute(
+                "camera.add",
+                &json!({"name": "Gate", "url": "rtsp://cam.invalid/1", "username": "admin",
+                        "password_b64": "c2VjcmV0", "onvif": {"device_url": "http://cam.invalid/onvif/device_service"}}),
+            )
+            .await
+            .expect("camera added")["id"]
+            .clone();
+        let moved_main = remote
+            .execute(
+                "camera.update",
+                &json!({"id": id, "url": "rtsp://attacker.invalid/1"}),
+            )
+            .await;
+        let moved_sub = remote
+            .execute(
+                "camera.update",
+                &json!({"id": id, "sub_url": "rtsp://attacker.invalid/2"}),
+            )
+            .await;
+        let moved_onvif = remote
+            .execute(
+                "camera.update",
+                &json!({"id": id, "onvif": {"device_url": "http://attacker.invalid/onvif"}}),
+            )
+            .await;
+        let same_host = remote
+            .execute(
+                "camera.update",
+                &json!({"id": id, "url": "rtsp://CAM.invalid/2"}),
+            )
+            .await;
+        // Naming a credential key without a new password is not entering
+        // it again (vulnerability checklist R2), nor is a page sending the
+        // listed camera back with a changed address.
+        let mut named = Vec::new();
+        for extra in [
+            json!({"username": "admin"}),
+            json!({"password_b64": ""}),
+            json!({"password": ""}),
+            json!({"password": "anything"}),
+            json!({"username": null}),
+            json!({"password_b64": null}),
+        ] {
+            let mut request = json!({"id": id, "url": "rtsp://attacker.invalid/1"});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            named.push(remote.execute("camera.update", &request).await);
+        }
+        let mut listed = remote.execute("camera.list", &json!({})).await.unwrap()[0].clone();
+        listed["url"] = json!("rtsp://attacker.invalid/1");
+        named.push(remote.execute("camera.update", &listed).await);
+        let retyped = remote
+            .execute("camera.update",
+                &json!({"id": id, "url": "rtsp://new-cam.invalid/1", "username": "admin", "password_b64": "bmV3"}))
+            .await;
+        let stored = state.read().await.config.cameras[0].clone();
+        done(&state, &path).await;
+
+        for refused in [moved_main, moved_sub, moved_onvif]
+            .into_iter()
+            .chain(named)
+        {
+            let error = refused.expect_err("a new host without credentials is refused");
+            assert!(
+                error.contains("enter the camera's username and password again"),
+                "{error}"
+            );
+        }
+        assert!(same_host.is_ok(), "{same_host:?}");
+        assert!(retyped.is_ok(), "{retyped:?}");
+        assert_eq!(stored.url, "rtsp://new-cam.invalid/1");
+        assert_eq!(stored.password_b64.as_deref(), Some("bmV3"));
+    }
+
+    #[tokio::test]
+    async fn security_portal_camera_addresses_are_network_addresses() {
+        // Vulnerability checklist R3: a path, a capture device or another
+        // scheme made the recorder open it (a file-exists oracle, and its
+        // pictures in the portal).
+        let (remote, state, path) = remote("network-addresses");
+        let mut refused = Vec::new();
+        for address in [
+            "/etc/hostname",
+            "/dev/video0",
+            "file:///etc/hostname",
+            "\\\\host\\share\\clip.mp4",
+            "C:\\clips\\a.mp4",
+            "rtsp://",
+            "rtsp:///path",
+            "smb://host/share",
+            "rtsp://host/a b",
+        ] {
+            refused.push(
+                remote
+                    .execute("camera.add", &json!({"name": "Odd", "url": address}))
+                    .await,
+            );
+            refused.push(
+                remote
+                    .execute(
+                        "camera.add",
+                        &json!({"name": "Odd", "url": "rtsp://cam.invalid/1", "streams": [{"id": "x", "url": address}]}),
+                    )
+                    .await,
+            );
+        }
+        let id = remote
+            .execute(
+                "camera.add",
+                &json!({"name": "Gate", "url": "RTSP://cam.invalid/1", "sub_url": "",
+                        "onvif": {"device_url": "http://cam.invalid/onvif/device_service"}}),
+            )
+            .await
+            .expect("a network camera is added")["id"]
+            .clone();
+        for change in [
+            json!({"id": id, "sub_url": "/dev/video0"}),
+            json!({"id": id, "onvif": {"device_url": "file:///etc/hostname"}}),
+        ] {
+            refused.push(remote.execute("camera.update", &change).await);
+        }
+        let renamed = remote
+            .execute("camera.update", &json!({"id": id, "name": "Front gate"}))
+            .await;
+        let cameras = state.read().await.config.cameras.len();
+        done(&state, &path).await;
+
+        for outcome in refused {
+            let error = outcome.expect_err("a local or odd address is refused");
+            assert!(error.contains("network address"), "{error}");
+        }
+        assert!(renamed.is_ok(), "{renamed:?}");
+        assert_eq!(cameras, 1, "only the network camera was added");
     }
 
     #[tokio::test]

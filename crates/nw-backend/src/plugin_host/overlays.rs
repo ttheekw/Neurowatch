@@ -16,6 +16,12 @@ const MAX_TEXT: usize = 64;
 const DEFAULT_TTL: Duration = Duration::from_secs(2);
 const MAX_TTL: Duration = Duration::from_secs(10);
 const MIN_TTL: Duration = Duration::from_millis(100);
+/// Layers one plugin may show on one camera at once, layer names' length, and
+/// everything shown at once: a plugin declaring thousands of layers must not
+/// grow the store without bound (security review 2026-11-20, finding 13).
+const MAX_LAYERS_PER_CAMERA: usize = 32;
+const MAX_LAYER_ID: usize = 64;
+const MAX_ENTRIES: usize = 4096;
 
 /// One layer's drawing, as clients receive it.
 #[derive(Debug, Clone, Serialize)]
@@ -152,6 +158,10 @@ impl OverlayStore {
         frame: Option<crate::streams::frames::Identity>,
         ttl_ms: Option<u32>,
     ) {
+        if layer.len() > MAX_LAYER_ID {
+            tracing::debug!(plugin, camera_id, "Drawing layer name too long: dropped");
+            return;
+        }
         let time_us = frame.map_or_else(|| crate::events::now_ms() * 1000, |frame| frame.time_us);
         let observed_us = frame
             .map(|frame| frame.observed_us)
@@ -184,6 +194,10 @@ impl OverlayStore {
                     return; // nothing shown, nothing changes
                 }
             } else {
+                if !entries.contains_key(&key) && !room_for(&mut entries, camera_id, plugin) {
+                    tracing::debug!(plugin, camera_id, "Too many drawing layers: dropped");
+                    return;
+                }
                 entries.insert(
                     key,
                     Entry {
@@ -365,6 +379,18 @@ impl OverlayStore {
 
 /// A plugin's drawing made safe to show: coordinates inside the picture,
 /// bounded counts and text. Items that cannot be made sense of are dropped.
+/// Whether a new layer of `plugin` on `camera_id` fits, after dropping
+/// lapsed entries (otherwise dropped only when a viewer asks).
+fn room_for(entries: &mut HashMap<Key, Entry>, camera_id: &str, plugin: &str) -> bool {
+    let now = Instant::now();
+    entries.retain(|_, entry| entry.until > now);
+    let layers = entries
+        .keys()
+        .filter(|(camera, owner, _)| camera == camera_id && owner == plugin)
+        .count();
+    layers < MAX_LAYERS_PER_CAMERA && entries.len() < MAX_ENTRIES
+}
+
 pub fn sanitize(items: Vec<OverlayItem>) -> Vec<OverlayItem> {
     items
         .into_iter()
@@ -455,28 +481,28 @@ mod tests {
         };
         let store = OverlayStore::default();
         let before = store.seq();
-        store.put_figures("c1", "vcount", vec![figure("Total today", "4")]);
+        store.put_figures("c1", "tally", vec![figure("Total today", "4")]);
         assert!(store.seq() > before, "viewers are told");
-        store.put_figures("c2", "vcount", vec![figure("Total today", "9")]);
+        store.put_figures("c2", "tally", vec![figure("Total today", "9")]);
         store.put_figures("c1", "other", vec![figure("Rate", "1")]);
         let shown = store.figures("c1");
         assert_eq!(
             shown.iter().map(|f| f.plugin.as_str()).collect::<Vec<_>>(),
-            ["other", "vcount"]
+            ["other", "tally"]
         );
         assert_eq!(shown[1].value, "4");
 
         let unchanged = store.seq();
-        store.put_figures("c1", "vcount", vec![figure("Total today", "4")]);
+        store.put_figures("c1", "tally", vec![figure("Total today", "4")]);
         assert_eq!(store.seq(), unchanged, "the same figures tell nobody");
-        store.put_figures("c1", "vcount", vec![figure("Total today", "5")]);
+        store.put_figures("c1", "tally", vec![figure("Total today", "5")]);
         assert_eq!(store.figures("c1")[1].value, "5");
         assert!(store.seq() > unchanged);
 
-        store.clear("vcount", Some("c1"));
+        store.clear("tally", Some("c1"));
         assert_eq!(store.figures("c1").len(), 1, "another plugin's stay");
         assert_eq!(store.figures("c2").len(), 1, "another camera's stay");
-        store.clear("vcount", None);
+        store.clear("tally", None);
         assert!(store.figures("c2").is_empty());
         store.put_figures("c1", "other", vec![]);
         assert!(store.figures("c1").is_empty());
@@ -598,6 +624,37 @@ mod tests {
             writer.put("c1", "p", "l", vec![boxed(0.1)], None, None);
         });
         assert_eq!(store.wait(0, Duration::from_secs(5)).await, 1);
+    }
+
+    #[test]
+    fn a_plugin_cannot_grow_the_drawing_store_without_bound() {
+        // Security review 2026-11-20, finding 13.
+        let store = OverlayStore::default();
+        for layer in 0..(MAX_LAYERS_PER_CAMERA + 10) {
+            store.put(
+                "cam",
+                "plugin",
+                &format!("layer-{layer}"),
+                vec![boxed(0.1)],
+                None,
+                None,
+            );
+        }
+        store.put(
+            "cam",
+            "plugin",
+            &"x".repeat(MAX_LAYER_ID + 1),
+            vec![boxed(0.1)],
+            None,
+            None,
+        );
+        let shown = store.snapshot(None);
+        assert_eq!(shown.len(), MAX_LAYERS_PER_CAMERA);
+        assert!(shown.iter().all(|s| s.layer.len() <= MAX_LAYER_ID));
+        // A layer already shown is still updated, and another plugin has room.
+        store.put("cam", "plugin", "layer-0", vec![boxed(0.2)], None, None);
+        store.put("cam", "other", "layer-0", vec![boxed(0.2)], None, None);
+        assert_eq!(store.snapshot(None).len(), MAX_LAYERS_PER_CAMERA + 1);
     }
 
     #[test]

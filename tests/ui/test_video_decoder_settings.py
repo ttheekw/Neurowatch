@@ -7,7 +7,9 @@ from typing import Any
 from neurowatch.dialogs import settings_dialog
 from neurowatch.dialogs.settings_dialog import SettingsDialog
 from neurowatch.models.video_decoder import (
+    AccelerationNotice,
     DecoderStatus,
+    acceleration_notice,
     decoder_choices,
     decoder_from_config,
     restart_reply,
@@ -26,6 +28,30 @@ _STATUS = {
             {"id": "d3d11", "label": "Direct3D 11"},
             {"id": "bogus", "label": "Not a decoder"},
         ],
+    },
+}
+
+_DRIVER_MISSING = {
+    "kind": "software",
+    "label": "Software (avdec)",
+    "hardware": False,
+    "available": True,
+    "reason": (
+        "This PC has Intel graphics that can decode video, but its VA-API driver (iHD)"
+        " isn't installed, so video is decoded on the CPU."
+    ),
+    "reason_code": "VAAPI_DRIVER_MISSING",
+    "cause": "driver_not_installed",
+    "gpu": {
+        "vendor": "Intel",
+        "kernel_driver": "i915",
+        "render_node": "/dev/dri/renderD128",
+        "va_driver": "iHD",
+    },
+    "suggested_packages": {
+        "deb": ["intel-media-va-driver"],
+        "rpm": ["libva-intel-media-driver"],
+        "arch": ["intel-media-driver"],
     },
 }
 
@@ -163,3 +189,48 @@ def test_saving_a_new_decoder_rides_out_the_restart(monkeypatch) -> None:
     worker.run()
     assert calls == ["config.set"]
     assert results == [sent], "what was sent is what the recorder saved"
+
+
+def test_a_missing_driver_is_told_with_the_card_and_the_packages() -> None:
+    notice = acceleration_notice(_DRIVER_MISSING)
+    assert notice == AccelerationNotice(
+        code="VAAPI_DRIVER_MISSING",
+        text=_DRIVER_MISSING["reason"],
+        vendor="Intel",
+        kernel_driver="i915",
+        render_node="/dev/dri/renderD128",
+        packages=(
+            ("Debian/Ubuntu", ("intel-media-va-driver",)),
+            ("Fedora", ("libva-intel-media-driver",)),
+            ("Arch", ("intel-media-driver",)),
+        ),
+    )
+    assert notice.detail == (
+        "Debian/Ubuntu: intel-media-va-driver\n"
+        "Fedora: libva-intel-media-driver\n"
+        "Arch: intel-media-driver"
+    )
+    assert notice.card == "Intel (i915, /dev/dri/renderD128)"
+    assert notice.short == "Intel GPU driver missing"
+    # Nothing to tell: another reason, no reason, an older recorder.
+    pending = {"kind": "software", "reason": "x", "reason_code": "GPU_NOT_ACCESSIBLE"}
+    assert acceleration_notice(pending) is None
+    assert acceleration_notice({"kind": "software", "reason": "x"}) is None
+    assert acceleration_notice({"reason_code": "VAAPI_DRIVER_MISSING"}) is None, "no reason"
+    assert acceleration_notice(None) is None
+    bare = acceleration_notice({"reason": "y", "reason_code": "NVDEC_LIBRARY_MISSING"})
+    assert bare is not None and (bare.detail, bare.card, bare.short) == (
+        "",
+        "Unknown",
+        "GPU driver missing",
+    )
+
+
+def test_settings_warns_that_the_graphics_card_has_no_driver(qtbot, monkeypatch) -> None:
+    status = DecoderStatus.from_status({"video_acceleration": _DRIVER_MISSING})
+    assert status.active == "the CPU (software)"
+    assert status.warning == _DRIVER_MISSING["reason"]
+    dlg = _dialog(qtbot, monkeypatch)
+    dlg._on_decoder_status(status)
+    assert dlg._decoder_warning.text() == _DRIVER_MISSING["reason"]
+    assert not dlg._decoder_warning.isHidden()

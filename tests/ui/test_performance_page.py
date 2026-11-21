@@ -172,6 +172,49 @@ def test_performance_page_reports_blocked_local_live_view(qtbot):
     assert "1.24.6" in page.acceleration_text()
 
 
+_DRIVER_MISSING = {
+    "kind": "software",
+    "label": "Software (avdec)",
+    "hardware": False,
+    "available": True,
+    "reason": (
+        "This PC has Intel graphics that can decode video, but its VA-API driver (iHD)"
+        " isn't installed, so video is decoded on the CPU."
+    ),
+    "reason_code": "VAAPI_DRIVER_MISSING",
+    "cause": "driver_not_installed",
+    "gpu": {
+        "vendor": "Intel",
+        "kernel_driver": "i915",
+        "render_node": "/dev/dri/renderD128",
+        "va_driver": "iHD",
+    },
+    "suggested_packages": {
+        "deb": ["intel-media-va-driver"],
+        "rpm": ["libva-intel-media-driver"],
+        "arch": ["intel-media-driver"],
+    },
+}
+
+
+def test_a_graphics_card_without_its_driver_names_the_card_and_the_packages(qtbot):
+    client = _StubClient(_snapshot(video_acceleration=_DRIVER_MISSING))
+    page = PerformancePage(ipc_client=client, refresh_interval_ms=0)
+    qtbot.addWidget(page)
+
+    _wait_render(qtbot, page)
+
+    text = page.acceleration_text()
+    assert "GPU driver missing" in page._accel_badge_label.text()
+    assert "Graphics card: Intel (i915, /dev/dri/renderD128)" in text
+    assert "VA-API driver (iHD) isn't installed" in text
+    assert "Debian/Ubuntu: intel-media-va-driver" in text
+    assert "Fedora: libva-intel-media-driver" in text
+    assert "Arch: intel-media-driver" in text
+    assert "#f59e0b" in page._accel_badge_label.styleSheet(), "amber, a warning"
+    assert "#f59e0b" in page._accel_detail_label.styleSheet()
+
+
 def test_performance_page_shows_vaapi_available_with_unknown_counters(qtbot):
     snap = _snapshot(
         video_acceleration={
@@ -351,20 +394,49 @@ def test_performance_page_refresh_does_not_block_main_thread(qtbot):
 
 
 def test_stream_connections_show_roles_rates_and_disconnected_streams(qtbot):
-    snap = _snapshot(stream_connections=[{
-        "camera_id": "cam-1", "stream": "main", "state": "streaming", "consumers": 2,
-        "roles": {"recording": 1, "browser": 1}, "video_bps": 2_000_000,
-        "audio_bps": 64_000, "fps": 25.0, "buffer_bytes": 1_048_576, "buffer_units": 25,
-        "queue_drops": 3,
-    }, {"camera_id": "cam-1", "stream": "sub", "state": "disconnected", "consumers": 0,
-         "roles": {}, "buffer_bytes": 0, "buffer_units": 0, "queue_drops": 0}])
+    snap = _snapshot(
+        stream_connections=[
+            {
+                "camera_id": "cam-1",
+                "stream": "main",
+                "state": "streaming",
+                "consumers": 2,
+                "roles": {"recording": 1, "browser": 1},
+                "video_bps": 2_000_000,
+                "audio_bps": 64_000,
+                "fps": 25.0,
+                "buffer_bytes": 1_048_576,
+                "buffer_units": 25,
+                "queue_drops": 3,
+            },
+            {
+                "camera_id": "cam-1",
+                "stream": "sub",
+                "state": "disconnected",
+                "consumers": 0,
+                "roles": {},
+                "buffer_bytes": 0,
+                "buffer_units": 0,
+                "queue_drops": 0,
+            },
+        ]
+    )
     page = PerformancePage(ipc_client=_StubClient(snap), refresh_interval_ms=0)
     qtbot.addWidget(page)
     page.set_camera_names({"cam-1": "Gate"})
     _wait_render(qtbot, page)
     text = page.snapshot_text()
     for value in (
-        "Gate", "Main", "Sub", "2 consumers", "Recording", "Web", "Frame buffer",
-        "2 Mbps", "64 Kbps", "Not in use", "1.0 MiB · 25 frames · 3 drops",
+        "Gate",
+        "Main",
+        "Sub",
+        "2 consumers",
+        "Recording",
+        "Web",
+        "Frame buffer",
+        "2 Mbps",
+        "64 Kbps",
+        "Not in use",
+        "1.0 MiB · 25 frames · 3 drops",
     ):
         assert value in text, (value, text)

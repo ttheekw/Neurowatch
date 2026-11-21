@@ -61,7 +61,7 @@ def _key_of(editor):
 def _manifest() -> Manifest:
     manifest = Manifest.from_dict(
         {
-            "id": "nw.vcount",
+            "id": "nw.counter",
             "name": "Vehicle counting",
             "vendor": "NeuroWatch",
             "version": "0.1.0",
@@ -247,7 +247,7 @@ def test_the_settings_form_saves_shapes_and_choices_together(qtbot) -> None:
     from neurowatch.dialogs.plugin_dialogs import BindingEditor, Camera
 
     existing = PluginBinding(
-        "vcount",
+        "counter",
         "c1",
         True,
         {
@@ -263,7 +263,7 @@ def test_the_settings_form_saves_shapes_and_choices_together(qtbot) -> None:
     qtbot.addWidget(editor)
     assert editor.shapes is not None and editor.zones is None, "all on one picture"
     assert editor.problem() is None
-    config = editor.binding("vcount").config
+    config = editor.binding("counter").config
     assert config["fps"] == 8 and config["classes"] == ["bus", "truck"]
     assert config["lanes"][0]["name"] == "Lane A"
     assert config["lines"][0]["lane"] == "l1" and config["lines"][0]["name"] == "Lane A"
@@ -345,7 +345,7 @@ def test_vehicle_counting_has_lanes_and_detection_areas_and_no_other_tabs(qtbot)
     }
     manifest = Manifest.from_dict(
         {
-            "id": "nw.vcount",
+            "id": "nw.counter",
             "name": "Vehicle counting",
             "vendor": "NeuroWatch",
             "version": "0.1.0",
@@ -394,7 +394,7 @@ def test_the_settings_fit_a_narrow_page_and_a_small_screen(qtbot) -> None:
     ]
     manifest = Manifest.from_dict(
         {
-            "id": "nw.vcount",
+            "id": "nw.counter",
             "name": "Vehicle counting",
             "vendor": "NeuroWatch",
             "version": "0.1.0",

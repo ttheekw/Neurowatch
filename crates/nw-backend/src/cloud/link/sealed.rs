@@ -39,6 +39,8 @@ pub enum SealError {
     Expired,
     #[error("the sealed request was already used")]
     Replayed,
+    #[error("the system's random numbers are not available")]
+    NoRandomness,
 }
 
 /// An opened request: its parameters and where to seal the answer.
@@ -148,10 +150,18 @@ fn open_with(
         .map_err(|_| SealError::Unopenable)
 }
 
-fn random<const N: usize>() -> [u8; N] {
+/// Fresh random bytes, or an error: a reply sealed with a key or nonce of
+/// zeros (what a failed read used to leave) would be readable by anyone.
+fn random<const N: usize>() -> Result<[u8; N], SealError> {
+    random_from(getrandom::getrandom)
+}
+
+fn random_from<const N: usize>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>,
+) -> Result<[u8; N], SealError> {
     let mut bytes = [0u8; N];
-    let _ = getrandom::getrandom(&mut bytes);
-    bytes
+    fill(&mut bytes).map_err(|_| SealError::NoRandomness)?;
+    Ok(bytes)
 }
 
 /// Request ids already opened, until they expire.
@@ -218,7 +228,7 @@ pub fn seal_reply(
     opened: &Opened,
     outcome: &std::result::Result<Value, String>,
 ) -> Result<Value, SealError> {
-    seal_reply_with(random(), random(), node_id, opened, outcome)
+    seal_reply_with(random()?, random()?, node_id, opened, outcome)
 }
 
 fn reply_plaintext(outcome: &std::result::Result<Value, String>) -> Vec<u8> {
@@ -318,6 +328,14 @@ mod tests {
             node_public_key(&key),
             MontgomeryPoint::mul_base_clamped(key.to_scalar_bytes()).to_bytes()
         );
+    }
+
+    #[test]
+    fn a_failed_random_read_is_an_error_not_zeros() {
+        let failed: Result<[u8; 32], _> = random_from(|_| Err(getrandom::Error::UNSUPPORTED));
+        assert_eq!(failed, Err(SealError::NoRandomness));
+        let fine: [u8; 12] = random().unwrap();
+        assert_ne!(fine, [0u8; 12]);
     }
 
     #[test]
