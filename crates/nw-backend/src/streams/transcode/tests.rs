@@ -393,10 +393,13 @@ fn an_h265_camera_comes_out_as_h264_access_units_with_parameter_sets() {
         .unwrap();
     let encoder_exists =
         next_trial(|name| gstreamer::ElementFactory::find(name).is_some(), &[]).is_some();
+    // Output, and the transcode listed: it is listed once its decoder is
+    // known, which the CPU path's first picture can come before.
     let ok = wait_for(Duration::from_secs(40), || {
-        sink.units.lock().unwrap().len() >= 110 || !sink.pictures.lock().unwrap().is_empty()
+        (sink.units.lock().unwrap().len() >= 110 || !sink.pictures.lock().unwrap().is_empty())
+            && !hubs.transcodes().is_empty()
     });
-    assert!(ok, "no output in 40 s");
+    assert!(ok, "no output, or not listed, in 40 s");
     let listed = hubs.transcodes();
     let units = sink.units.lock().unwrap().clone();
     if !units.is_empty() {

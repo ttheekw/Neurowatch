@@ -331,7 +331,14 @@ jobs:
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           target="$image:${RELEASE_TAG#v}-${{ matrix.variant }}-${{ matrix.platform }}"
           docker tag "neurowatch-ci:${{ matrix.variant }}" "$target"
-          docker push "$target"
+          # GHCR now and then answers "unknown blob" for a layer it just said
+          # exists (seen pushing a version again, and with the other variant's
+          # jobs pushing the same base layers at once): try again.
+          for attempt in 1 2 3 4; do
+            docker push "$target" && exit 0
+            [ "$attempt" -lt 4 ] && sleep $((attempt * 20))
+          done
+          exit 1
 
   publish:
     name: Publish GitHub Release
