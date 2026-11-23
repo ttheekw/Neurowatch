@@ -46,6 +46,8 @@ pub struct RemoteConfig {
     served: crate::cloud::link::ServedCameras,
 }
 
+/// The most kinds `events.activity` lists as going on at one camera.
+const GOING_ON_PER_CAMERA: usize = 8;
 /// Most pictures asked for in one `events.thumbnails` request.
 const THUMBNAILS_PER_ANSWER: usize = 16;
 /// Picture data (base64) per answer: sealed, an answer may be at most 256 KiB
@@ -468,6 +470,9 @@ impl RemoteConfig {
         Ok(cameras)
     }
 
+    /// `events.activity`: per camera, events to acknowledge, whether
+    /// anything goes on, and what (`going_on`, at most
+    /// [`GOING_ON_PER_CAMERA`]).
     async fn event_activity(&self) -> Outcome {
         let (db, hub) = {
             let state = self.state.read().await;
@@ -476,10 +481,22 @@ impl RemoteConfig {
         tokio::task::spawn_blocking(move || {
             hub.flush();
             let conn = db.lock().map_err(|_| "event database unavailable".to_owned())?;
-            let mut statement = conn.prepare("SELECT camera_id, SUM(acknowledged = 0), COALESCE(MAX(CASE WHEN acknowledged = 0 THEN id END),0), SUM(end_ts IS NULL) FROM events WHERE event_type IN ('motion','intrusion','line_crossing','person','vehicle','animal') AND camera_id IS NOT NULL GROUP BY camera_id").map_err(|e| e.to_string())?;
+            let mut statement = conn.prepare(&format!("SELECT camera_id, SUM(acknowledged = 0), COALESCE(MAX(CASE WHEN acknowledged = 0 THEN id END),0), SUM(end_ts IS NULL) FROM events WHERE event_type IN {} AND camera_id IS NOT NULL GROUP BY camera_id", nw_core::event::EventKind::ACTIVITY_SQL)).map_err(|e| e.to_string())?;
             let rows = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?))).map_err(|e| e.to_string())?;
             let mut cameras = Map::new();
-            for row in rows { let (id,pending,through_id,active) = row.map_err(|e| e.to_string())?; cameras.insert(id,json!({"pending":pending,"through_id":through_id,"active":active>0})); }
+            for row in rows { let (id,pending,through_id,active) = row.map_err(|e| e.to_string())?; cameras.insert(id,json!({"pending":pending,"through_id":through_id,"active":active>0,"going_on":[]})); }
+            // What is going on at each camera (2026-11-23): each kind once,
+            // an `object` by the plugin's name for it ("Car"), oldest first,
+            // so a tile names it instead of saying "Motion" for everything.
+            let mut statement = conn.prepare(&format!("SELECT camera_id, event_type, detail FROM events WHERE end_ts IS NULL AND event_type IN {} AND camera_id IS NOT NULL ORDER BY ts, id", nw_core::event::EventKind::ACTIVITY_SQL)).map_err(|e| e.to_string())?;
+            let rows = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?))).map_err(|e| e.to_string())?;
+            for row in rows {
+                let (id, kind, detail) = row.map_err(|e| e.to_string())?;
+                let entry = if kind == "object" { json!({"kind":kind,"detail":detail}) } else { json!({"kind":kind}) };
+                if let Some(going_on) = cameras.get_mut(&id).and_then(|camera| camera["going_on"].as_array_mut()) {
+                    if !going_on.contains(&entry) && going_on.len() < GOING_ON_PER_CAMERA { going_on.push(entry); }
+                }
+            }
             Ok(json!({"cameras":cameras}))
         }).await.map_err(|e| e.to_string())?
     }
@@ -571,7 +588,7 @@ impl RemoteConfig {
             let ids: Vec<i64> = tokio::task::spawn_blocking(move || -> Result<Vec<i64>,String> {
                 hub.flush();
                 let conn=db.lock().map_err(|_|"event database unavailable".to_owned())?;
-                let mut statement=conn.prepare("SELECT id FROM events WHERE camera_id=?1 AND id<=?2 AND acknowledged=0 AND event_type IN ('motion','intrusion','line_crossing','person','vehicle','animal') LIMIT 500").map_err(|e|e.to_string())?;
+                let mut statement=conn.prepare(&format!("SELECT id FROM events WHERE camera_id=?1 AND id<=?2 AND acknowledged=0 AND event_type IN {} LIMIT 500", nw_core::event::EventKind::ACTIVITY_SQL)).map_err(|e|e.to_string())?;
                 let rows=statement.query_map(rusqlite::params![camera,through],|row|row.get(0)).map_err(|e|e.to_string())?;
                 rows.collect::<rusqlite::Result<Vec<i64>>>().map_err(|e|e.to_string())
             }).await.map_err(|e|e.to_string())??;
@@ -792,6 +809,7 @@ fn trim_event(event: &mut Value) {
                 "topic",
                 "acknowledged",
                 "kept",
+                "detection",
             ]
             .contains(&key.as_str())
         });
@@ -1191,6 +1209,40 @@ mod tests {
             unasked.get("plugins").is_none(),
             "no role, no plugin status"
         );
+        done(&state, &path).await;
+    }
+
+    #[tokio::test]
+    async fn activity_says_what_is_going_on_by_name_each_once() {
+        // Detect's events are objects named by the plugin ("Car"): the
+        // portal's tile names them instead of saying "Motion" for all.
+        use crate::events::NewEvent;
+        use nw_core::event::{EventKind, EventSource};
+        let (remote, state, path) = remote("portal-going-on");
+        let hub = Arc::clone(&state.read().await.events);
+        let object = |name: &str, at: i64| {
+            let mut event = NewEvent::new(Some("a".into()), EventKind::Object, EventSource::Plugin);
+            event.detail = Some(name.into());
+            hub.start_at(event, at)
+        };
+        object("Car", 1000);
+        hub.start_at(
+            NewEvent::new(Some("a".into()), EventKind::Motion, EventSource::Plugin),
+            2000,
+        );
+        object("Car", 3000);
+        let person = object("Person", 4000);
+        hub.end(person.id);
+        let activity = remote.execute("events.activity", &json!({})).await.unwrap();
+        assert_eq!(
+            activity["cameras"]["a"]["going_on"],
+            json!([
+                {"kind": "object", "detail": "Car"},
+                {"kind": "motion"},
+            ]),
+            "{activity}"
+        );
+        assert_eq!(activity["cameras"]["a"]["active"], true);
         done(&state, &path).await;
     }
 

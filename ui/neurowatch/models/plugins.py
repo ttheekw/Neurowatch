@@ -8,9 +8,16 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+
+from neurowatch.models.plugin_decoding import (
+    DecodingLines,
+    SharedSource,
+    decoding_lines,
+    parse_shared_source,
+)
 
 #: Plugin ids the recorder accepts (``plugin_host::config``).
 _ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -312,6 +319,11 @@ class BindingStatus:
     #: The camera stream it gets (``sub``/``main``) and its format.
     stream: str = ""
     format: str = ""
+    #: NeuroWatch shares its decoded pictures with the plugin now, how many a
+    #: second, and which of its decoders made them on what (newer recorders).
+    shared_pictures: bool = False
+    shared_fps: float | None = None
+    shared_source: SharedSource | None = None
 
 
 @dataclass
@@ -386,6 +398,8 @@ def parse_status(result: object) -> dict[str, ServerStatus]:
                 continue
             reported = view.get("plugin")
             plugin: dict[str, Any] = reported if isinstance(reported, dict) else {}
+            shared = view.get("shared_pictures") is True
+            rate = view.get("shared_fps")
             bindings[str(camera_id)] = BindingStatus(
                 state=str(view.get("state", "")),
                 detail=str(view.get("detail") or ""),
@@ -397,6 +411,9 @@ def parse_status(result: object) -> dict[str, ServerStatus]:
                 decoder=str(plugin.get("decoder") or ""),
                 stream=str(view.get("stream") or ""),
                 format=str(view.get("format") or ""),
+                shared_pictures=shared,
+                shared_fps=float(rate) if shared and isinstance(rate, (int, float)) else None,
+                shared_source=parse_shared_source(view.get("shared_source")) if shared else None,
             )
         statuses[str(raw["id"])] = ServerStatus(
             id=str(raw["id"]),
@@ -428,10 +445,29 @@ def server_text(server: PluginServer, status: ServerStatus | None) -> tuple[str,
     return (f"Not reachable{detail}. Is the plugin running? The recorder keeps trying.", "error")
 
 
+def binding_decoding(status: BindingStatus | None, plugin_name: str) -> DecodingLines | None:
+    """Who decodes the binding's pictures and who scales them down; None
+    until the binding runs."""
+    if status is None or status.state != "active":
+        return None
+    return decoding_lines(
+        plugin_name=plugin_name,
+        shared_pictures=status.shared_pictures,
+        shared_fps=status.shared_fps,
+        shared_source=status.shared_source,
+        plugin_decoder=status.decoder,
+    )
+
+
 def binding_text(
-    binding: PluginBinding, status: BindingStatus | None, connected: bool
+    binding: PluginBinding,
+    status: BindingStatus | None,
+    connected: bool,
+    *,
+    decoding: bool = True,
 ) -> tuple[str, str]:
-    """(text, tone) for one bound camera."""
+    """(text, tone) for one bound camera. ``decoding``: say who decodes and
+    scales its pictures (off where the full lines are shown beside it)."""
     if binding.withdrawn:
         return ("Not covered any more · add it under Subscription in NeuroWatch Cloud", "muted")
     if not binding.enabled:
@@ -447,8 +483,11 @@ def binding_text(
     plugin = status.plugin_state
     if plugin == "running":
         text = f"Running · {status.fps:.0f} pictures a second"
-        if status.decoder:
-            text += f" · {status.decoder}"
+        lines = binding_decoding(status, "") if decoding else None
+        if lines is not None and (status.decoder or lines.shared):
+            text += f" · {lines.decoded_by}"
+            if lines.scaled:
+                text += f" · {lines.scaled}"
         if status.dropped:
             text += f" · {status.dropped} frames dropped"
         return (text, "success")
@@ -462,12 +501,184 @@ def binding_text(
 # ---- Settings form --------------------------------------------------------
 
 
+#: A choice list with more options than this gets a search box and scrolls.
+SCROLL_THRESHOLD = 8
+
+
+def needs_scroll(option_count: int) -> bool:
+    """Whether a list of this many options is shown scrolling with a search box."""
+    return option_count > SCROLL_THRESHOLD
+
+
+def schema_order(node: object) -> list[str]:
+    """``x-nw-order`` of a schema object: the keys to show first, in order."""
+    raw = node.get("x-nw-order") if isinstance(node, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return [k for k in raw if isinstance(k, str)]
+
+
+def apply_order(keys: Sequence[str], order: Sequence[str]) -> list[str]:
+    """``keys`` with those named in ``order`` first (in that order, once each;
+    unknown names ignored), then the rest in their own order."""
+    present = set(keys)
+    first = [k for k in dict.fromkeys(order) if k in present]
+    named = set(first)
+    return first + [k for k in keys if k not in named]
+
+
+def shape_summary(values: Mapping[str, float], defaults: Mapping[str, float]) -> str:
+    """One line for a class's size and shape limits: "Any size" while they are
+    the defaults, else what is limited ("1–20%, 0.2–1.0": share of the picture,
+    then width ÷ height)."""
+    parts: list[str] = []
+    size = tuple(values.get(k, defaults.get(k, 0)) for k in ("min_size", "max_size"))
+    if size != tuple(defaults.get(k, 0) for k in ("min_size", "max_size")):
+        parts.append(f"{size[0]:g}–{size[1]:g}%")
+    ratio = tuple(values.get(k, defaults.get(k, 0)) for k in ("min_ratio", "max_ratio"))
+    if ratio != tuple(defaults.get(k, 0) for k in ("min_ratio", "max_ratio")):
+        parts.append(f"{ratio[0]:g}–{ratio[1]:g}")
+    return ", ".join(parts) or "Any size"
+
+
+def chosen_first(options: Sequence[str], chosen: Sequence[str]) -> list[str]:
+    """``options`` with the chosen ones first; each group keeps its order."""
+    picked = set(chosen)
+    return [o for o in options if o in picked] + [o for o in options if o not in picked]
+
+
+@dataclass
+class ExtraField:
+    """A field of one area (``nw:zones``) or one class (``nw:classes``) beyond
+    the ones NeuroWatch itself draws, as the item schema describes it.
+
+    ``kind``: ``int``, ``float``, ``bool``, ``many`` (a multi-choice list,
+    empty meaning the field's own "all") or ``numbers`` (``length`` number
+    inputs in a row)."""
+
+    key: str
+    kind: str
+    title: str
+    description: str = ""
+    default: Any = None
+    minimum: float | None = None
+    maximum: float | None = None
+    choices: list[str] = field(default_factory=list)
+    choice_labels: dict[str, str] = field(default_factory=dict)
+    length: int = 0
+    #: ``x-nw-zone-kinds``: the area kinds that show it (empty: all of them).
+    zone_kinds: tuple[str, ...] = ()
+
+    def applies_to(self, zone_kind: str) -> bool:
+        return not self.zone_kinds or zone_kind in self.zone_kinds
+
+    def initial(self) -> Any:
+        """What a missing value shows and saves."""
+        if self.default is not None:
+            return self.default
+        if self.kind == "bool":
+            return False
+        if self.kind == "many":
+            return []
+        if self.kind == "numbers":
+            return [self.minimum or 0] * self.length
+        return self.minimum if self.minimum is not None else 0
+
+    def value_of(self, value: object) -> Any:
+        """``value`` when it fits the field, else the default."""
+        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if self.kind in ("int", "float"):
+            return value if number else self.initial()
+        if self.kind == "bool":
+            return value if isinstance(value, bool) else self.initial()
+        if self.kind == "many":
+            if isinstance(value, list):
+                return [v for v in value if isinstance(v, str) and v in self.choices]
+            return list(self.initial())
+        if isinstance(value, list) and len(value) == self.length:
+            if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value):
+                return list(value)
+        return list(self.initial())
+
+
+_FIXED_KEYS_ZONE = frozenset({"id", "name", "kind", "points"})
+_FIXED_KEYS_CLASS = frozenset({"id", "confidence"})
+
+
+def extra_fields(item_schema: object, fixed: frozenset[str]) -> list[ExtraField]:
+    """The fields of an array's items (``items.properties``) other than
+    ``fixed``, of the types the form can show; others are left out and kept
+    as they are."""
+    props = _dict_at(item_schema, "properties") if isinstance(item_schema, dict) else {}
+    result: list[ExtraField] = []
+    for key in apply_order(list(props), schema_order(item_schema)):
+        prop = props[key]
+        if key in fixed or not isinstance(prop, dict):
+            continue
+        kind = prop.get("type")
+        minimum, maximum = prop.get("minimum"), prop.get("maximum")
+        low = float(minimum) if isinstance(minimum, (int, float)) else None
+        high = float(maximum) if isinstance(maximum, (int, float)) else None
+        entry = ExtraField(
+            key=str(key),
+            kind="",
+            title=str(prop.get("title") or str(key).replace("_", " ").capitalize()),
+            description=str(prop.get("description") or ""),
+            default=prop.get("default"),
+            minimum=low,
+            maximum=high,
+        )
+        sub = prop.get("items")
+        if kind == "integer":
+            entry.kind = "int"
+        elif kind == "number":
+            entry.kind = "float"
+        elif kind == "boolean":
+            entry.kind = "bool"
+        elif kind == "array" and isinstance(sub, dict) and isinstance(sub.get("enum"), list):
+            entry.kind = "many"
+            entry.choices = [str(c) for c in sub["enum"]]
+            labels = sub.get("x-nw-labels")
+            if isinstance(labels, dict):
+                entry.choice_labels = {
+                    str(k): str(v) for k, v in labels.items() if isinstance(v, str)
+                }
+        elif (
+            kind == "array"
+            and isinstance(sub, dict)
+            and sub.get("type") in ("number", "integer")
+            and isinstance(prop.get("minItems"), int)
+            and prop.get("minItems") == prop.get("maxItems")
+            and 0 < prop["minItems"] <= 16
+        ):
+            entry.kind = "numbers"
+            entry.length = prop["minItems"]
+            low, high = sub.get("minimum"), sub.get("maximum")
+            entry.minimum = float(low) if isinstance(low, (int, float)) else entry.minimum
+            entry.maximum = float(high) if isinstance(high, (int, float)) else entry.maximum
+            if not isinstance(prop.get("default"), list):
+                entry.default = None
+        else:
+            continue  # an unknown type: kept untouched in the saved item
+        if entry.kind in ("int", "float", "bool") and entry.default is not None:
+            ok = isinstance(entry.default, bool) == (entry.kind == "bool") and isinstance(
+                entry.default, (int, float)
+            )
+            if not ok:
+                entry.default = None
+        zone_kinds = prop.get("x-nw-zone-kinds")
+        if isinstance(zone_kinds, list):
+            entry.zone_kinds = tuple(str(k) for k in zone_kinds)
+        result.append(entry)
+    return result
+
+
 @dataclass
 class FormField:
     """One setting of a plugin's configuration, as its JSON Schema describes it."""
 
     key: str
-    kind: str  # "int", "float", "bool", "choice", "text", "zones", "lanes"
+    kind: str  # "int", "float", "bool", "choice", "text", "zones", "lanes", "classes"
     title: str
     default: Any = None
     minimum: float | None = None
@@ -481,6 +692,19 @@ class FormField:
     #: The most entries a drawn field may have, and points in an area.
     max_items: int = 0
     max_points: int = 0
+    #: ``classes``: the per-class confidence (None when the plugin has none),
+    #: its bounds, its default, and the defaults of single classes.
+    has_confidence: bool = False
+    #: ``classes``: what the per-class confidence is called and means.
+    confidence_title: str = ""
+    confidence_description: str = ""
+    confidence_min: int = 0
+    confidence_max: int = 100
+    confidence_default: int = 50
+    class_defaults: dict[str, int] = field(default_factory=dict)
+    #: ``zones``: each area's extra fields; ``classes``: each class's.
+    area_fields: list[ExtraField] = field(default_factory=list)
+    class_fields: list[ExtraField] = field(default_factory=list)
 
 
 def _dict_at(value: dict[str, Any], *keys: str) -> dict[str, Any]:
@@ -498,7 +722,8 @@ def form_fields(schema: object) -> list[FormField]:
     fields: list[FormField] = []
     if not isinstance(props, dict):
         return fields  # a plugin's schema is not trusted to be well formed
-    for key, prop in props.items():
+    for key in apply_order(list(props), schema_order(schema)):
+        prop = props[key]
         if not isinstance(prop, dict):
             continue
         kind = prop.get("type")
@@ -510,6 +735,10 @@ def form_fields(schema: object) -> list[FormField]:
             shown = "lines"
         elif prop.get("x-nw-widget") == "nw:areas":
             shown = "areas"
+        elif prop.get("x-nw-widget") == "nw:classes" and isinstance(
+            _dict_at(prop, "items", "properties", "id").get("enum"), list
+        ):
+            shown = "classes"
         elif isinstance(prop.get("items"), dict) and isinstance(prop["items"].get("enum"), list):
             shown = "many"
         elif isinstance(prop.get("enum"), list):
@@ -528,6 +757,28 @@ def form_fields(schema: object) -> list[FormField]:
         labels = prop.get("x-nw-labels")
         points = _dict_at(prop, "items", "properties", "points")
         options = _dict_at(prop, "items").get("enum") if shown == "many" else prop.get("enum")
+        if shown == "many" and not isinstance(labels, dict):
+            # A list's labels may sit with its options.
+            labels = _dict_at(prop, "items").get("x-nw-labels")
+        class_id = _dict_at(prop, "items", "properties", "id")
+        confidence = _dict_at(prop, "items", "properties", "confidence")
+        if shown == "classes":
+            options = class_id.get("enum")
+            labels = class_id.get("x-nw-labels")
+        low, high, base = (_whole(confidence.get(n)) for n in ("minimum", "maximum", "default"))
+        low = 0 if low is None else low
+        high = 100 if high is None else max(high, low)
+        base = low if base is None else min(max(base, low), high)
+        per_class = confidence.get("x-nw-defaults")
+        class_defaults = (
+            {
+                str(k): min(max(v, low), high)
+                for k, raw in per_class.items()
+                if (v := _whole(raw)) is not None
+            }
+            if isinstance(per_class, dict)
+            else {}
+        )
         fields.append(
             FormField(
                 key=str(key),
@@ -536,9 +787,11 @@ def form_fields(schema: object) -> list[FormField]:
                 default=prop.get("default"),
                 minimum=float(minimum) if isinstance(minimum, (int, float)) else None,
                 maximum=float(maximum) if isinstance(maximum, (int, float)) else None,
-                choices=[str(c) for c in options or []] if shown in ("choice", "many") else [],
+                choices=[str(c) for c in options or []]
+                if shown in ("choice", "many", "classes")
+                else [],
                 choice_labels={str(k): str(v) for k, v in labels.items() if isinstance(v, str)}
-                if shown in ("choice", "many") and isinstance(labels, dict)
+                if shown in ("choice", "many", "classes") and isinstance(labels, dict)
                 else {},
                 description=str(prop.get("description") or ""),
                 lines_key=str(prop.get("x-nw-lines") or "lines") if shown == "lanes" else "",
@@ -546,9 +799,36 @@ def form_fields(schema: object) -> list[FormField]:
                 max_points=int(points["maxItems"])
                 if isinstance(points.get("maxItems"), int)
                 else 0,
+                has_confidence=shown == "classes" and bool(confidence),
+                confidence_title=str(confidence.get("title") or "Confidence (%)")
+                if shown == "classes"
+                else "",
+                confidence_description=str(confidence.get("description") or "")
+                if shown == "classes"
+                else "",
+                confidence_min=low,
+                confidence_max=high,
+                confidence_default=base,
+                class_defaults=class_defaults if shown == "classes" else {},
+                area_fields=extra_fields(prop.get("items"), _FIXED_KEYS_ZONE)
+                if shown == "zones"
+                else [],
+                class_fields=[
+                    f
+                    for f in extra_fields(prop.get("items"), _FIXED_KEYS_CLASS)
+                    if f.kind in ("int", "float")
+                ]
+                if shown == "classes"
+                else [],
             )
         )
     return fields
+
+
+def _whole(value: object) -> int | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    return None
 
 
 def camera_plugins_text(result: object, camera_id: str) -> str:

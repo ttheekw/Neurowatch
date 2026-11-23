@@ -67,6 +67,16 @@ def _animal(p: QPainter) -> None:
     p.drawEllipse(QPointF(18.0, 10.5), 1.7, 2.1)
 
 
+def _object(p: QPainter) -> None:
+    # A box with corner brackets: "something found", whatever it is.
+    p.drawRoundedRect(QRectF(7.0, 7.0, 10.0, 10.0), 1.5, 1.5)
+    for sx, sy in ((3.5, 3.5), (20.5, 3.5), (3.5, 20.5), (20.5, 20.5)):
+        dx = 3.0 if sx < 12 else -3.0
+        dy = 3.0 if sy < 12 else -3.0
+        p.drawLine(QPointF(sx, sy), QPointF(sx + dx, sy))
+        p.drawLine(QPointF(sx, sy), QPointF(sx, sy + dy))
+
+
 def _intrusion(p: QPainter) -> None:
     shield = QPainterPath(QPointF(12.0, 3.0))
     shield.lineTo(19.5, 6.0)
@@ -230,6 +240,7 @@ _GLYPHS: dict[str, _Glyph] = {
     "person": _person,
     "vehicle": _vehicle,
     "animal": _animal,
+    "object": _object,
     "tamper": _tamper,
     "digital_input": _digital_input,
     "camera_event": _camera_event,

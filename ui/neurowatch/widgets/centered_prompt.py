@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from neurowatch.theme import apply_dialog_theme, set_button_variant, set_label_role
+from neurowatch.utils.dialogs import run_dialog
 from neurowatch.widgets.window_chrome import (
     SHADOW_MARGIN,
     ChromeTitleBar,
@@ -142,10 +143,11 @@ class CenteredPrompt(QDialog):
         return self._buttons[key]
 
     def choose(self) -> str | None:
-        """Show centred and wait for a choice."""
+        """Show centred and wait for a choice. Once: Qt deletes the prompt
+        afterwards (``run_dialog``)."""
         self._chosen = None
         self._present()
-        self.exec()
+        run_dialog(self)
         return self._chosen
 
     def _choose(self, key: str) -> None:

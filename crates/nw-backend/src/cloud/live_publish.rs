@@ -10,6 +10,12 @@
 //! the recording cannot stall it. With `NW_STREAM_HUB=0` each publication
 //! opens a dedicated connection instead ([`crate::pipeline::encoded`]).
 //!
+//! The one exception: a session whose browser cannot play H.265 asks for a
+//! transcode (`PublishDirective::transcode`). For an H.265 stream the video
+//! then comes from the shared [`crate::streams::transcode`] (decode once per
+//! camera stream, H.264 from a GPU encoder, else raw pictures the session
+//! encodes as VP8); an H.264 stream is forwarded unchanged as ever.
+//!
 //! `main` is the camera's main stream and `sub` its configured sub stream. A
 //! camera without a sub stream has no `sub`: the main stream is never
 //! relabelled. [`StreamCodecs`] remembers each stream's codec once seen, for
@@ -47,6 +53,7 @@ use crate::pipeline::encoded::{self, EncodedOutputs};
 use crate::pipeline::sanitize_credentials;
 use crate::streams::annexb::AnnexB;
 use crate::streams::sound::SoundDecoder;
+use crate::streams::transcode::{TranscodeSink, TranscodeViewer};
 use crate::streams::{Delivery, Media, Phase, SharedUnit, SubscriberPolicy, Subscription};
 use nw_core::encoded::EncodedAccessUnit;
 
@@ -155,7 +162,7 @@ impl LiveSourceOpener for CameraLiveSourceOpener {
         units: Arc<EncodedSubmitter>,
     ) -> Result<Box<dyn LiveSourceRun>, PublishError> {
         if crate::streams::enabled() {
-            return self.open_shared(camera_id, representation, units);
+            return self.open_shared(camera_id, representation, units, None);
         }
         // Called from the runtime, so the config is only peeked at; the
         // source checks again on every connection.
@@ -207,6 +214,21 @@ impl LiveSourceOpener for CameraLiveSourceOpener {
             .map_err(|_| PublishError::Transport)?;
         Ok(Box::new(SourceRun(stop, audio_stop)))
     }
+
+    /// Transcoding needs the shared connection (one decode for every viewer
+    /// of the stream); with `NW_STREAM_HUB=0` the stream is forwarded as it is.
+    fn open_transcoded(
+        &self,
+        camera_id: &str,
+        representation: Representation,
+        units: Arc<EncodedSubmitter>,
+        max_bitrate_kbps: u32,
+    ) -> Result<Box<dyn LiveSourceRun>, PublishError> {
+        if crate::streams::enabled() {
+            return self.open_shared(camera_id, representation, units, Some(max_bitrate_kbps));
+        }
+        self.open(camera_id, representation, units)
+    }
 }
 
 impl CameraLiveSourceOpener {
@@ -215,6 +237,7 @@ impl CameraLiveSourceOpener {
         camera_id: &str,
         representation: Representation,
         units: Arc<EncodedSubmitter>,
+        transcode_kbps: Option<u32>,
     ) -> Result<Box<dyn LiveSourceRun>, PublishError> {
         // Called from the runtime, so the config is only peeked at; the
         // source checks again whenever it subscribes.
@@ -237,6 +260,7 @@ impl CameraLiveSourceOpener {
             camera_id: camera_id.to_owned(),
             representation,
             units,
+            transcode_kbps,
             stop: Arc::clone(&stop),
         };
         // A plain thread: it waits on its subscription and reads the config
@@ -283,6 +307,10 @@ struct SharedSource {
     camera_id: String,
     representation: Representation,
     units: Arc<EncodedSubmitter>,
+    /// The session's browser cannot play H.265 and its grant allows this
+    /// many kbit/s: an H.265 stream is transcoded for it
+    /// ([`crate::streams::transcode`]), anything else forwarded unchanged.
+    transcode_kbps: Option<u32>,
     stop: Arc<AtomicBool>,
 }
 
@@ -395,7 +423,13 @@ impl SharedSource {
             .subscribe_stream(
                 &self.camera_id,
                 self.representation.code(),
-                SubscriberPolicy::live_video(),
+                // The cached GOP is the viewer's start, however far into it
+                // the camera is: cut short, the viewer waits for the next
+                // keyframe (seconds on a camera with a long GOP).
+                SubscriberPolicy {
+                    whole_gop: true,
+                    ..SubscriberPolicy::live_video()
+                },
             )
             .map_err(|_| PublishError::StreamUnavailable)?;
         Ok((subscription, url))
@@ -432,11 +466,39 @@ impl SharedSource {
         (false, main)
     }
 
+    /// Join (starting it if need be) the transcode of this camera stream,
+    /// delivering to this publication.
+    fn join_transcode(&self, url: &str, kbps: u32) -> Result<TranscodeViewer, String> {
+        let state = self.state.blocking_read();
+        let camera = state
+            .config
+            .cameras
+            .iter()
+            .find(|camera| camera.id == self.camera_id)
+            .ok_or_else(|| "Camera not found".to_owned())?;
+        let mut source = camera.clone();
+        source.url = url.to_owned();
+        let stream = match self.representation {
+            Representation::Main => "main",
+            Representation::Sub => "sub",
+        };
+        state.streams.transcode(
+            &source,
+            stream,
+            kbps,
+            Arc::clone(&self.units) as Arc<dyn TranscodeSink>,
+        )
+    }
+
     fn forward(&self, subscription: &Subscription, url: &str) -> Forwarded {
         let mut converter: Option<(gstreamer::Caps, AnnexB)> = None;
         // Decided at the first picture, once the stream was described.
         let mut sound_from: Option<(bool, Option<Subscription>)> = None;
         let mut sound = Sound::default();
+        // Joined once the stream proves to be H.265 and this session asked
+        // for a transcode; the video then comes from it, the sound as ever
+        // from this subscription.
+        let mut transcoding: Option<TranscodeViewer> = None;
         let mut checked = Instant::now();
         loop {
             if self.stopped() {
@@ -481,7 +543,21 @@ impl SharedSource {
                     if sound_from.is_none() {
                         sound_from = Some(self.sound_source(subscription));
                     }
-                    if let Some((_, convert)) = &converter {
+                    let h265 = converter
+                        .as_ref()
+                        .is_some_and(|(_, convert)| convert.codec == VideoCodec::H265);
+                    if let (Some(kbps), true, None) = (self.transcode_kbps, h265, &transcoding) {
+                        match self.join_transcode(url, kbps) {
+                            Ok(viewer) => transcoding = Some(viewer),
+                            Err(error) => {
+                                tracing::warn!(cam_id = %self.camera_id, %error, "Live view cannot transcode this camera stream");
+                                return Forwarded::GaveUp(PublishError::UnsupportedSource);
+                            }
+                        }
+                    }
+                    if transcoding.is_some() {
+                        // The transcode's own subscription carries the video.
+                    } else if let Some((_, convert)) = &converter {
                         if let Some(access_unit) = access_unit(convert, &unit) {
                             self.units.submit(access_unit);
                         }
@@ -1075,6 +1151,7 @@ mod tests {
             camera_id: "gone".into(),
             representation: Representation::Main,
             units,
+            transcode_kbps: None,
             stop: Arc::new(AtomicBool::new(false)),
         };
         source.run();
@@ -1092,6 +1169,7 @@ mod tests {
             camera_id: "cam-1".into(),
             representation: Representation::Main,
             units,
+            transcode_kbps: None,
             stop: Arc::new(AtomicBool::new(false)),
         };
         source.run();
@@ -1107,6 +1185,7 @@ mod tests {
             camera_id: "cam-1".into(),
             representation: Representation::Main,
             units,
+            transcode_kbps: None,
             stop: Arc::new(AtomicBool::new(true)),
         };
         source.run();
@@ -1138,6 +1217,89 @@ mod tests {
             vec![(Representation::Main, Some(VideoCodec::H264))]
         );
         run.stop();
+    }
+
+    #[test]
+    fn an_h264_stream_is_forwarded_unchanged_even_when_a_transcode_was_asked_for() {
+        let fixture = CameraFile::new(250);
+        let state = state_with(vec![file_camera(&fixture)]);
+        let opener = CameraLiveSourceOpener::new(Arc::clone(&state), Arc::default());
+        let (units, feed) = channel();
+        let run = opener
+            .open_transcoded("cam-1", Representation::Main, Arc::clone(&units), 2_000)
+            .unwrap_or_else(|_| panic!("a file stream can be forwarded"));
+        let first = runtime()
+            .block_on(async { tokio::time::timeout(Duration::from_secs(20), feed.next()).await })
+            .expect("a picture arrives")
+            .expect("the feed is open");
+        assert_eq!(first.codec, VideoCodec::H264);
+        assert!(first.keyframe);
+        assert!(
+            state.try_read().unwrap().streams.transcodes().is_empty(),
+            "nothing is decoded for an H.264 stream"
+        );
+        run.stop();
+    }
+
+    #[test]
+    fn two_sessions_that_asked_share_one_transcode_of_an_h265_stream() {
+        let Some(fixture) = CameraFile::h265(400, 640, 360) else {
+            eprintln!("skipped: no x265enc to make an H.265 camera");
+            return;
+        };
+        let state = state_with(vec![file_camera(&fixture)]);
+        let opener = CameraLiveSourceOpener::new(Arc::clone(&state), Arc::default());
+        let (first_units, first_feed) = channel();
+        let (second_units, second_feed) = channel();
+        let first_run = opener
+            .open_transcoded("cam-1", Representation::Main, first_units, 2_000)
+            .unwrap_or_else(|_| panic!("a file stream can be transcoded"));
+        let second_run = opener
+            .open_transcoded("cam-1", Representation::Main, second_units, 800)
+            .unwrap_or_else(|_| panic!("a file stream can be transcoded"));
+        let rt = runtime();
+        let wait = |feed: &EncodedFeed| {
+            rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(40), async {
+                    tokio::select! {
+                        unit = feed.next() => unit.map(Some),
+                        _ = feed.next_picture() => Some(None),
+                    }
+                })
+                .await
+            })
+            .expect("the transcode delivers")
+            .expect("the feed is open")
+        };
+        for feed in [&first_feed, &second_feed] {
+            // An encoder: H.264 at the camera's size, from a keyframe; with
+            // none here, pictures for the CPU path instead.
+            if let Some(unit) = wait(feed) {
+                assert_eq!(unit.codec, VideoCodec::H264);
+                assert!(unit.keyframe);
+                assert_eq!((unit.width, unit.height), (640, 360));
+            }
+        }
+        // Listed once its decoder is named (a moment after the first picture).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut listed = state.try_read().unwrap().streams.transcodes();
+        while listed.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            listed = state.try_read().unwrap().streams.transcodes();
+        }
+        assert_eq!(listed.len(), 1, "one transcode: {listed:?}");
+        assert_eq!(listed[0].viewers, 2);
+        assert_eq!((listed[0].from, listed[0].stream), ("h265", "main"));
+        first_run.stop();
+        second_run.stop();
+        // Both sessions ended: the transcode stops with them.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !state.try_read().unwrap().streams.transcodes().is_empty()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(state.try_read().unwrap().streams.transcodes().is_empty());
     }
 
     #[test]

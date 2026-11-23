@@ -60,6 +60,8 @@ from neurowatch.models.camera import CameraConfig, WallPosition
 from neurowatch.models.wall_layout import GRID_PRESETS, Placement, Span, grid_label, restore
 from neurowatch.models.window_session import SavedGeometry, SavedTile, SavedWindow
 from neurowatch.theme import active_colors, apply_dialog_theme, themed_menu
+from neurowatch.utils.dialogs import run_dialog
+from neurowatch.utils.screens import screen_of
 from neurowatch.widgets.video_wall import CameraHandover, VideoWallWidget
 from neurowatch.widgets.window_chrome import (
     GRIP_WIDTH,
@@ -397,7 +399,7 @@ class DetachedWallWindow(QWidget):
         from neurowatch.dialogs.custom_grid_dialog import CustomGridDialog
 
         dialog = CustomGridDialog(self._rows, self._cols, self)
-        if dialog.exec() == CustomGridDialog.DialogCode.Accepted:
+        if run_dialog(dialog) == CustomGridDialog.DialogCode.Accepted:
             self.set_grid(dialog.rows, dialog.cols)
 
     def _on_layout_edit(self, placements: object, spans: object, page: int) -> None:
@@ -473,7 +475,7 @@ class DetachedWallWindow(QWidget):
             state = "normal"
         normal = self.normalGeometry()
         rect = normal if state != "normal" and normal.isValid() else self.geometry()
-        screen = self.screen()
+        screen = screen_of(self)
         geometry = SavedGeometry(
             screen.name() if screen is not None else "",
             rect.x(),
@@ -634,7 +636,7 @@ class DetachedWallWindow(QWidget):
     def place_near(self, main_window: QWidget) -> None:
         """Open on another monitor when there is one, else beside ``main_window``."""
         screens = QGuiApplication.screens()
-        current = main_window.screen()
+        current = screen_of(main_window)
         others = [s for s in screens if s is not current]
         if others:
             area = others[(self.number - 2) % len(others)].availableGeometry()

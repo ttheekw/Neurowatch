@@ -84,6 +84,12 @@ pub struct SubscriberPolicy {
     pub linger: Duration,
     /// Only this media (`None`: picture and sound).
     pub media: Option<Media>,
+    /// Start with the whole GOP the hub has cached, however long: the
+    /// limits above bound how far a consumer falls behind, and that GOP is
+    /// where it starts, not a backlog (they then count what comes after it).
+    /// Without it, a subscriber that joins late in a long GOP gets only what
+    /// fits, and then nothing until the camera's next keyframe.
+    pub whole_gop: bool,
 }
 
 impl SubscriberPolicy {
@@ -109,6 +115,7 @@ impl SubscriberPolicy {
             start_at_keyframe: true,
             linger: Duration::ZERO,
             media: None,
+            whole_gop: false,
         }
     }
 
@@ -126,6 +133,7 @@ impl SubscriberPolicy {
             start_at_keyframe: true,
             linger: LIVE_LINGER,
             media: None,
+            whole_gop: false,
         }
     }
 
@@ -142,6 +150,7 @@ impl SubscriberPolicy {
             start_at_keyframe: true,
             linger: LIVE_LINGER,
             media: Some(Media::Video),
+            whole_gop: false,
         }
     }
 
@@ -205,6 +214,7 @@ impl SubscriberPolicy {
             start_at_keyframe: false,
             linger: LIVE_LINGER,
             media: Some(Media::Audio),
+            whole_gop: false,
         }
     }
 }
@@ -226,6 +236,10 @@ pub enum Delivery<U> {
 struct Inner<U> {
     items: VecDeque<Delivery<U>>,
     bytes: usize,
+    /// Items at the front, and their bytes, that the limits do not count:
+    /// the GOP a `whole_gop` subscriber started with.
+    exempt: usize,
+    exempt_bytes: usize,
     policy: SubscriberPolicy,
     /// Dropping until a video keyframe fits.
     skipping: bool,
@@ -247,6 +261,8 @@ impl<U: Unit> SubscriberQueue<U> {
             inner: Mutex::new(Inner {
                 items: VecDeque::new(),
                 bytes: 0,
+                exempt: 0,
+                exempt_bytes: 0,
                 policy,
                 skipping: policy.start_at_keyframe,
                 gap: false,
@@ -267,6 +283,17 @@ impl<U: Unit> SubscriberQueue<U> {
 
     /// Hand `unit` to this subscriber. Never blocks.
     pub fn push(&self, unit: U) {
+        self.push_as(unit, false);
+    }
+
+    /// Hand this subscriber a unit of the GOP it starts with (the hub's
+    /// cache, in order, before any live unit): for a `whole_gop` policy it
+    /// is queued whatever the limits, and they do not count it.
+    pub fn push_start(&self, unit: U) {
+        self.push_as(unit, true);
+    }
+
+    fn push_as(&self, unit: U, start: bool) {
         let mut inner = self.lock();
         if inner.closed
             || inner
@@ -277,9 +304,10 @@ impl<U: Unit> SubscriberQueue<U> {
             return;
         }
         let policy = inner.policy;
+        let exempt = start && policy.whole_gop && inner.exempt == inner.items.len();
         if inner.skipping {
             let starts = unit.media() == Media::Video && unit.keyframe();
-            if !starts || !fits(&inner, &unit) {
+            if !starts || !(exempt || fits(&inner, &unit)) {
                 // Waiting for the first keyframe is no loss; skipping after
                 // falling behind is.
                 if inner.gap {
@@ -288,7 +316,7 @@ impl<U: Unit> SubscriberQueue<U> {
                 return;
             }
             inner.skipping = false;
-        } else if !fits(&inner, &unit) {
+        } else if !exempt && !fits(&inner, &unit) {
             match policy.overflow {
                 Overflow::SkipToKeyframe => {
                     inner.skipping = true;
@@ -314,6 +342,10 @@ impl<U: Unit> SubscriberQueue<U> {
         }
         let after_gap = std::mem::take(&mut inner.gap);
         inner.bytes += unit.bytes();
+        if exempt {
+            inner.exempt += 1;
+            inner.exempt_bytes += unit.bytes();
+        }
         inner.items.push_back(Delivery::Unit { unit, after_gap });
         drop(inner);
         self.ready.notify_one();
@@ -348,8 +380,13 @@ impl<U: Unit> SubscriberQueue<U> {
                 .unwrap_or_else(|p| p.into_inner().0);
         }
         let item = inner.items.pop_front()?;
+        let was_exempt = inner.exempt > 0;
+        inner.exempt = inner.exempt.saturating_sub(1);
         if let Delivery::Unit { unit, .. } = &item {
             inner.bytes = inner.bytes.saturating_sub(unit.bytes());
+            if was_exempt {
+                inner.exempt_bytes = inner.exempt_bytes.saturating_sub(unit.bytes());
+            }
         }
         Some(item)
     }
@@ -379,16 +416,24 @@ impl<U: Unit> SubscriberQueue<U> {
 /// Whether `unit` fits next to what `inner` holds.
 fn fits<U: Unit>(inner: &Inner<U>, unit: &U) -> bool {
     let policy = &inner.policy;
-    if inner.items.is_empty() {
+    // What the subscriber started with (`whole_gop`) is not counted.
+    let counted = inner.items.len() - inner.exempt.min(inner.items.len());
+    if counted == 0 {
         return true;
     }
-    if inner.items.len() >= policy.max_units || inner.bytes + unit.bytes() > policy.max_bytes {
+    if counted >= policy.max_units
+        || inner.bytes.saturating_sub(inner.exempt_bytes) + unit.bytes() > policy.max_bytes
+    {
         return false;
     }
-    let oldest = inner.items.iter().find_map(|item| match item {
-        Delivery::Unit { unit, .. } => unit.time_ns(),
-        Delivery::Discontinuity { .. } => None,
-    });
+    let oldest = inner
+        .items
+        .iter()
+        .skip(inner.exempt)
+        .find_map(|item| match item {
+            Delivery::Unit { unit, .. } => unit.time_ns(),
+            Delivery::Discontinuity { .. } => None,
+        });
     match (oldest, unit.time_ns()) {
         (Some(oldest), Some(newest)) => {
             newest.saturating_sub(oldest) <= policy.max_span.as_nanos() as u64
@@ -453,6 +498,7 @@ pub(crate) mod tests {
             start_at_keyframe: true,
             linger: Duration::ZERO,
             media: None,
+            whole_gop: false,
         }
     }
 
@@ -464,6 +510,65 @@ pub(crate) mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn a_whole_gop_start_is_kept_whatever_the_limits_which_then_count_what_follows() {
+        // Live view starting 8 s into a camera's GOP: the limits (3 units,
+        // 2 s) are for falling behind, and without the whole GOP the viewer
+        // waits for the camera's next keyframe.
+        let policy = SubscriberPolicy {
+            max_span: Duration::from_secs(2),
+            whole_gop: true,
+            ..small(Overflow::SkipToKeyframe)
+        };
+        let queue = SubscriberQueue::new(policy);
+        for i in 0..9u64 {
+            queue.push_start(video(i * 1000, i == 0));
+        }
+        assert_eq!(queue.level().0, 9, "all of it, 8 s and 9 units");
+        // Live units after it are counted from the first of them.
+        queue.push(video(9000, false));
+        queue.push(video(10_000, false));
+        queue.push(video(11_000, false));
+        assert_eq!(queue.dropped(), 0, "2 s and 3 units of live video fit");
+        queue.push(video(12_000, false));
+        assert_eq!(
+            queue.dropped(),
+            1,
+            "a fourth, 3 s after the first, does not"
+        );
+        let got: Vec<u64> = drain(&queue).into_iter().map(|(ms, _)| ms).collect();
+        assert_eq!(got, (0..12).map(|i| i * 1000).collect::<Vec<_>>());
+        // Read, the start no longer exempts anything.
+        queue.push(video(13_000, true));
+        for i in 0..3u64 {
+            queue.push(video(13_100 + i, false));
+        }
+        assert_eq!(queue.level().0, 3, "the limits apply as ever");
+    }
+
+    #[test]
+    fn a_start_is_limited_like_any_unit_without_whole_gop() {
+        let queue = SubscriberQueue::new(SubscriberPolicy {
+            max_span: Duration::from_secs(2),
+            ..small(Overflow::SkipToKeyframe)
+        });
+        for i in 0..9u64 {
+            queue.push_start(video(i * 1000, i == 0));
+        }
+        assert_eq!(queue.level().0, 3, "what fits, as before");
+        // And a start is only the units before any live one.
+        let queue = SubscriberQueue::new(SubscriberPolicy {
+            whole_gop: true,
+            ..small(Overflow::SkipToKeyframe)
+        });
+        queue.push_start(video(0, true));
+        queue.push(video(10, false));
+        for i in 0..5u64 {
+            queue.push_start(video(20 + i, false));
+        }
+        assert_eq!(queue.level().0, 4, "a keyframe, then three counted units");
     }
 
     #[test]

@@ -268,8 +268,10 @@ def parse_overlays(result: object, now: float) -> dict[str, list[Drawing]]:
         if not isinstance(entry, dict) or "camera_id" not in entry:
             continue
         items = tuple(item for item in entry.get("items") or [] if _valid(item))
-        if not items:
-            continue
+        if not items and not isinstance(entry.get("time_us"), int):
+            continue  # nothing to draw and no picture named: the layer is cleared
+        # With a picture named, no items is a result too: "analysed, nothing to
+        # draw". It paints nothing, but the plugin did analyse that picture.
         ttl = entry.get("ttl_ms")
         ttl_s = float(ttl) / 1000 if isinstance(ttl, (int, float)) else 2.0
         # ``ttl_ms`` is the time left; ``lifetime_ms`` (newer recorders) the
@@ -314,6 +316,28 @@ def on_wall(
         if kept:
             shown[camera_id] = kept
     return shown
+
+
+def analysing_clock(
+    drawings: dict[str, list[Drawing]],
+    cameras: dict[str, list[CameraPlugin]],
+    mode: str = "chosen",
+) -> dict[str, list[Drawing]]:
+    """The results that say which picture an analysed-pictures tile shows
+    next: every layer of the plugins drawing on the camera's wall tile
+    (``on_wall``'s plugins), the layers the user did not choose and the empty
+    results ("analysed, nothing to draw") included. They are never painted:
+    ``on_wall`` decides that. Without them a plugin that draws only while it
+    sees something would put the tile live in every quiet moment."""
+    if mode == "off":
+        return {}
+    clock: dict[str, list[Drawing]] = {}
+    for camera_id, layers in drawings.items():
+        plugins = {p.plugin for p in cameras.get(camera_id, []) if mode == "all" or p.wall_layers}
+        kept = [d for d in layers if d.plugin in plugins and d.time_us is not None]
+        if kept:
+            clock[camera_id] = kept
+    return clock
 
 
 @dataclass
@@ -422,6 +446,10 @@ def _ahead_of(drawing: Drawing, seq: int, capture_us: int, observed_us: int = 0)
 PICTURE_MATCH_US = 200_000
 #: Held beyond the measured delay, for its variation between results.
 _HOLD_MARGIN_US = 500_000
+#: The delay assumed until a result has measured it. A plugin that draws only
+#: when it sees something (Motion's boxes, Detect) shows none for a long time,
+#: and the pictures its first result describes must be held by then.
+_UNMEASURED_DELAY_US = 2_000_000
 
 
 def picture_gap_us(later: tuple[int, int], earlier: tuple[int, int]) -> int:
@@ -451,7 +479,10 @@ class AnalysedPictures:
 
     Large pictures would fill ``max_bytes`` in less time than a slow plugin
     takes (1080p: under a second), and its results would find nothing. So
-    only as many are kept as the budget allows over the delay measured.
+    only as many are kept as the budget allows over the delay measured (until
+    a first result measures it, a delay of ``_UNMEASURED_DELAY_US`` is assumed:
+    a plugin drawing only when it sees something has no result to measure for
+    a long time, and its first one would find its picture already dropped).
     """
 
     keep_us: int = 4_000_000
@@ -464,7 +495,8 @@ class AnalysedPictures:
     #: Monotonic time since playing live while results are current, or None.
     live_since: float | None = None
     #: How long results take, newest picture to the picture they describe.
-    _delay_us: int = 0
+    _delay_us: int = _UNMEASURED_DELAY_US
+    _measured: bool = False
     _noted: tuple[int, int] | None = None
     #: The tile has shown a picture since it opened on this camera.
     opened: bool = False
@@ -503,7 +535,11 @@ class AnalysedPictures:
             delay = identity[1] - (drawing.time_us or 0)
         # Up at once, down slowly: one quick result must not thin the pictures
         # the next slow one needs.
-        self._delay_us = max(delay, self._delay_us * 19 // 20, 0)
+        if self._measured:
+            self._delay_us = max(delay, self._delay_us * 19 // 20, 0)
+        else:
+            self._delay_us = max(delay, 0)  # the first measurement replaces the assumption
+            self._measured = True
 
     def next_result(self, drawing: Drawing | None) -> tuple[Drawing, object] | None:
         """Note the newest result; the newest one not yet shown whose picture
@@ -563,7 +599,8 @@ class AnalysedPictures:
         self._bytes = 0
         self.shown = None
         self.live_since = None
-        self._delay_us = 0
+        self._delay_us = _UNMEASURED_DELAY_US
+        self._measured = False
         self._noted = None
         self._waiting.clear()
         self.opened = False

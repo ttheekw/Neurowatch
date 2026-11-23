@@ -13,6 +13,7 @@ use self::hwaccel::HwAccelKind;
 pub mod audio;
 pub mod builder;
 pub mod decoder_driver;
+pub(crate) mod decoder_health;
 pub mod encoded;
 pub mod hwaccel;
 pub mod ingest;

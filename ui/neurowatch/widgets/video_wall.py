@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -354,7 +354,8 @@ class VideoWallWidget(QWidget):
         # cam_id -> the camera's audio track ("AAC", …), when it has one.
         self._audio_by_id: dict[str, str] = {}
         # Cameras whose tiles show the MOTION badge (motion going on).
-        self._motion_ids: set[str] = set()
+        # Camera → the names of what is going on there (the tile's badge).
+        self._motion_ids: dict[str, tuple[str, ...]] = {}
         self._pending_motion_ids: set[str] = set()
         # Analytics plugins: each camera's marker (tooltip line, running) and
         # the drawings shown over its picture.
@@ -362,6 +363,9 @@ class VideoWallWidget(QWidget):
         # Cloud Backup symbols: {camera_id: (state, tooltip line)}.
         self._backup_by_id: dict[str, tuple[str, str]] = {}
         self._drawings_by_id: dict[str, list[Drawing]] = {}
+        # The results that pace an analysed-pictures tile: every layer of the
+        # plugins drawing on it, chosen or not, empty results included.
+        self._clock_by_id: dict[str, list[Drawing]] = {}
         # What each analysed camera's tile shows over its picture.
         self._plugin_info_by_id: dict[str, TileInfo] = {}
         # Cameras whose tile shows no drawings: plain live video, nothing held.
@@ -867,7 +871,7 @@ class VideoWallWidget(QWidget):
             cell.set_stream_choice(self._view_stream.get(cam.id))
             self._cell_by_cam_id[cam.id] = i
             cell.set_status(self._status_by_id.get(cam.id, CellStatus.CONNECTING))
-            cell.set_motion(cam.id in self._motion_ids)
+            cell.set_motion(self._motion_ids.get(cam.id, ()))
             cell.set_motion_pending(cam.id in self._pending_motion_ids)
             marker = self._analytics_by_id.get(cam.id)
             cell.set_analytics(*(marker if marker is not None else (None, False)))
@@ -1571,14 +1575,20 @@ class VideoWallWidget(QWidget):
             if cell is not None:
                 cell.set_motion_pending(cam_id in camera_ids)
 
-    def set_motion_cameras(self, camera_ids: set[str]) -> None:
-        """Cameras with motion going on: their tiles show the MOTION badge."""
-        changed = self._motion_ids ^ camera_ids
-        self._motion_ids = set(camera_ids)
+    def set_motion_cameras(self, cameras: Mapping[str, Sequence[str]]) -> None:
+        """Cameras with activity going on → its names ("Motion", "Car"):
+        their tiles show them in the activity badge, one after another."""
+        new = {cam_id: tuple(names) for cam_id, names in cameras.items() if names}
+        changed = {
+            cam_id
+            for cam_id in set(self._motion_ids) | set(new)
+            if self._motion_ids.get(cam_id) != new.get(cam_id)
+        }
+        self._motion_ids = new
         for cam_id in changed:
             cell = self._cell_for_cam_id(cam_id)
             if cell is not None:
-                cell.set_motion(cam_id in camera_ids)
+                cell.set_motion(new.get(cam_id, ()))
 
     def set_analytics(self, markers: dict[str, tuple[str, bool]]) -> None:
         """Cameras an analytics plugin analyses: ``{camera_id: (tooltip line,
@@ -1605,10 +1615,23 @@ class VideoWallWidget(QWidget):
                 mark = marks.get(cam_id)
                 cell.set_backup(*(mark if mark is not None else (None, "")))
 
-    def set_drawings(self, drawings: dict[str, list[Drawing]]) -> None:
-        """What analytics plugins draw over each camera's picture now."""
-        changed = set(self._drawings_by_id) | set(drawings)
+    def set_drawings(
+        self,
+        drawings: dict[str, list[Drawing]],
+        clock: dict[str, list[Drawing]] | None = None,
+    ) -> None:
+        """What analytics plugins draw over each camera's picture now.
+
+        ``clock`` (default: the drawings) holds the results that decide which
+        analysed picture a tile shows next: all layers of the plugins on the
+        camera, also those not drawn here and results with nothing to draw.
+        Only ``drawings`` are painted."""
+        changed = set(self._drawings_by_id) | set(drawings) | set(self._clock_by_id)
         self._drawings_by_id = {cam_id: list(d) for cam_id, d in drawings.items()}
+        self._clock_by_id = {
+            cam_id: list(d) for cam_id, d in (drawings if clock is None else clock).items()
+        }
+        changed |= set(self._clock_by_id)
         for cam_id in changed:
             cell = self._cell_for_cam_id(cam_id)
             if cell is not None:
@@ -1653,8 +1676,7 @@ class VideoWallWidget(QWidget):
             and cam_id not in self._plain_ids
             and (
                 cam_id in self._awaited_ids
-                or analysed_target(self._drawings_by_id.get(cam_id, []), time.monotonic())
-                is not None
+                or analysed_target(self._clock_by_id.get(cam_id, []), time.monotonic()) is not None
             )
         )
 
@@ -1663,7 +1685,7 @@ class VideoWallWidget(QWidget):
         shows analysed pictures and this one waits for its result."""
         analysed = (
             self._analytics_by_id.get(cam_id, ("", False))[1]
-            or bool(self._drawings_by_id.get(cam_id))
+            or bool(self._clock_by_id.get(cam_id))
             or cam_id in self._awaited_ids
         )
         if not self._drawings_on_analysed or not analysed or cam_id in self._plain_ids:
@@ -1678,7 +1700,7 @@ class VideoWallWidget(QWidget):
             pictures.clear()
         pictures.size = (frame[1], frame[2])
         pictures.add(self._frame_identities.get(cam_id, (0, 0, 0)), frame, len(frame[0]))
-        target = analysed_target(self._drawings_by_id.get(cam_id, []), time.monotonic())
+        target = analysed_target(self._clock_by_id.get(cam_id, []), time.monotonic())
         if target is not None:
             pictures.note_result(target)
         if target is None and cam_id in self._awaited_ids and not pictures.opened:
@@ -1742,7 +1764,7 @@ class VideoWallWidget(QWidget):
         if pictures is None:
             return
         ready = pictures.next_result(
-            analysed_target(self._drawings_by_id.get(cam_id, []), time.monotonic())
+            analysed_target(self._clock_by_id.get(cam_id, []), time.monotonic())
         )
         if ready is None:
             return

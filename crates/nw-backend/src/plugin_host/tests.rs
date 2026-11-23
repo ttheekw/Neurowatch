@@ -219,6 +219,23 @@ fn a_plugin_receives_the_cameras_video_and_its_events_reach_the_hub() {
                 .chain((0..20).map(|i| json!({"label": format!("Lane {i}"), "value": i.to_string()})))
                 .collect::<Vec<_>>()}]}),
     ));
+    // Detections: event 4 stays one, event 5 is upgraded to an alert.
+    plugin.send(event(
+        method::EVENT_START,
+        json!({"binding": binding, "event": 4, "kind": "motion", "alert": false}),
+    ));
+    plugin.send(event(
+        method::EVENT_START,
+        json!({"binding": binding, "event": 5, "kind": "motion", "alert": false}),
+    ));
+    plugin.send(event(
+        method::EVENT_UPDATE,
+        json!({"binding": binding, "event": 4, "alert": false}),
+    ));
+    plugin.send(event(
+        method::EVENT_UPDATE,
+        json!({"binding": binding, "event": 5, "alert": true}),
+    ));
     plugin.send(event(
         method::EVENT_END,
         json!({"binding": binding, "event": 1}),
@@ -241,12 +258,14 @@ fn a_plugin_receives_the_cameras_video_and_its_events_reach_the_hub() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut phases = vec![];
+    let mut all = vec![];
     let mut ended = None;
     while ended.is_none() && Instant::now() < deadline {
         // Keep the node's media flowing while waiting.
         let _ = plugin.media();
         while let Ok(notice) = notices.try_recv() {
             phases.push(notice.phase);
+            all.push(notice.clone());
             if notice.phase == EventPhase::End {
                 ended = Some(notice.event);
             }
@@ -261,10 +280,36 @@ fn a_plugin_receives_the_cameras_video_and_its_events_reach_the_hub() {
     assert_eq!(ended.bbox, Some([0.1, 0.2, 0.3, 0.4]));
     assert_eq!(ended.zones, vec!["door".to_owned()]);
     assert_eq!(phases.first(), Some(&EventPhase::Start));
-    // The undeclared kind was ignored: one event only.
+    // The undeclared kind was ignored: three events (one alert, two detections).
     assert_eq!(
         phases.iter().filter(|p| **p == EventPhase::Start).count(),
-        1
+        3
+    );
+    let starts: Vec<bool> = all
+        .iter()
+        .filter(|n| n.phase == EventPhase::Start)
+        .map(|n| n.event.detection)
+        .collect();
+    assert_eq!(starts, vec![false, true, true], "no flag is an alert");
+    let flags = |id: i64| -> Vec<bool> {
+        all.iter()
+            .filter(|n| n.event.id == id)
+            .map(|n| n.event.detection)
+            .collect()
+    };
+    let (detected, upgraded) = {
+        let ids: Vec<i64> = all
+            .iter()
+            .filter(|n| n.phase == EventPhase::Start && n.event.detection)
+            .map(|n| n.event.id)
+            .collect();
+        (ids[0], ids[1])
+    };
+    assert!(flags(detected).iter().all(|d| *d), "a detection stays one");
+    assert_eq!(
+        flags(upgraded),
+        vec![true, false],
+        "alert: true upgrades it"
     );
     assert!(host.detecting(&fixture.camera.id));
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -701,6 +746,10 @@ fn desktop_stream_consumers_name_only_active_current_plugin_bindings() {
         a.format = Some("H.265 1920×1080".into());
         a.shared_pictures = true;
         a.shared_fps = Some(9.5);
+        a.shared_source = Some(crate::plugin_host::SharedSource {
+            by: "always_on",
+            decoder: "VA-API",
+        });
         a.plugin = Some(
             serde_json::from_value(json!({"binding": 1, "state": "running",
                 "fps": 5.0, "frames": 10, "decoder": "VA-API (Intel, AMD)"}))
@@ -714,6 +763,11 @@ fn desktop_stream_consumers_name_only_active_current_plugin_bindings() {
     assert_eq!(rows[0].decoder.as_deref(), Some("VA-API (Intel, AMD)"));
     assert_eq!(rows[0].shared_fps, Some(9.5));
     assert_eq!(rows[1].shared_fps, None, "only while sharing");
+    assert_eq!(
+        rows[0].shared_source.map(|s| (s.by, s.decoder)),
+        Some(("always_on", "VA-API"))
+    );
+    assert_eq!(rows[1].shared_source, None);
     assert_eq!(
         (rows[1].codec, rows[1].pictures, rows[1].decoder.as_deref()),
         (None, super::PluginPictures::Compressed, None),
@@ -737,7 +791,7 @@ fn desktop_stream_consumers_name_only_active_current_plugin_bindings() {
     assert!(wire.contains(r#""plugin_paths":{"compressed":0,"shared":1}"#));
     assert!(
         wire.contains(
-            r#""plugins":[{"name":"Test","pictures":"shared","decoder":"VA-API (Intel, AMD)","shared_fps":9.5}]"#
+            r#""plugins":[{"name":"Test","pictures":"shared","decoder":"VA-API (Intel, AMD)","shared_fps":9.5,"shared_source":{"by":"always_on","decoder":"VA-API"}}]"#
         ),
         "{wire}"
     );
@@ -753,6 +807,7 @@ fn desktop_stream_consumers_name_only_active_current_plugin_bindings() {
         pictures: super::PluginPictures::Compressed,
         decoder: Some("  ".into()),
         shared_fps: None,
+        shared_source: None,
     };
     let mut bounded = crate::streams::StreamHubs::default().diagnostics(&cameras[1..2]);
     crate::streams::diagnostics::with_plugins(&mut bounded, std::slice::from_mut(&mut long));

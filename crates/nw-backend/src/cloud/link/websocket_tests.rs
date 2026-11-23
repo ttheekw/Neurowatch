@@ -360,6 +360,7 @@ async fn websocket_real_portal_contract() {
             ("main", Some("h264")),
             ("sub", None),
         ])),
+        transcode: None,
         formats: Some(std::collections::BTreeMap::from([(
             "main",
             StreamVideo {

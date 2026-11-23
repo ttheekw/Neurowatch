@@ -716,6 +716,47 @@ mod tests {
             .dispatch("plugins.overlays", &json!({"camera_ids": "cam-1"}))
             .await
             .is_err());
+        // An analysed picture with nothing to draw is a layer with no items.
+        store.put("cam-1", "motion", "detections", vec![], Some(9), None);
+        let quiet = handler
+            .dispatch("plugins.overlays", &json!({"camera_ids": ["cam-1"]}))
+            .await
+            .unwrap();
+        assert_eq!(quiet["overlays"][0]["items"], json!([]));
+        assert_eq!(quiet["overlays"][0]["frame"], 9);
+        assert_eq!(quiet["overlays"][0]["layer"], "detections");
+        assert!(quiet["overlays"][0]["time_us"].as_i64().unwrap() > 0);
+        // An empty result keeps the picture's own clocks, and replaces the
+        // layer's earlier drawing, so a viewer follows the plugin's pictures.
+        store.put_identified(
+            "cam-1",
+            "motion",
+            "detections",
+            vec![],
+            Some(crate::streams::frames::Identity {
+                seq: 10,
+                time_us: 77_000_010,
+                observed_us: 88_000_010,
+            }),
+            None,
+        );
+        let identified = handler
+            .dispatch("plugins.overlays", &json!({"camera_ids": ["cam-1"]}))
+            .await
+            .unwrap();
+        let layer = identified["overlays"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|shown| shown["layer"] == "detections")
+            .collect::<Vec<_>>();
+        assert_eq!(layer.len(), 1, "one entry per layer: {layer:?}");
+        assert_eq!(layer[0]["items"], json!([]));
+        assert_eq!(layer[0]["frame"], 10);
+        assert_eq!(layer[0]["time_us"], 77_000_010);
+        assert_eq!(layer[0]["observed_us"], 88_000_010);
+        assert_eq!(layer[0]["camera_id"], "cam-1");
+        assert_eq!(layer[0]["plugin"], "motion");
         let _ = std::fs::remove_file(path);
     }
 

@@ -18,6 +18,7 @@ EVENT_LABELS: dict[str, str] = {
     "person": "Person",
     "vehicle": "Vehicle",
     "animal": "Animal",
+    "object": "Object",
     "tamper": "Tampering",
     "digital_input": "Alarm input",
     "camera_event": "Camera event",
@@ -44,7 +45,9 @@ END_LABELS: dict[str, str] = {
     "plugin_lagging": "Plugin keeping up again",
 }
 #: Kinds a tile shows as movement in the picture.
-ACTIVITY_KINDS = frozenset({"motion", "intrusion", "line_crossing", "person", "vehicle", "animal"})
+ACTIVITY_KINDS = frozenset(
+    {"motion", "intrusion", "line_crossing", "person", "vehicle", "animal", "object"}
+)
 PLAYBACK_KINDS = frozenset(EVENT_LABELS) - {
     "disk_low",
     "storage_missing",
@@ -69,6 +72,7 @@ EVENT_COLORS = {
     "person": "#f97316",
     "vehicle": "#f97316",
     "animal": "#f97316",
+    "object": "#f97316",
     "tamper": "#a855f7",
     "digital_input": "#06b6d4",
     "camera_event": "#64748b",
@@ -111,6 +115,7 @@ _KIND_NOUNS: dict[str, str] = {
     "person": "people",
     "vehicle": "vehicles",
     "animal": "animals",
+    "object": "objects",
     "tamper": "tampering",
     "digital_input": "alarm inputs",
     "camera_event": "other camera events",
@@ -145,6 +150,8 @@ class Event:
     has_image: bool = False
     #: A bookmark whose footage cleanup never deletes.
     kept: bool = False
+    #: A plugin marked it a detection: recorded and listed, never an alert.
+    detection: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Event | None:
@@ -172,6 +179,7 @@ class Event:
                 bbox=_bounds(raw.get("bbox")),
                 has_image=isinstance(raw.get("thumbnail"), str) and bool(raw["thumbnail"]),
                 kept=raw.get("kept") is True,
+                detection=raw.get("detection") is True,
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -184,10 +192,20 @@ class Event:
     def label(self) -> str:
         return label(self.kind)
 
+    @property
+    def activity_label(self) -> str:
+        """What a tile's activity badge calls it while it goes on: the
+        plugin's own name for an object ("Car"), else its kind ("Motion")."""
+        if self.kind == "object" and self.detail and self.detail.strip():
+            return self.detail.strip()
+        return label(self.kind)
+
     def describe(self, camera_name: str | None = None) -> str:
         """What happened, with the detail when it adds something."""
         if self.kind == "backend_started" and self.detail:
             return f"{self.detail} started"  # "NeuroWatch 0.1.0 started"
+        if self.kind == "object" and self.detail:
+            return self.detail  # "Car": the plugin's own name for what it found
         parts = [self.label]
         if self.detail and self.detail != camera_name:
             parts.append(self.detail)
@@ -329,8 +347,8 @@ class ActivityTracker:
     from the events going on and notices as they arrive."""
 
     _open: dict[int, Event] = field(default_factory=dict)
-    # Instant events: camera → shown until this time (monotonic seconds).
-    _flash: dict[str, float] = field(default_factory=dict)
+    # Instant events: camera → their names → shown until (monotonic seconds).
+    _flash: dict[str, dict[str, float]] = field(default_factory=dict)
     # Stored separately from current activity: ending motion never clears an alert.
     _pending: dict[str, set[int]] = field(default_factory=dict)
     _acknowledged_through: dict[str, int] = field(default_factory=dict)
@@ -384,12 +402,28 @@ class ActivityTracker:
         if phase == "end":
             started = self._open.pop(event.id, None)
             if started is None or event.end_ms == event.start_ms:
-                self._flash[event.camera_id] = now + INSTANT_ACTIVITY_S
+                flash = self._flash.setdefault(event.camera_id, {})
+                flash[event.activity_label] = now + INSTANT_ACTIVITY_S
         else:
             self._open[event.id] = event
 
     def active(self, now: float | None = None) -> set[str]:
+        return set(self.labels(now))
+
+    def labels(self, now: float | None = None) -> dict[str, tuple[str, ...]]:
+        """Each camera with activity now → the names of what is going on
+        ("Motion", "Car", "Person"), each once, in the order they started."""
         now = time.monotonic() if now is None else now
-        self._flash = {cam: until for cam, until in self._flash.items() if until > now}
-        cameras = {e.camera_id for e in self._open.values() if e.camera_id}
-        return cameras | set(self._flash)
+        self._flash = {
+            camera: kept
+            for camera, flash in self._flash.items()
+            if (kept := {name: until for name, until in flash.items() if until > now})
+        }
+        names: dict[str, dict[str, None]] = {}
+        for event in sorted(self._open.values(), key=lambda e: (e.start_ms, e.id)):
+            if event.camera_id:
+                names.setdefault(event.camera_id, {})[event.activity_label] = None
+        for camera, flash in self._flash.items():
+            for name in flash:
+                names.setdefault(camera, {})[name] = None
+        return {camera: tuple(found) for camera, found in names.items()}

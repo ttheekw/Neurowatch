@@ -18,7 +18,7 @@ from collections.abc import Callable
 from typing import Any, ClassVar
 
 from PySide6.QtCore import QDateTime, QSize, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox,
     QDateTimeEdit,
@@ -49,6 +49,7 @@ from neurowatch.theme import (
     set_status_tone,
     style_calendar,
 )
+from neurowatch.utils.screens import screen_of
 from neurowatch.utils.threads import Worker
 from neurowatch.widgets.cell_widget import CellWidget
 from neurowatch.widgets.trim_timeline import MIN_TRIM_MS, TrimTimeline
@@ -359,7 +360,7 @@ class ExportVideoDialog(QDialog):
         """Large enough for a useful preview, well within the screen: GNOME
         maximizes a window that opens nearly as large as the screen."""
         wanted = QSize(DEFAULT_WIDTH, DEFAULT_HEIGHT)
-        screen = self.screen() or QGuiApplication.primaryScreen()
+        screen = screen_of(self)
         if screen is not None:
             room = screen.availableGeometry().size() * MAX_SCREEN_SHARE
             wanted = wanted.boundedTo(room)

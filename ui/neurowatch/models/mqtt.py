@@ -114,7 +114,7 @@ def topics_help(prefix: str) -> str:
     """The topics, for people writing their own automations."""
     base = prefix or DEFAULT_PREFIX
     return (
-        f"{base}/<camera>/motion, …/person, …/vehicle, …/animal and …/online: ON or OFF. "
+        f"{base}/<camera>/motion, …/object, …/person, …/vehicle, …/animal and …/online: ON or OFF. "
         f"{base}/<camera>/picture: the latest event picture. {base}/problem: the recorder needs "
         f"attention. {base}/events: every event as JSON. {base}/status: online or offline."
     )

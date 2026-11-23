@@ -11,6 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from neurowatch.models.plugin_decoding import parse_plugin_decoder, parse_shared_source
+from neurowatch.models.transcode import WHY, parse_transcode
+
 CODECS = {"h264": "H.264", "h265": "H.265"}
 STATES = {
     "streaming": "Connected",
@@ -28,8 +31,6 @@ _PLAIN = {
     "snapshot": "Snapshots",
     "audio": "Audio",
 }
-#: Decoder words a plugin reports while it decodes nothing itself.
-_NO_DECODER = ("neurowatch's pictures", "video wall pictures", "desktop (shared)")
 
 
 @dataclass
@@ -84,9 +85,24 @@ def _bytes(value: object) -> str:
 
 
 def _plugin_decoder(consumer: dict[str, Any]) -> str:
-    decoder = consumer.get("decoder")
-    decoder = decoder.strip() if isinstance(decoder, str) else ""
-    return "" if decoder.lower().startswith(_NO_DECODER) else decoder
+    """The decoder the plugin names, without its scaling words; nothing for
+    the words it uses while it decodes nothing itself."""
+    text = parse_plugin_decoder(consumer.get("decoder"))
+    return "" if text.shares else text.decoder
+
+
+def _plugin_scaling(consumer: dict[str, Any]) -> str:
+    """``GPU``/``CPU``: where the plugin scales its pictures down; empty if not said."""
+    return parse_plugin_decoder(consumer.get("decoder")).scaling
+
+
+def _shared_hardware(plugins: list[dict[str, Any]], by: str) -> str:
+    """What the recorder's ``by`` decoder runs on, as a sharing plugin's row says."""
+    for plugin in plugins:
+        source = parse_shared_source(plugin.get("shared_source"))
+        if source is not None and source.by == by and source.decoder:
+            return source.decoder
+    return ""
 
 
 def stream_flow(
@@ -169,7 +185,7 @@ def stream_flow(
         box = FlowNode(
             "decoder",
             _decoder_title(codec, "always on"),
-            desktop_decoder or "",
+            desktop_decoder or _shared_hardware(shared, "always_on"),
             description=f"The recorder decodes this stream's {codec or 'video'} all the "
             "time (the camera's setting); plugins below it share these pictures.",
         )
@@ -185,7 +201,11 @@ def stream_flow(
         wall = FlowNode(
             "decoder",
             _decoder_title(codec, "video wall"),
-            " · ".join(part for part in (desktop_decoder or "", fps) if part),
+            " · ".join(
+                part
+                for part in (desktop_decoder or _shared_hardware(shared, "video_wall"), fps)
+                if part
+            ),
             description=f"The recorder decodes this stream's {codec or 'video'} for the "
             "desktop video wall" + ("." if always else "; plugins below it share these pictures."),
         )
@@ -194,17 +214,42 @@ def stream_flow(
             for plugin in shared:
                 wall.children.append(_shared_plugin(plugin))
         branches.append(wall)
-    plain("browser")
+    transcode = parse_transcode(row.get("transcode"))
+    web = int(roles.get("browser", 0) or 0)
+    if transcode is None:
+        plain("browser")
+    else:
+        # Viewers the recorder converts hang under the conversion; the rest
+        # (browsers that play the stream as it is) stay directly under the buffer.
+        converted = min(web, transcode.viewers) if web else transcode.viewers
+        if web - converted > 0:
+            branches.append(FlowNode("consumer", _PLAIN["browser"] + _times(web - converted)))
+        box = FlowNode(
+            "transcode",
+            f"Transcoding {transcode.conversion}",
+            transcode.detail,
+            description=WHY,
+        )
+        box.children.append(FlowNode("consumer", _PLAIN["browser"] + _times(converted)))
+        branches.append(box)
     for plugin in own:
         branches.append(_decoding_plugin(plugin, codec))
     if shared and not desktop and not always:
         for plugin in shared:
             node = _shared_plugin(plugin)
-            node.detail = (
-                f"Uses the video wall's decoded pictures ({shared_elsewhere})"
-                if shared_elsewhere
+            source = parse_shared_source(plugin.get("shared_source"))
+            words = (
+                "Uses the always-on decoder's pictures"
+                if source is not None and source.by == "always_on"
                 else "Uses the video wall's decoded pictures"
-            ) + _shared_rate(plugin)
+            )
+            node.detail = (
+                words
+                + (f" ({shared_elsewhere})" if shared_elsewhere else "")
+                + (f" · {source.decoder}" if source is not None and source.decoder else "")
+                + _shared_rate(plugin)
+                + _scales(plugin)
+            )
             branches.append(node)
     plain("snapshot")
     plain("audio")
@@ -222,12 +267,17 @@ def _shared_rate(plugin: dict[str, Any]) -> str:
     return f" · {fps:.1f} fps" if isinstance(fps, (int, float)) else ""
 
 
+def _scales(plugin: dict[str, Any]) -> str:
+    scaling = _plugin_scaling(plugin)
+    return f" · scales down on the {scaling}" if scaling else ""
+
+
 def _shared_plugin(plugin: dict[str, Any]) -> FlowNode:
     name = str(plugin.get("name", "")).strip() or "Plugin"
     return FlowNode(
         "plugin",
         name,
-        "Uses these decoded pictures" + _shared_rate(plugin),
+        "Uses these decoded pictures" + _shared_rate(plugin) + _scales(plugin),
         dashed=True,
         description=f"{name} uses the pictures the video wall already decodes: no second decoder.",
     )
@@ -237,6 +287,7 @@ def _decoding_plugin(plugin: dict[str, Any], stream_codec: str | None) -> FlowNo
     name = str(plugin.get("name", "")).strip() or "Plugin"
     codec = codec_text(plugin.get("codec")) or stream_codec
     decoder = _plugin_decoder(plugin)
+    scaling = _plugin_scaling(plugin)
     if plugin.get("pictures") is None:
         # An older recorder: it does not say how the plugin gets its video.
         return FlowNode("plugin", name, description=f"{name} receives this stream.")
@@ -245,9 +296,13 @@ def _decoding_plugin(plugin: dict[str, Any], stream_codec: str | None) -> FlowNo
         _decoder_title(codec, f"in {name}"),
         decoder,
         description=f"{name} receives the compressed {codec or 'video'} and decodes it "
-        "itself" + (f" ({decoder})." if decoder else "."),
+        "itself"
+        + (f" ({decoder})" if decoder else "")
+        + (f", then scales the pictures down on the {scaling}." if scaling else "."),
     )
-    box.children.append(FlowNode("plugin", name))
+    box.children.append(
+        FlowNode("plugin", name, f"Scales down on the {scaling}" if scaling else "")
+    )
     return box
 
 

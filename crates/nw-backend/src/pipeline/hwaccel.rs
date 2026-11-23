@@ -746,12 +746,58 @@ pub fn is_hardware_decoder(factory: &str) -> bool {
 /// The hardware decoder inside `bin` (searched recursively), if any.
 pub fn hardware_decoder_in(bin: &gstreamer::Bin) -> Option<String> {
     use gstreamer::prelude::*;
+    hardware_decoder_element_in(bin)
+        .and_then(|element| element.factory())
+        .map(|factory| factory.name().to_string())
+}
+
+/// The hardware decoder element inside `bin` (searched recursively), if any.
+pub fn hardware_decoder_element_in(bin: &gstreamer::Bin) -> Option<gstreamer::Element> {
+    use gstreamer::prelude::*;
+    bin.iterate_recurse()
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|element| {
+            element
+                .factory()
+                .is_some_and(|factory| is_hardware_decoder(factory.name().as_str()))
+        })
+}
+
+/// What a video decoder element factory is called to a person: the API it
+/// decodes through (`CPU` for a software decoder). The vocabulary of
+/// `shared_source.decoder`.
+pub fn decoder_label(factory: &str) -> &'static str {
+    if !is_hardware_decoder(factory) {
+        "CPU"
+    } else if factory.starts_with("d3d12") {
+        "Direct3D 12"
+    } else if factory.starts_with("d3d11") {
+        "Direct3D 11"
+    } else if factory.starts_with("qsv") || factory.starts_with("msdk") {
+        "Quick Sync"
+    } else if factory.starts_with("nv") {
+        "NVDEC"
+    } else if factory.starts_with("v4l2") {
+        "V4L2"
+    } else {
+        "VA-API"
+    }
+}
+
+/// The label of the video decoder `decodebin` plugged (searched recursively),
+/// or `None` while it has not plugged one yet (it does so on the first data).
+pub fn decoder_label_in(bin: &gstreamer::Bin) -> Option<&'static str> {
+    use gstreamer::prelude::*;
     bin.iterate_recurse()
         .into_iter()
         .filter_map(Result::ok)
         .filter_map(|element| element.factory())
-        .map(|factory| factory.name().to_string())
-        .find(|name| is_hardware_decoder(name))
+        .find(|factory| {
+            let klass = factory.klass();
+            klass.contains("Decoder") && klass.contains("Video")
+        })
+        .map(|factory| decoder_label(factory.name().as_str()))
 }
 
 /// Make `decodebin` skip hardware decoders, so it plugs a CPU decoder: for a
@@ -1109,6 +1155,7 @@ mod tests {
         );
         let bin = decodebin.clone().downcast::<gstreamer::Bin>().unwrap();
         let hardware = super::hardware_decoder_in(&bin);
+        let label = super::decoder_label_in(&bin);
         let software = bin
             .iterate_recurse()
             .into_iter()
@@ -1118,6 +1165,7 @@ mod tests {
         assert!(ended.is_some_and(|m| m.type_() == gstreamer::MessageType::Eos));
         assert_eq!(hardware, None);
         assert!(software, "decodebin plugged the CPU decoder");
+        assert_eq!(label, Some("CPU"));
         assert_eq!(pictures.load(std::sync::atomic::Ordering::Relaxed), 10);
     }
 
@@ -1161,6 +1209,26 @@ mod tests {
             !plugged.iter().any(|name| super::is_hardware_decoder(name)),
             "{plugged:?}"
         );
+    }
+
+    #[test]
+    fn decoders_are_labelled_by_the_api_they_use() {
+        for (factory, label) in [
+            ("vah264dec", "VA-API"),
+            ("vaapih264dec", "VA-API"),
+            ("nvh264dec", "NVDEC"),
+            ("nvh265sldec", "NVDEC"),
+            ("d3d11h264dec", "Direct3D 11"),
+            ("d3d12h265dec", "Direct3D 12"),
+            ("qsvh264dec", "Quick Sync"),
+            ("msdkh264dec", "Quick Sync"),
+            ("v4l2slh264dec", "V4L2"),
+            ("avdec_h264", "CPU"),
+            ("openh264dec", "CPU"),
+            ("avdec_h265", "CPU"),
+        ] {
+            assert_eq!(super::decoder_label(factory), label, "{factory}");
+        }
     }
 
     #[test]

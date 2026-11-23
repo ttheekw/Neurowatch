@@ -89,7 +89,11 @@ budget is exceeded. Per-session media outboxes are bounded at 256 frames / 32 Mi
 32 MiB budgets and cancellable old GOP streams. Pending UI queries are capped at 64 and expire;
 page forwarding has an eight-request channel. Hostile input cannot block recorder fan-out.
 
-Events must use declared known kinds. The host validates finite coordinates, confidence, rate,
+Events must use declared known kinds. `event.start` and `event.update` may carry an optional
+`alert` boolean: `false` on a start makes the event a detection (recorded and listed, never fires
+alert rules); `true` or absent is an alert, as before. `alert: true` on an update upgrades a
+detection to an alert, which then fires the alert rules once; an alert never goes back to a
+detection. Plugins that never send it keep every event an alert, and older recorders ignore it. The host validates finite coordinates, confidence, rate,
 open-event count and frame references. Drawings are limited to 256 items, 64 points, eight text
 lines and 64 characters per line, with a 25/s per-binding/layer limit and 0.1–10 second TTL.
 Plugins choose style tokens, never arbitrary host colours: `accent`, `success`, `warning`, `danger`,
@@ -104,7 +108,9 @@ into a private bounded latest-picture ring at the rate the plugin asks for (`max
 pool buffers are never retained externally. Raw rings are bounded at 32 MiB / 4096 pixels per axis.
 
 A plugin declares accepted formats, rate and optional minimum dimensions. Nonzero dimensions
-permit an already-visible larger stream from the same camera and credentials. Stable publication
+permit an already-visible larger stream from the same camera and credentials, so the plugin then
+analyses whichever stream a desktop shows (a camera shown on its own: its main stream); leave them
+at zero when results must not depend on that (NeuroWatch Motion does). Stable publication
 warms for one second and source changes withdraw/reoffer the capability. The SDK caches compressed
 units by reference (16 MiB / 1024 units), switching back to a keyframe after one stale second.
 Low-CPU motion keeps compressed keyframes only. Python currently consumes compressed units; native
@@ -195,3 +201,6 @@ Qt alpha glyph rows are padded to four bytes; leaving the tightly packed video
 alignment at one corrupts them into diagonal stripes. Raster/offscreen rendering
 cannot exercise this failure. Run `tests/ui/test_gpu_annotations.py` on an OpenGL
 display (a private Xvfb with Mesa suffices); ordinary offscreen runs skip it.
+
+
+Per-item settings fields (2026-11-23). **Areas** (`nw:zones`): `items.properties` may hold fields beyond `id`, `name`, `kind`, `points`; each is shown for the selected area in the area editor (desktop `widgets/zone_editor.py` with `widgets/extra_fields.py`; parsed by `models/plugins.py` `extra_fields` into `FormField.area_fields`) with its `title`, `description` (tooltip), `minimum`, `maximum` and `default`, and saved inside that area's object. Types: `integer`/`number` (number input), `boolean` (check box), `array` of an `enum` (multi-choice, names from `x-nw-labels`; an empty list is the field's own "all"), `array` of numbers with `minItems == maxItems == N` (N number inputs in a row). `x-nw-zone-kinds: ["include"]` on a field shows it only for areas of those kinds. A missing or wrong-typed value shows and saves the default; fields of other types are kept untouched. **Classes** (`nw:classes`): `items.properties` may hold `integer`/`number` fields beyond `id` and `confidence`; each is a spin box per chosen class next to its confidence (title, description as tooltip, bounds, default), saved in that class's entry (`_ClassesPicker`); other keys of a class's entry are kept. The portal's area editor and class picker take the same conventions. **Detections:** an event a plugin marks `alert: false` is stored with `detection: true`, never sends alerts, and the desktop's event lists (Events tab and Playback, `widgets/event_list.py`) show a muted "Detection" tag after its kind; a missing field is false.

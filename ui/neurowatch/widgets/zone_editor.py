@@ -9,9 +9,10 @@ import base64
 import logging
 from typing import Any
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QIcon, QPixmap, QShowEvent
 from PySide6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -24,11 +25,18 @@ from PySide6.QtWidgets import (
 
 from neurowatch.ipc.sync_client import SyncIpcClient
 from neurowatch.models.motion import valid_motion_zones
+from neurowatch.models.plugins import ExtraField
 from neurowatch.theme import set_button_variant, set_label_role, set_status_tone
 from neurowatch.utils.threads import Worker, retire
+from neurowatch.widgets.choice_list import FieldGrid, setting_block
+from neurowatch.widgets.extra_fields import connect_changed, get_value, make_input, set_value
 from neurowatch.widgets.zone_canvas import ZoneCanvas, zone_color
 
 logger = logging.getLogger(__name__)
+
+
+#: The widest the selected area's settings get (the plugin settings card's width).
+AREA_SETTINGS_WIDTH = 912
 
 
 class _SnapshotWorker(Worker):
@@ -121,10 +129,16 @@ class ZoneEditor(QWidget):
         *,
         endpoint: str | None = None,
         camera_id: str | None = None,
+        area_fields: list[ExtraField] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._camera_id = camera_id
+        self._area_fields = list(area_fields or [])
+        self._inputs_made: dict[str, QWidget] = {}
+        self._area_blocks: dict[str, QWidget] = {}
+        self._area_ready = False
+        self._loading = False
         self._snapshots = SnapshotSource(endpoint, self)
         self._snapshots.picture.connect(self._on_picture)
         self._snapshots.failed.connect(self._on_no_picture)
@@ -187,6 +201,7 @@ class ZoneEditor(QWidget):
         zone_column.addWidget(self.remove_button)
         editor.addLayout(zone_column, 1)
         layout.addLayout(editor)
+        self._build_area_panel(layout)
         hint = QLabel(
             "Without zones the whole picture is watched; ignored areas always win. Click "
             "the picture to add points (three or more make a zone), drag a point to move "
@@ -198,8 +213,85 @@ class ZoneEditor(QWidget):
         layout.addWidget(hint)
         self._refresh()
 
+    def _build_area_panel(self, layout: QVBoxLayout) -> None:
+        """The selected area's own settings: a grid of titled inputs with their
+        descriptions under them, below the picture."""
+        self.area_panel = QFrame()
+        self.area_panel.setObjectName("areaSettings")
+        panel = QVBoxLayout(self.area_panel)
+        panel.setContentsMargins(0, 4, 0, 0)
+        panel.setSpacing(8)
+        self.area_title = QLabel("Area settings")
+        set_label_role(self.area_title, "sectionLabel")
+        panel.addWidget(self.area_title)
+        self.area_grid = FieldGrid(cell_width=380, max_columns=2)
+        panel.addWidget(self.area_grid)
+        self.sides_note = QLabel("Draw an area with 4 corners on the ground to measure speed.")
+        self.sides_note.setWordWrap(True)
+        set_label_role(self.sides_note, "hint")
+        self.sides_note.hide()
+        panel.addWidget(self.sides_note)
+        self.area_panel.setVisible(bool(self._area_fields))
+        # As wide as the settings card above, however wide the window: long
+        # description lines across a maximised window are hard to read.
+        self.area_panel.setMaximumWidth(AREA_SETTINGS_WIDTH)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.area_panel, 1)
+        row.addStretch(0)
+        layout.addLayout(row)
+
+    @property
+    def _area_inputs(self) -> dict[str, QWidget]:
+        self._ensure_area_fields()
+        return self._inputs_made
+
+    def _ensure_area_fields(self) -> None:
+        """Make the area inputs (the "Applies to" list alone is 80 check
+        boxes): when the editor first appears, or when first asked."""
+        if self._area_ready:
+            return
+        self._area_ready = True
+        for item in self._area_fields:
+            field_input = make_input(item)
+            if item.description:
+                field_input.setToolTip(item.description)
+            connect_changed(field_input, self._extra_edited)
+            self._inputs_made[item.key] = field_input
+            block = setting_block(
+                item.title, field_input, item.description, with_title=item.kind != "bool"
+            )
+            self._area_blocks[item.key] = block
+            self.area_grid.add(block)
+        zones = self.canvas.zones()
+        self._show_extras(zones[self.canvas.selected] if zones else None)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        if not self._area_ready and self._area_fields:
+            QTimer.singleShot(0, self._ensure_area_fields)
+
+    def area_field_shown(self, key: str) -> bool:
+        """Whether the selected area shows this field (its kind uses it, and
+        side lengths only for an area with four corners)."""
+        self._ensure_area_fields()
+        return not self._area_blocks[key].isHidden()
+
+    @staticmethod
+    def _is_sides(item: ExtraField) -> bool:
+        """Side lengths of a four-cornered area: a row of four numbers."""
+        return item.kind == "numbers" and item.length == 4
+
     def zones(self) -> list[dict[str, Any]]:
-        return self.canvas.zones()
+        """The areas to save; each has a value for every extra field that
+        applies to its kind (the default where none was set)."""
+        zones = self.canvas.zones()
+        for zone in zones:
+            kind = str(zone.get("kind") or "include")
+            for item in self._area_fields:
+                if item.applies_to(kind):
+                    zone[item.key] = item.value_of(zone.get(item.key))
+        return zones
 
     def valid(self) -> bool:
         return valid_motion_zones(self.zones())
@@ -284,7 +376,48 @@ class ZoneEditor(QWidget):
             self.name.setText(name)
         self.name.setEnabled(bool(zones))
         self.remove_button.setEnabled(bool(zones))
+        self._show_extras(zones[index] if zones else None)
         self.canvas.update()
+
+    def _show_extras(self, zone: dict[str, Any] | None) -> None:
+        """Fill the extra fields from the selected area; hide the ones its
+        kind does not use, and the side lengths unless it has 4 corners."""
+        if not self._area_ready:
+            return  # made when the editor appears, then filled
+        self._loading = True
+        try:
+            kind = str(zone.get("kind") or "include") if zone else ""
+            corners = len(zone.get("points", [])) if zone else 0
+            note = False
+            for item in self._area_fields:
+                widget = self._inputs_made[item.key]
+                shown = zone is not None and item.applies_to(kind)
+                if shown and self._is_sides(item) and corners != 4:
+                    shown = False
+                    note = True
+                self._area_blocks[item.key].setHidden(not shown)
+                if zone is not None:
+                    set_value(widget, item, zone.get(item.key))
+            self.sides_note.setVisible(note)
+            self.area_grid.relayout()
+            name = str(zone.get("name") or zone["id"]) if zone else ""
+            self.area_title.setText(f"Settings for {name}" if name else "Area settings")
+        finally:
+            self._loading = False
+
+    def _extra_edited(self) -> None:
+        if self._loading:
+            return
+        zones = self.canvas.zones()
+        if not zones:
+            return
+        zone = zones[self.canvas.selected]
+        kind = str(zone.get("kind") or "include")
+        for item in self._area_fields:
+            if item.applies_to(kind):
+                zone[item.key] = get_value(self._inputs_made[item.key])
+        self.canvas.set_zones(zones)
+        self.changed.emit()
 
     def _rename(self, name: str) -> None:
         zones = self.canvas.zones()

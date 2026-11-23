@@ -15,8 +15,50 @@ pub(crate) const MAX_SHARED_FPS: u32 = 30;
 const INTERVAL: Duration = Duration::from_millis(25);
 pub(crate) const SWITCH_DELAY: Duration = Duration::from_secs(1);
 
+/// The decoder a publisher's pipeline runs, as people name it
+/// (`hwaccel::decoder_label`). Found once per pipeline run, off the picture
+/// path, and read by whoever holds a picture from it.
+#[derive(Debug, Default)]
+pub(crate) struct DecoderLabel(std::sync::atomic::AtomicU8);
+
+/// 0 is unknown; label `n` is `LABELS[n - 1]`.
+const LABELS: [&str; 7] = [
+    "VA-API",
+    "NVDEC",
+    "Direct3D 11",
+    "Direct3D 12",
+    "Quick Sync",
+    "V4L2",
+    "CPU",
+];
+
+impl DecoderLabel {
+    pub fn set(&self, label: &str) {
+        if let Some(index) = LABELS.iter().position(|known| *known == label) {
+            self.0.store(index as u8 + 1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn get(&self) -> Option<&'static str> {
+        let index = usize::from(self.0.load(Ordering::Relaxed)).checked_sub(1)?;
+        LABELS.get(index).copied()
+    }
+}
+
+/// Who decoded the pictures a plugin got, and on what (`BindingView::shared_source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SharedSource {
+    /// `always_on` (the recorder's always-on decoder) or `video_wall` (a
+    /// desktop view's decoder).
+    pub by: &'static str,
+    /// `VA-API`, `NVDEC`, `Direct3D 11`, `Direct3D 12`, `Quick Sync`, `V4L2`
+    /// or `CPU`.
+    pub decoder: &'static str,
+}
+
 #[derive(Clone)]
 pub(crate) struct Frame {
+    decoder: Option<Arc<DecoderLabel>>,
     pub sample: gstreamer::Sample,
     pub identity: Option<super::frames::Identity>,
     published: Instant,
@@ -24,6 +66,21 @@ pub(crate) struct Frame {
     sequence: u64,
     /// Who published it: an always-on decoder (1) wins over a desktop view (0).
     priority: u8,
+}
+
+impl Frame {
+    /// Who decoded this picture and on what; `None` until the decoder of its
+    /// pipeline run is known.
+    pub fn source(&self) -> Option<SharedSource> {
+        Some(SharedSource {
+            by: if self.priority >= 1 {
+                "always_on"
+            } else {
+                "video_wall"
+            },
+            decoder: self.decoder.as_ref()?.get()?,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -37,6 +94,7 @@ impl Channel {
     pub(crate) fn stable_picture(&self, sample: &gstreamer::Sample) {
         let now = Instant::now();
         *self.latest.lock().unwrap() = Some(Frame {
+            decoder: None,
             sample: sample.clone(),
             identity: None,
             published: now,
@@ -55,7 +113,7 @@ impl Channel {
 
     #[cfg(test)]
     fn publish(&self, sample: &gstreamer::Sample, _decoder: &Arc<str>, now: Instant) {
-        self.publish_identified(sample, now, None, 0);
+        self.publish_identified(sample, now, None, 0, None);
     }
 
     /// A stream may have two decoders: a desktop view's and an always-on one.
@@ -67,6 +125,7 @@ impl Channel {
         now: Instant,
         identity: Option<super::frames::Identity>,
         priority: u8,
+        decoder: Option<&Arc<DecoderLabel>>,
     ) {
         // The common case does not even read the clock, lock or clone a sample.
         // The caller supplies the time only after checking demand.
@@ -90,6 +149,7 @@ impl Channel {
             .map_or(now, |f| f.since);
         let sequence = latest.as_ref().map_or(1, |f| f.sequence + 1);
         *latest = Some(Frame {
+            decoder: decoder.cloned(),
             sample: sample.clone(),
             identity,
             published: now,
@@ -139,6 +199,7 @@ pub(crate) struct Publisher {
     caps: Mutex<Option<(gstreamer::Caps, bool)>>,
     frames: Option<Arc<Mutex<super::frames::DecoderFrames>>>,
     priority: u8,
+    decoder: Option<Arc<DecoderLabel>>,
 }
 
 impl Publisher {
@@ -148,7 +209,15 @@ impl Publisher {
             caps: Mutex::new(None),
             frames: None,
             priority: 0,
+            decoder: None,
         }
+    }
+
+    /// Name the decoder of the pipeline these pictures come from, once it is
+    /// known (the caller sets the label, off the picture path).
+    pub fn with_decoder(mut self, decoder: Arc<DecoderLabel>) -> Self {
+        self.decoder = Some(decoder);
+        self
     }
 
     pub fn with_frames(
@@ -202,8 +271,13 @@ impl Publisher {
             .buffer()
             .and_then(|buffer| buffer.pts())
             .and_then(|pts| self.frames.as_ref()?.try_lock().ok()?.get(pts.nseconds()));
-        self.channel
-            .publish_identified(sample, Instant::now(), identity, self.priority);
+        self.channel.publish_identified(
+            sample,
+            Instant::now(),
+            identity,
+            self.priority,
+            self.decoder.as_ref(),
+        );
     }
 }
 
@@ -219,6 +293,36 @@ mod tests {
             .buffer(&buffer)
             .caps(&caps)
             .build()
+    }
+
+    #[test]
+    fn a_picture_says_who_decoded_it_and_on_what() {
+        let channel = Arc::new(Channel::default());
+        let mut receiver = channel.subscribe();
+        let sample = picture();
+        let label = Arc::new(DecoderLabel::default());
+        let now = Instant::now();
+        channel.publish_identified(&sample, now, None, 0, Some(&label));
+        let frame = receiver.take().unwrap().0;
+        assert_eq!(frame.source(), None, "decoder not known yet");
+        // Found after the pictures started flowing: pictures already held see it.
+        label.set("VA-API");
+        assert_eq!(
+            frame.source(),
+            Some(SharedSource {
+                by: "video_wall",
+                decoder: "VA-API"
+            })
+        );
+        channel.publish_identified(&sample, now + SWITCH_DELAY, None, 1, Some(&label));
+        label.set("CPU");
+        let frame = receiver.take().unwrap().0;
+        assert_eq!(
+            serde_json::to_string(&frame.source()).unwrap(),
+            r#"{"by":"always_on","decoder":"CPU"}"#
+        );
+        label.set("unheard of");
+        assert_eq!(frame.source().unwrap().decoder, "CPU");
     }
 
     #[test]
@@ -291,12 +395,12 @@ mod tests {
         let sample = picture();
         let start = Instant::now() - Duration::from_secs(5);
         let at = |ms: u64| start + Duration::from_millis(ms);
-        channel.publish_identified(&sample, at(0), None, 0);
+        channel.publish_identified(&sample, at(0), None, 0, None);
         // The always-on decoder takes over at once, warming up again.
-        channel.publish_identified(&sample, at(30), None, 1);
+        channel.publish_identified(&sample, at(30), None, 1, None);
         // A desktop view publishing meanwhile is ignored.
         for ms in [40, 70, 100, 900] {
-            channel.publish_identified(&sample, at(ms), None, 0);
+            channel.publish_identified(&sample, at(ms), None, 0, None);
             assert_eq!(
                 channel.latest.lock().unwrap().as_ref().unwrap().priority,
                 1,
@@ -304,13 +408,13 @@ mod tests {
             );
         }
         for ms in (60..1100).step_by(30) {
-            channel.publish_identified(&sample, at(ms), None, 1);
+            channel.publish_identified(&sample, at(ms), None, 1, None);
         }
         let latest = channel.latest.lock().unwrap().clone().unwrap();
         assert_eq!(latest.since, at(30), "the switch restarted the warm-up");
         drop(receiver.take());
         // Once it stops for SWITCH_DELAY, the desktop's pictures are used again.
-        channel.publish_identified(&sample, at(1100) + SWITCH_DELAY, None, 0);
+        channel.publish_identified(&sample, at(1100) + SWITCH_DELAY, None, 0, None);
         assert_eq!(channel.latest.lock().unwrap().as_ref().unwrap().priority, 0);
     }
 

@@ -31,6 +31,8 @@ pub(super) struct Counters {
     pub shared_pictures: AtomicBool,
     /// The measured sharing rate, in tenths of a frame per second.
     pub shared_fps_tenths: std::sync::atomic::AtomicU32,
+    /// Who decoded the last shared picture, and on what.
+    pub shared_source: Mutex<Option<crate::streams::decoded::SharedSource>>,
     /// Only pictures this binding actually received can be referred to.
     pub frames: Mutex<crate::streams::frames::History>,
 }

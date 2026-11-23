@@ -11,6 +11,11 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub const MAX_JPEG_BYTES: usize = 128 * 1024;
+/// Longest an event waits for a keyframe at or after its start.
+const KEYFRAME_WAIT: Duration = Duration::from_secs(4);
+/// A plugin draws a picture some time after it arrives: the box is read this
+/// long after the picture's time.
+const DRAWING_DELAY_US: i64 = 800_000;
 const MAX_KEYFRAME_BYTES: usize = 8 * 1024 * 1024;
 const TAIL: &str = "videoconvert ! videoscale ! video/x-raw,width=640,height=360,pixel-aspect-ratio=1/1 ! jpegenc quality=75 snapshot=true ! appsink name=snapshot_sink max-buffers=1 drop=true sync=false";
 
@@ -101,6 +106,32 @@ impl SnapshotService {
         camera: nw_core::camera::CameraConfig,
         shared: bool,
     ) -> Result<Vec<u8>, String> {
+        self.capture_inner(camera, shared, None)
+            .await
+            .map(|(jpeg, _)| jpeg)
+    }
+
+    /// A picture of the first keyframe whose time is at or after `min_us`
+    /// (µs since the Unix epoch, the picture clock of plugin drawings), with
+    /// that time; waits a few seconds for it on an open stream. Without one
+    /// in time (or without an open stream) it gives what [`Self::capture`]
+    /// gives, with no time.
+    pub async fn capture_since(
+        &self,
+        camera: nw_core::camera::CameraConfig,
+        min_us: i64,
+    ) -> Result<(Vec<u8>, Option<i64>), String> {
+        let shared = crate::streams::enabled()
+            && crate::pipeline::builder::shared_view_supported(&camera.url);
+        self.capture_inner(camera, shared, Some(min_us)).await
+    }
+
+    async fn capture_inner(
+        &self,
+        camera: nw_core::camera::CameraConfig,
+        shared: bool,
+        since_us: Option<i64>,
+    ) -> Result<(Vec<u8>, Option<i64>), String> {
         let permit = self
             .slots
             .clone()
@@ -110,17 +141,32 @@ impl SnapshotService {
         let streams = Arc::clone(&self.streams);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            if let Some(min_us) = since_us.filter(|_| shared) {
+                if let Some((caps, buffer, time_us)) =
+                    streams.keyframe_since(&camera, min_us, KEYFRAME_WAIT)
+                {
+                    let picked = Keyframe {
+                        caps,
+                        buffer,
+                        seen: Instant::now(),
+                    };
+                    if let Ok(jpeg) = decode_keyframe(&picked) {
+                        return Ok((jpeg, Some(time_us)));
+                    }
+                }
+            }
             if let Some(frame) = frame {
                 if let Ok(jpeg) = decode_keyframe(&frame) {
-                    return Ok(jpeg);
+                    return Ok((jpeg, None));
                 }
             }
             if shared {
-                return decode_keyframe(&shared_keyframe(&streams, &camera)?);
+                return decode_keyframe(&shared_keyframe(&streams, &camera)?)
+                    .map(|jpeg| (jpeg, None));
             }
             let pipeline = crate::pipeline::builder::build(&stream_snapshot_pipeline(&camera))
                 .map_err(|_| "The snapshot stream could not be opened".to_owned())?;
-            take_picture(&pipeline)
+            take_picture(&pipeline).map(|jpeg| (jpeg, None))
         })
         .await
         .map_err(|_| "Snapshot worker stopped".to_owned())?
@@ -287,14 +333,22 @@ pub async fn run(
             notice = notices.recv() => {
                 let notice = match notice { Ok(notice) => notice, Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue, Err(_) => break };
                 if notice.phase != EventPhase::Start || !notice.event.kind.is_activity() || tasks.len() >= 2 { continue; }
-                let Some(camera_id) = notice.event.camera_id else { continue; };
-                let (camera, pictures, hub, db) = {
+                let Some(camera_id) = notice.event.camera_id.clone() else { continue; };
+                let (camera, pictures, hub, db, plugins) = {
                     let state = state.read().await;
-                    (state.config.cameras.iter().find(|c| c.id == camera_id).cloned(), Arc::clone(&state.snapshots), Arc::clone(&state.events), Arc::clone(&state.db))
+                    (state.config.cameras.iter().find(|c| c.id == camera_id).cloned(), Arc::clone(&state.snapshots), Arc::clone(&state.events), Arc::clone(&state.db), Arc::clone(&state.plugins))
                 };
                 let Some(camera) = camera else { continue; };
                 tasks.spawn(async move {
-                    let Ok(jpeg) = pictures.capture(camera).await else { return; };
+                    // A plugin's event: the picture is the first keyframe at or
+                    // after its start, and its box the drawing of that picture.
+                    let from_plugin = notice.event.source == nw_core::event::EventSource::Plugin;
+                    let captured = if from_plugin {
+                        pictures.capture_since(camera, notice.event.start_ms.saturating_mul(1000)).await
+                    } else {
+                        pictures.capture(camera).await.map(|jpeg| (jpeg, None))
+                    };
+                    let Ok((jpeg, picture_us)) = captured else { return; };
                     let relative = format!("{}.jpg", notice.event.id);
                     let Ok(path) = thumbnail_path(&relative) else { return; };
                     let saved = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
@@ -303,10 +357,41 @@ pub async fn run(
                         std::fs::write(&temporary, jpeg)?; std::fs::rename(temporary, path)
                     }).await;
                     if !matches!(saved, Ok(Ok(()))) { return; }
-                    if hub.update(notice.event.id, |event| event.thumbnail = Some(relative.clone())).is_none() {
+                    let event_box = match (picture_us, from_plugin) {
+                        (Some(picture_us), true) => {
+                            let wait = (picture_us + DRAWING_DELAY_US - crate::events::now_ms() * 1000).max(0);
+                            tokio::time::sleep(Duration::from_micros(wait as u64)).await;
+                            let history = plugins.overlays.history.clone();
+                            let event = notice.event.clone();
+                            let reference = hub.open_event(event.id).and_then(|open| open.bbox);
+                            let servers = event.topic.as_deref().map(|topic| {
+                                let mut servers = plugins.servers_of_manifest(topic);
+                                servers.push(topic.to_owned());
+                                servers
+                            }).unwrap_or_default();
+                            tokio::task::spawn_blocking(move || {
+                                let history = history?;
+                                let camera_id = event.camera_id.as_deref()?;
+                                                                crate::plugin_host::event_box::lookup(&history, camera_id, &servers, picture_us, event.detail.as_deref(), reference)
+                            }).await.ok().flatten()
+                        }
+                        _ => None,
+                    };
+                    let id = notice.event.id;
+                    let box_in_hub = event_box;
+                    let updated = hub.update(id, |event| {
+                        event.thumbnail = Some(relative.clone());
+                        if box_in_hub.is_some() { event.bbox = box_in_hub; }
+                    });
+                    if updated.is_none() {
                         let _ = tokio::task::spawn_blocking(move || {
                             hub.flush();
-                            if let Ok(conn) = db.lock() { let _ = conn.execute("UPDATE events SET thumbnail=?1 WHERE id=?2", rusqlite::params![relative, notice.event.id]); }
+                            if let Ok(conn) = db.lock() {
+                                let _ = conn.execute("UPDATE events SET thumbnail=?1 WHERE id=?2", rusqlite::params![relative, id]);
+                                if let Some(rect) = box_in_hub {
+                                    if let Ok(json) = serde_json::to_string(&rect) { let _ = conn.execute("UPDATE events SET bbox=?1 WHERE id=?2", rusqlite::params![json, id]); }
+                                }
+                            }
                         }).await;
                     }
                 });
@@ -320,6 +405,9 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::taps::KeyframeSink;
+
+    /// Tests that point event pictures at a private data directory run one at a time.
+    static DATA_HOME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A camera whose sub stream is open (a plugin watches it) gives its
     /// snapshot from there: its main stream is never connected for a picture.
@@ -668,6 +756,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_activity_event_gets_its_picture_saved_and_attached() {
         use nw_core::event::{EventKind, EventSource};
+        let _env = DATA_HOME.lock().await;
         let data = std::env::temp_dir().join(format!("nw-snapshot-run-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&data).unwrap();
         // Event pictures live under the user's data directory: use a private one.
@@ -731,6 +820,114 @@ mod tests {
         assert_eq!(relative, format!("{}.jpg", attached.id));
         let saved = std::fs::read(data.join("neurowatch/events").join(&relative)).unwrap();
         assert!(saved.starts_with(&[255, 216]));
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    fn unit(delta: bool, arrived_us: i64, picture_us: Option<i64>) -> crate::streams::SharedUnit {
+        let (caps, mut buffer) = jpeg_sample();
+        if delta {
+            buffer
+                .make_mut()
+                .set_flags(gstreamer::BufferFlags::DELTA_UNIT);
+        }
+        crate::streams::SharedUnit {
+            media: crate::streams::Media::Video,
+            buffer,
+            caps,
+            arrived_us,
+            frame: picture_us.map(|time_us| crate::streams::frames::Identity {
+                seq: 1,
+                time_us,
+                observed_us: arrived_us,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_keyframe_for_an_event_is_the_first_at_or_after_its_start() {
+        gstreamer::init().unwrap();
+        let start = 10_000_000;
+        let cached_older = unit(false, 8_000_000, Some(8_000_000));
+        let delta_after = unit(true, 10_500_000, Some(10_500_000));
+        let at_start = unit(false, 10_000_100, Some(10_000_000));
+        let later = unit(false, 12_000_000, Some(12_000_000));
+        let order = [&cached_older, &delta_after, &later, &at_start];
+        let picked = order
+            .iter()
+            .find(|u| crate::streams::keyframe_since(u, start))
+            .map(|u| crate::streams::unit_time_us(u));
+        assert_eq!(
+            picked,
+            Some(12_000_000),
+            "older and delta units are skipped"
+        );
+        assert!(crate::streams::keyframe_since(&at_start, start));
+        assert!(!crate::streams::keyframe_since(&cached_older, start));
+        // Without a picture identity the arrival time is the unit's time.
+        let bare = unit(false, 11_000_000, None);
+        assert_eq!(crate::streams::unit_time_us(&bare), 11_000_000);
+        assert!(crate::streams::keyframe_since(&bare, start));
+    }
+
+    /// A plugin event with no stream open falls back to the cached picture and
+    /// keeps the plugin's box; an event of another source is left as it was.
+    #[tokio::test]
+    async fn plugin_events_fall_back_and_keep_their_box_and_others_are_unchanged() {
+        use nw_core::event::{EventKind, EventSource};
+        let _env = DATA_HOME.lock().await;
+        let data = std::env::temp_dir().join(format!("nw-snapshot-box-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data).unwrap();
+        std::env::set_var("XDG_DATA_HOME", &data);
+        let mut config = crate::config::AppConfig::default();
+        let camera = nw_core::camera::CameraConfig::new("Gate", "rtsp://127.0.0.1:9/live");
+        config.cameras.push(camera.clone());
+        let state = Arc::new(tokio::sync::RwLock::new(
+            crate::app_state::AppState::with_database(
+                config,
+                data.join("config.json"),
+                crate::pipeline::hwaccel::HwAccelKind::Software,
+                crate::db::connection::open_in_memory().unwrap(),
+            ),
+        ));
+        let (hub, pictures) = {
+            let st = state.read().await;
+            (Arc::clone(&st.events), Arc::clone(&st.snapshots))
+        };
+        let (caps, buffer) = jpeg_sample();
+        pictures.record(&camera.id, caps, buffer);
+        let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(run(Arc::clone(&state), shutdown_rx));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let rect = [0.1, 0.2, 0.3, 0.4];
+        let mut ids = Vec::new();
+        for source in [EventSource::Plugin, EventSource::Onvif] {
+            let started = hub.start(crate::events::NewEvent::new(
+                Some(camera.id.clone()),
+                EventKind::Motion,
+                source,
+            ));
+            hub.update(started.id, |event| event.bbox = Some(rect));
+            ids.push(started.id);
+            // The two picture workers are never both needed at once here.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while hub
+                .open_event(started.id)
+                .is_some_and(|event| event.thumbnail.is_none())
+            {
+                assert!(Instant::now() < deadline, "no picture was attached");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        for id in ids {
+            let event = hub.open_event(id).unwrap();
+            assert_eq!(event.bbox, Some(rect));
+            assert_eq!(event.thumbnail, Some(format!("{id}.jpg")));
+        }
         shutdown.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), task)
             .await

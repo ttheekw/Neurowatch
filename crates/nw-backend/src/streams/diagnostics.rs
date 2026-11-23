@@ -42,6 +42,10 @@ pub struct StreamConnection {
     /// Cloud Backup is copying this stream in real time.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub cloud_backup: bool,
+    /// A transcode (H.265 to H.264 or VP8, for browsers) reads this stream.
+    /// Not a role: its own subscription counts under `browser`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<super::transcode::StreamTranscode>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -58,6 +62,10 @@ pub struct StreamPlugin {
     /// Pictures shared with it a second, while it uses the video wall's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_fps: Option<f32>,
+    /// Who decoded those pictures and on what (`always_on` / `video_wall`;
+    /// `VA-API`, `NVDEC`, …, `CPU`), once known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_source: Option<super::decoded::SharedSource>,
 }
 
 /// Longest plugin name or decoder text a stream row carries (characters).
@@ -103,6 +111,7 @@ pub fn with_plugins(
                     .map(short)
                     .filter(|text| !text.trim().is_empty()),
                 shared_fps: consumer.shared_fps.filter(|fps| fps.is_finite()),
+                shared_source: consumer.shared_source,
             });
         }
         if paths != PluginPaths::default() {
@@ -217,6 +226,7 @@ impl StreamHubs {
                     always_decoded: false,
                     shared_views: 0,
                     cloud_backup: false,
+                    transcode: self.transcodes.row(&key),
                 };
                 if let Some((_, hub)) = open.iter().find(|(source, _)| source == &key) {
                     let core = lock(&hub.core);

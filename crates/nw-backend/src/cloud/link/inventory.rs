@@ -55,6 +55,16 @@ impl From<crate::streams::VideoFormat> for StreamVideo {
     }
 }
 
+/// That this recorder can transcode H.265 for a browser that cannot play it,
+/// and how: the encoder a transcode would use now (`VA-API`, `NVENC`,
+/// `Quick Sync`, `Media Foundation`, `V4L2`, or `CPU`: the VP8 fallback).
+/// Sent for a camera with an H.265 stream; a recorder without this field
+/// cannot transcode, and the portal then falls back (an H.264 sub stream).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct TranscodeSupport {
+    pub encoder: &'static str,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CameraSnapshot {
     pub camera_id: String,
@@ -64,6 +74,9 @@ pub struct CameraSnapshot {
     /// Left out when not known, so the cloud keeps its earlier assumption.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live: Option<LiveStreams>,
+    /// Left out unless a stream of the camera is H.265 (see [`TranscodeSupport`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode: Option<TranscodeSupport>,
     /// Left out when no stream has been seen yet. (Not `video`: the cloud
     /// refuses that key anywhere, as a guard against media in reports.)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,6 +122,7 @@ pub fn camera_inventory_with_live(
                 // and an offline camera records nothing.
                 recording: states.get(&camera.id).map(String::as_str) == Some("recording_ready"),
                 live: live(camera),
+                transcode: None,
                 formats: formats(camera).filter(|streams| !streams.is_empty()),
                 hardware: hardware(camera).filter(|found| !found.is_empty()),
             })
@@ -118,6 +132,18 @@ pub fn camera_inventory_with_live(
         .into_iter()
         .filter_map(|index| listed.get_mut(index).and_then(Option::take))
         .collect()
+}
+
+/// Says on every camera with an H.265 stream that this recorder can
+/// transcode it, with `encoder` (see [`TranscodeSupport`]).
+pub fn report_transcode(cameras: &mut [CameraSnapshot], encoder: &'static str) {
+    for camera in cameras {
+        let h265 = camera
+            .live
+            .as_ref()
+            .is_some_and(|live| live.values().any(|codec| *codec == Some("h265")));
+        camera.transcode = h265.then_some(TranscodeSupport { encoder });
+    }
 }
 
 /// The id each camera is reported under, in order: its own id when that is

@@ -48,6 +48,9 @@ const MAX_OPEN_EVENTS: usize = 16;
 const EVENT_STARTS_PER_SECOND: u32 = 10;
 const OVERLAYS_PER_SECOND: u32 = 25;
 const MAX_ZONES: usize = 32;
+/// A plugin's own event kind (a detection class): its id and its label.
+const MAX_KIND_ID: usize = 64;
+const MAX_KIND_LABEL: usize = 64;
 const MAX_TEXT: usize = 200;
 
 pub(crate) struct Context {
@@ -1059,6 +1062,7 @@ impl Session<'_> {
                     v.format = None;
                     v.shared_pictures = false;
                     v.shared_fps = None;
+                    v.shared_source = None;
                 });
             }
             Err(problem) => {
@@ -1096,7 +1100,11 @@ impl Session<'_> {
                 let shared = pump.counters.shared_pictures.load(Ordering::Relaxed);
                 let shared_fps = shared
                     .then(|| pump.counters.shared_fps_tenths.load(Ordering::Relaxed) as f32 / 10.0);
+                let shared_source = shared
+                    .then(|| pump.counters.shared_source.lock().ok().and_then(|s| *s))
+                    .flatten();
                 self.context.view(camera_id, |v| {
+                    v.shared_source = shared_source;
                     v.sent = sent;
                     v.dropped = dropped;
                     v.format = format;
@@ -1181,8 +1189,7 @@ impl Session<'_> {
         let Some(manifest) = self.manifest.as_ref() else {
             return;
         };
-        let declared = manifest.event_kinds.iter().any(|k| k.id == start.kind);
-        let Some(kind) = EventKind::parse(&start.kind).filter(|_| declared) else {
+        let Some((kind, detail)) = plugin_event_kind(&manifest.event_kinds, &start.kind) else {
             let plugin = self.context.server_id.clone();
             let kind = start.kind.clone();
             self.warn_once(format!("kind:{kind}"), || {
@@ -1212,7 +1219,9 @@ impl Session<'_> {
         *count += 1;
         let mut event = NewEvent::new(Some(camera_id), kind, EventSource::Plugin);
         event.topic = Some(manifest.id.clone());
+        event.detail = detail;
         event.score = start.score.and_then(unit_interval);
+        event.detection = start.alert == Some(false);
         let record = match frame {
             Some(frame) => self.context.events.start_at(event, frame.time_us / 1000),
             None => self.context.events.start(event),
@@ -1246,11 +1255,15 @@ impl Session<'_> {
             .filter(|zone| !zone.is_empty() && zone.len() <= 64)
             .take(MAX_ZONES)
             .collect();
+        let upgrade = update.alert == Some(true);
         self.context.events.update(open.id, |record| {
+            if upgrade {
+                record.detection = false;
+            }
             if score.is_some() {
                 record.score = score;
             }
-            if bbox.is_some() {
+            if bbox.is_some() && plugin_box_applies(record) {
                 record.bbox = bbox;
             }
             if !zones.is_empty() {
@@ -1322,14 +1335,10 @@ impl Session<'_> {
             .drawn
             .entry((overlay.binding, overlay.layer.clone()))
             .or_insert((now, 0));
-        if window.elapsed() >= Duration::from_secs(1) {
-            *window = now;
-            *count = 0;
-        }
-        if *count >= OVERLAYS_PER_SECOND && !overlay.items.is_empty() {
+        let is_result = !overlay.items.is_empty() || frame.is_some();
+        if !within_overlay_rate(window, count, now, is_result) {
             return;
         }
-        *count += 1;
         self.context.overlays.put_identified(
             &camera_id,
             &self.context.server_id,
@@ -1383,13 +1392,70 @@ impl Session<'_> {
     }
 }
 
+/// The event a plugin's `event.start` kind makes, and its detail. Only kinds
+/// the manifest declares count. A detection plugin names its own classes,
+/// whatever they are: every class is an [`EventKind::Object`] titled with the
+/// plugin's label for it ("Person", "Forklift"), never matched against
+/// NeuroWatch's own kinds. The one exception is `motion` (the Motion plugin).
+/// A plugin never makes a system event (camera offline, disk low).
+fn plugin_event_kind(
+    declared: &[messages::EventKindInfo],
+    kind: &str,
+) -> Option<(EventKind, Option<String>)> {
+    let info = declared.iter().find(|info| info.id == kind)?;
+    if kind.is_empty() || kind.len() > MAX_KIND_ID {
+        return None;
+    }
+    if kind == EventKind::Motion.as_str() {
+        return Some((EventKind::Motion, None));
+    }
+    let label = info.label.trim();
+    let label = if label.is_empty() { kind } else { label };
+    Some((
+        EventKind::Object,
+        Some(clip_to(label.to_owned(), MAX_KIND_LABEL)),
+    ))
+}
+
+/// Whether a plugin's box may replace an event's: only until the event has
+/// its picture. The recorder then sets the box drawn on that very picture
+/// (`snapshot.rs`, `plugin_host::event_box`); the plugin's own box comes from
+/// another moment, so a later update must not move it off the object.
+fn plugin_box_applies(record: &nw_core::event::EventRecord) -> bool {
+    record.thumbnail.is_none()
+}
+
+#[cfg(test)]
+mod event_box_rule_tests {
+    use super::*;
+
+    #[test]
+    fn a_plugin_box_applies_only_until_the_event_has_its_picture() {
+        let mut record: nw_core::event::EventRecord = serde_json::from_value(serde_json::json!({
+            "id": 1, "camera_id": "c", "kind": "motion", "source": "plugin",
+            "start_ms": 0, "end_ms": null
+        }))
+        .unwrap();
+        assert!(plugin_box_applies(&record));
+        record.thumbnail = Some("1.jpg".into());
+        assert!(
+            !plugin_box_applies(&record),
+            "the box matched to the picture stays"
+        );
+    }
+}
+
 fn unit_interval(value: f32) -> Option<f32> {
     value.is_finite().then(|| value.clamp(0.0, 1.0))
 }
 
-fn clip(mut text: String) -> String {
-    if text.len() > MAX_TEXT {
-        let mut end = MAX_TEXT;
+fn clip(text: String) -> String {
+    clip_to(text, MAX_TEXT)
+}
+
+fn clip_to(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut end = max;
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -1800,5 +1866,99 @@ impl Write for Conn {
             #[cfg(windows)]
             Self::Pipe(pipe) => pipe.flush(),
         }
+    }
+}
+
+/// Counts one drawing in the layer's one-second window; `false` when it is
+/// over [`OVERLAYS_PER_SECOND`] and must be dropped. A clear (an empty overlay
+/// without a picture) always passes; results, empty ones too, are limited.
+fn within_overlay_rate(
+    window: &mut Instant,
+    count: &mut u32,
+    now: Instant,
+    is_result: bool,
+) -> bool {
+    if now.saturating_duration_since(*window) >= Duration::from_secs(1) {
+        *window = now;
+        *count = 0;
+    }
+    if *count >= OVERLAYS_PER_SECOND && is_result {
+        return false;
+    }
+    *count += 1;
+    true
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    fn kinds(pairs: &[(&str, &str)]) -> Vec<messages::EventKindInfo> {
+        pairs
+            .iter()
+            .map(|(id, label)| messages::EventKindInfo {
+                id: (*id).into(),
+                label: (*label).into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_plugins_classes_are_named_objects_and_motion_is_motion() {
+        let declared = kinds(&[
+            ("person", "Person"),
+            ("forklift", "Forklift"),
+            ("traffic_light", " "),
+            ("disk_low", "Disk low"),
+            ("motion", "Motion"),
+        ]);
+        // Class names are the plugin's own: "person" is not NeuroWatch's Person.
+        assert_eq!(
+            plugin_event_kind(&declared, "person"),
+            Some((EventKind::Object, Some("Person".into())))
+        );
+        assert_eq!(
+            plugin_event_kind(&declared, "motion"),
+            Some((EventKind::Motion, None))
+        );
+        assert_eq!(
+            plugin_event_kind(&declared, "forklift"),
+            Some((EventKind::Object, Some("Forklift".into())))
+        );
+        // No label: the class's own name.
+        assert_eq!(
+            plugin_event_kind(&declared, "traffic_light"),
+            Some((EventKind::Object, Some("traffic_light".into())))
+        );
+        // A plugin never raises a system event, whatever it names a class.
+        assert_eq!(
+            plugin_event_kind(&declared, "disk_low"),
+            Some((EventKind::Object, Some("Disk low".into())))
+        );
+        assert_eq!(plugin_event_kind(&declared, "dragon"), None, "undeclared");
+        let long = "x".repeat(MAX_KIND_ID + 1);
+        assert_eq!(plugin_event_kind(&kinds(&[(&long, "Long")]), &long), None);
+    }
+}
+
+#[cfg(test)]
+mod overlay_rate_tests {
+    use super::*;
+
+    #[test]
+    fn results_are_rate_limited_but_a_clear_always_passes() {
+        let start = Instant::now();
+        let (mut window, mut count) = (start, 0);
+        // Per-picture results, empty ones too: 25 pass, then the flood is dropped.
+        for _ in 0..OVERLAYS_PER_SECOND {
+            assert!(within_overlay_rate(&mut window, &mut count, start, true));
+        }
+        assert!(!within_overlay_rate(&mut window, &mut count, start, true));
+        // A clear (no picture, no items) is never dropped, or a layer could stay up.
+        assert!(within_overlay_rate(&mut window, &mut count, start, false));
+        // The next second starts afresh.
+        let later = start + Duration::from_millis(1100);
+        assert!(within_overlay_rate(&mut window, &mut count, later, true));
+        assert_eq!(count, 1);
     }
 }

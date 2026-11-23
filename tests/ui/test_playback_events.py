@@ -208,9 +208,6 @@ def test_window_event_export_uses_existing_dialog_lifecycle(monkeypatch):
         def shutdown(self):
             calls.append("shutdown")
 
-        def deleteLater(self):  # noqa: N802 — Qt's lifecycle method
-            calls.append("delete")
-
     monkeypatch.setattr(main, "ExportVideoDialog", Dialog)
     window = SimpleNamespace(_cameras=[], _ipc=SimpleNamespace(endpoint="unix:/tmp/fake.sock"))
     event = Event(91, "motion", "gate", 1_800_000_000_000, 1_800_000_001_000)
@@ -220,5 +217,4 @@ def test_window_event_export_uses_existing_dialog_lifecycle(monkeypatch):
         ("preset", event),
         "review",
         "shutdown",
-        "delete",
     ]

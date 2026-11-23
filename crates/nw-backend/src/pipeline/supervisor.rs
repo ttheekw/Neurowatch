@@ -175,9 +175,16 @@ pub struct PipelineSupervisor {
     borrowed: Option<crate::streams::decoded::Receiver>,
     /// When a borrowed picture last arrived (or the run began).
     borrow_seen: Instant,
-    /// A hardware decoder failed on this view's stream before showing a
-    /// picture: later runs decode it on the CPU (`hwaccel::software_only`).
-    software_decode: bool,
+    /// When this view's hardware decoder is given up for the CPU
+    /// (`decoder_health`): later runs decode on it (`hwaccel::software_only`).
+    decoder_health: super::decoder_health::DecoderHealth,
+    /// The decoder this run's pictures come from, named once it is plugged.
+    decoder_label: Arc<crate::streams::decoded::DecoderLabel>,
+    decoder_label_tried: Instant,
+    /// A stall was counted against the decoder since its last picture.
+    stall_counted: bool,
+    /// When a unit last went into this run's decoder.
+    last_pushed: Option<Instant>,
     /// The run's time origin for borrowed pictures' timestamps.
     raw_start: Instant,
 }
@@ -223,7 +230,11 @@ impl PipelineSupervisor {
             reachability: None,
             reconnect_attempt: 0,
             frame_counter: Arc::new(AtomicU64::new(0)),
-            software_decode: false,
+            decoder_health: super::decoder_health::DecoderHealth::default(),
+            decoder_label: Arc::default(),
+            decoder_label_tried: Instant::now(),
+            stall_counted: false,
+            last_pushed: None,
             hubs: None,
             shared_any: false,
             subscription: None,
@@ -466,7 +477,11 @@ impl PipelineSupervisor {
             }
         };
 
-        if shared && !borrowing && self.software_decode {
+        self.decoder_health.run_started();
+        self.decoder_label = Arc::default();
+        self.stall_counted = false;
+        self.last_pushed = None;
+        if shared && !borrowing && self.decoder_health.software() {
             if let Some(decodebin) = pipeline.by_name(builder::VIEW_DECODE) {
                 super::hwaccel::software_only(&decodebin);
             }
@@ -613,6 +628,7 @@ impl PipelineSupervisor {
                     pipeline,
                     Arc::clone(&self.frame_ids),
                 )
+                .with_decoder(Arc::clone(&self.decoder_label))
             });
         if self.headless {
             return (None, self.wire_headless_appsink(&appsink, decoded));
@@ -766,9 +782,14 @@ impl PipelineSupervisor {
                 return;
             }
             let waiting_for_camera = self.follow_hub();
+            self.name_decoder(&pipeline);
             if self.frames_counted {
                 let frames = self.frame_counter.load(AtomicOrdering::Relaxed);
                 if frames != last_frames {
+                    self.stall_counted = false;
+                    if frames > 0 {
+                        self.decoder_health.picture();
+                    }
                     // Frames decoded from what arrived before a loss do not
                     // mean the camera is back; the shared connection streaming
                     // again does.
@@ -782,16 +803,38 @@ impl PipelineSupervisor {
                 } else if waiting_for_camera {
                     // The shared connection is reconnecting: no decoder fault.
                     last_progress = Instant::now();
-                } else if last_progress.elapsed() >= NO_FRAME_TIMEOUT {
-                    let reason = if frames == 0 {
-                        "No video received from camera"
-                    } else {
-                        "Video stopped arriving from camera"
-                    };
-                    self.state = State::Error {
-                        reason: reason.into(),
-                    };
-                    return;
+                } else {
+                    let idle = last_progress.elapsed();
+                    // Units keep arriving from a streaming camera and no
+                    // picture comes out: the decoder's fault, not the camera's
+                    // (before the run's first picture, only once the run
+                    // would be given up anyway).
+                    if idle >= super::decoder_health::STALL
+                        && !self.stall_counted
+                        && (frames > 0 || idle >= NO_FRAME_TIMEOUT)
+                    {
+                        self.stall_counted = true;
+                        if self.units_flowing()
+                            && self.blame_decoder(&pipeline, None)
+                                == super::decoder_health::Verdict::Software
+                        {
+                            self.state = State::Error {
+                                reason: "The hardware decoder stalled; decoding on the CPU".into(),
+                            };
+                            return;
+                        }
+                    }
+                    if idle >= NO_FRAME_TIMEOUT {
+                        let reason = if frames == 0 {
+                            "No video received from camera"
+                        } else {
+                            "Video stopped arriving from camera"
+                        };
+                        self.state = State::Error {
+                            reason: reason.into(),
+                        };
+                        return;
+                    }
                 }
             }
 
@@ -850,7 +893,7 @@ impl PipelineSupervisor {
                         e.debug().unwrap_or_default()
                     ));
                     tracing::error!(cam_id = %self.cam_id, %reason, "Pipeline error");
-                    self.note_decoder_failure(pipeline);
+                    self.blame_decoder(pipeline, Some(msg));
                     return Some(State::Error { reason });
                 }
                 MessageView::Eos(_) => {
@@ -872,25 +915,79 @@ impl PipelineSupervisor {
         None
     }
 
-    /// A failed run of a shared view that never showed a picture, with a
-    /// hardware decoder in it: decode this stream on the CPU from now on (a
-    /// stream the hardware cannot take, e.g. above a Raspberry Pi 4's 1080p).
-    fn note_decoder_failure(&mut self, pipeline: &gstreamer::Pipeline) {
-        if self.software_decode
-            || self.feed.is_none()
-            || self.frame_counter.load(AtomicOrdering::Relaxed) > 0
-        {
-            return;
+    /// A run of a shared view failed (`msg`: the pipeline's error) or its
+    /// decoder stalled (`None`): count it against a hardware decoder when it
+    /// is the decoder's doing, and say whether to decode on the CPU from now on
+    /// (`decoder_health`). Before the run's first picture any pipeline error
+    /// counts (a stream the hardware cannot take, e.g. above a Raspberry Pi
+    /// 4's 1080p); after pictures only an error raised by the decoder itself
+    /// or a stall does. Nothing counts while the camera connection is down.
+    fn blame_decoder(
+        &mut self,
+        pipeline: &gstreamer::Pipeline,
+        msg: Option<&gstreamer::Message>,
+    ) -> super::decoder_health::Verdict {
+        use super::decoder_health::{describe, raised_by, Verdict};
+        if self.feed.is_none() || self.decoder_health.software() {
+            return Verdict::Ignore;
+        }
+        if self.frame_counter.load(AtomicOrdering::Relaxed) > 0 {
+            self.decoder_health.picture();
+        }
+        if self.subscription.as_ref().is_some_and(|subscription| {
+            subscription.state().phase != crate::streams::Phase::Streaming
+        }) {
+            return Verdict::Ignore;
         }
         let Some(decodebin) = pipeline
             .by_name(builder::VIEW_DECODE)
             .and_then(|element| element.downcast::<gstreamer::Bin>().ok())
         else {
-            return;
+            return Verdict::Ignore;
         };
-        if let Some(decoder) = super::hwaccel::hardware_decoder_in(&decodebin) {
-            tracing::warn!(cam_id = %self.cam_id, %decoder, "The hardware decoder failed on this stream before showing a picture; decoding it on the CPU");
-            self.software_decode = true;
+        let Some(decoder) = super::hwaccel::hardware_decoder_element_in(&decodebin) else {
+            return Verdict::Ignore;
+        };
+        let caused =
+            msg.is_none_or(|msg| raised_by(msg, &decoder)) || !self.decoder_health.pictures_seen();
+        let verdict = self.decoder_health.failed(Instant::now(), caused);
+        let name = decoder.factory().map(|f| f.name().to_string());
+        let decoder_name = name.as_deref().unwrap_or("unknown");
+        match verdict {
+            Verdict::Software => {
+                tracing::warn!(cam_id = %self.cam_id, decoder = decoder_name, reason = describe(msg.is_none()), "The hardware decoder failed on this stream; decoding it on the CPU for the rest of this view");
+            }
+            Verdict::Retry => {
+                tracing::warn!(cam_id = %self.cam_id, decoder = decoder_name, reason = describe(msg.is_none()), "The hardware decoder failed on this stream; trying it again (a second failure within 10 minutes moves to the CPU)");
+            }
+            Verdict::Ignore => {}
+        }
+        verdict
+    }
+
+    /// Units went into the decoder in the last moments.
+    fn units_flowing(&self) -> bool {
+        self.last_pushed
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(2))
+    }
+
+    /// Name the decoder this run plugged, for whoever receives its pictures
+    /// (`DecoderLabel`): looked up here, never on the picture path, and only
+    /// until it is found.
+    fn name_decoder(&mut self, pipeline: &gstreamer::Pipeline) {
+        if self.feed.is_none()
+            || self.decoder_label.get().is_some()
+            || self.decoder_label_tried.elapsed() < Duration::from_millis(250)
+        {
+            return;
+        }
+        self.decoder_label_tried = Instant::now();
+        let label = pipeline
+            .by_name(builder::VIEW_DECODE)
+            .and_then(|element| element.downcast::<gstreamer::Bin>().ok())
+            .and_then(|decodebin| super::hwaccel::decoder_label_in(&decodebin));
+        if let Some(label) = label {
+            self.decoder_label.set(label);
         }
     }
 
@@ -946,6 +1043,10 @@ impl PipelineSupervisor {
                     Some(State::Reconnecting {
                         attempt: self.reconnect_attempt,
                     })
+                }
+                Ok(Pushed::Pushed) => {
+                    self.last_pushed = Some(Instant::now());
+                    None
                 }
                 Ok(_) | Err(gstreamer::FlowError::Flushing) => None,
                 Err(error) => Some(State::Error {

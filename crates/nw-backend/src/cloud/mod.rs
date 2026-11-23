@@ -280,7 +280,7 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
         let codecs = Arc::clone(&inventory_codecs);
         Box::pin(async move {
             let st = state.read().await;
-            link::camera_inventory_with_live(
+            let mut cameras = link::camera_inventory_with_live(
                 &st.config.cameras,
                 &st.supervisor_states(),
                 |camera| {
@@ -304,7 +304,14 @@ fn start(cloud: Cloud, services: Services) -> RunningCloud {
                     )
                 },
                 |camera| st.identities.get(&camera.id),
-            )
+            );
+            // Which encoder a transcode of an H.265 stream would use (the
+            // registry is only looked at: nothing is opened).
+            link::report_transcode(
+                &mut cameras,
+                crate::streams::transcode::available_encoder_label(),
+            );
+            cameras
         })
     });
     // Only *when* each camera has recordings leaves the node, for the

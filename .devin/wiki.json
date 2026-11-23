@@ -1,0 +1,75 @@
+{
+  "repo_notes": [
+    {
+      "content": "NeuroWatch is an open-source (Apache-2.0) video recorder (NVR) for IP cameras on Linux and Windows: a Rust recorder service, a Python/PySide6 desktop app, and analytics plugins that run as separate processes.\n\ndocs/technical/ is the authoritative description of the architecture. It is generated from the canonical pages at https://neurowatch.app/docs (never edited by hand); prefer it to older notes elsewhere in docs/, and keep its anchor ids when linking.\n\nKey directories: crates/nw-backend (the recorder service: streams/, pipeline/, recording/, playback/, export/, events/, onvif_events/, plugin_host/, shm/, ipc/, cloud/); crates/nw-core (shared types); crates/nw-analytics-protocol and crates/nw-analytics-sdk (the plugin protocol and Rust SDK); sdk/python (the Python plugin SDK); ui/neurowatch (the desktop app, tray and service controller).\n\nThe free plugins, NeuroWatch Motion and NeuroWatch Detect, live in their own public repositories. Do not quote benchmark figures or describe the video path as copy-free: the docs deliberately make neither claim."
+    }
+  ],
+  "pages": [
+    {
+      "title": "Start here",
+      "purpose": "Introduce this part of NeuroWatch and link its pages: Overview, Architecture."
+    },
+    {
+      "title": "Video pipeline",
+      "purpose": "Introduce this part of NeuroWatch and link its pages: Stream engine and buffers, Decoding and hardware acceleration, Desktop rendering, Recording, playback and export, Browser viewing."
+    },
+    {
+      "title": "Analytics and events",
+      "purpose": "Introduce this part of NeuroWatch and link its pages: Analytics plugins, Events and integrations."
+    },
+    {
+      "title": "Engineering",
+      "purpose": "Introduce this part of NeuroWatch and link its pages: Engineering in Rust."
+    },
+    {
+      "title": "Overview",
+      "purpose": "How the NeuroWatch camera recorder is built: a Rust recorder service, a Qt desktop app and analytics plugins as separate processes, and the rules behind them. Follow docs/technical/overview.md (from https://neurowatch.app/docs) and the code it names.",
+      "parent": "Start here"
+    },
+    {
+      "title": "Architecture",
+      "purpose": "Inside the NeuroWatch recorder service and an analytics plugin: the modules, who owns which thread, how the service starts and how it restarts itself. Follow docs/technical/architecture.md (from https://neurowatch.app/docs/architecture) and the code it names.",
+      "parent": "Start here"
+    },
+    {
+      "title": "Stream engine and buffers",
+      "purpose": "How NeuroWatch opens each camera stream once, numbers every picture, caches the current GOP and gives each reader a bounded queue with its own loss rule. Follow docs/technical/stream-engine.md (from https://neurowatch.app/docs/stream-engine) and the code it names.",
+      "parent": "Video pipeline"
+    },
+    {
+      "title": "Decoding and hardware acceleration",
+      "purpose": "When NeuroWatch decodes video, how it ranks VA-API, NVDEC, Direct3D, Quick Sync and V4L2 decoders, and how it falls back to the CPU without losing the camera. Follow docs/technical/hardware-decoding.md (from https://neurowatch.app/docs/hardware-decoding) and the code it names.",
+      "parent": "Video pipeline"
+    },
+    {
+      "title": "Desktop rendering",
+      "purpose": "How pictures reach the NeuroWatch video wall: shared-memory rings, NV12 converted on the GPU, a reader that sets its rate, and latest-frame-only painting. Follow docs/technical/desktop-rendering.md (from https://neurowatch.app/docs/desktop-rendering) and the code it names.",
+      "parent": "Video pipeline"
+    },
+    {
+      "title": "Recording, playback and export",
+      "purpose": "How NeuroWatch records cameras as segmented Matroska without decoding, indexes them in SQLite, protects missing drives, archives to a NAS and exports MP4 clips. Follow docs/technical/recording.md (from https://neurowatch.app/docs/recording) and the code it names.",
+      "parent": "Video pipeline"
+    },
+    {
+      "title": "Browser viewing",
+      "purpose": "What the NeuroWatch recorder does for browser viewers: the camera's own H.264 or H.265 passed through, a fast start from the GOP cache, and when it converts. Follow docs/technical/browser-viewing.md (from https://neurowatch.app/docs/browser-viewing) and the code it names.",
+      "parent": "Video pipeline"
+    },
+    {
+      "title": "Analytics plugins",
+      "purpose": "How NeuroWatch analytics plugins work: separate processes over sockets, TLS or QUIC, signed keys, compressed or shared pictures, drawings tied to pictures. Follow docs/technical/plugins.md (from https://neurowatch.app/docs/plugins) and the code it names.",
+      "parent": "Analytics and events"
+    },
+    {
+      "title": "Events and integrations",
+      "purpose": "How NeuroWatch handles events: an EventHub that never waits on the database, ONVIF push and pull, plugin events, pictures, alerts and MQTT. Follow docs/technical/events.md (from https://neurowatch.app/docs/events) and the code it names.",
+      "parent": "Analytics and events"
+    },
+    {
+      "title": "Engineering in Rust",
+      "purpose": "Why the NeuroWatch recorder is written in Rust, the rules its code follows for locks, errors and streaming threads, how it is tested, and its licence. Follow docs/technical/rust.md (from https://neurowatch.app/docs/rust) and the code it names.",
+      "parent": "Engineering"
+    }
+  ]
+}

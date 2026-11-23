@@ -13,6 +13,7 @@ pub(crate) mod credentials;
 mod decoded;
 mod diagnostics;
 pub(crate) mod discovery;
+pub mod event_box;
 pub mod history;
 pub mod lag;
 pub(crate) mod legacy_motion;
@@ -23,6 +24,7 @@ mod session;
 mod tests;
 pub(crate) mod web;
 
+pub use crate::streams::decoded::SharedSource;
 pub use config::{Managed, PluginBinding, PluginServer, PluginsConfig};
 pub use diagnostics::{PluginPictures, PluginStreamConsumer};
 pub use overlays::OverlayStore;
@@ -113,6 +115,10 @@ pub struct BindingView {
     /// How many of them a second (measured over the last two seconds).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_fps: Option<f32>,
+    /// Who decoded the pictures it was last given and on what, while
+    /// `shared_pictures` (left out until the decoder is known).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_source: Option<SharedSource>,
 }
 
 /// A plugin analysing a camera, for whoever shows the camera
@@ -182,6 +188,27 @@ pub(super) struct Query {
 }
 
 impl PluginHost {
+    /// The ids (in `plugins.servers`) of the connected servers whose plugin
+    /// declares manifest id `manifest_id`. Drawings are stored by server id,
+    /// an event's `topic` holds the manifest id.
+    pub fn servers_of_manifest(&self, manifest_id: &str) -> Vec<String> {
+        self.status.lock().map_or_else(
+            |_| Vec::new(),
+            |status| {
+                status
+                    .iter()
+                    .filter(|(_, server)| {
+                        server
+                            .manifest
+                            .as_ref()
+                            .is_some_and(|manifest| manifest.id == manifest_id)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            },
+        )
+    }
+
     /// Hosted services' tickets, from the portal's latest answer.
     pub fn set_tickets(&self, tickets: HashMap<String, String>) {
         if let Ok(mut held) = self.tickets.lock() {

@@ -47,6 +47,7 @@ fn consumed_directive_acknowledgements_are_durable_and_deduplicated() {
             },
             publisher_token: "header.payload.signature".into(),
             playback: None,
+            transcode: false,
         }],
         active_session_ids: vec!["session-1".into()],
     };
@@ -836,6 +837,40 @@ fn camera_inventory_reports_which_streams_a_browser_can_be_sent() {
     // Not known: left out, so a cloud keeps its earlier assumption and older
     // signed payloads are unchanged.
     assert!(json[1].get("live").is_none());
+}
+
+#[test]
+fn camera_inventory_reports_transcode_support_for_h265_streams_only() {
+    let cameras = vec![
+        camera("cam-a", "Front door", true),
+        camera("cam-b", "Gate", false),
+        camera("cam-c", "Yard", false),
+    ];
+    let mut snapshot = camera_inventory_with_live(
+        &cameras,
+        &std::collections::HashMap::new(),
+        |camera| match camera.id.as_str() {
+            "cam-a" => Some(std::collections::BTreeMap::from([
+                ("main", Some("h265")),
+                ("sub", Some("h264")),
+            ])),
+            "cam-b" => Some(std::collections::BTreeMap::from([("main", Some("h264"))])),
+            // Not seen yet: unknown, so nothing is promised.
+            _ => Some(std::collections::BTreeMap::from([("main", None)])),
+        },
+        |_| None,
+        |_| None,
+    );
+    report_transcode(&mut snapshot, "VA-API");
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(json[0]["transcode"], json!({"encoder": "VA-API"}));
+    assert!(json[1].get("transcode").is_none(), "{json}");
+    assert!(json[2].get("transcode").is_none(), "{json}");
+    report_transcode(&mut snapshot, "CPU");
+    assert_eq!(
+        serde_json::to_value(&snapshot).unwrap()[0]["transcode"],
+        json!({"encoder": "CPU"})
+    );
 }
 
 #[test]
@@ -2066,6 +2101,7 @@ fn a_camera_status_change_is_reported_within_seconds_but_not_more_than_every_ten
             status,
             recording: false,
             live: None,
+            transcode: None,
             formats: None,
             hardware: None,
         }]
@@ -2103,6 +2139,7 @@ fn a_camera_still_connecting_is_reported_once_it_settles_or_after_a_while() {
             status,
             recording: false,
             live: None,
+            transcode: None,
             formats: None,
             hardware: None,
         }]

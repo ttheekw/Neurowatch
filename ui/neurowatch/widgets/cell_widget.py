@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import datetime
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
@@ -99,7 +99,12 @@ _GRIP_SHADOW = QColor(0, 0, 0, 150)
 # Recording indicator colours
 _MOTION_BG = QColor(234, 88, 12, 235)  # #ea580c — motion going on
 _MOTION_TEXT = QColor(255, 247, 237)
-_MOTION_LABEL = "MOTION"
+#: Between the names in the activity badge ("MOTION · CAR").
+_ACTIVITY_JOIN = " · "
+#: The camera name's width (px) kept before the activity badge gets room for
+#: its words, and before it gets room even for its glyph.
+_NAME_KEPT = 90
+_NAME_KEPT_ALWAYS = 40
 _REC_DOT_RED = QColor(239, 68, 68)  # #ef4444 — recording
 _REC_DOT_AMBER = QColor(245, 158, 11)  # #f59e0b — scheduled
 
@@ -120,6 +125,20 @@ _TOP_GAP = 4
 
 #: The camera's audio as a tile shows it (``CellWidget.set_audio``).
 AUDIO_NONE, AUDIO_AVAILABLE, AUDIO_ON = "none", "available", "on"
+
+
+def activity_badge_text(names: Sequence[str], room: int | None, width: Callable[[str], int]) -> str:
+    """The activity badge's words: every name ("MOTION · CAR · PERSON"), else
+    the first ones and how many more ("MOTION +2"), within ``room`` pixels
+    (``None``: no limit) as ``width`` measures; "" when not even one fits."""
+    upper = [name.upper() for name in names]
+    for count in range(len(upper), 0, -1):
+        text = _ACTIVITY_JOIN.join(upper[:count])
+        if count < len(upper):
+            text += f" +{len(upper) - count}"
+        if room is None or width(text) <= room:
+            return text
+    return ""
 
 
 class CellStatus:
@@ -179,8 +198,8 @@ class CellWidget(QWidget):
         self._fps: float | None = None
         self._aspect: str = "free"  # "free" | "16:9" | "4:3"
         self._recording_state: str = "idle"  # "idle" | "recording" | "scheduled"
-        # Motion (or other movement the camera reports) going on now.
-        self._motion = False
+        # What is going on at the camera now ("Motion", "Car"): the badge.
+        self._motion: tuple[str, ...] = ()
         self._motion_pending = False
         self._motion_alert_click_rect = QRect()
         self._motion_alert_click_at = -1.0
@@ -283,7 +302,7 @@ class CellWidget(QWidget):
         self._fps = None
         self._overlay_ts_ms = None
         self._audio = AUDIO_NONE
-        self._motion = False
+        self._motion = ()
         self._motion_pending = False
         self._motion_alert_click_rect = QRect()
         self._analytics = None
@@ -405,15 +424,25 @@ class CellWidget(QWidget):
     def drawings(self) -> list[Drawing]:
         return self._drawings
 
-    def set_motion(self, active: bool) -> None:
-        """Show the MOTION badge beside the camera's name while the camera
-        reports motion (or intrusion, a line crossed)."""
-        if active != self._motion:
-            self._motion = active
+    def set_motion(self, names: Sequence[str] | bool) -> None:
+        """Show what is going on at the camera ("Motion", "Car", "Person")
+        in the activity badge beside its name, one name after another; empty:
+        no badge. ``True`` is plain motion."""
+        if isinstance(names, bool):
+            names = ("Motion",) if names else ()
+        shown = tuple(dict.fromkeys(name for name in names if name))
+        if shown != self._motion:
+            self._motion = shown
+            self._refresh_tooltip()
             self.update()
 
     @property
     def motion_active(self) -> bool:
+        return bool(self._motion)
+
+    @property
+    def activity_names(self) -> tuple[str, ...]:
+        """The names the activity badge shows (all of them, fitted or not)."""
         return self._motion
 
     def set_motion_pending(self, pending: bool) -> None:
@@ -676,8 +705,10 @@ class CellWidget(QWidget):
             hint = f"{hint}\n{_LAYOUT_HINT}"
         if getattr(self, "_audio", AUDIO_NONE) != AUDIO_NONE:
             hint = f"{hint}\nSpeaker (top right): hear this camera"
+        if getattr(self, "_motion", ()):
+            hint = f"{hint}\nGoing on now: {', '.join(self._motion)}"
         if self._motion_pending:
-            hint = f"{hint}\nOrange motion alert (top right): click to acknowledge motion"
+            hint = f"{hint}\nOrange alert (top right): click to acknowledge what was detected"
         if getattr(self, "_analytics", None):
             hint = f"{hint}\n{self._analytics}"
         if getattr(self, "_backup", None):
@@ -1342,7 +1373,7 @@ class CellWidget(QWidget):
         badge_label: str,
         badge_bg: QColor,
         dpr: float,
-        motion: bool = False,
+        activity: tuple[str, ...] = (),
         max_width: int | None = None,
     ) -> QPixmap:
         fonts = _overlay_fonts()
@@ -1353,15 +1384,27 @@ class CellWidget(QWidget):
         dot = {"recording": _REC_DOT_RED, "scheduled": _REC_DOT_AMBER}.get(recording_state)
         dot_w = text_h + 1 if dot is not None else 0
         bw = QFontMetrics(fonts["badge"]).horizontalAdvance(badge_label) + 8
-        # Motion badge: a sensor glyph (dot and two waves) and the word.
+        # Activity badge: a sensor glyph (dot and two waves) and what is going
+        # on, as many names as fit ("MOTION · CAR", else "MOTION +1").
         glyph_w = 14
-        mw = QFontMetrics(fonts["badge"]).horizontalAdvance(_MOTION_LABEL) + glyph_w + 10
+        motion = bool(activity)
+        badge_fm = QFontMetrics(fonts["badge"])
+        # The camera's name comes first: the badge takes only the room left
+        # after a readable part of it (all of a short name).
+        name_first = min(text_w, _NAME_KEPT)
+        name_least = min(text_w, _NAME_KEPT_ALWAYS)
+        activity_text = activity_badge_text(
+            activity,
+            None if max_width is None else max_width - (dot_w + bw + 6 + name_first) - glyph_w - 10,
+            badge_fm.horizontalAdvance,
+        )
+        mw = badge_fm.horizontalAdvance(activity_text) + glyph_w + 10
         compact_motion = False
         if max_width is not None:
-            if motion and max_width < dot_w + bw + mw + 6 + 24:
+            if motion and (not activity_text or max_width < dot_w + bw + mw + 6 + name_first):
                 compact_motion = True
                 mw = _TOP_HEIGHT
-            if motion and max_width < dot_w + bw + mw + 6 + 12:
+            if motion and max_width < dot_w + bw + mw + 6 + name_least:
                 motion = False
             fixed_width = dot_w + 3 + bw + (3 + mw if motion else 0)
             available = max(0, max_width - fixed_width)
@@ -1421,7 +1464,7 @@ class CellWidget(QWidget):
                 painter.drawText(
                     QRect(mx + glyph_w + 4, 0, mw - glyph_w - 6, text_h),
                     Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                    _MOTION_LABEL,
+                    activity_text,
                 )
         painter.end()
         return strip

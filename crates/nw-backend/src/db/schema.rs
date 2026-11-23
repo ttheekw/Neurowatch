@@ -178,6 +178,19 @@ pub fn apply_migrations(conn: &rusqlite::Connection) -> anyhow::Result<()> {
          INSERT OR IGNORE INTO schema_version VALUES (10);",
     )?;
     conn.execute_batch("INSERT OR IGNORE INTO schema_version VALUES (11);")?;
+
+    // ── Schema version 12 — detections ───────────────────────────────
+    // `detection`: a plugin marked the event a detection (recorded and
+    // listed, never fires alert rules). Existing rows are alerts (0).
+    let has_detection: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('events') WHERE name='detection'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_detection == 0 {
+        conn.execute_batch("ALTER TABLE events ADD COLUMN detection INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    conn.execute_batch("INSERT OR IGNORE INTO schema_version VALUES (12);")?;
     Ok(())
 }
 
@@ -215,6 +228,27 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn detection_column_defaults_to_alert_for_existing_events() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&conn).unwrap();
+        conn.execute_batch("INSERT INTO events (ts, event_type) VALUES (1, 'person');")
+            .unwrap();
+        // Re-running over an older database adds the column once.
+        conn.execute_batch("ALTER TABLE events DROP COLUMN detection;")
+            .unwrap();
+        apply_migrations(&conn).unwrap();
+        apply_migrations(&conn).unwrap();
+        let detection: i64 = conn
+            .query_row("SELECT detection FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(detection, 0);
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
     }
 
     #[test]

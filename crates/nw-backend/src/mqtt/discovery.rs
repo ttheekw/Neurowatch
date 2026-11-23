@@ -28,16 +28,19 @@ pub enum Sensor {
     Person,
     Vehicle,
     Animal,
+    /// Anything else a detection plugin finds (its `detail` names it).
+    Object,
     /// The camera is streaming (ON) or offline (OFF).
     Online,
 }
 
 impl Sensor {
-    pub const ALL: [Sensor; 5] = [
+    pub const ALL: [Sensor; 6] = [
         Sensor::Motion,
         Sensor::Person,
         Sensor::Vehicle,
         Sensor::Animal,
+        Sensor::Object,
         Sensor::Online,
     ];
 
@@ -47,6 +50,7 @@ impl Sensor {
             Sensor::Person => "person",
             Sensor::Vehicle => "vehicle",
             Sensor::Animal => "animal",
+            Sensor::Object => "object",
             Sensor::Online => "online",
         }
     }
@@ -57,6 +61,7 @@ impl Sensor {
             Sensor::Person => "Person",
             Sensor::Vehicle => "Vehicle",
             Sensor::Animal => "Animal",
+            Sensor::Object => "Object",
             Sensor::Online => "Online",
         }
     }
@@ -68,6 +73,7 @@ impl Sensor {
             Sensor::Person => (Some("occupancy"), Some("mdi:account")),
             Sensor::Vehicle => (None, Some("mdi:car")),
             Sensor::Animal => (None, Some("mdi:paw")),
+            Sensor::Object => (None, Some("mdi:shape-outline")),
             Sensor::Online => (Some("connectivity"), None),
         }
     }
@@ -85,6 +91,7 @@ impl Sensor {
             EventKind::Person => Sensor::Person,
             EventKind::Vehicle => Sensor::Vehicle,
             EventKind::Animal => Sensor::Animal,
+            EventKind::Object => Sensor::Object,
             EventKind::CameraOffline => Sensor::Online,
             _ => return None,
         })
@@ -283,6 +290,8 @@ pub fn event_message(event: &EventRecord, phase: EventPhase, camera_name: Option
         "score": event.score,
         "zones": event.zones,
         "detail": event.detail,
+        // True: a plugin marked it a detection, which never fires alert rules.
+        "detection": event.detection,
     })
 }
 
@@ -393,6 +402,7 @@ mod tests {
             detail: None,
             acknowledged: false,
             kept: false,
+            detection: false,
         }
     }
 
@@ -419,7 +429,7 @@ mod tests {
         assert_eq!(document["availability_topic"], "site-a/neurowatch/status");
         let (_, picture) = topics.picture_config("cam-1", "Front door");
         assert_eq!(picture["image_topic"], "site-a/neurowatch/cam-1/picture");
-        assert_eq!(topics.camera_config_topics("cam-1").len(), 6);
+        assert_eq!(topics.camera_config_topics("cam-1").len(), 7);
     }
 
     #[test]

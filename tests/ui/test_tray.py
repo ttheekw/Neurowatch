@@ -428,14 +428,17 @@ def test_prompt_returns_the_choice_or_none(qapp, qtbot) -> None:
 
     from neurowatch.widgets.centered_prompt import CenteredPrompt
 
-    prompt = CenteredPrompt("Stop NeuroWatch", "Stop the service?", "Cameras stop recording.")
-    qtbot.addWidget(prompt)
-    prompt.add_button("cancel", "Cancel")
-    stop = prompt.add_button("stop", "Stop service", "danger")
+    def stop_prompt() -> tuple[CenteredPrompt, object]:
+        prompt = CenteredPrompt("Stop NeuroWatch", "Stop the service?", "Cameras stop recording.")
+        prompt.add_button("cancel", "Cancel")
+        return prompt, prompt.add_button("stop", "Stop service", "danger")
+
+    prompt, stop = stop_prompt()
     assert stop.property("variant") == "danger"
     assert prompt.property("nwThemed"), "the app's dialog theme"
     QTimer.singleShot(0, stop.click)
     assert prompt.choose() == "stop"
+    prompt, _stop = stop_prompt()
     QTimer.singleShot(0, prompt.reject)  # Escape / the header's close button
     assert prompt.choose() is None
 

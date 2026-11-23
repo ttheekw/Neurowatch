@@ -164,7 +164,7 @@ def test_status_reads_as_plain_text() -> None:
     views = status["motion"].bindings
     binding = PluginBinding("motion", "c1")
     assert binding_text(binding, views["c1"], True) == (
-        "Running · 5 pictures a second · avdec_h264 · 2 frames dropped",
+        "Running · 5 pictures a second · decoded in the plugin with avdec_h264 · 2 frames dropped",
         "success",
     )
     assert binding_text(binding, views["c2"], True) == ("Refused: No capacity", "error")
@@ -276,6 +276,44 @@ def _view(qtbot, recorder: FakeRecorder):
     return view
 
 
+def test_camera_page_says_who_decodes_and_scales_the_pictures(qtbot) -> None:
+    class SharingRecorder(FakeRecorder):
+        def __call__(self, method: str, params: dict[str, Any]) -> Any:
+            result = super().__call__(method, params)
+            if method == "plugins.status":
+                for plugin in result["plugins"]:
+                    for view in plugin["bindings"].values():
+                        view.update(
+                            shared_pictures=True,
+                            shared_fps=5.0,
+                            shared_source={"by": "always_on", "decoder": "VA-API"},
+                        )
+                        view["plugin"]["decoder"] = (
+                            "NeuroWatch's pictures (no decoding here) · scaled down on the CPU"
+                        )
+            return result
+
+    recorder = SharingRecorder()
+    recorder.config = {
+        "servers": [{"id": "motion", "address": "unix:/tmp/m.sock", "enabled": True}],
+        "bindings": [{"server": "motion", "camera_id": "c1", "enabled": True, "config": {}}],
+    }
+    view = _view(qtbot, recorder)
+    view._select(("motion", "c1"))
+    view._refresh_status()
+    assert view.pages.currentWidget() is view.camera_page
+    assert view.camera_status.text() == "Motion detection · Running · 5 pictures a second"
+    assert view.camera_decoding.isVisibleTo(view)
+    assert view.camera_decoding.text() == (
+        "Decoding: NeuroWatch's always-on decoder · VA-API · shared at 5.0 fps\n"
+        "Scaling to analysis size: In Motion detection · CPU"
+    )
+    row = view.tree.topLevelItem(0).child(0)
+    assert row.toolTip(0) == (
+        "Running · 5 pictures a second · decoded by NeuroWatch (VA-API) · scaled on the CPU"
+    )
+
+
 def _wait_saved(qtbot, view, recorder: FakeRecorder, count: int) -> None:
     qtbot.waitUntil(
         lambda: (
@@ -355,6 +393,61 @@ def test_adding_a_plugin_binding_a_camera_and_removing_it(qtbot, monkeypatch) ->
     _wait_saved(qtbot, view, recorder, 5)
     assert recorder.config == {"servers": [], "bindings": []}
     assert view.pages.currentWidget() is view.empty_page
+    view.stop()
+
+
+def test_a_camera_is_unbound_from_its_row_the_tree_menu_or_its_page(qtbot, monkeypatch) -> None:
+    from neurowatch.widgets import plugins_view
+
+    recorder = FakeRecorder()
+    recorder.config = {
+        "servers": [{"id": "motion", "address": "unix:/tmp/m.sock", "enabled": True}],
+        "bindings": [
+            {"server": "motion", "camera_id": c, "enabled": True, "config": {}}
+            for c in ("c1", "c2")
+        ],
+    }
+    view = _view(qtbot, recorder)
+    asked: list[str] = []
+
+    def answer(yes: bool):
+        def ask(_parent, title, text, **_kwargs) -> bool:
+            asked.append(text)
+            assert title == "Unbind camera"
+            return yes
+
+        return ask
+
+    # The plugin page: an Unbind… beside each camera's Open.
+    view._select(("motion", None))
+    rows = [b for b in view.plugin_page.widget().findChildren(QPushButton) if b.text() == "Unbind…"]
+    assert len(rows) == 2 and all(b.isVisibleTo(view) for b in rows)
+    monkeypatch.setattr(plugins_view, "ask", answer(False))
+    rows[0].click()
+    assert asked and "Door" in asked[-1], "it asks first"
+    assert len(recorder.config["bindings"]) == 2, "Cancel keeps it"
+    monkeypatch.setattr(plugins_view, "ask", answer(True))
+    rows[0].click()
+    _wait_saved(qtbot, view, recorder, 1)
+    assert [b["camera_id"] for b in recorder.config["bindings"]] == ["c2"]
+
+    # The tree: a camera's right-click menu has Open and Unbind Camera…, a
+    # plugin's has Bind Camera….
+    plugin_item = view.tree.topLevelItem(0)
+    menu = view._tree_menu(plugin_item)
+    assert menu is not None
+    assert [a.text() for a in menu.actions()] == ["Bind Camera…"]
+    assert menu.actions()[0].isEnabled(), "Door is free again"
+    menu = view._tree_menu(plugin_item.child(0))
+    assert menu is not None
+    actions = [a for a in menu.actions() if not a.isSeparator()]
+    assert [a.text() for a in actions] == ["Open", "Unbind Camera…"]
+    actions[1].trigger()
+    _wait_saved(qtbot, view, recorder, 2)
+    assert recorder.config["bindings"] == []
+
+    # The camera's own page keeps its button, under the same name.
+    assert view.unbind_button.text() == "Unbind Camera…"
     view.stop()
 
 
@@ -685,8 +778,9 @@ def test_plugin_picker_discovers_local_daemons_and_rejects_added_ones(qtbot) -> 
     dialog = AddPluginDialog(["included-motion"], rpc=rpc)
     qtbot.addWidget(dialog)
     dialog.show()
-    from neurowatch.dialogs.plugin_dialogs import ADD_PLUGIN_WIDTH
     from PySide6.QtGui import QGuiApplication
+
+    from neurowatch.dialogs.plugin_dialogs import ADD_PLUGIN_WIDTH
 
     screen = QGuiApplication.primaryScreen().availableGeometry().width()
     assert dialog.width() >= min(ADD_PLUGIN_WIDTH, int(screen * 0.9)), "room for a socket path"
@@ -1459,6 +1553,7 @@ def test_a_hosted_plugin_says_who_provides_it_and_offers_no_controls(qtbot) -> N
         page = view.plugin_page.widget()
         buttons = [button.text() for button in page.findChildren(QPushButton)]
         assert "Remove…" not in buttons, "the portal decides"
+        assert "Unbind…" not in buttons, "the portal decides"
         assert not [box for box in page.findChildren(QCheckBox) if box.text() == "On"]
         texts = [label.text() for label in page.findChildren(QLabel)]
         assert not [text for text in texts if "counter-1.example.test" in text], (
@@ -1593,3 +1688,25 @@ def test_plugin_supplied_text_is_shown_as_written(qtbot) -> None:
     finally:
         MANIFEST.clear()
         MANIFEST.update(original)
+
+
+def test_the_live_wall_of_the_plugins_page_gets_all_layers_as_its_clock(qtbot) -> None:
+    import time
+
+    from neurowatch.models.analytics import Drawing
+    from neurowatch.widgets.plugins_view import PluginsView
+
+    view = PluginsView(None, rpc=FakeRecorder())
+    qtbot.addWidget(view)
+    until = time.monotonic() + 60
+    named = {"frame": 7, "time_us": 700_000, "observed_us": 701_000}
+    boxes = Drawing("cam", "motion", "detections", (), until, **named)
+    debug = Drawing("cam", "motion", "debug", ({"type": "text", "lines": ["x"]},), until, **named)
+    view._selection = ("motion", "cam")
+    view._drawings = {"cam": [boxes, debug]}
+    view._layers.hidden = {("motion", "debug")}
+    view._show_drawings()
+    wall = view.live_wall
+    assert [d.layer for d in wall._drawings_by_id["cam"]] == ["detections"]
+    assert {d.layer for d in wall._clock_by_id["cam"]} == {"detections", "debug"}
+    view.stop()

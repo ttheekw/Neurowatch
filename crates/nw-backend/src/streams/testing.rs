@@ -19,13 +19,32 @@ impl CameraFile {
         ), 30)
     }
 
+    /// An H.265 camera (`None` where this computer has no `x265enc`; used
+    /// only to make test pictures, never by the product).
+    pub fn h265(frames: u32, width: u32, height: u32) -> Option<Self> {
+        gstreamer::init().ok()?;
+        gstreamer::ElementFactory::find("x265enc")?;
+        Some(Self::encoded_with(
+            &format!(
+                "videotestsrc num-buffers={frames} pattern=ball ! video/x-raw,format=I420,width={width},height={height},framerate=25/1 \
+                 ! x265enc key-int-max=25 tune=zerolatency"
+            ),
+            "h265parse",
+            30,
+        ))
+    }
+
     /// Native-resolution detail and motion make decoder CPU worth measuring.
     fn encoded(source: &str, timeout_sec: u64) -> Self {
+        Self::encoded_with(source, "h264parse", timeout_sec)
+    }
+
+    fn encoded_with(source: &str, parser: &str, timeout_sec: u64) -> Self {
         gstreamer::init().unwrap();
         let path =
             std::env::temp_dir().join(format!("nw-stage4-{}.mkv", uuid::Uuid::new_v4().simple()));
         let make = crate::pipeline::builder::build(&format!(
-            "{source} ! h264parse ! matroskamux ! filesink location=\"{}\"",
+            "{source} ! {parser} ! matroskamux ! filesink location=\"{}\"",
             path.display()
         ))
         .unwrap();

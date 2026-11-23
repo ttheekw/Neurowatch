@@ -5,6 +5,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import QPushButton, QWidget
 
 from neurowatch.dialogs.message import MessageDialog
+from neurowatch.utils.dialogs import run_dialog
 
 
 def build_confirmation(
@@ -56,7 +57,6 @@ def confirm_action(
         destructive=destructive,
         informative_text=informative_text,
     )
-    box.exec()
+    run_dialog(box)
     confirmed = box.clicked_button() is confirm_btn
-    box.deleteLater()
     return confirmed

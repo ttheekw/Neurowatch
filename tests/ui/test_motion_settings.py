@@ -186,7 +186,8 @@ def test_motion_tab_reads_camera_events_and_plugins_once_at_a_time(qtbot, monkey
         }
     )
     assert dialog._plugins_lbl.text() == (
-        "Analysed by Motion detection (running · 5 pictures a second · avdec_h264)."
+        "Analysed by Motion detection "
+        "(running · 5 pictures a second · decoded in the plugin with avdec_h264)."
     )
     dialog._on_plugins_status({"plugins": []})
     assert dialog._plugins_lbl.text() == "No plugin analyses this camera."

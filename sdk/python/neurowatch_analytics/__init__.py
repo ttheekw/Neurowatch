@@ -211,11 +211,19 @@ class Session:
         *,
         score: float | None = None,
         seq: int | None = None,
+        alert: bool | None = None,
     ) -> None:
-        await self.notify(
-            "event.start",
-            {"binding": binding, "event": event, "kind": kind, "score": score, "seq": seq},
-        )
+        params: dict[str, Any] = {
+            "binding": binding,
+            "event": event,
+            "kind": kind,
+            "score": score,
+            "seq": seq,
+        }
+        if alert is not None:
+            # False: a detection (recorded and listed, never fires alert rules).
+            params["alert"] = alert
+        await self.notify("event.start", params)
 
     async def overlay(
         self,

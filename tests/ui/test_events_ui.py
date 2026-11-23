@@ -58,6 +58,27 @@ def test_activity_follows_open_events_and_flashes_instant_ones():
     assert tracker.active(now=30) == {"cam-a"}
 
 
+def test_activity_names_what_is_going_on_each_once_in_order():
+    # Detect's objects are "object" events named by the plugin ("Car"); a
+    # tile names them, not "Motion".
+    tracker = ActivityTracker()
+    car = Event.from_dict(_event(1, "object", detail="Car"))
+    motion = Event.from_dict(_event(2))
+    second_car = Event.from_dict(_event(3, "object", detail="Car"))
+    person = Event.from_dict(_event(4, "person", "cam-b"))
+    for event in (car, motion, second_car, person):
+        assert event is not None
+        tracker.apply("start", event, now=0)
+    assert tracker.labels(now=0) == {"cam-a": ("Car", "Motion"), "cam-b": ("Person",)}
+    tracker.apply("end", Event.from_dict({**_event(2), "end_ms": 9000}), now=1)  # type: ignore[arg-type]
+    assert tracker.labels(now=1) == {"cam-a": ("Car",), "cam-b": ("Person",)}
+    crossed = Event.from_dict({**_event(5, "line_crossing"), "end_ms": 5000})
+    assert crossed is not None
+    tracker.apply("end", crossed, now=2)
+    assert tracker.labels(now=2)["cam-a"] == ("Car", "Line crossed"), "an instant one, for a while"
+    assert tracker.labels(now=8)["cam-a"] == ("Car",)
+
+
 def test_durations_and_kind_lists_read_naturally():
     def make(start: int, end: int | None) -> Event:
         event = Event.from_dict({"id": 1, "kind": "motion", "start_ms": start, "end_ms": end})
@@ -188,8 +209,8 @@ def test_clearing_a_tile_alert_uses_selected_endpoint_and_updates_all_walls(qtbo
     tracker.restore_pending([event])
     owner = SimpleNamespace(
         _activity=tracker,
-        _motion_cameras=set(),
-        _pending_motion_cameras=set(),
+        _motion_cameras={},
+        _pending_motion_cameras={},
         _motion_ack_workers={},
         _walls=lambda: walls,
         _ipc_endpoint=lambda: "unix:/tmp/selected.sock",
@@ -629,7 +650,7 @@ def test_live_burst_during_a_history_read_keeps_the_limit_and_recoverable_cursor
     assert view._has_more
 
 
-def test_tiles_and_the_camera_list_show_motion(qtbot):
+def test_tiles_and_the_camera_list_show_what_is_going_on(qtbot):
     from neurowatch.widgets.camera_panel import CameraPanel
     from neurowatch.widgets.cell_widget import CellWidget
     from neurowatch.widgets.video_wall import VideoWallWidget
@@ -637,27 +658,61 @@ def test_tiles_and_the_camera_list_show_motion(qtbot):
     cell = CellWidget()
     qtbot.addWidget(cell)
     cell.set_camera(CAMERAS[0])
-    cell.set_motion(True)
-    assert cell.motion_active
+    cell.set_motion(("Car",))
+    assert cell.motion_active and cell.activity_names == ("Car",)
+    assert "Going on now: Car" in cell.toolTip()
     plain = cell._render_label_strip("Gate", "idle", "LIVE", cell._badge()[1], 1.0)
-    with_motion = cell._render_label_strip("Gate", "idle", "LIVE", cell._badge()[1], 1.0, True)
-    assert with_motion.width() > plain.width()
+    car = cell._render_label_strip("Gate", "idle", "LIVE", cell._badge()[1], 1.0, ("Car",))
+    both = cell._render_label_strip(
+        "Gate", "idle", "LIVE", cell._badge()[1], 1.0, ("Motion", "Car")
+    )
+    assert plain.width() < car.width() < both.width(), "each name is added on"
     cell.set_camera(CAMERAS[1])
     assert not cell.motion_active, "another camera starts without the badge"
 
     wall = VideoWallWidget()
     qtbot.addWidget(wall)
     wall.set_cameras(CAMERAS)
-    wall.set_motion_cameras({"cam-b"})
-    assert wall._cell_for_cam_id("cam-b").motion_active
+    wall.set_motion_cameras({"cam-b": ("Motion", "Car")})
+    assert wall._cell_for_cam_id("cam-b").activity_names == ("Motion", "Car")
     assert not wall._cell_for_cam_id("cam-a").motion_active
+    wall.set_motion_cameras({"cam-b": ("Car",)})
+    assert wall._cell_for_cam_id("cam-b").activity_names == ("Car",), "Motion ended"
 
     panel = CameraPanel()
     qtbot.addWidget(panel)
     panel.set_cameras(CAMERAS)
-    panel.set_motion_cameras({"cam-a"})
-    assert not panel._item_widgets["cam-a"]._motion.isHidden()
+    panel.set_motion_cameras({"cam-a": ("Car", "Person")})
+    badge = panel._item_widgets["cam-a"]._motion
+    assert not badge.isHidden() and badge.text() == "Car · Person"
     assert panel._item_widgets["cam-b"]._motion.isHidden()
+
+
+def test_the_tiles_name_strip_never_outgrows_its_room_however_many_names(qtbot):
+    from neurowatch.widgets.cell_widget import CellWidget
+
+    cell = CellWidget()
+    qtbot.addWidget(cell)
+    names = ("Motion", "Car", "Person", "Truck", "Bicycle", "Dog", "Line crossed", "Motorcycle")
+    for room in (40, 90, 140, 220, 400, 900):
+        strip = cell._render_label_strip(
+            "Front gate", "recording", "LIVE", cell._badge()[1], 1.0, names, room
+        )
+        assert strip.width() <= room, f"{room}px of room, {strip.width()}px drawn"
+
+
+def test_the_activity_badge_lists_as_many_names_as_fit():
+    from neurowatch.widgets.cell_widget import activity_badge_text
+
+    def width(text: str) -> int:
+        return len(text)
+
+    names = ("Motion", "Car", "Person")
+    assert activity_badge_text(names, None, width) == "MOTION · CAR · PERSON"
+    assert activity_badge_text(names, 21, width) == "MOTION · CAR · PERSON"
+    assert activity_badge_text(names, 15, width) == "MOTION · CAR +1"
+    assert activity_badge_text(names, 9, width) == "MOTION +2"
+    assert activity_badge_text(names, 5, width) == "", "not even one: the glyph alone"
 
 
 def test_the_events_tab_counts_new_events(qtbot):

@@ -96,8 +96,8 @@ class MqttPanel(QWidget):
 
         intro = QLabel(
             "Send camera events to Home Assistant, or to anything else that speaks MQTT. "
-            "With Home Assistant each camera appears by itself, with motion, people, "
-            "vehicles and animals, whether it is online, and its latest event picture."
+            "With Home Assistant each camera appears by itself, with motion, objects a "
+            "detection plugin finds, whether it is online, and its latest event picture."
         )
         intro.setObjectName("dialogSubtitle")
         intro.setWordWrap(True)

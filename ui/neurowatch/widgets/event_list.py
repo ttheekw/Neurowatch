@@ -469,6 +469,38 @@ def kind_color(kind: str) -> QColor:
     return QColor(EVENT_COLORS.get(kind, "#64748b"))
 
 
+DETECTION_TAG = "Detection"
+
+
+def _tag_font(base: QFont) -> QFont:
+    font = QFont(base)
+    font.setPixelSize(10)
+    font.setWeight(QFont.Weight.Normal)
+    return font
+
+
+def detection_tag_width(base: QFont) -> int:
+    """Width of the "Detection" tag drawn after an event's kind."""
+    return QFontMetrics(_tag_font(base)).horizontalAdvance(DETECTION_TAG) + 10
+
+
+def paint_detection_tag(
+    painter: QPainter, left: float, center_y: float, color: QColor, back: QColor
+) -> None:
+    """The muted outline tag for events a plugin marked as detections."""
+    font = _tag_font(painter.font())
+    width = QFontMetrics(font).horizontalAdvance(DETECTION_TAG) + 10
+    rect = QRectF(left, center_y - 8, width, 16)
+    painter.save()
+    painter.setFont(font)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.setPen(_mix(color, back, 0.6))
+    painter.drawRoundedRect(rect, 8, 8)
+    painter.setPen(color)
+    painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, DETECTION_TAG)
+    painter.restore()
+
+
 def paint_badge(
     painter: QPainter, right: float, center_y: float, text: str, color: QColor, back: QColor
 ) -> float:
@@ -664,14 +696,27 @@ class EventDelegate(QStyledItemDelegate):
             left += 13
             title_width -= 13
             painter.setPen(QColor(c.text))
-        title = QFontMetrics(title_font).elidedText(
-            event.describe(camera), Qt.TextElideMode.ElideRight, int(max(0, title_width))
+        tag_width = detection_tag_width(painter.font()) + 6 if event.detection else 0
+        title_metrics = QFontMetrics(title_font)
+        title = title_metrics.elidedText(
+            event.describe(camera),
+            Qt.TextElideMode.ElideRight,
+            int(max(0, title_width - tag_width)),
         )
         painter.drawText(
             QRectF(left, top_line.top(), title_width, top_line.height()),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
             title,
         )
+        if event.detection:
+            # A small muted tag after the title: recorded, but never an alert.
+            paint_detection_tag(
+                painter,
+                left + title_metrics.horizontalAdvance(title) + 6,
+                top_line.center().y(),
+                QColor(c.text_muted),
+                back,
+            )
         sub_font = QFont(painter.font())
         sub_font.setPixelSize(12)
         sub_font.setWeight(QFont.Weight.Normal)

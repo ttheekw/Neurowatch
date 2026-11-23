@@ -54,7 +54,7 @@ impl<U: Unit> HubCore<U> {
     pub fn subscribe(&mut self, policy: SubscriberPolicy) -> (u64, Arc<SubscriberQueue<U>>) {
         let queue = Arc::new(SubscriberQueue::new(policy));
         for unit in &self.gop {
-            queue.push(unit.clone());
+            queue.push_start(unit.clone());
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -243,6 +243,7 @@ mod tests {
             start_at_keyframe: true,
             linger: Duration::from_secs(10),
             media: None,
+            whole_gop: false,
         }
     }
 
@@ -253,6 +254,29 @@ mod tests {
                 Delivery::Discontinuity { .. } => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_live_viewer_joining_late_in_a_long_gop_gets_all_of_it() {
+        // A camera with a keyframe every 8 s, 5 s into its GOP. Live view's
+        // limits (2 s behind) cut the cached GOP short and the viewer then
+        // waited for the camera's next keyframe: 3 s without a picture.
+        let mut hub = HubCore::default();
+        for i in 0..75u64 {
+            hub.publish(video(i * 66, i == 0));
+        }
+        let (_, limited) = hub.subscribe(SubscriberPolicy::live_video());
+        let (_, whole) = hub.subscribe(SubscriberPolicy {
+            whole_gop: true,
+            ..SubscriberPolicy::live_video()
+        });
+        hub.publish(video(75 * 66, false));
+        assert!(units(&limited).len() < 40, "2 s of it, then skipping");
+        assert_eq!(
+            units(&whole),
+            (0..76u64).map(|i| i * 66).collect::<Vec<_>>(),
+            "the whole GOP, then the camera's next picture"
+        );
     }
 
     #[test]

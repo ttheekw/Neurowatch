@@ -66,6 +66,7 @@ from neurowatch.models.analytics import (
     Marking,
     MarkingHold,
     TileInfo,
+    analysing_clock,
     marker_text,
     markings_reported,
     on_wall,
@@ -85,6 +86,7 @@ from neurowatch.service.manager import ServiceController
 from neurowatch.service.paths import service_endpoint
 from neurowatch.service.startup import StartupPrefs, load_prefs
 from neurowatch.theme import app_icon, apply_app_theme, icon_path
+from neurowatch.utils.dialogs import run_dialog
 from neurowatch.utils.private_files import (
     PrivateRotatingFileHandler,
     copy_private,
@@ -109,6 +111,7 @@ from neurowatch.widgets.status_bar_widget import StatusBarWidget
 from neurowatch.widgets.status_overlay import DEFAULT_OPACITY, StatusOverlay
 from neurowatch.widgets.title_bar import TitleBar
 from neurowatch.widgets.toolbar import ToolBar
+from neurowatch.widgets.transcode_notice import TranscodeNotice
 from neurowatch.widgets.video_wall import VideoWallWidget
 from neurowatch.widgets.welcome_screen import StartupStage, WelcomeScreen
 from neurowatch.widgets.window_chrome import guard_window_size, guard_windows_on_focus
@@ -303,14 +306,6 @@ class _PollWorker(Worker):
                 if self.isInterruptionRequested():
                     return
                 self.msleep(200)
-
-
-def _delete_after_use(dialog: QDialog) -> None:
-    """A dialog shown with ``exec()`` is the window's child: without this it
-    stays alive, hidden, until the application quits, and its chrome gets
-    events while Python shuts down. Deletion waits for the event loop, so the
-    caller still reads the dialog's values after ``exec()`` returns."""
-    dialog.finished.connect(dialog.deleteLater)
 
 
 def tray_running() -> bool:
@@ -593,6 +588,9 @@ class MainWindow(QMainWindow):
         self._decoder_notice = DecoderDriverNotice()
         self._decoder_notice.clicked.connect(lambda: self._title_bar.select_tab("diagnostics"))
         self.add_status_indicator(self._decoder_notice)
+        self._transcode_notice = TranscodeNotice()
+        self._transcode_notice.clicked.connect(lambda: self._title_bar.select_tab("diagnostics"))
+        self.add_status_indicator(self._transcode_notice)
         self._decoder_notice_shown = False  # the startup message, once per app start
         self._poll_worker.system.connect(self._on_system_status)
         self._poll_worker.start()
@@ -600,7 +598,8 @@ class MainWindow(QMainWindow):
         # Events as they happen: tiles show MOTION while a camera reports it,
         # the Events tab lists them and counts new ones while it is not shown.
         self._activity = ActivityTracker()
-        self._motion_cameras: set[str] = set()
+        # Camera → the names of what is going on there (its activity badge).
+        self._motion_cameras: dict[str, tuple[str, ...]] = {}
         self._pending_motion_cameras: set[str] = set()
         self._motion_ack_workers: dict[str, _IpcCallWorker] = {}
         self._wall.motion_acknowledge_requested.connect(self._acknowledge_motion)
@@ -779,8 +778,7 @@ class MainWindow(QMainWindow):
             existing_names=[c.name for c in self._cameras],
             records_all_cameras=self._records_all_cameras(),
         )
-        _delete_after_use(dlg)
-        accepted = dlg.exec() == AddEditCameraDialog.DialogCode.Accepted
+        accepted = run_dialog(dlg) == AddEditCameraDialog.DialogCode.Accepted
         # Cameras added from the search (the backend already has them), also
         # when the dialog was closed after adding some.
         added = dlg.added_cameras()
@@ -944,16 +942,14 @@ class MainWindow(QMainWindow):
 
         cameras = [(cam.id, cam.name) for cam in self._cameras]
         dialog = AlertsDialog(self._ipc_endpoint(), cameras, self)
-        dialog.exec()
-        dialog.deleteLater()
+        run_dialog(dialog)
 
     def _open_users(self) -> None:
         from neurowatch.dialogs.users_dialog import UsersDialog
 
         cameras = [(cam.id, cam.name) for cam in self._cameras]
         dialog = UsersDialog(self._ipc_endpoint(), cameras, self)
-        dialog.exec()
-        dialog.deleteLater()
+        run_dialog(dialog)
         if dialog.requires_sign_in_now:
             self._sign_in_again("Sign-in is now required. Sign in with an admin account.")
 
@@ -961,8 +957,7 @@ class MainWindow(QMainWindow):
         from neurowatch.dialogs.users_dialog import ChangePasswordDialog
 
         dialog = ChangePasswordDialog(self._ipc_endpoint(), self)
-        changed = dialog.exec()
-        dialog.deleteLater()
+        changed = run_dialog(dialog)
         if changed:
             self._sign_in_again("Your password was changed. Sign in with the new one.")
 
@@ -1016,8 +1011,7 @@ class MainWindow(QMainWindow):
             return
         at_ms = int(time.time() * 1000)
         dialog = BookmarkDialog(self._ipc_endpoint(), [(camera.id, camera.name)], at_ms, self)
-        dialog.exec()
-        dialog.deleteLater()
+        run_dialog(dialog)
 
     def _records_all_cameras(self) -> bool:
         return (self._config.get("recording") or {}).get("local_all_cameras") is True
@@ -1040,8 +1034,7 @@ class MainWindow(QMainWindow):
             records_all_cameras=self._records_all_cameras(),
         )
         dlg.recording_policy_copied.connect(self._on_recording_policy_copied)
-        _delete_after_use(dlg)
-        if dlg.exec() != AddEditCameraDialog.DialogCode.Accepted:
+        if run_dialog(dlg) != AddEditCameraDialog.DialogCode.Accepted:
             return
         updated = dlg.get_config()
         # camera.update reconciles automatic recording. Explicit Start/Stop
@@ -1162,8 +1155,7 @@ class MainWindow(QMainWindow):
         dlg = CustomGridDialog(
             grid.get("rows", _DEFAULT_ROWS), grid.get("cols", _DEFAULT_COLS), self
         )
-        _delete_after_use(dlg)
-        if dlg.exec() == CustomGridDialog.DialogCode.Accepted:
+        if run_dialog(dlg) == CustomGridDialog.DialogCode.Accepted:
             self._on_grid_changed(dlg.rows, dlg.cols)
 
     def _on_prev_page(self) -> None:
@@ -1364,8 +1356,13 @@ class MainWindow(QMainWindow):
             for cam_id, layers in on_wall(drawings, self._analytics_cameras, mode).items()
             if self._tile_choice(cam_id)[0]
         }
+        clock = {
+            cam_id: layers
+            for cam_id, layers in analysing_clock(drawings, self._analytics_cameras, mode).items()
+            if self._tile_choice(cam_id)[0]
+        }
         for wall in self._walls():
-            wall.set_drawings(shown)
+            wall.set_drawings(shown, clock)
         self._plugins_view.set_drawings(drawings)
         if mode == "off":
             self._marking_hold.clear()
@@ -1408,8 +1405,7 @@ class MainWindow(QMainWindow):
         windows = [WindowSummary(w.number, w.page_count, len(w.camera_ids)) for w in self._detached]
         chosen = target.number if isinstance(target, DetachedWallWindow) else None
         dlg = NewWindowDialog(pages, rows, cols, self, windows=windows, destination=chosen)
-        _delete_after_use(dlg)
-        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.selected_page is None:
+        if run_dialog(dlg) != QDialog.DialogCode.Accepted or dlg.selected_page is None:
             return
         window = next((w for w in self._detached if w.number == dlg.selected_window), None)
         if window is None:
@@ -1941,7 +1937,7 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _apply_activity(self) -> None:
-        active = self._activity.active()
+        active = self._activity.labels()
         if active != self._motion_cameras:
             self._motion_cameras = active
             for wall in self._walls():
@@ -2209,8 +2205,7 @@ class MainWindow(QMainWindow):
             startup=startup,
             startup_note=_startup_note(),
         )
-        _delete_after_use(dlg)
-        if dlg.exec() == SettingsDialog.DialogCode.Accepted:
+        if run_dialog(dlg) == SettingsDialog.DialogCode.Accepted:
             wanted = dlg.startup_prefs()
             if wanted is not None and wanted != startup:
                 self._apply_startup(wanted)
@@ -2299,10 +2294,9 @@ class MainWindow(QMainWindow):
         endpoint = str(getattr(self._ipc, "endpoint", ""))
         dialog = ExportVideoDialog(self._cameras, endpoint, self)
         try:
-            dialog.exec()
+            run_dialog(dialog)
         finally:
             dialog.shutdown()
-            dialog.deleteLater()
 
     def _export_event(self, event: object) -> None:
         """Use the existing export dialog; preparing a preset starts no export job."""
@@ -2312,10 +2306,9 @@ class MainWindow(QMainWindow):
         dialog = ExportVideoDialog(self._cameras, endpoint, self, camera_id=event.camera_id)
         try:
             dialog.load_event(event)
-            dialog.exec()
+            run_dialog(dialog)
         finally:
             dialog.shutdown()
-            dialog.deleteLater()
 
     def _on_import_config(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Import Config", "", "JSON Files (*.json)")
@@ -2332,8 +2325,7 @@ class MainWindow(QMainWindow):
 
     def _on_about(self) -> None:
         dlg = AboutDialog(self)
-        _delete_after_use(dlg)
-        dlg.exec()
+        run_dialog(dlg)
 
     # ------------------------------------------------------------------
     # Status bar, menu and shutdown hooks (NeuroWatch Cloud uses them)
@@ -2369,6 +2361,7 @@ class MainWindow(QMainWindow):
         if isinstance(status, dict):
             self._decoder_notice.set_acceleration(status.get("video_acceleration"))
         self._backup_indicator.set_status(status)
+        self._transcode_notice.set_status(status)
         # Each wall tile of a camera with a plan shows its backup symbol too.
         marks = backup_tile_marks(status)
         for wall in self._walls():

@@ -55,7 +55,9 @@ use livekit::webrtc::audio_source::{
     native::NativeAudioSource, AudioSourceOptions, RtcAudioSource,
 };
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
-use livekit::webrtc::video_frame::{EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame};
+use livekit::webrtc::video_frame::{
+    EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame, I420Buffer, VideoFrame, VideoRotation,
+};
 use livekit::webrtc::video_source::{native::NativeVideoSource, RtcVideoSource, VideoResolution};
 use nw_cloud_protocol::media_session::{
     MediaAction, MediaGrant, PlaybackControl, PublishDirective, Representation,
@@ -64,6 +66,7 @@ use nw_cloud_protocol::media_session::{
 use nw_core::encoded::{EncodedAccessUnit, VideoCodec};
 
 use crate::plugin_host::OverlayStore;
+use crate::streams::transcode::{Picture, TranscodeSink};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -247,6 +250,13 @@ pub enum SubmitOutcome {
 const ENCODED_QUEUE_UNITS: usize = 64;
 /// Most bytes waiting for the uplink, whatever the camera's bitrate.
 const ENCODED_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+/// Most units and bytes waiting while a publication starts. Nothing reads
+/// the queue until the room is joined, and what waits then is the camera's
+/// current GOP (the viewer's start, see [`GopCache`]) and what came while
+/// joining: cut short, the viewer waits for the camera's next keyframe.
+/// Once the queue has been read to its end, the limits above apply.
+const ENCODED_START_UNITS: usize = GOP_CACHE_MAX_UNITS + ENCODED_QUEUE_UNITS;
+const ENCODED_START_BYTES: usize = GOP_CACHE_MAX_BYTES + ENCODED_QUEUE_BYTES;
 /// Sample rate of the audio handed to [`EncodedSubmitter::submit_audio`] (mono).
 pub const AUDIO_RATE: u32 = 48_000;
 /// Most audio chunks waiting for the audio track; more are dropped, so a
@@ -263,15 +273,38 @@ const AUDIO_SOURCE_QUEUE_MS: u32 = 50;
 pub struct EncodedSubmitter {
     sender: mpsc::Sender<EncodedAccessUnit>,
     queued_bytes: std::sync::Arc<AtomicUsize>,
+    queued_units: std::sync::Arc<AtomicUsize>,
+    /// The queue was read to its end once: the start is over (see
+    /// [`ENCODED_START_UNITS`]).
+    steady: std::sync::Arc<AtomicBool>,
     awaiting_keyframe: AtomicBool,
     dropped: AtomicU64,
     /// Capture timestamp of the last unit queued, or `i64::MIN`.
     last_timestamp_us: AtomicI64,
     failure: watch::Sender<Option<PublishError>>,
     audio: mpsc::Sender<Vec<i16>>,
+    /// Decoded pictures of a transcode on the CPU path (newest wins).
+    pictures: std::sync::Arc<PictureMailbox>,
+}
+
+/// A one-picture mailbox: a newer picture replaces an unread one, so a slow
+/// publication never holds the decoder up or lags behind.
+#[derive(Default)]
+struct PictureMailbox {
+    slot: Mutex<Option<std::sync::Arc<Picture>>>,
+    ready: tokio::sync::Notify,
 }
 
 impl EncodedSubmitter {
+    /// Hands a decoded picture to the publication's raw track (the CPU
+    /// transcode path). Never blocks; an unread older picture is replaced.
+    pub fn submit_picture(&self, picture: std::sync::Arc<Picture>) {
+        if let Ok(mut slot) = self.pictures.slot.lock() {
+            *slot = Some(picture);
+        }
+        self.pictures.ready.notify_one();
+    }
+
     /// Capture timestamp of the last unit queued, if any: a new source
     /// (a recording sought) goes on from it.
     pub fn last_timestamp_us(&self) -> Option<i64> {
@@ -296,20 +329,35 @@ impl EncodedSubmitter {
             return SubmitOutcome::DroppedQueueFull;
         }
         let size = unit.payload.len();
-        if self.queued_bytes.load(Ordering::Relaxed) + size > ENCODED_QUEUE_BYTES {
+        let (max_units, max_bytes) = if self.steady.load(Ordering::Relaxed) {
+            (ENCODED_QUEUE_UNITS, ENCODED_QUEUE_BYTES)
+        } else {
+            (ENCODED_START_UNITS, ENCODED_START_BYTES)
+        };
+        if self.queued_units.load(Ordering::Relaxed) >= max_units
+            || self.queued_bytes.load(Ordering::Relaxed) + size > max_bytes
+        {
             return self.drop_until_keyframe();
         }
         let timestamp_us = unit.timestamp_us;
+        // Counted before it can be read, so the reader never counts below zero.
+        self.queued_units.fetch_add(1, Ordering::Relaxed);
+        self.queued_bytes.fetch_add(size, Ordering::Relaxed);
         match self.sender.try_send(unit) {
             Ok(()) => {
                 self.last_timestamp_us
                     .store(timestamp_us, Ordering::Relaxed);
-                self.queued_bytes.fetch_add(size, Ordering::Relaxed);
                 self.awaiting_keyframe.store(false, Ordering::Relaxed);
                 SubmitOutcome::Queued
             }
-            Err(mpsc::error::TrySendError::Full(_)) => self.drop_until_keyframe(),
-            Err(mpsc::error::TrySendError::Closed(_)) => SubmitOutcome::Closed,
+            Err(refused) => {
+                self.queued_units.fetch_sub(1, Ordering::Relaxed);
+                self.queued_bytes.fetch_sub(size, Ordering::Relaxed);
+                match refused {
+                    mpsc::error::TrySendError::Full(_) => self.drop_until_keyframe(),
+                    mpsc::error::TrySendError::Closed(_) => SubmitOutcome::Closed,
+                }
+            }
         }
     }
 
@@ -335,15 +383,63 @@ impl EncodedSubmitter {
     }
 }
 
+impl TranscodeSink for EncodedSubmitter {
+    fn unit(&self, unit: &EncodedAccessUnit) {
+        let _ = self.submit(unit.clone());
+    }
+
+    fn picture(&self, picture: &std::sync::Arc<Picture>) {
+        self.submit_picture(std::sync::Arc::clone(picture));
+    }
+
+    fn resync(&self) {
+        EncodedSubmitter::resync(self);
+    }
+
+    fn fail(&self) {
+        EncodedSubmitter::fail(self, PublishError::UnsupportedSource);
+    }
+}
+
 /// Consumer half of the encoded hand-off.
 pub struct EncodedFeed {
     receiver: AsyncMutex<mpsc::Receiver<EncodedAccessUnit>>,
     queued_bytes: std::sync::Arc<AtomicUsize>,
+    queued_units: std::sync::Arc<AtomicUsize>,
+    /// Set once the queue is found empty after its first unit was read.
+    steady: std::sync::Arc<AtomicBool>,
+    delivered: AtomicBool,
     failure: watch::Receiver<Option<PublishError>>,
     audio: Mutex<Option<mpsc::Receiver<Vec<i16>>>>,
+    pictures: std::sync::Arc<PictureMailbox>,
 }
 
 impl EncodedFeed {
+    /// The newest decoded picture not yet taken (the CPU transcode path).
+    pub async fn next_picture(&self) -> std::sync::Arc<Picture> {
+        loop {
+            let ready = self.pictures.ready.notified();
+            if let Some(picture) = self.pictures.slot.lock().ok().and_then(|mut s| s.take()) {
+                return picture;
+            }
+            ready.await;
+        }
+    }
+
+    /// Resolves when the source gave up, with why; `None` once the source is
+    /// gone without a failure.
+    pub async fn failed(&self) -> Option<PublishError> {
+        let mut failure = self.failure.clone();
+        loop {
+            if let Some(error) = failure.borrow_and_update().clone() {
+                return Some(error);
+            }
+            if failure.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+
     /// The audio handed to [`EncodedSubmitter::submit_audio`]. Taken once.
     pub fn take_audio(&self) -> Option<mpsc::Receiver<Vec<i16>>> {
         self.audio.lock().ok()?.take()
@@ -356,13 +452,32 @@ impl EncodedFeed {
             return None;
         }
         let mut receiver = self.receiver.lock().await;
-        let unit = tokio::select! {
-            unit = receiver.recv() => unit?,
-            _ = failure.changed() => return None,
+        let unit = match receiver.try_recv() {
+            Ok(unit) => unit,
+            Err(mpsc::error::TryRecvError::Disconnected) => return None,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                // Read to its end after its first unit: what queued while the
+                // publication started has been taken (see `ENCODED_START_UNITS`).
+                if self.delivered.load(Ordering::Relaxed) {
+                    self.steady.store(true, Ordering::Relaxed);
+                }
+                tokio::select! {
+                    unit = receiver.recv() => unit?,
+                    _ = failure.changed() => return None,
+                }
+            }
         };
+        self.delivered.store(true, Ordering::Relaxed);
+        self.queued_units.fetch_sub(1, Ordering::Relaxed);
         self.queued_bytes
             .fetch_sub(unit.payload.len(), Ordering::Relaxed);
         Some(unit)
+    }
+
+    /// The queue was read to its end once: what comes now is the source's
+    /// newest, not what queued while the publication started.
+    pub fn steady(&self) -> bool {
+        self.steady.load(Ordering::Relaxed)
     }
 
     /// Why the source gave up, if it did.
@@ -373,25 +488,35 @@ impl EncodedFeed {
 
 /// The bounded encoded hand-off; it starts by waiting for a keyframe.
 pub fn encoded_channel() -> (EncodedSubmitter, EncodedFeed) {
-    let (sender, receiver) = mpsc::channel(ENCODED_QUEUE_UNITS);
+    let (sender, receiver) = mpsc::channel(ENCODED_START_UNITS);
     let queued_bytes = std::sync::Arc::new(AtomicUsize::new(0));
+    let queued_units = std::sync::Arc::new(AtomicUsize::new(0));
+    let steady = std::sync::Arc::new(AtomicBool::new(false));
     let (failure, failed) = watch::channel(None);
     let (audio, audio_rx) = mpsc::channel(AUDIO_QUEUE_CHUNKS);
+    let pictures = std::sync::Arc::new(PictureMailbox::default());
     (
         EncodedSubmitter {
             sender,
             queued_bytes: std::sync::Arc::clone(&queued_bytes),
+            queued_units: std::sync::Arc::clone(&queued_units),
+            steady: std::sync::Arc::clone(&steady),
             awaiting_keyframe: AtomicBool::new(true),
             dropped: AtomicU64::new(0),
             last_timestamp_us: AtomicI64::new(i64::MIN),
             failure,
             audio,
+            pictures: std::sync::Arc::clone(&pictures),
         },
         EncodedFeed {
             receiver: AsyncMutex::new(receiver),
             queued_bytes,
+            queued_units,
+            steady,
+            delivered: AtomicBool::new(false),
             failure: failed,
             audio: Mutex::new(Some(audio_rx)),
+            pictures,
         },
     )
 }
@@ -405,6 +530,12 @@ pub fn encoded_channel() -> (EncodedSubmitter, EncodedFeed) {
 pub trait PublishedVideoTrack: Send + Sync {
     /// Hands one compressed access unit to the pre-encoded track, unchanged.
     fn capture_encoded(&self, unit: &EncodedAccessUnit) -> Result<(), PublishError>;
+
+    /// Hands one decoded picture to a raw track, which the transport encodes
+    /// itself (the CPU transcode path, VP8). `timestamp_us` only moves forward.
+    fn capture_raw(&self, _picture: &Picture, _timestamp_us: i64) -> Result<(), PublishError> {
+        Err(PublishError::UnsupportedSource)
+    }
 
     fn frame_timings(&self) -> Vec<FrameTiming> {
         Vec::new()
@@ -651,6 +782,18 @@ pub trait RoomConnector: Send + Sync {
         codec: VideoCodec,
         resolution: (u32, u32),
     ) -> BoxFuture<'a, Result<Box<dyn PublishedVideoTrack>, PublishError>>;
+
+    /// Publish a raw track the transport encodes itself as VP8, in software,
+    /// at no more than `max_bitrate_kbps` (a transcode on the CPU).
+    fn connect_and_publish_raw<'a>(
+        &'a self,
+        _signaling_url: &'a str,
+        _participant_token: &'a str,
+        _grant: &'a MediaGrant,
+        _resolution: (u32, u32),
+    ) -> BoxFuture<'a, Result<Box<dyn PublishedVideoTrack>, PublishError>> {
+        Box::pin(async { Err(PublishError::UnsupportedSource) })
+    }
 }
 
 impl RoomConnector for std::sync::Arc<dyn RoomConnector> {
@@ -663,6 +806,16 @@ impl RoomConnector for std::sync::Arc<dyn RoomConnector> {
         resolution: (u32, u32),
     ) -> BoxFuture<'a, Result<Box<dyn PublishedVideoTrack>, PublishError>> {
         (**self).connect_and_publish(signaling_url, participant_token, grant, codec, resolution)
+    }
+
+    fn connect_and_publish_raw<'a>(
+        &'a self,
+        signaling_url: &'a str,
+        participant_token: &'a str,
+        grant: &'a MediaGrant,
+        resolution: (u32, u32),
+    ) -> BoxFuture<'a, Result<Box<dyn PublishedVideoTrack>, PublishError>> {
+        (**self).connect_and_publish_raw(signaling_url, participant_token, grant, resolution)
     }
 }
 
@@ -697,6 +850,20 @@ pub trait LiveSourceOpener: Send + Sync {
         representation: Representation,
         units: std::sync::Arc<EncodedSubmitter>,
     ) -> Result<Box<dyn LiveSourceRun>, PublishError>;
+
+    /// [`LiveSourceOpener::open`] for a session whose browser cannot play
+    /// H.265: an H.265 stream is transcoded (`max_bitrate_kbps` is the
+    /// session's grant), an H.264 one forwarded unchanged. A source that
+    /// cannot transcode forwards the stream as it is.
+    fn open_transcoded(
+        &self,
+        camera_id: &str,
+        representation: Representation,
+        units: std::sync::Arc<EncodedSubmitter>,
+        _max_bitrate_kbps: u32,
+    ) -> Result<Box<dyn LiveSourceRun>, PublishError> {
+        self.open(camera_id, representation, units)
+    }
 }
 
 /// A running dedicated live source. Stopping it is idempotent.
@@ -1008,6 +1175,37 @@ pub struct LiveKitRoomConnector {
 }
 
 impl RoomConnector for LiveKitRoomConnector {
+    fn connect_and_publish_raw<'a>(
+        &'a self,
+        signaling_url: &'a str,
+        participant_token: &'a str,
+        grant: &'a MediaGrant,
+        resolution: (u32, u32),
+    ) -> BoxFuture<'a, Result<Box<dyn PublishedVideoTrack>, PublishError>> {
+        Box::pin(async move {
+            let (width, height) = resolution;
+            if width == 0 || height == 0 {
+                return Err(PublishError::InvalidFrame);
+            }
+            // The encoded constructor only skips the black keepalive frames:
+            // the first real picture is already in hand.
+            let source = NativeVideoSource::new_encoded(VideoResolution { width, height });
+            let talk = self
+                .talk
+                .clone()
+                .filter(|_| grant.scope.action == MediaAction::Live);
+            connect_room(
+                signaling_url,
+                participant_token,
+                grant,
+                source,
+                raw_publish_options(grant.max_bitrate_kbps),
+                talk,
+            )
+            .await
+        })
+    }
+
     fn connect_and_publish<'a>(
         &'a self,
         signaling_url: &'a str,
@@ -1038,6 +1236,22 @@ impl RoomConnector for LiveKitRoomConnector {
             )
             .await
         })
+    }
+}
+
+/// The options of a raw track the SDK encodes as VP8 in software, at most
+/// `max_bitrate_kbps`: the CPU transcode path. No simulcast (one encoding).
+fn raw_publish_options(max_bitrate_kbps: u32) -> TrackPublishOptions {
+    TrackPublishOptions {
+        video_codec: TrackCodec::VP8,
+        video_encoder: VideoEncoderBackend::Software,
+        video_encoding: Some(VideoEncoding {
+            max_bitrate: u64::from(max_bitrate_kbps.max(150)) * 1000,
+            max_framerate: 30.0,
+        }),
+        source: TrackSource::Camera,
+        simulcast: false,
+        ..Default::default()
     }
 }
 
@@ -1214,6 +1428,30 @@ async fn connect_room(
     }) as Box<dyn PublishedVideoTrack>)
 }
 
+/// Copies `rows` packed rows of `width` bytes into a plane with `stride`.
+fn copy_plane(
+    destination: &mut [u8],
+    stride: usize,
+    source: &[u8],
+    width: usize,
+    rows: usize,
+) -> Result<(), PublishError> {
+    if source.len() < width * rows || stride < width {
+        return Err(PublishError::InvalidFrame);
+    }
+    if stride == width && destination.len() >= width * rows {
+        destination[..width * rows].copy_from_slice(&source[..width * rows]);
+        return Ok(());
+    }
+    for row in 0..rows {
+        let to = destination
+            .get_mut(row * stride..row * stride + width)
+            .ok_or(PublishError::InvalidFrame)?;
+        to.copy_from_slice(&source[row * width..(row + 1) * width]);
+    }
+    Ok(())
+}
+
 fn stop_talker(
     talkers: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     sink: Option<&dyn TalkSink>,
@@ -1324,6 +1562,62 @@ impl PublishedVideoTrack for LiveKitPublishedTrack {
                     frame_id: Some(frame.seq as u32),
                     user_data: None,
                 }),
+        });
+        Ok(())
+    }
+
+    fn capture_raw(&self, picture: &Picture, timestamp_us: i64) -> Result<(), PublishError> {
+        let guard = self.session.lock().map_err(|_| PublishError::Transport)?;
+        let Some(session) = guard.as_ref() else {
+            return Err(PublishError::Transport);
+        };
+        if picture.width == 0 || picture.height == 0 {
+            return Err(PublishError::InvalidFrame);
+        }
+        let mut buffer = I420Buffer::new(picture.width, picture.height);
+        let (stride_y, stride_u, stride_v) = buffer.strides();
+        let (chroma_width, chroma_height) = (
+            picture.width.div_ceil(2) as usize,
+            picture.height.div_ceil(2) as usize,
+        );
+        let (y, u, v) = buffer.data_mut();
+        copy_plane(
+            y,
+            stride_y as usize,
+            &picture.y,
+            picture.width as usize,
+            picture.height as usize,
+        )?;
+        copy_plane(
+            u,
+            stride_u as usize,
+            &picture.u,
+            chroma_width,
+            chroma_height,
+        )?;
+        copy_plane(
+            v,
+            stride_v as usize,
+            &picture.v,
+            chroma_width,
+            chroma_height,
+        )?;
+        if let Some(frame) = picture.frame {
+            if let Ok(mut frames) = self.frames.lock() {
+                frames.submit(frame);
+            }
+        }
+        session.source.capture_frame(&VideoFrame {
+            rotation: VideoRotation::VideoRotation0,
+            timestamp_us,
+            frame_metadata: picture.frame.map(|frame| {
+                livekit::webrtc::video_frame::FrameMetadata {
+                    user_timestamp: Some(frame.time_us.max(0) as u64),
+                    frame_id: Some(frame.seq as u32),
+                    user_data: None,
+                }
+            }),
+            buffer,
         });
         Ok(())
     }
@@ -1536,6 +1830,20 @@ const MIN_FRAME_SPACING_US: i64 = 1_000;
 /// Longest a publication holds its pictures waiting for a viewer's first
 /// keyframe request; past it, it sends anyway.
 const AWAIT_VIEWER_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Longest the hold goes on once a viewer has subscribed, for its keyframe
+/// request. The media server asks when it has a picture to forward to that
+/// viewer and no keyframe to start it from, a moment after it subscribed (a
+/// browser first puts the video on screen). The GOP sent before that is lost
+/// to it, and its request then waits out [`GOP_REPLAY_MIN_GAP`]. Without a
+/// request (a source with no new pictures: a paused recording), the GOP goes
+/// out after this.
+const VIEWER_REQUEST_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+/// A source whose last picture is older than this has none coming (a
+/// paused recording): nothing would make the media server ask, so its GOP
+/// goes out as soon as a viewer has subscribed.
+const SOURCE_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
+/// How often a publication holding its pictures looks for its viewer.
+const AWAIT_VIEWER_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 /// Longest a published track's sender may report no codec. A camera's
 /// track offers only the camera's codec, so a media server without it
 /// agrees on none, and the sender then never sends: past this, the track
@@ -1590,8 +1898,20 @@ impl GopCache {
     }
 }
 
+/// What starts a publication: the first H.264/H.265 unit, or (CPU transcode)
+/// the first decoded picture.
+enum First {
+    Unit(EncodedAccessUnit),
+    Picture(std::sync::Arc<Picture>),
+}
+
 /// The live-view bridge: connect, publish a pre-encoded track, then forward
 /// the camera's access units unchanged. Nothing here decodes or encodes.
+///
+/// A transcoding source (`streams::transcode`) either feeds H.264 units (a
+/// GPU encoder: the same path, nothing differs) or, with no encoder, decoded
+/// pictures: then a raw track is published and the transport encodes it as VP8
+/// ([`EncodedMediaBridge::pump_raw`]).
 ///
 /// The track needs the stream's codec and size, which come from its first
 /// keyframe, so the room is joined only once that keyframe has arrived. As
@@ -1643,6 +1963,49 @@ impl<C: RoomConnector> EncodedMediaBridge<C> {
         self
     }
 
+    /// The raw (CPU transcode) path: every decoded picture, newest first,
+    /// to a track the transport encodes as VP8. Nothing to resend or pace: a
+    /// viewer's keyframe request is answered by the encoder itself.
+    async fn pump_raw(
+        &self,
+        track: &dyn PublishedVideoTrack,
+        first: std::sync::Arc<Picture>,
+        grant: &MediaGrant,
+    ) -> Result<(), PublishError> {
+        let mut cancel = self.cancel.clone();
+        let mut next = Some(first);
+        let mut last_timestamp_us = i64::MIN;
+        let mut codec_confirmed = false;
+        let mut next_codec_check = std::time::Instant::now();
+        loop {
+            if !codec_confirmed && std::time::Instant::now() >= next_codec_check {
+                next_codec_check = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                if let Some(negotiated) = track.negotiated_codec().await {
+                    if negotiated != "video/vp8" {
+                        tracing::warn!(session = %grant.session_id, %negotiated, "the media server does not accept VP8");
+                        return Err(PublishError::CodecRefused);
+                    }
+                    codec_confirmed = true;
+                }
+            }
+            if let Some(picture) = next.take() {
+                let timestamp_us = picture
+                    .timestamp_us
+                    .max(last_timestamp_us.saturating_add(MIN_FRAME_SPACING_US));
+                last_timestamp_us = timestamp_us;
+                track.capture_raw(&picture, timestamp_us)?;
+                self.captured.fetch_add(1, Ordering::Relaxed);
+            }
+            next = tokio::select! {
+                biased;
+                _ = cancel.changed() => return Ok(()),
+                gone = self.feed.failed() => return gone.map_or(Ok(()), Err),
+                picture = self.feed.next_picture() => Some(picture),
+                _ = tokio::time::sleep(KEYFRAME_REQUEST_POLL) => None,
+            };
+        }
+    }
+
     async fn pump(
         &self,
         track: &dyn PublishedVideoTrack,
@@ -1671,9 +2034,15 @@ impl<C: RoomConnector> EncodedMediaBridge<C> {
         // asks for a keyframe, and the GOP would go out again, back over
         // pictures it may already show (the picture jumps back, then races
         // forward). Held until the first request, the GOP goes out once, from
-        // its keyframe, and becomes the viewer's start.
+        // its keyframe, and becomes the viewer's start. A new track's first
+        // pictures are also lost in the transport itself (its sender starts
+        // on them), so a GOP sent as the track's first never arrived whole.
         let mut awaiting_viewer = track.viewer_attached() == Some(false);
         let viewer_deadline = std::time::Instant::now() + AWAIT_VIEWER_LIMIT;
+        // When the first viewer subscribed (its keyframe request follows),
+        // and when the source last gave a picture.
+        let mut viewer_attached_at: Option<std::time::Instant> = None;
+        let mut last_unit_at = std::time::Instant::now();
         let expected_mime = match codec {
             VideoCodec::H264 => "video/h264",
             VideoCodec::H265 => "video/h265",
@@ -1696,16 +2065,21 @@ impl<C: RoomConnector> EncodedMediaBridge<C> {
                 }
             }
             if let Some(mut unit) = next.take() {
+                last_unit_at = std::time::Instant::now();
                 if unit.codec != codec {
                     // The track was negotiated for one codec; a changed camera
                     // ends this publication, and the next grant starts a new one.
                     tracing::warn!(session = %grant.session_id, "camera stream changed codec");
                     return Err(PublishError::CodecChanged);
                 }
-                if awaiting_viewer {
-                    // Held: no viewer could decode it yet (see `awaiting_viewer`).
-                    gop.push(&unit);
-                } else {
+                // While the first viewer is awaited, what a viewer starts from
+                // is held: keyframes, and what queued while the room was joined
+                // (see `awaiting_viewer`). The camera's newest pictures still
+                // go out: nothing can start from them, and the media server
+                // asks for a keyframe once it has a viewer to forward them to.
+                // That request ends the hold.
+                let held = awaiting_viewer && (unit.keyframe || !self.feed.steady());
+                if !held {
                     if unit.timestamp_us < last_timestamp_us.saturating_add(MIN_FRAME_SPACING_US) {
                         unit.frame = None; // cached catch-up pictures carry no current drawings
                     }
@@ -1734,16 +2108,23 @@ impl<C: RoomConnector> EncodedMediaBridge<C> {
                         keyframe_wanted = false;
                         let _ = track.take_keyframe_request();
                     }
-                    gop.push(&unit);
                 }
+                gop.push(&unit);
             }
             let requested = track.take_keyframe_request();
             if awaiting_viewer {
-                // The first viewer is attached (or none came in time): its
-                // start is the held GOP, from its keyframe.
+                // The first viewer asked for a keyframe (or subscribed and
+                // did not ask, or none came in time): its start is the held
+                // GOP, from its keyframe.
+                let now = std::time::Instant::now();
+                if viewer_attached_at.is_none() && track.viewer_attached() == Some(true) {
+                    viewer_attached_at = Some(now);
+                }
                 if requested
-                    || track.viewer_attached() == Some(true)
-                    || std::time::Instant::now() >= viewer_deadline
+                    || viewer_attached_at.is_some_and(|at| {
+                        now >= at + VIEWER_REQUEST_GRACE || now >= last_unit_at + SOURCE_IDLE
+                    })
+                    || now >= viewer_deadline
                 {
                     awaiting_viewer = false;
                     keyframe_wanted = true;
@@ -1786,7 +2167,7 @@ impl<C: RoomConnector> EncodedMediaBridge<C> {
                     Some(unit) => Some(unit),
                     None => return self.feed.failure().map_or(Ok(()), Err),
                 },
-                _ = tokio::time::sleep(KEYFRAME_REQUEST_POLL) => None,
+                _ = tokio::time::sleep(if awaiting_viewer { AWAIT_VIEWER_POLL } else { KEYFRAME_REQUEST_POLL }) => None,
             };
         }
     }
@@ -1823,21 +2204,31 @@ impl<C: RoomConnector> MediaBridge for EncodedMediaBridge<C> {
                 return Ok(());
             }
             // The feed starts at a keyframe; the camera may still be connecting.
+            // A transcoding source on the CPU path sends pictures instead.
             let first = tokio::select! {
                 biased;
                 _ = cancel.changed() => return Ok(()),
                 unit = self.feed.next() => match unit {
-                    Some(unit) => unit,
+                    Some(unit) => First::Unit(unit),
                     None => return self.feed.failure().map_or(Ok(()), Err),
                 },
+                picture = self.feed.next_picture() => First::Picture(picture),
             };
-            let connect = self.connector.connect_and_publish(
-                &config.signaling_url,
-                participant_token,
-                grant,
-                first.codec,
-                (first.width, first.height),
-            );
+            let connect = match &first {
+                First::Unit(first) => self.connector.connect_and_publish(
+                    &config.signaling_url,
+                    participant_token,
+                    grant,
+                    first.codec,
+                    (first.width, first.height),
+                ),
+                First::Picture(first) => self.connector.connect_and_publish_raw(
+                    &config.signaling_url,
+                    participant_token,
+                    grant,
+                    (first.width, first.height),
+                ),
+            };
             let track = tokio::select! {
                 biased;
                 _ = cancel.changed() => return Ok(()),
@@ -1866,7 +2257,10 @@ impl<C: RoomConnector> MediaBridge for EncodedMediaBridge<C> {
                     std::sync::Arc::clone(&track),
                 )
             });
-            let result = self.pump(track.as_ref(), first, grant).await;
+            let result = match first {
+                First::Unit(first) => self.pump(track.as_ref(), first, grant).await,
+                First::Picture(first) => self.pump_raw(track.as_ref(), first, grant).await,
+            };
             timings.abort();
             if let Some(channel) = channel {
                 channel.abort();
@@ -1969,7 +2363,8 @@ fn spawn_overlays(
 }
 
 /// The [`OVERLAY_TOPIC`] message for `shown`, kept under
-/// [`MAX_OVERLAY_MESSAGE`]: the largest drawings lose their last items.
+/// [`MAX_OVERLAY_MESSAGE`]: the largest drawing thins its unlabelled boxes
+/// first (then loses its last items).
 fn overlay_message(
     mut shown: Vec<crate::plugin_host::overlays::Shown>,
     figures: &[crate::plugin_host::overlays::ShownFigure],
@@ -2000,8 +2395,33 @@ fn overlay_message(
         if largest.items.is_empty() {
             return message;
         }
-        let keep = largest.items.len() / 2;
-        largest.items.truncate(keep);
+        // The bulk of a big layer is unlabelled boxes (Motion's changed
+        // blocks): thin those first, from the end, so polygons, lines, text
+        // and labelled boxes survive. Item order is kept.
+        let bulk: Vec<usize> = largest
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                matches!(
+                    item,
+                    nw_analytics_protocol::messages::OverlayItem::Box { label: None, .. }
+                )
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if bulk.is_empty() {
+            let keep = largest.items.len() / 2;
+            largest.items.truncate(keep);
+        } else {
+            let drop: std::collections::HashSet<usize> =
+                bulk[bulk.len() / 2..].iter().copied().collect();
+            let mut index = 0;
+            largest.items.retain(|_| {
+                index += 1;
+                !drop.contains(&(index - 1))
+            });
+        }
     }
 }
 
@@ -2396,11 +2816,21 @@ impl PublisherSupervisor {
                         .as_ref()
                         .ok_or(PublishError::UnsupportedSource)?;
                     let (submitter, feed) = encoded_channel();
-                    let run = opener.open(
-                        &grant.scope.camera_id,
-                        grant.scope.representation,
-                        std::sync::Arc::new(submitter),
-                    )?;
+                    let submitter = std::sync::Arc::new(submitter);
+                    let run = if directive.transcode {
+                        opener.open_transcoded(
+                            &grant.scope.camera_id,
+                            grant.scope.representation,
+                            submitter,
+                            grant.max_bitrate_kbps,
+                        )?
+                    } else {
+                        opener.open(
+                            &grant.scope.camera_id,
+                            grant.scope.representation,
+                            submitter,
+                        )?
+                    };
                     let (mut bridge, cancel) = EncodedMediaBridge::new(feed, connector);
                     if let Some(store) = &self.overlays {
                         bridge = bridge.with_overlays(
@@ -2713,6 +3143,7 @@ mod tests {
             },
             publisher_token: PUBLISHER_TOKEN.into(),
             playback: None,
+            transcode: false,
         };
         let config = LiveKitPublisherConfig::for_directive(
             &directive,
@@ -2880,6 +3311,9 @@ mod tests {
     #[tokio::test]
     async fn a_full_encoded_queue_drops_whole_gops_never_a_dependent_frame() {
         let (submitter, feed) = encoded_channel();
+        // Past its start (read to its end once), the queue holds this much.
+        assert_eq!(submitter.submit(unit(250, true)), SubmitOutcome::Queued);
+        assert_eq!(drain(&feed).await, vec![250]);
         assert_eq!(submitter.submit(unit(0, true)), SubmitOutcome::Queued);
         for index in 1..ENCODED_QUEUE_UNITS as u8 {
             assert_eq!(submitter.submit(unit(index, false)), SubmitOutcome::Queued);
@@ -2899,6 +3333,44 @@ mod tests {
         assert_eq!(submitter.submit(unit(203, false)), SubmitOutcome::Queued);
         assert_eq!(drain(&feed).await, vec![202, 203]);
         assert_eq!(submitter.dropped(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_starting_publication_keeps_a_whole_gop_while_its_room_is_joined() {
+        // Live view starting late in a camera's long GOP: the GOP arrives at
+        // once and nothing reads the queue until the room is joined. Cut
+        // short, the viewer got its first pictures and then waited for the
+        // camera's next keyframe.
+        let (submitter, feed) = encoded_channel();
+        let gop = ENCODED_QUEUE_UNITS * 4;
+        assert_eq!(submitter.submit(unit(0, true)), SubmitOutcome::Queued);
+        for index in 1..gop {
+            assert_eq!(
+                submitter.submit(unit((index % 200) as u8, false)),
+                SubmitOutcome::Queued,
+                "unit {index} of the GOP"
+            );
+        }
+        assert_eq!(drain(&feed).await.len(), gop);
+        assert_eq!(submitter.dropped(), 0);
+        // Its start over, it is bounded as ever.
+        for index in 0..ENCODED_QUEUE_UNITS as u8 {
+            assert_eq!(submitter.submit(unit(index, false)), SubmitOutcome::Queued);
+        }
+        assert_eq!(
+            submitter.submit(unit(201, false)),
+            SubmitOutcome::DroppedQueueFull
+        );
+        // And a start is bounded too: by the longest GOP kept.
+        let (submitter, _feed) = encoded_channel();
+        submitter.submit(unit(0, true));
+        for _ in 1..ENCODED_START_UNITS {
+            assert_eq!(submitter.submit(unit(1, false)), SubmitOutcome::Queued);
+        }
+        assert_eq!(
+            submitter.submit(unit(2, false)),
+            SubmitOutcome::DroppedQueueFull
+        );
     }
 
     #[tokio::test]
@@ -2928,6 +3400,8 @@ mod tests {
         units: Mutex<Vec<u8>>,
         timestamps: Mutex<Vec<i64>>,
         keyframe_request: AtomicBool,
+        /// What the track says of its viewer (`None`: it cannot tell).
+        viewer: Mutex<Option<bool>>,
         closed: AtomicUsize,
         audio_tracks: AtomicUsize,
         audio: Mutex<Vec<usize>>,
@@ -2948,6 +3422,9 @@ mod tests {
         }
         fn take_keyframe_request(&self) -> bool {
             self.0.keyframe_request.swap(false, Ordering::SeqCst)
+        }
+        fn viewer_attached(&self) -> Option<bool> {
+            *self.0.viewer.lock().unwrap()
         }
         fn close(&self) -> BoxFuture<'_, ()> {
             self.0.closed.fetch_add(1, Ordering::SeqCst);
@@ -3053,6 +3530,134 @@ mod tests {
         assert_eq!(log.audio.lock().unwrap().as_slice(), &[480, 960]);
     }
 
+    #[derive(Default)]
+    struct RawLog {
+        published: Mutex<Vec<(u32, u32)>>,
+        encoded_published: AtomicUsize,
+        pictures: Mutex<Vec<(u8, i64)>>,
+        closed: AtomicUsize,
+    }
+    struct RawTrack(std::sync::Arc<RawLog>);
+    impl PublishedVideoTrack for RawTrack {
+        fn capture_encoded(&self, _: &EncodedAccessUnit) -> Result<(), PublishError> {
+            Err(PublishError::UnsupportedSource)
+        }
+        fn capture_raw(&self, picture: &Picture, timestamp_us: i64) -> Result<(), PublishError> {
+            self.0
+                .pictures
+                .lock()
+                .unwrap()
+                .push((picture.y[0], timestamp_us));
+            Ok(())
+        }
+        fn close(&self) -> BoxFuture<'_, ()> {
+            self.0.closed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+    struct RawConnector(std::sync::Arc<RawLog>);
+    impl RoomConnector for RawConnector {
+        fn connect_and_publish<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a MediaGrant,
+            _: VideoCodec,
+            _: (u32, u32),
+        ) -> BoxFuture<'a, Result<Box<dyn PublishedVideoTrack>, PublishError>> {
+            self.0.encoded_published.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(PublishError::UnsupportedSource) })
+        }
+        fn connect_and_publish_raw<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a MediaGrant,
+            resolution: (u32, u32),
+        ) -> BoxFuture<'a, Result<Box<dyn PublishedVideoTrack>, PublishError>> {
+            self.0.published.lock().unwrap().push(resolution);
+            let log = std::sync::Arc::clone(&self.0);
+            Box::pin(async move { Ok(Box::new(RawTrack(log)) as Box<dyn PublishedVideoTrack>) })
+        }
+    }
+
+    fn picture(shade: u8, timestamp_us: i64) -> std::sync::Arc<Picture> {
+        std::sync::Arc::new(Picture {
+            width: 4,
+            height: 2,
+            y: vec![shade; 8],
+            u: vec![128; 2],
+            v: vec![128; 2],
+            timestamp_us,
+            frame: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn pictures_from_a_cpu_transcode_go_to_a_raw_track_newest_first() {
+        let (config, _, _) = fixture();
+        let log = std::sync::Arc::new(RawLog::default());
+        let (submitter, feed) = encoded_channel();
+        let (bridge, cancel) =
+            EncodedMediaBridge::new(feed, RawConnector(std::sync::Arc::clone(&log)));
+        let grant = live_grant();
+        let publishing =
+            tokio::spawn(async move { bridge.publish(&config, &grant, "token").await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            log.published.lock().unwrap().is_empty(),
+            "no picture, no room"
+        );
+        // A burst before the publication reads: only the newest is kept.
+        for shade in 1..=3 {
+            submitter.submit_picture(picture(shade, 5_000));
+        }
+        let waited = |log: std::sync::Arc<RawLog>, count: usize| async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            while log.pictures.lock().unwrap().len() < count
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        waited(std::sync::Arc::clone(&log), 1).await;
+        // The same capture time again still moves forward.
+        submitter.submit_picture(picture(4, 5_000));
+        waited(std::sync::Arc::clone(&log), 2).await;
+        cancel.cancel();
+        assert_eq!(publishing.await.unwrap(), Ok(()));
+        assert_eq!(log.published.lock().unwrap().as_slice(), &[(4, 2)]);
+        assert_eq!(
+            log.encoded_published.load(Ordering::SeqCst),
+            0,
+            "a raw track, never a pre-encoded one"
+        );
+        let pictures = log.pictures.lock().unwrap().clone();
+        assert_eq!(pictures.iter().map(|p| p.0).collect::<Vec<_>>(), [3, 4]);
+        assert!(pictures[1].1 >= pictures[0].1 + MIN_FRAME_SPACING_US);
+        assert_eq!(log.closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_transcode_ends_a_raw_publication_with_its_reason() {
+        let (config, _, _) = fixture();
+        let log = std::sync::Arc::new(RawLog::default());
+        let (submitter, feed) = encoded_channel();
+        let (bridge, _cancel) =
+            EncodedMediaBridge::new(feed, RawConnector(std::sync::Arc::clone(&log)));
+        let grant = live_grant();
+        let publishing =
+            tokio::spawn(async move { bridge.publish(&config, &grant, "token").await });
+        submitter.submit_picture(picture(1, 1_000));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        TranscodeSink::fail(&submitter);
+        assert_eq!(
+            publishing.await.unwrap(),
+            Err(PublishError::UnsupportedSource)
+        );
+        assert_eq!(log.closed.load(Ordering::SeqCst), 1);
+    }
+
     /// Wait until the track has been handed `count` units.
     async fn captured(log: &EncodedLog, count: usize) -> Vec<u8> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -3096,6 +3701,131 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[1] >= pair[0] + MIN_FRAME_SPACING_US),
             "capture timestamps only move forward, by at least 1 ms: {timestamps:?}"
+        );
+        cancel.cancel();
+        assert_eq!(publishing.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn the_held_gop_goes_out_at_the_viewers_keyframe_request_not_at_its_subscription() {
+        // The media server says a viewer subscribed a moment before it
+        // forwards to it (a browser first puts the video on screen). Sent at
+        // the subscription, the GOP was lost to the viewer, and its request
+        // then waited out the gap between two sendings: half a second late.
+        let (config, _, _) = fixture();
+        let log = std::sync::Arc::new(EncodedLog::default());
+        *log.viewer.lock().unwrap() = Some(false);
+        let (submitter, feed) = encoded_channel();
+        let (bridge, cancel) =
+            EncodedMediaBridge::new(feed, EncodedConnector(std::sync::Arc::clone(&log)));
+        let grant = live_grant();
+        let publishing =
+            tokio::spawn(async move { bridge.publish(&config, &grant, "token").await });
+        for (index, keyframe) in [(1, true), (2, false), (3, false)] {
+            submitter.submit(unit(index, keyframe));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(log.units.lock().unwrap().is_empty(), "held: nobody watches");
+        // The camera's next picture goes out: nothing can start from it, and
+        // it is what makes the media server ask for a keyframe.
+        submitter.submit(unit(4, false));
+        assert_eq!(captured(&log, 1).await, [4]);
+        *log.viewer.lock().unwrap() = Some(true);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            log.units.lock().unwrap().as_slice(),
+            [4],
+            "subscribed, but not asking yet: the GOP is still held"
+        );
+        // The camera's next keyframe is held too: the start is what is asked for.
+        submitter.submit(unit(5, true));
+        submitter.submit(unit(6, false));
+        assert_eq!(captured(&log, 2).await, [4, 6]);
+        log.keyframe_request.store(true, Ordering::SeqCst);
+        let asked = std::time::Instant::now();
+        assert_eq!(captured(&log, 4).await, [4, 6, 5, 6]);
+        assert!(
+            asked.elapsed() < std::time::Duration::from_millis(150),
+            "sent at the request, within {:?}",
+            asked.elapsed()
+        );
+        // Once, and the camera's pictures follow, keyframes too.
+        submitter.submit(unit(7, false));
+        submitter.submit(unit(8, true));
+        assert_eq!(captured(&log, 6).await, [4, 6, 5, 6, 7, 8]);
+        let timestamps = log.timestamps.lock().unwrap().clone();
+        assert!(
+            timestamps
+                .windows(2)
+                .all(|pair| pair[1] >= pair[0] + MIN_FRAME_SPACING_US),
+            "capture timestamps only move forward: {timestamps:?}"
+        );
+        cancel.cancel();
+        assert_eq!(publishing.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_subscribed_viewer_that_never_asks_gets_the_held_gop_after_a_moment() {
+        let (config, _, _) = fixture();
+        let log = std::sync::Arc::new(EncodedLog::default());
+        // Subscribed only once the publication runs (it starts held).
+        *log.viewer.lock().unwrap() = Some(false);
+        let (submitter, feed) = encoded_channel();
+        let (bridge, cancel) =
+            EncodedMediaBridge::new(feed, EncodedConnector(std::sync::Arc::clone(&log)));
+        let grant = live_grant();
+        let publishing =
+            tokio::spawn(async move { bridge.publish(&config, &grant, "token").await });
+        submitter.submit(unit(1, true));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        *log.viewer.lock().unwrap() = Some(true);
+        let subscribed = std::time::Instant::now();
+        // The camera goes on sending; the GOP's keyframe is not among what goes out.
+        let mut sent = 1u8;
+        while subscribed.elapsed() < VIEWER_REQUEST_GRACE / 2 {
+            sent += 1;
+            submitter.submit(unit(sent, false));
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        assert!(
+            !log.units.lock().unwrap().contains(&1),
+            "waiting for the viewer's request"
+        );
+        while !log.units.lock().unwrap().contains(&1) && subscribed.elapsed() < AWAIT_VIEWER_LIMIT {
+            sent += 1;
+            submitter.submit(unit(sent, false));
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        assert!(subscribed.elapsed() >= VIEWER_REQUEST_GRACE);
+        assert!(subscribed.elapsed() < VIEWER_REQUEST_GRACE * 2);
+        cancel.cancel();
+        assert_eq!(publishing.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_source_without_new_pictures_sends_its_gop_once_a_viewer_subscribed() {
+        // A recording opened paused: no picture follows that would make the
+        // media server ask for a keyframe.
+        let (config, _, _) = fixture();
+        let log = std::sync::Arc::new(EncodedLog::default());
+        *log.viewer.lock().unwrap() = Some(false);
+        let (submitter, feed) = encoded_channel();
+        let (bridge, cancel) =
+            EncodedMediaBridge::new(feed, EncodedConnector(std::sync::Arc::clone(&log)));
+        let grant = live_grant();
+        let publishing =
+            tokio::spawn(async move { bridge.publish(&config, &grant, "token").await });
+        submitter.submit(unit(1, true));
+        submitter.submit(unit(2, false));
+        tokio::time::sleep(SOURCE_IDLE + std::time::Duration::from_millis(50)).await;
+        assert!(log.units.lock().unwrap().is_empty(), "held: nobody watches");
+        *log.viewer.lock().unwrap() = Some(true);
+        let subscribed = std::time::Instant::now();
+        assert_eq!(captured(&log, 2).await, [1, 2]);
+        assert!(
+            subscribed.elapsed() < std::time::Duration::from_millis(150),
+            "at once: {:?}",
+            subscribed.elapsed()
         );
         cancel.cancel();
         assert_eq!(publishing.await.unwrap(), Ok(()));
@@ -3353,6 +4083,365 @@ mod tests {
             late_pictures >= 15 && first_viewer_pictures >= 60,
             "pictures stopped"
         );
+    }
+
+    /// A stand-in for the control plane and a recorder, for timing live
+    /// view's start in a real browser. A test camera at `NW_E2E_FPS` (15)
+    /// with a keyframe every `NW_E2E_GOP_FRAMES` (60) feeds the stream hub's
+    /// own core; each session subscribes as live view does and publishes
+    /// through the real bridge. On `NW_E2E_CONTROL_PORT` (5377):
+    ///
+    /// - `GET /wait?gop_ms=N` answers once the camera's current GOP is `N` ms old;
+    /// - `GET /session` answers at once with a room and a viewer token, and
+    ///   `NW_E2E_NODE_DELAY_MS` (115: the wake-up, the challenge and the
+    ///   directive pull) later the camera is published there for 15 s;
+    /// - `GET /report` says what the recorder side did in each session, in ms
+    ///   since its request;
+    /// - `GET /quit` ends it (as do `NW_E2E_SERVE_SECS`, 300).
+    ///
+    /// Measurement only.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a LiveKit server: NW_LIVEKIT_E2E_URL, NW_LIVEKIT_E2E_KEY, NW_LIVEKIT_E2E_SECRET"]
+    async fn live_view_browser_start_harness() {
+        use crate::streams::core::HubCore;
+        use crate::streams::queue::{Delivery, Media, SubscriberPolicy, Unit};
+        use gstreamer::prelude::*;
+        use std::time::{Duration, Instant};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        #[derive(Clone)]
+        struct CameraUnit(EncodedAccessUnit);
+        impl Unit for CameraUnit {
+            fn media(&self) -> Media {
+                Media::Video
+            }
+            fn keyframe(&self) -> bool {
+                self.0.keyframe
+            }
+            fn bytes(&self) -> usize {
+                self.0.payload.len()
+            }
+            fn time_ns(&self) -> Option<u64> {
+                u64::try_from(self.0.timestamp_us).ok().map(|us| us * 1000)
+            }
+        }
+
+        /// What the recorder side did in one session, in ms since its request.
+        #[derive(Default)]
+        struct Marks {
+            asked: Option<Instant>,
+            events: Vec<(u128, String)>,
+            captured: u64,
+        }
+        impl Marks {
+            fn note(&mut self, what: impl Into<String>) {
+                if let Some(asked) = self.asked {
+                    self.events.push((asked.elapsed().as_millis(), what.into()));
+                }
+            }
+        }
+        type Shared = std::sync::Arc<Mutex<Marks>>;
+
+        struct TimedTrack {
+            inner: Box<dyn PublishedVideoTrack>,
+            marks: Shared,
+            attached: AtomicBool,
+        }
+        impl PublishedVideoTrack for TimedTrack {
+            fn capture_encoded(&self, unit: &EncodedAccessUnit) -> Result<(), PublishError> {
+                {
+                    let mut marks = self.marks.lock().unwrap();
+                    marks.captured += 1;
+                    let nth = marks.captured;
+                    if nth == 1 {
+                        marks.note("first picture handed to the track");
+                    } else if unit.keyframe {
+                        marks.note(format!("keyframe handed to the track (picture {nth})"));
+                    }
+                }
+                self.inner.capture_encoded(unit)
+            }
+            fn frame_timings(&self) -> Vec<FrameTiming> {
+                self.inner.frame_timings()
+            }
+            fn take_keyframe_request(&self) -> bool {
+                let asked = self.inner.take_keyframe_request();
+                if asked {
+                    self.marks.lock().unwrap().note("keyframe request");
+                }
+                asked
+            }
+            fn viewer_attached(&self) -> Option<bool> {
+                let attached = self.inner.viewer_attached();
+                if attached == Some(true) && !self.attached.swap(true, Ordering::Relaxed) {
+                    self.marks.lock().unwrap().note("viewer attached");
+                }
+                attached
+            }
+            fn negotiated_codec(&self) -> BoxFuture<'_, Option<String>> {
+                self.inner.negotiated_codec()
+            }
+            fn close(&self) -> BoxFuture<'_, ()> {
+                self.inner.close()
+            }
+            fn take_messages(&self) -> Option<mpsc::Receiver<ViewerMessage>> {
+                self.inner.take_messages()
+            }
+            fn send_data(&self, payload: Vec<u8>) -> BoxFuture<'_, Result<(), PublishError>> {
+                self.inner.send_data(payload)
+            }
+            fn send_topic(
+                &self,
+                topic: &'static str,
+                payload: Vec<u8>,
+            ) -> BoxFuture<'_, Result<(), PublishError>> {
+                self.inner.send_topic(topic, payload)
+            }
+        }
+
+        struct TimedConnector {
+            inner: LiveKitRoomConnector,
+            marks: Shared,
+        }
+        impl RoomConnector for TimedConnector {
+            fn connect_and_publish<'a>(
+                &'a self,
+                signaling_url: &'a str,
+                participant_token: &'a str,
+                grant: &'a MediaGrant,
+                codec: VideoCodec,
+                resolution: (u32, u32),
+            ) -> BoxFuture<'a, Result<Box<dyn PublishedVideoTrack>, PublishError>> {
+                Box::pin(async move {
+                    self.marks.lock().unwrap().note("joining the room");
+                    let track = self
+                        .inner
+                        .connect_and_publish(
+                            signaling_url,
+                            participant_token,
+                            grant,
+                            codec,
+                            resolution,
+                        )
+                        .await?;
+                    self.marks.lock().unwrap().note("track published");
+                    Ok(Box::new(TimedTrack {
+                        inner: track,
+                        marks: std::sync::Arc::clone(&self.marks),
+                        attached: AtomicBool::new(false),
+                    }) as Box<dyn PublishedVideoTrack>)
+                })
+            }
+        }
+
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} required"));
+        let (url, key, secret) = (
+            var("NW_LIVEKIT_E2E_URL"),
+            var("NW_LIVEKIT_E2E_KEY"),
+            var("NW_LIVEKIT_E2E_SECRET"),
+        );
+        let number = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let (gop, fps, node_delay, port, serve) = (
+            number("NW_E2E_GOP_FRAMES", 60),
+            number("NW_E2E_FPS", 15),
+            Duration::from_millis(number("NW_E2E_NODE_DELAY_MS", 115)),
+            number("NW_E2E_CONTROL_PORT", 5377) as u16,
+            Duration::from_secs(number("NW_E2E_SERVE_SECS", 300)),
+        );
+
+        gstreamer::init().unwrap();
+        // The camera's shared connection: the hub core, and when its GOP began.
+        let hub = std::sync::Arc::new(Mutex::new((
+            HubCore::<CameraUnit>::default(),
+            None::<Instant>,
+        )));
+        let camera = std::sync::Arc::clone(&hub);
+        let source = format!(
+            "videotestsrc is-live=true pattern=ball ! video/x-raw,format=I420,width=640,height=360,framerate={fps}/1 ! \
+             timeoverlay ! x264enc tune=zerolatency key-int-max={gop} bframes=0 bitrate=800 ! rtph264pay ! \
+             application/x-rtp,media=video ! parsebin name=encoded_parse"
+        );
+        let pipeline = crate::pipeline::encoded::build(
+            &source,
+            true,
+            crate::pipeline::encoded::EncodedOutputs {
+                unit: std::sync::Arc::new(move |unit| {
+                    let mut camera = camera.lock().unwrap();
+                    if unit.keyframe {
+                        camera.1 = Some(Instant::now());
+                    }
+                    camera.0.publish(CameraUnit(unit));
+                }),
+                codec: std::sync::Arc::new(|_| {}),
+            },
+        )
+        .unwrap();
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("control port");
+        eprintln!(
+            "live view harness: http://127.0.0.1:{port} (camera {fps} fps, keyframe every {gop} pictures = {} ms; recorder delay {} ms)",
+            gop * 1000 / fps,
+            node_delay.as_millis()
+        );
+        let sessions: std::sync::Arc<Mutex<Vec<(String, Shared)>>> = Default::default();
+        let until = tokio::time::Instant::now() + serve;
+        loop {
+            let Ok(Ok((mut socket, _))) = tokio::time::timeout_at(until, listener.accept()).await
+            else {
+                break;
+            };
+            let mut request = vec![0u8; 2048];
+            let read = socket.read(&mut request).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&request[..read]).to_string();
+            let target = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+            let answer = |body: String| {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\
+                     Cache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            if target.starts_with("/quit") {
+                let _ = socket.write_all(answer("{}".into()).as_bytes()).await;
+                break;
+            } else if target.starts_with("/wait") {
+                let wanted = target
+                    .split("gop_ms=")
+                    .nth(1)
+                    .and_then(|ms| ms.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let hub = std::sync::Arc::clone(&hub);
+                let frame = Duration::from_millis(1000 / fps);
+                tokio::spawn(async move {
+                    // Within a picture of the wanted age, in a fresh GOP.
+                    let age = loop {
+                        let began = hub.lock().unwrap().1;
+                        if let Some(age) = began.map(|at| at.elapsed()) {
+                            let wanted = Duration::from_millis(wanted);
+                            if age >= wanted && age < wanted + frame {
+                                break age;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    };
+                    let body = format!("{{\"gop_ms\":{}}}", age.as_millis());
+                    let _ = socket.write_all(answer(body).as_bytes()).await;
+                });
+            } else if target.starts_with("/report") {
+                let report: Vec<serde_json::Value> = sessions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(room, marks)| {
+                        let marks = marks.lock().unwrap();
+                        serde_json::json!({
+                            "room": room,
+                            "pictures": marks.captured,
+                            "events": marks.events.iter().map(|(ms, what)| serde_json::json!([ms, what])).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                let body = serde_json::Value::Array(report).to_string();
+                let _ = socket.write_all(answer(body).as_bytes()).await;
+            } else if target.starts_with("/session") {
+                let room = format!("e2e-{}", uuid::Uuid::new_v4().simple());
+                let token = |identity: &str, publish: bool| {
+                    livekit_api::access_token::AccessToken::with_api_key(&key, &secret)
+                        .with_identity(identity)
+                        .with_grants(livekit_api::access_token::VideoGrants {
+                            room_join: true,
+                            room: room.clone(),
+                            can_publish: Some(publish),
+                            can_subscribe: Some(!publish),
+                            ..Default::default()
+                        })
+                        .to_jwt()
+                        .unwrap()
+                };
+                let marks: Shared = Default::default();
+                marks.lock().unwrap().asked = Some(Instant::now());
+                let began = hub.lock().unwrap().1;
+                marks.lock().unwrap().note(format!(
+                    "asked, {} ms into the camera's GOP",
+                    began.map_or(0, |at| at.elapsed().as_millis())
+                ));
+                sessions
+                    .lock()
+                    .unwrap()
+                    .push((room.clone(), std::sync::Arc::clone(&marks)));
+                let body = serde_json::json!({
+                    "server_url": url, "room_name": room, "participant_token": token("viewer:e2e", false),
+                    "expires_at": "2099-01-01T00:00:00Z", "session_id": room, "viewer_id": "viewer",
+                })
+                .to_string();
+                let _ = socket.write_all(answer(body).as_bytes()).await;
+                let publisher_token = token("node:e2e", true);
+                let (hub, url) = (std::sync::Arc::clone(&hub), url.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(node_delay).await;
+                    let (submitter, feed) = encoded_channel();
+                    let submitter = std::sync::Arc::new(submitter);
+                    // As `live_publish::SharedSource`: a live-view subscription
+                    // of the camera's connection, forwarded unit by unit.
+                    let (id, queue) = hub.lock().unwrap().0.subscribe(SubscriberPolicy {
+                        whole_gop: true,
+                        ..SubscriberPolicy::live_video()
+                    });
+                    marks.lock().unwrap().note(format!(
+                        "subscribed to the camera: {} pictures waiting",
+                        queue.level().0
+                    ));
+                    let stop = std::sync::Arc::new(AtomicBool::new(false));
+                    let (stopped, units) = (
+                        std::sync::Arc::clone(&stop),
+                        std::sync::Arc::clone(&submitter),
+                    );
+                    let forwarding = std::thread::spawn(move || {
+                        while !stopped.load(Ordering::Relaxed) {
+                            if let Some(Delivery::Unit { unit, .. }) =
+                                queue.pop(Duration::from_millis(100))
+                            {
+                                units.submit(unit.0);
+                            }
+                        }
+                        queue.dropped()
+                    });
+                    let (mut config, _, _) = fixture();
+                    config.signaling_url = url;
+                    let mut grant = live_grant();
+                    grant.session_id = room;
+                    let connector = TimedConnector {
+                        inner: LiveKitRoomConnector::default(),
+                        marks: std::sync::Arc::clone(&marks),
+                    };
+                    let (bridge, cancel) = EncodedMediaBridge::new(feed, connector);
+                    let publishing = tokio::spawn(async move {
+                        bridge.publish(&config, &grant, &publisher_token).await
+                    });
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    cancel.cancel();
+                    let _ = publishing.await;
+                    stop.store(true, Ordering::Relaxed);
+                    let queue_dropped = forwarding.join().unwrap_or(0);
+                    hub.lock().unwrap().0.unsubscribe(id);
+                    marks.lock().unwrap().note(format!(
+                        "ended: the camera subscription dropped {queue_dropped}, the publisher's queue {}",
+                        submitter.dropped()
+                    ));
+                });
+            } else {
+                let _ = socket.write_all(answer("{}".into()).as_bytes()).await;
+            }
+        }
+        pipeline.set_state(gstreamer::State::Null).unwrap();
     }
 
     /// The cadence of the first seconds a viewer sees: when each decoded
@@ -4277,6 +5366,7 @@ mod tests {
             },
             publisher_token: PUBLISHER_TOKEN.into(),
             playback,
+            transcode: false,
         }
     }
 
@@ -4675,6 +5765,74 @@ mod tests {
         assert_eq!(all.len(), 2, "{all:?}");
         assert_eq!(all[1].1["overlays"], serde_json::json!([]));
         task.abort();
+    }
+
+    #[test]
+    fn an_analysed_picture_with_nothing_to_draw_is_sent_as_an_empty_layer() {
+        let store = OverlayStore::default();
+        store.put("cam-1", "motion", "detections", vec![], Some(12), None);
+        let message = overlay_message(store.snapshot(None), &[]);
+        assert!(message.len() <= MAX_OVERLAY_MESSAGE);
+        let value: serde_json::Value = serde_json::from_slice(&message).unwrap();
+        let layers = value["overlays"].as_array().unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0]["layer"], "detections");
+        assert_eq!(layers[0]["items"], serde_json::json!([]));
+        assert_eq!(layers[0]["frame"], 12);
+        assert!(layers[0]["time_us"].as_i64().unwrap() > 0);
+        assert!(layers[0]["lifetime_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn trimming_keeps_zones_and_text_and_thins_the_blocks() {
+        use nw_analytics_protocol::messages::{Anchor, OverlayItem, Style};
+        let store = OverlayStore::default();
+        let mut items: Vec<OverlayItem> = (0..144)
+            .map(|i| OverlayItem::Box {
+                rect: [
+                    (i % 16) as f32 / 17.0,
+                    (i / 16) as f32 / 9.3,
+                    0.0625001,
+                    0.1111111,
+                ],
+                label: None,
+                style: Style::Warning,
+                fill: true,
+            })
+            .collect();
+        for zone in 0..3 {
+            items.push(OverlayItem::Polygon {
+                points: (0..12)
+                    .map(|p| [p as f32 / 13.0, zone as f32 / 3.1])
+                    .collect(),
+                label: Some(format!("Door {zone}")),
+                style: Style::Accent,
+                fill: false,
+            });
+        }
+        items.push(OverlayItem::Text {
+            anchor: Anchor::BottomLeft,
+            lines: vec!["Score 80% · motion".into()],
+            style: Style::Warning,
+        });
+        store.put("cam-1", "motion", "debug", items, None, None);
+        let untrimmed = serde_json::to_vec(&store.snapshot(None)).unwrap().len();
+        assert!(
+            untrimmed > MAX_OVERLAY_MESSAGE,
+            "the layer is over the limit: {untrimmed}"
+        );
+        let message = overlay_message(store.snapshot(None), &[]);
+        assert!(message.len() <= MAX_OVERLAY_MESSAGE);
+        let value: serde_json::Value = serde_json::from_slice(&message).unwrap();
+        let kept = value["overlays"][0]["items"].as_array().unwrap();
+        assert!(kept.len() < 148, "over the limit, so thinned");
+        let kinds: Vec<_> = kept.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            &kinds[kinds.len() - 4..],
+            ["polygon", "polygon", "polygon", "text"],
+            "zones and text kept, in order"
+        );
+        assert!(kinds[..kinds.len() - 4].iter().all(|k| *k == "box"));
     }
 
     #[test]
@@ -5188,7 +6346,7 @@ mod tests {
     async fn a_unit_past_the_queue_byte_budget_waits_for_the_next_keyframe() {
         let (submitter, feed) = encoded_channel();
         let mut huge = unit(1, true);
-        huge.payload = vec![0; ENCODED_QUEUE_BYTES + 1];
+        huge.payload = vec![0; ENCODED_START_BYTES + 1];
         assert_eq!(submitter.submit(huge), SubmitOutcome::DroppedQueueFull);
         assert_eq!(submitter.dropped(), 1);
         assert_eq!(submitter.last_timestamp_us(), None);

@@ -70,7 +70,7 @@ pub fn refresh_flags(
         "UPDATE segments SET has_event=1 WHERE camera_id=?1 AND has_event=0
          AND EXISTS (
            SELECT 1 FROM events e WHERE e.camera_id=?1
-             AND e.event_type IN ('motion','intrusion','line_crossing','person','vehicle','animal','tamper','digital_input','camera_event','bookmark')
+             AND e.event_type IN ('motion','intrusion','line_crossing','person','vehicle','animal','object','tamper','digital_input','camera_event','bookmark')
              AND e.ts-?2<=segments.end_ts
              AND (e.end_ts IS NULL OR e.end_ts+?3>=segments.start_ts))",
         params![camera, i64::from(pre_sec)*1000, i64::from(post_sec)*1000],

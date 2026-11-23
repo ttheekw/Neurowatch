@@ -12,6 +12,7 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QWidget
 
 from neurowatch.theme import apply_dialog_theme, set_button_variant, set_label_role
+from neurowatch.utils.dialogs import run_dialog
 from neurowatch.widgets.window_chrome import install_dialog_chrome
 
 #: Width of a message's text; it wraps, and the card grows in height only.
@@ -128,8 +129,7 @@ def show_message(
     dialog = MessageDialog(parent, title, text, detail=detail, kind=kind)
     ok = dialog.add_button("OK", variant="primary")
     dialog.set_default_button(ok)
-    dialog.exec()
-    dialog.deleteLater()
+    run_dialog(dialog)
 
 
 def ask(
@@ -149,6 +149,5 @@ def ask(
     yes = dialog.add_button(yes_text, variant="danger" if destructive else "primary")
     dialog.set_escape_button(no)
     dialog.set_default_button(yes if default_yes and not destructive else no)
-    answered = dialog.exec() == QDialog.DialogCode.Accepted and dialog.clicked_button() is yes
-    dialog.deleteLater()
+    answered = run_dialog(dialog) == QDialog.DialogCode.Accepted and dialog.clicked_button() is yes
     return answered

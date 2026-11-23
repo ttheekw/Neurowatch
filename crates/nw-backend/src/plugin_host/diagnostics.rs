@@ -34,6 +34,9 @@ pub struct PluginStreamConsumer {
     /// Pictures shared with it a second, while `pictures` is `shared`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_fps: Option<f32>,
+    /// Who decoded those pictures and on what, once known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_source: Option<super::SharedSource>,
 }
 
 impl PluginHost {
@@ -112,6 +115,7 @@ impl PluginHost {
                         .and_then(|status| status.decoder.clone())
                         .filter(|decoder| !decoder.trim().is_empty()),
                     shared_fps: active.shared_fps.filter(|_| active.shared_pictures),
+                    shared_source: active.shared_source.filter(|_| active.shared_pictures),
                 })
             })
             .collect()

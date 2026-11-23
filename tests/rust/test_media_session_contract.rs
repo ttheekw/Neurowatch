@@ -340,6 +340,7 @@ fn a_node_publish_directive_round_trips_and_stays_opaque() {
         },
         publisher_token: PUBLISHER_TOKEN.into(),
         playback: None,
+        transcode: false,
     };
     directive.validate().expect("publish directive is valid");
     let encoded = serde_json::to_string(&directive).expect("encode");
@@ -350,6 +351,27 @@ fn a_node_publish_directive_round_trips_and_stays_opaque() {
     let decoded: PublishDirective = serde_json::from_str(&encoded).expect("decode");
     assert_eq!(decoded, directive);
     assert!(contains_local_material(&encoded).is_none(), "{encoded}");
+}
+
+#[test]
+fn a_transcode_request_is_only_on_the_wire_when_true_and_old_directives_still_parse() {
+    let mut directive = directive("sess-tc");
+    let plain = serde_json::to_value(&directive).expect("encode");
+    assert!(
+        plain.get("transcode").is_none(),
+        "false is not serialised: {plain}"
+    );
+    // A directive from before the field existed.
+    let parsed: PublishDirective = serde_json::from_value(plain).expect("old directive");
+    assert!(!parsed.transcode);
+    directive.transcode = true;
+    directive
+        .validate()
+        .expect("a transcoding directive is valid");
+    let wire = serde_json::to_value(&directive).expect("encode");
+    assert_eq!(wire["transcode"], serde_json::json!(true));
+    let decoded: PublishDirective = serde_json::from_value(wire).expect("decode");
+    assert_eq!(decoded, directive);
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +391,7 @@ fn directive(session: &str) -> PublishDirective {
         },
         publisher_token: PUBLISHER_TOKEN.into(),
         playback: None,
+        transcode: false,
     }
 }
 

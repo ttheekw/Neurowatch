@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 from PySide6.QtCore import QMimeData, QSize, Qt, Signal
 from PySide6.QtGui import QResizeEvent
 from PySide6.QtWidgets import (
@@ -142,7 +144,6 @@ class _CameraItem(QWidget):
 
         self._motion = QLabel("Motion")
         self._motion.setFixedHeight(16)
-        self._motion.setToolTip("The camera reports motion now")
         self._motion.setStyleSheet(
             "background: #ea580c; color: #fff7ed; font-size: 9px; font-weight: bold;"
             " padding: 0 5px; border-radius: 3px;"
@@ -150,8 +151,11 @@ class _CameraItem(QWidget):
         self._motion.hide()
         layout.addWidget(self._motion)
 
-    def set_motion(self, active: bool) -> None:
-        self._motion.setVisible(active)
+    def set_motion(self, names: Sequence[str]) -> None:
+        """What is going on at the camera now ("Motion", "Car"), or nothing."""
+        self._motion.setText(" · ".join(names))
+        self._motion.setToolTip(f"Going on now: {', '.join(names)}" if names else "")
+        self._motion.setVisible(bool(names))
 
     def set_status(self, status: str) -> None:
         # Status is re-sent on every poll; restyling a widget is expensive.
@@ -237,7 +241,7 @@ class CameraPanel(QWidget):
         self._selected_id: str | None = None
         self._camera_statuses: dict[str, str] = {}
         self._recording_states: dict[str, str] = {}
-        self._motion_ids: set[str] = set()
+        self._motion_ids: dict[str, tuple[str, ...]] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -281,11 +285,11 @@ class CameraPanel(QWidget):
         if widget := self._item_widgets.get(cam_id):
             widget.set_recording(state)
 
-    def set_motion_cameras(self, camera_ids: set[str]) -> None:
-        """Cameras with motion going on show a Motion badge in the list."""
-        self._motion_ids = set(camera_ids)
+    def set_motion_cameras(self, cameras: Mapping[str, Sequence[str]]) -> None:
+        """Cameras with activity going on show its names in the list."""
+        self._motion_ids = {cam_id: tuple(names) for cam_id, names in cameras.items() if names}
         for cam_id, widget in self._item_widgets.items():
-            widget.set_motion(cam_id in camera_ids)
+            widget.set_motion(self._motion_ids.get(cam_id, ()))
 
     @property
     def selected_id(self) -> str | None:
@@ -466,7 +470,7 @@ class CameraPanel(QWidget):
             item_widget = _CameraItem(cam)
             item_widget.set_status(status)
             item_widget.set_recording(self._recording_states.get(cam.id, "idle"))
-            item_widget.set_motion(cam.id in self._motion_ids)
+            item_widget.set_motion(self._motion_ids.get(cam.id, ()))
             item = QListWidgetItem()
             # As wide as the panel, whatever the name's length.
             item.setSizeHint(QSize(1, item_widget.sizeHint().height()))

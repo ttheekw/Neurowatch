@@ -10,8 +10,9 @@
 //! subscriber, reconnects on its own with backoff while anyone subscribes,
 //! and closes when the last subscriber left and its linger passed.
 //!
-//! Nothing here decodes: decoding stays with desktop viewing and opt-in
-//! analysis (see the performance rules in `CLAUDE.md`).
+//! Nothing here decodes: decoding stays with desktop viewing, opt-in
+//! analysis and, only for a browser session that asked and an H.265 stream,
+//! [`transcode`] (see the performance rules in `CLAUDE.md`).
 //!
 //! Subscribers so far: the recorder (`pipeline::ingest`), and through
 //! [`crate::app_state::AppState::subscribe_stream`] extensions (the cloud's
@@ -31,6 +32,7 @@ pub mod sound;
 mod source;
 #[cfg(test)]
 pub(crate) mod testing;
+pub mod transcode;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,6 +67,18 @@ pub struct SharedUnit {
     pub arrived_us: i64,
     /// Assigned by the hub, shared unchanged by every consumer.
     pub frame: Option<frames::Identity>,
+}
+
+/// The time of a unit's picture, µs since the Unix epoch: the hub's picture
+/// identity (the clock the plugins' drawings and event starts use), else when
+/// the unit arrived.
+pub fn unit_time_us(unit: &SharedUnit) -> i64 {
+    unit.frame.map_or(unit.arrived_us, |frame| frame.time_us)
+}
+
+/// A video keyframe whose picture is at or after `min_us`.
+pub fn keyframe_since(unit: &SharedUnit, min_us: i64) -> bool {
+    unit.keyframe() && unit_time_us(unit) >= min_us
 }
 
 impl Unit for SharedUnit {
@@ -319,6 +333,8 @@ pub struct StreamHubs {
     shutdown: Arc<AtomicBool>,
     /// The last format seen of each source (see [`StreamHubs::video_format`]).
     formats: Arc<Mutex<HashMap<SourceKey, VideoFormat>>>,
+    /// H.265 streams transcoded for browsers (see [`transcode`]).
+    transcodes: Arc<transcode::Registry>,
 }
 
 impl StreamHubs {
@@ -358,6 +374,36 @@ impl StreamHubs {
             match subscription.recv(left) {
                 Some(Delivery::Unit { unit, .. }) if unit.keyframe() => {
                     return Some((unit.caps, unit.buffer));
+                }
+                Some(_) => {}
+                None => return None,
+            }
+        }
+        None
+    }
+
+    /// The first keyframe of a stream of `camera` that is already streaming
+    /// whose picture time is at or after `min_us` (µs since the Unix epoch,
+    /// the clock of [`frames::Identity::time_us`]), with that time. Waits at
+    /// most `timeout` (keyframes come every second or two); the cached,
+    /// older group of pictures is skipped. Never opens a connection.
+    /// Blocking.
+    pub fn keyframe_since(
+        &self,
+        camera: &CameraConfig,
+        min_us: i64,
+        timeout: Duration,
+    ) -> Option<(gstreamer::Caps, gstreamer::Buffer, i64)> {
+        let source = self.streaming_source(camera)?;
+        let subscription = self
+            .subscribe(&source, SubscriberPolicy::snapshot(), None)
+            .ok()?;
+        let deadline = Instant::now() + timeout;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match subscription.recv(left) {
+                Some(Delivery::Unit { unit, .. }) if keyframe_since(&unit, min_us) => {
+                    let time = unit_time_us(&unit);
+                    return Some((unit.caps, unit.buffer, time));
                 }
                 Some(_) => {}
                 None => return None,
@@ -455,6 +501,7 @@ impl StreamHubs {
     /// Close every connection now (backend shutdown).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.transcodes.shutdown();
         let hubs: Vec<_> = lock(&self.hubs).drain().map(|(_, hub)| hub).collect();
         for hub in hubs {
             hub.close_now();

@@ -47,7 +47,8 @@ class DrawingWindow:
             if time_us >= int(record["time_us"]) + int(record.get("ttl_ms", 0)) * 1000:
                 continue
             parsed = parse_overlays({"overlays": [record]}, 0.0).get(camera, [])
-            shown.extend(replace(drawing, until=math.inf) for drawing in parsed)
+            # A recorded empty result is the layer cleared: nothing to show.
+            shown.extend(replace(drawing, until=math.inf) for drawing in parsed if drawing.items)
         return shown
 
 

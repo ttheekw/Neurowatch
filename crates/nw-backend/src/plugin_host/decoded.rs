@@ -290,6 +290,9 @@ impl Forwarder {
             return;
         }
         self.shared.push_back(Instant::now());
+        if let Ok(mut source) = counters.shared_source.lock() {
+            *source = picture.source();
+        }
         if fresh {
             if let Ok(file) = ring.descriptor() {
                 out.descriptor(
@@ -342,6 +345,7 @@ fn choose_layout(info: &VideoInfo, request: &DecodedRequest) -> Option<RawLayout
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streams::SubscriberPolicy;
     #[test]
     fn another_desktop_stream_is_used_only_when_the_active_stream_stalls() {
         gstreamer::init().unwrap();
@@ -396,6 +400,74 @@ mod tests {
             "undersized alternatives are refused"
         );
     }
+    /// A camera with a Main and a Sub stream, both with a live connection; the
+    /// plugin is bound to Sub, which has no picture (stalled), while Main
+    /// shows a large live picture.
+    fn forwarder_on_a_stalled_sub(
+        min_width: u32,
+        min_height: u32,
+    ) -> (Forwarder, StreamHubs, Vec<crate::streams::Subscription>) {
+        gstreamer::init().unwrap();
+        let camera: CameraConfig = serde_json::from_value(serde_json::json!({
+            "id":"camera", "name":"Camera", "url":"rtsp://example.invalid/main",
+            "sub_url":"rtsp://example.invalid/sub", "transport":"tcp", "notes":""
+        }))
+        .unwrap();
+        let mut sub_camera = camera.clone();
+        sub_camera.url = "rtsp://example.invalid/sub".into();
+        let streams = StreamHubs::default();
+        let main = streams
+            .subscribe(&camera, SubscriberPolicy::shared_view(), None)
+            .unwrap();
+        let sub = streams
+            .subscribe(&sub_camera, SubscriberPolicy::shared_view(), None)
+            .unwrap();
+        let info = VideoInfo::builder(VideoFormat::Rgb, 1920, 1080)
+            .build()
+            .unwrap();
+        let sample = gstreamer::Sample::builder()
+            .caps(&info.to_caps().unwrap())
+            .build();
+        main.decoded().stable_picture(&sample);
+        let request = DecodedRequest {
+            formats: vec![RawFormat::Rgb24],
+            max_fps: 5,
+            min_width,
+            min_height,
+        };
+        let mut forwarder = Forwarder::new(sub.decoded(), request, streams.clone(), camera);
+        // Sub was being shared and has now stalled past the switch delay.
+        forwarder.active = Some(sub.decoded());
+        forwarder.seen = Instant::now() - SWITCH_DELAY;
+        (forwarder, streams, vec![main, sub])
+    }
+
+    #[test]
+    fn a_plugin_asking_for_no_minimum_size_never_leaves_its_own_stream() {
+        let (mut forwarder, streams, _hubs) = forwarder_on_a_stalled_sub(0, 0);
+        for _ in 0..3 {
+            // Past the 500 ms look for other channels, which min 0x0 never makes.
+            forwarder.checked = Instant::now() - Duration::from_secs(1);
+            assert!(
+                forwarder.picture().is_none(),
+                "a stalled own stream must not move the plugin to Main"
+            );
+        }
+        assert_eq!(forwarder.receivers.len(), 1, "only its own channel");
+        streams.shutdown();
+    }
+
+    /// Documents the opt-in: a nonzero minimum permits an already-visible
+    /// larger stream. Motion asks for none of it; Detector asks for 416 wide.
+    #[test]
+    fn a_plugin_asking_for_a_minimum_size_moves_to_a_larger_live_stream() {
+        let (mut forwarder, streams, hubs) = forwarder_on_a_stalled_sub(416, 0);
+        let (_, stable, source) = forwarder.picture().expect("Main is live and large");
+        assert!(stable);
+        assert!(Arc::ptr_eq(&source, &hubs[0].decoded()));
+        streams.shutdown();
+    }
+
     #[test]
     fn sharing_follows_the_plugins_rate_whatever_the_cameras_jitter() {
         let start = Instant::now();

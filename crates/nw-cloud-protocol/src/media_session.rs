@@ -546,6 +546,15 @@ pub struct PublishDirective {
     /// (and not serialised) on live directives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playback: Option<PlaybackControl>,
+    /// The viewer's browser cannot play this stream's codec: send it in one
+    /// it can. A node transcodes only when this is set and the granted
+    /// stream is H.265 (H.264 is forwarded unchanged). Older nodes refuse
+    /// it (`deny_unknown_fields`, and a batch is all or nothing), so a
+    /// control plane must set it only for a node whose inventory reports
+    /// transcode support; with that rule no protocol version bump is needed.
+    /// Absent (and not serialised) when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcode: bool,
 }
 
 /// Supported playback rates, in percent of real time.

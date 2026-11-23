@@ -96,6 +96,8 @@ pub struct NewEvent {
     pub score: Option<f32>,
     /// Keep the recordings it covers (bookmarks).
     pub kept: bool,
+    /// A plugin marked it a detection: listed, never alerting.
+    pub detection: bool,
 }
 
 impl NewEvent {
@@ -108,6 +110,7 @@ impl NewEvent {
             detail: None,
             score: None,
             kept: false,
+            detection: false,
         }
     }
 
@@ -267,6 +270,7 @@ impl EventHub {
             detail: event.detail,
             acknowledged: false,
             kept: event.kept,
+            detection: event.detection,
         };
         self.lock().open.insert(record.id, record.clone());
         self.write(Write::Insert(record.clone(), start_ms));
@@ -315,6 +319,11 @@ impl EventHub {
     }
 
     /// Events still going on.
+    /// One open event as it is now.
+    pub fn open_event(&self, id: i64) -> Option<EventRecord> {
+        self.lock().open.get(&id).cloned()
+    }
+
     pub fn open_events(&self) -> Vec<EventRecord> {
         let mut open: Vec<EventRecord> = self.lock().open.values().cloned().collect();
         open.sort_by_key(|record| record.id);

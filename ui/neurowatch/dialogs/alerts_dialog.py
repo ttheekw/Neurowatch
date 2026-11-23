@@ -43,6 +43,7 @@ from neurowatch.theme import (
     set_status_tone,
     themed_menu,
 )
+from neurowatch.utils.dialogs import run_dialog
 from neurowatch.utils.threads import Worker
 from neurowatch.widgets.window_chrome import install_dialog_chrome, resize_window
 
@@ -106,6 +107,13 @@ class AlertsDialog(QDialog):
         self._rules.itemChanged.connect(self._rule_toggled)
         self._rules.currentRowChanged.connect(lambda _row: self._sync_buttons())
         rules_layout.addWidget(self._rules, 1)
+        self._detections_note = QLabel(
+            "Events a plugin marks as detections are recorded and listed, but they never "
+            "send alerts, whatever the rules say."
+        )
+        self._detections_note.setWordWrap(True)
+        set_label_role(self._detections_note, "hint")
+        rules_layout.addWidget(self._detections_note)
         self._rules_empty = QLabel()
         self._rules_empty.setWordWrap(True)
         set_label_role(self._rules_empty, "hint")
@@ -329,7 +337,7 @@ class AlertsDialog(QDialog):
         taken = {c.id for c in self._settings.channels}
         channel = Channel(id=new_id(name, taken), name=name if kind == "desktop" else "", kind=kind)
         dialog = ChannelDialog(self._endpoint, channel, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if run_dialog(dialog) == QDialog.DialogCode.Accepted:
             self._settings.channels.append(dialog.channel)
             self._render()
             self._channels.setCurrentRow(len(self._settings.channels) - 1)
@@ -340,7 +348,7 @@ class AlertsDialog(QDialog):
         if not 0 <= row < len(self._settings.channels):
             return
         dialog = ChannelDialog(self._endpoint, self._settings.channels[row], self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if run_dialog(dialog) == QDialog.DialogCode.Accepted:
             self._settings.channels[row] = dialog.channel
             self._render()
             self._channels.setCurrentRow(row)
@@ -369,7 +377,7 @@ class AlertsDialog(QDialog):
             channels=[self._settings.channels[0].id] if len(self._settings.channels) == 1 else [],
         )
         dialog = RuleDialog(rule, self._cameras, self._settings.channels, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if run_dialog(dialog) == QDialog.DialogCode.Accepted:
             rule = dialog.rule
             rule.id = new_id(rule.name or "rule", taken)
             self._settings.rules.append(rule)
@@ -382,7 +390,7 @@ class AlertsDialog(QDialog):
         if not 0 <= row < len(self._settings.rules):
             return
         dialog = RuleDialog(self._settings.rules[row], self._cameras, self._settings.channels, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if run_dialog(dialog) == QDialog.DialogCode.Accepted:
             self._settings.rules[row] = dialog.rule
             self._render()
             self._rules.setCurrentRow(row)

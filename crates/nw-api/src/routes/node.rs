@@ -400,6 +400,7 @@ pub async fn publish_directives(
             },
             publisher_token,
             playback: None,
+            transcode: false,
         });
     }
     let batch = PublishDirectiveBatch {

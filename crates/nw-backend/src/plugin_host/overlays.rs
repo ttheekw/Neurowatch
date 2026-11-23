@@ -125,7 +125,9 @@ impl OverlayStore {
         }
     }
 
-    /// What `layer` of `plugin` shows on `camera_id` now (empty: nothing).
+    /// What `layer` of `plugin` shows on `camera_id` now (empty without a
+    /// picture: nothing, the layer is cleared; empty with a picture: that
+    /// picture was analysed and had nothing to draw, kept as a result).
     pub fn put(
         &self,
         camera_id: &str,
@@ -171,7 +173,7 @@ impl OverlayStore {
         let ttl = ttl_ms.map_or(DEFAULT_TTL, |ms| {
             Duration::from_millis(u64::from(ms)).clamp(MIN_TTL, MAX_TTL)
         });
-        let record = self
+        let mut record = self
             .history
             .as_ref()
             .map(|_| super::history::DrawingRecord {
@@ -188,15 +190,25 @@ impl OverlayStore {
                     .is_ok_and(|chosen| chosen.contains(&key)),
                 items: items.clone(),
             });
+        // An empty result for an identified picture is a result ("analysed,
+        // nothing to draw"): kept like any drawing so viewers can follow the
+        // plugin's picture clock. Only an empty one without a picture clears.
+        let identified = frame.is_some();
         if let Ok(mut entries) = self.entries.lock() {
-            if items.is_empty() {
+            if items.is_empty() && !identified {
                 if entries.remove(&key).is_none() {
                     return; // nothing shown, nothing changes
                 }
             } else {
-                if !entries.contains_key(&key) && !room_for(&mut entries, camera_id, plugin) {
+                let had_items = entries.get(&key).map(|entry| !entry.items.is_empty());
+                if had_items.is_none() && !room_for(&mut entries, camera_id, plugin) {
                     tracing::debug!(plugin, camera_id, "Too many drawing layers: dropped");
                     return;
+                }
+                if items.is_empty() && had_items != Some(true) {
+                    // Empty after empty (or after nothing): the history gains
+                    // nothing, only viewers need the newer picture.
+                    record = None;
                 }
                 entries.insert(
                     key,
@@ -562,6 +574,77 @@ mod tests {
         assert_eq!(store.snapshot(None)[0].camera_id, "c2");
         store.clear("motion", None);
         assert!(store.snapshot(None).is_empty());
+    }
+
+    #[test]
+    fn an_empty_result_with_a_picture_is_kept_and_one_without_clears() {
+        let store = OverlayStore::default();
+        let identity = |seq| crate::streams::frames::Identity {
+            seq,
+            time_us: 5_000_000 + seq as i64,
+            observed_us: 7_000_000 + seq as i64,
+        };
+        store.put_identified(
+            "c1",
+            "p",
+            "boxes",
+            vec![boxed(0.1)],
+            Some(identity(1)),
+            None,
+        );
+        let before = store.seq();
+        store.put_identified("c1", "p", "boxes", vec![], Some(identity(2)), Some(1500));
+        assert!(store.seq() > before, "a box ending is a change");
+        let shown = store.snapshot(None);
+        assert_eq!(shown.len(), 1, "replaces the layer's entry, no growth");
+        assert!(shown[0].items.is_empty());
+        assert_eq!(shown[0].frame, Some(2));
+        assert_eq!(shown[0].time_us, 5_000_002);
+        assert_eq!(shown[0].observed_us, Some(7_000_002));
+        assert_eq!(shown[0].lifetime_ms, 1500);
+        assert!(shown[0].ttl_ms > 1000);
+        let wire = serde_json::to_value(&shown[0]).unwrap();
+        assert_eq!(wire["items"], serde_json::json!([]));
+        assert_eq!(wire["frame"], 2);
+
+        // The next picture's empty result moves the identity on.
+        let before = store.seq();
+        store.put_identified("c1", "p", "boxes", vec![], Some(identity(3)), None);
+        assert!(store.seq() > before, "viewers need the newest identity");
+        assert_eq!(store.snapshot(None)[0].frame, Some(3));
+
+        // A new layer may start with an empty result; it lapses like any.
+        store.put_identified("c1", "p", "zones", vec![], Some(identity(3)), Some(100));
+        assert_eq!(store.snapshot(None).len(), 2);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(store.snapshot(None).len(), 1);
+
+        // Without a picture an empty overlay clears.
+        store.put("c1", "p", "boxes", vec![], None, None);
+        assert!(store.snapshot(None).is_empty());
+        let before = store.seq();
+        store.put("c1", "p", "boxes", vec![], None, None);
+        assert_eq!(store.seq(), before);
+    }
+
+    #[test]
+    fn empty_results_respect_the_layer_limits() {
+        let store = OverlayStore::default();
+        for layer in 0..(MAX_LAYERS_PER_CAMERA + 5) {
+            store.put("cam", "p", &format!("l{layer}"), vec![], Some(1), None);
+        }
+        assert_eq!(store.snapshot(None).len(), MAX_LAYERS_PER_CAMERA);
+        store.put(
+            "cam",
+            "p",
+            &"x".repeat(MAX_LAYER_ID + 1),
+            vec![],
+            Some(1),
+            None,
+        );
+        assert_eq!(store.snapshot(None).len(), MAX_LAYERS_PER_CAMERA);
+        store.put("cam", "p", "l0", vec![], Some(2), None);
+        assert_eq!(store.snapshot(None).len(), MAX_LAYERS_PER_CAMERA);
     }
 
     #[test]

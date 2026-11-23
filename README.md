@@ -37,6 +37,7 @@
   <a href="#installing"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-informational" alt="Linux and Windows"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0"></a>
   <a href="https://neurowatch.app"><img src="https://img.shields.io/badge/website-neurowatch.app-2563eb" alt="Website: neurowatch.app"></a>
+  <a href="https://deepwiki.com/ttheekw/Neurowatch"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
 </p>
 
 ### Why NeuroWatch
@@ -46,7 +47,7 @@
 - **Connect your existing cameras.** Add RTSP streams or use **Search Network** to discover ONVIF cameras. Compatibility depends on the camera's streams and ONVIF support.
 - **Keep recording in the background.** Recording carries on after you close the window, can start automatically, and reconnects cameras when they drop.
 - **Watch from anywhere, if you want to.** Optional NeuroWatch Cloud access shows your cameras in a browser. Cloud plans are separate from the desktop editions.
-- **Light by design, in Rust.** Recording, browser viewing and clip export never decode video, every reader of a camera stream shares one connection and one buffer, and a picture is decoded at most once however many walls and plugins use it. [How it works](#how-it-works).
+- **Light by design, in Rust.** Recording, browser viewing and clip export never decode video (the one exception: converting H.265 for a browser that can't play it), every reader of a camera stream shares one connection and one buffer, and a picture is decoded at most once however many walls and plugins use it. [How it works](#how-it-works).
 
 Comparing recorders? See [NeuroWatch compared with Frigate, Shinobi, Bluecherry, ZoneMinder, Agent DVR, Viseron, Scrypted and Blue Iris](docs/comparison.md), including when each one is the better choice.
 
@@ -95,21 +96,74 @@ NeuroWatch is **free and open source** ([Apache-2.0](LICENSE)), including its Ne
 
 ### Motion detection
 
-Motion detection is a plugin, **[NeuroWatch Motion](https://github.com/ttheekw/Neurowatch-Motion)**, installed separately: [download it](https://github.com/ttheekw/Neurowatch-Motion#download) for the computer NeuroWatch runs on (or another one), then add it once in **Plugins**.
+Motion detection is a free plugin, **[NeuroWatch Motion](https://github.com/ttheekw/Neurowatch-Motion)**, installed separately. It finds movement in your cameras' video and reports **Motion** events, with a box over what moved on the live wall. It runs as its own program, so recording carries on even if it stops (the status bar and tray then show **Plugin offline**), and it keeps working whether or not the NeuroWatch window is open.
 
-- **How it works:** NeuroWatch sends the plugin each chosen camera's video as the camera sent it (H.264 or H.265), and the plugin sends back motion events and drawings. The events are kept like any other (the **Events** tab, alerts, recording only when something happens); the drawings appear as boxes on the live wall, on the picture they describe. The plugin runs in its own process, so recording goes on even if it stops; the status bar and tray then show **Plugin offline**. Analysis runs whether or not the window is open.
-- **Who decodes:** by default (**Automatic**) the plugin reuses pictures NeuroWatch already decodes, for a video wall or for a stream you set to **Decode on this recorder all the time** (Edit Camera → **Motion**), at the rate it asks for, and decodes the camera itself only when there are none. **Always decode in the plugin** (the camera's plugin **Settings**) makes it decode by itself. Diagnostics shows which is happening.
-- **Its dashboard:** in NeuroWatch Cloud, a recorder's **Plugin dashboards** and a camera's **Plugin** tab open the motion dashboard: each camera's motion today, counts for the last hour, day and week, an hourly chart and recent motion to play.
+**1. Install it.** [Download NeuroWatch Motion](https://github.com/ttheekw/Neurowatch-Motion#download) for the computer NeuroWatch runs on:
+
+| System | Install |
+|---|---|
+| Windows 10/11 | Run `nw-motion-windows-x86_64-setup.exe`. It installs for your account and starts at sign-in. |
+| Ubuntu 22.04+, Debian 12+ | `sudo apt install ./nw-motion_amd64.deb` (ARM: `nw-motion_arm64.deb`) |
+| Fedora and other RPM systems | `sudo dnf install ./nw-motion.x86_64.rpm` (ARM: `nw-motion.aarch64.rpm`) |
+| Arch Linux | `sudo pacman -U nw-motion-x86_64.pkg.tar.zst` |
+
+The Linux packages start it as your account, now and at every sign-in. Nothing else needs setting up: it waits for NeuroWatch on a private local connection and opens no network port. Portable ZIP and tarball downloads are also available; you start those by hand.
+
+**2. Add it to NeuroWatch.** Open **Plugins** (administrators only) → **Add Plugin…** → **Local**: it is listed there, found on the same computer. Choose it and click **Add**, check the **Key fingerprint**, then click **Approve Key and Permissions**. This is needed once.
+
+**3. Choose cameras and settings.** Choose NeuroWatch Motion, click **Bind Camera…**, pick a camera, and set its **Settings**, on the desktop or in the portal (recorder managers: **Plugins** → NeuroWatch Motion → the camera → **Settings**). Every setting explains itself:
+
+| Setting | Default | What it does |
+|---|---|---|
+| Sensitivity | 5 (1–10) | Higher notices smaller changes, and gives more false alarms from rain, shadows or leaves |
+| Minimum duration | 0.5 s | Movement shorter than this is ignored, such as a flash of light |
+| Ends after quiet | 10 s | An event ends once nothing has moved for this long |
+| Keyframes only (low CPU) | off | Looks at about one picture every one or two seconds: far less processing, and quick movement can be missed |
+| Video decoder | Automatic | What decodes the video: a hardware decoder where one works, else the processor |
+| Watched areas | whole picture | Draw areas on the camera's picture: **+ Watch** where movement counts, **+ Ignore** where it never does |
+
+**4. Use it.** Motion events are kept like any other: the **Events** tab, [alerts](#alert-notifications), recording only when something happens, and the Motion sensor in [Home Assistant](#home-assistant-and-mqtt). On the Plugins page, **Live** shows its drawings and **Output** lists its events. In NeuroWatch Cloud, a recorder's **Plugin dashboards** and a camera's **Plugin** tab open the motion dashboard: each camera's motion today, how many motion events in the last hour, day and week, an hourly chart and recent motion to play.
 
   <img src="docs/images/portal-motion-dashboard.webp" width="640" alt="The NeuroWatch Motion dashboard in the web portal: two cameras with today's motion, one camera's counts for the last hour, today and 7 days, an hourly chart and recent motion events with Play buttons. The camera pictures are drawn mock scenes.">
 
-- **Set it up:** install NeuroWatch Motion, open **Plugins** (administrators only), **Add Plugin… → Local socket** (it is found on the same computer), check the key fingerprint and approve it. Then choose NeuroWatch Motion, **Bind Camera…**, then set sensitivity, minimum duration, cooldown, low CPU mode, the video decoder and watched/ignored zones in the camera's **Settings** (on the desktop or in the portal; every setting explains itself). **Live** shows its drawings and **Output** lists its events. Motion settings from earlier versions are kept: once Motion is installed and approved, they apply again.
-- **On another computer:** to take the work off the recorder, [download NeuroWatch Motion](https://github.com/ttheekw/Neurowatch-Motion#download) for that computer (Windows, or Linux on a 64-bit PC or ARM), start it with `nw-motion --listen quic:0.0.0.0:7690`, then in **Plugins → Add Plugin → URL** enter `quic://that-computer:7690`, check that the key fingerprint matches the one the plugin prints, and approve it. Its [instructions](https://github.com/ttheekw/Neurowatch-Motion#connect-it-to-neurowatch) also cover [access codes](https://github.com/ttheekw/Neurowatch-Motion#access-codes) that limit which recorders may use it (enter the code under **Vendor Credential…**).
+- **Who decodes:** NeuroWatch sends the plugin each chosen camera's video as the camera sent it (H.264 or H.265). By default (**Automatic**) the plugin reuses pictures NeuroWatch already decodes, for a video wall or for a stream you set to **Decode on this recorder all the time** (Edit Camera → **Decoding**), and decodes the camera itself only when there are none. **Always decode in the plugin** (the camera's plugin **Settings**) makes it decode by itself. Diagnostics shows which is happening.
+- **On another computer:** to take the work off the recorder, [download NeuroWatch Motion](https://github.com/ttheekw/Neurowatch-Motion#download) for that computer (Windows, or Linux on a 64-bit PC or ARM) and start it as its [remote mode instructions](https://github.com/ttheekw/Neurowatch-Motion#remote-mode-optional) show: `nw-motion --listen quic:0.0.0.0:7690` with an [access code](https://github.com/ttheekw/Neurowatch-Motion#access-codes) file, which limits which recorders may use it. Then in **Plugins → Add Plugin… → URL** enter `quic://that-computer:7690`, check that the key fingerprint matches the one the plugin prints, approve it, and enter the code under **Vendor Credential…**.
+- **Earlier settings:** motion settings from NeuroWatch versions that had motion built in are kept; once Motion is installed and approved, they apply again.
 - **Your camera's own detection** is separate and needs no plugin: see Camera motion events below.
+
+### Object detection
+
+People, cars, animals and other objects are found by a second free plugin, **[NeuroWatch Detect](https://github.com/ttheekw/Neurowatch-Detector)**, also installed separately. It runs beside NeuroWatch Motion and is a first release (version 0.1).
+
+- **What it finds:** its built-in model knows 80 everyday kinds of object, from people, cars, bicycles, buses and trucks to dogs, cats, birds, bags and suitcases. You tick the ones to report, and each is its own event, named after it ("Person", "Car", "Dog"), with a labelled box such as **Car 87%** around each one on the live wall. It reports what it sees; it does not count, and it does not recognise faces.
+- **How it works:** the model is small and built in, and runs on the processor: there is no graphics card to buy and no AI software to install. By default it looks at two pictures a second per camera.
+- **Why a separate program:** recording must never fail, so detection runs beside it, not inside it. If the detector crashes, falls behind or is being updated, recording carries on (the status bar and tray then show **Plugin offline**), and it can run on another computer.
+
+**1. Install it.** [Download NeuroWatch Detect](https://github.com/ttheekw/Neurowatch-Detector#download) for the computer NeuroWatch runs on and install it as for Motion: `nw-detect-windows-x86_64-setup.exe` on Windows, `sudo apt install ./nw-detect_amd64.deb` on Ubuntu and Debian, `sudo dnf install ./nw-detect.x86_64.rpm` on Fedora, `sudo pacman -U nw-detect-x86_64.pkg.tar.zst` on Arch Linux (ARM builds too). It starts by itself, now and at every sign-in.
+
+**2. Add it to NeuroWatch.** **Plugins** → **Add Plugin…** → **Local**, choose it and click **Add**, check the **Key fingerprint** and click **Approve Key and Permissions**. One camera can use both plugins.
+
+**3. Choose cameras and settings.** Choose NeuroWatch Detect, **Bind Camera…**, and set the camera's **Settings** (on the desktop or in the portal):
+
+| Setting | Default | What it does |
+|---|---|---|
+| Detect | Person and Car | Tick each kind of object to report, and set how sure the detector must be of it (**Confidence**, 10–95%, starting at 50%). Higher: fewer false alarms, and small or distant objects can be missed. Search the list to find a kind |
+| Minimum duration | 1 s | Something seen for less than this is not reported |
+| Ends after | 10 s | An event ends once none of its kind has been seen for this long |
+| Pictures analysed per second | 2 (1–10) | More catches quick visits and uses more processing |
+| Keyframes only (low CPU) | off | About one picture every one or two seconds |
+| Video decoder | Automatic | A hardware decoder where one works, else the processor |
+| Watched areas | whole picture | Areas to watch or ignore; an object counts where it stands, at the bottom of its box |
+
+**4. Use it.** Each ticked kind is its own event, alert and recording trigger: the **Events** tab shows "Car", "Dog" and so on, [alerts](#alert-notifications) can send "Car detected · Driveway", recording can keep only the moments something was found, and [Home Assistant](#home-assistant-and-mqtt) gets an **Object** sensor per camera, whose events name what was found.
+
+- **What to expect:** the built-in model is small. It is good on people and vehicles at normal camera distances in daylight, and weaker on small, distant or night-time objects. Raise that kind's confidence or use watched areas where it reports things that are not there. A larger model with its own list of kinds can be used instead; see its [models guide](https://github.com/ttheekw/Neurowatch-Detector/blob/main/models/README.md).
+- **On another computer:** [download NeuroWatch Detect](https://github.com/ttheekw/Neurowatch-Detector#download) there and start it as its [remote mode instructions](https://github.com/ttheekw/Neurowatch-Detector#remote-mode-optional) show, then add it in **Plugins → Add Plugin… → URL**, as for NeuroWatch Motion above.
 
 ### Events
 
 - **Motion detection:** by the NeuroWatch Motion plugin; see [Motion detection](#motion-detection).
+- **People, vehicles, animals and other objects:** by the NeuroWatch Detect plugin; see [Object detection](#object-detection).
 - **Camera motion events:** compatible ONVIF cameras can report their own motion detection. Turn on **Camera's own detection** in a camera's **Motion** tab (Edit Camera), and NeuroWatch records each motion event without continuously decoding video for detection. Event pictures use a short, one-frame snapshot. Supported camera analytics also report intrusion, line crossing, tampering and alarm inputs. The Motion tab shows whether the camera is sending its events. Set where and how sensitively the camera looks for motion in the camera's own web settings.
 - Cameras send their events straight to NeuroWatch when they can reach your computer (TCP port 7681; allow it in your firewall if one blocks cameras). Otherwise NeuroWatch asks each camera for its events every few seconds, automatically; the Motion tab says which.
 - **See events in the app:** the **Events** tab lists activity and alerts as they happen. Search your event history by camera, event or details; filter by camera, event type, ongoing/finished status and date range. Click a column heading to sort the loaded rows, and **Show Older** to go further back. Double-click an event to watch that moment in Playback. The tab counts new events while you're elsewhere; a camera's tile shows an orange **MOTION** badge while the camera sees motion.
@@ -126,7 +180,7 @@ Motion detection is a plugin, **[NeuroWatch Motion](https://github.com/ttheekw/N
 ### Home Assistant and MQTT
 
 - Open **Settings → Home Assistant**, enter your MQTT broker (for Home Assistant, the Mosquitto broker add-on's address, user name and password), press **Test Connection**, then **Save**.
-- Each camera then appears in Home Assistant by itself: **Motion**, **Person**, **Vehicle** and **Animal** sensors, **Online**, and a **Last event** picture. The recorder appears too, with a **Problem** sensor (recording failing, a drive full or missing, a plugin or Cloud Backup failing). Use them in automations like any other sensor.
+- Each camera then appears in Home Assistant by itself: **Motion**, **Person**, **Vehicle**, **Animal** and **Object** sensors, **Online**, and a **Last event** picture (Object is reported by [NeuroWatch Detect](#object-detection), whose events name what it found). The recorder appears too, with a **Problem** sensor (recording failing, a drive full or missing, a plugin or Cloud Backup failing). Use them in automations like any other sensor.
 - Not using Home Assistant? Any MQTT system can read the same topics: `neurowatch/<camera>/person` and the others are `ON` or `OFF`, `neurowatch/events` carries every event as JSON, and `neurowatch/status` says whether the recorder is online. Give each recorder on the same broker its own topic prefix.
 
 ### Local accounts and permissions
@@ -176,7 +230,7 @@ NeuroWatch Cloud is an optional online service for browser access. Its plans are
 - Light and dark themes.
 
 ### Coming later
-Email alerts, a local web interface, a multi-site desktop dashboard and native mobile apps remain planned. Object detection (people, vehicles and animals) comes as a separate plugin, NeuroWatch Detect, which is not yet included in the downloads. It is a separate program on purpose: recording must never fail, so detection runs beside it, not inside it. If the detector crashes, falls behind or is being updated, recording carries on, and it can run on another computer.
+Email alerts, a local web interface, a multi-site desktop dashboard and native mobile apps remain planned.
 
 ---
 
@@ -198,7 +252,7 @@ flowchart LR
 
 - **One connection, one buffer.** Each camera stream is opened once. Its compressed units go into a buffer that keeps the latest group of pictures (from the last keyframe), and recording, the desktop wall, browsers and plugins all read references to the same units, not copies. A new viewer or plugin starts from that keyframe straight away.
 - **Bounded, independent readers.** Every reader has its own bounded queue that skips ahead to the next keyframe or drops its oldest units when it falls behind. A slow browser or a busy plugin never holds up the camera or recording.
-- **Recording and viewing without decoding.** Video goes to disk as the camera compressed it (segmented Matroska), browsers receive it forwarded unchanged over WebRTC, and exports copy it into MP4. None of these decodes or re-encodes video.
+- **Recording and viewing without decoding.** Video goes to disk as the camera compressed it (segmented Matroska), browsers receive it forwarded unchanged over WebRTC, and exports copy it into MP4. None of these decodes or re-encodes video, with one exception: when a browser can't play a camera's H.265 and the camera has no H.264 stream to show instead, the recorder converts it for that browser (to H.264 on the graphics card, or VP8 on the processor) and says so on screen; the conversion stops when the last such viewer leaves.
 - **Decode once, share the pictures.** The desktop decodes only the cameras on screen, on the graphics card where it can (VA-API, NVDEC, Direct3D 11/12, Quick Sync, V4L2), with smaller substreams in grids. Plugins on the same computer reuse those pictures, or the pictures of a stream you choose to decode all the time, instead of decoding the camera again; a wall showing that stream borrows them too. Pictures are copied into each plugin's private read-only buffer, and graphics memory never leaves its pool.
 - **Pictures never reopen a camera.** Event pictures and portal thumbnails come from a recorded keyframe or a stream that is already open; only when there is neither does NeuroWatch ask the camera.
 - **Streams close when unused.** A stream nobody needs lingers a few seconds, then disconnects, and opens again on demand.
@@ -211,7 +265,9 @@ flowchart LR
 
 <img src="docs/images/portal-diagnostics-flow.webp" alt="The same three cameras in the NeuroWatch Cloud portal's Diagnostics page, drawn as trees in the portal's light theme.">
 
-There are no benchmark figures here on purpose: the load depends on your cameras, codecs, graphics hardware and how many are on screen. Diagnostics shows the real numbers for your own recorder. The full design is in [docs/architecture.md](docs/architecture.md), and [docs/analytics-plugins.md](docs/analytics-plugins.md) describes the plugin protocol and SDKs.
+There are no benchmark figures here on purpose: the load depends on your cameras, codecs, graphics hardware and how many are on screen. Diagnostics shows the real numbers for your own recorder. The full design, with sequence diagrams, is in [docs/technical](docs/technical/README.md) (also at [neurowatch.app/docs](https://neurowatch.app/docs)), and [docs/analytics-plugins.md](docs/analytics-plugins.md) describes the plugin protocol and SDKs.
+
+**Technical documentation**, with sequence diagrams, is on the website at [neurowatch.app/docs](https://neurowatch.app/docs) and in this repository under [docs/technical](docs/technical/README.md), generated from the same source.
 
 ---
 

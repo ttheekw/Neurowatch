@@ -54,6 +54,7 @@ from neurowatch.theme import (
     set_label_role,
     style_calendar,
 )
+from neurowatch.utils.dialogs import run_dialog
 from neurowatch.utils.threads import Worker, retire
 from neurowatch.widgets.cell_widget import AUDIO_AVAILABLE, AUDIO_NONE, AUDIO_ON, CellWidget
 from neurowatch.widgets.figures_legend import FiguresLegend
@@ -763,8 +764,7 @@ class PlaybackView(QWidget):
             self._ipc_endpoint(), cameras, int(at_ms), self, allow_every_camera=True
         )
         dialog.saved.connect(lambda _event: self._reload_motion_events())
-        dialog.exec()
-        dialog.deleteLater()
+        run_dialog(dialog)
 
     def _reload_motion_events(self) -> None:
         if self._event_scope is not None:

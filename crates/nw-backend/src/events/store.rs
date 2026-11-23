@@ -1,11 +1,11 @@
-//! The `events` table (schema v7, `kept` since v9, see [`crate::db::schema`]). Times are
+//! The `events` table (schema v7, `kept` since v9, `detection` since v12, see [`crate::db::schema`]). Times are
 //! milliseconds since the Unix epoch, like the recording index.
 
 use nw_core::event::{EventKind, EventRecord, EventSource};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 const COLUMNS: &str = "id, ts, end_ts, camera_id, event_type, source, topic, score, zones, \
-                       bbox, thumbnail, detail, acknowledged, kept";
+                       bbox, thumbnail, detail, acknowledged, kept, detection";
 
 /// Most events one query returns.
 pub const MAX_LIST: u32 = 1000;
@@ -13,8 +13,8 @@ pub const MAX_LIST: u32 = 1000;
 pub fn insert(conn: &Connection, record: &EventRecord, seen_ms: i64) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO events (id, ts, end_ts, last_ts, camera_id, event_type, source, \
-         topic, score, zones, bbox, thumbnail, detail, acknowledged, kept) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+         topic, score, zones, bbox, thumbnail, detail, acknowledged, kept, detection) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             record.id,
             record.start_ms,
@@ -31,6 +31,7 @@ pub fn insert(conn: &Connection, record: &EventRecord, seen_ms: i64) -> rusqlite
             record.detail,
             record.acknowledged,
             record.kept,
+            record.detection,
         ],
     )
     .map(|_| ())
@@ -40,7 +41,7 @@ pub fn insert(conn: &Connection, record: &EventRecord, seen_ms: i64) -> rusqlite
 pub fn update(conn: &Connection, record: &EventRecord, seen_ms: i64) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE events SET end_ts = ?2, last_ts = ?3, score = ?4, zones = ?5, bbox = ?6, \
-         thumbnail = ?7, detail = ?8 WHERE id = ?1",
+         thumbnail = ?7, detail = ?8, detection = ?9 WHERE id = ?1",
         params![
             record.id,
             record.end_ms,
@@ -50,6 +51,7 @@ pub fn update(conn: &Connection, record: &EventRecord, seen_ms: i64) -> rusqlite
             bbox_json(record),
             record.thumbnail,
             record.detail,
+            record.detection,
         ],
     )
     .map(|_| ())
@@ -309,6 +311,7 @@ fn from_row(row: &Row<'_>) -> rusqlite::Result<EventRecord> {
         detail: row.get(11)?,
         acknowledged: row.get(12)?,
         kept: row.get(13)?,
+        detection: row.get(14)?,
     })
 }
 
@@ -338,6 +341,7 @@ mod tests {
             detail: None,
             acknowledged: false,
             kept: false,
+            detection: false,
         }
     }
 

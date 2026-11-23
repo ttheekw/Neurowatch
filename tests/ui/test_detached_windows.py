@@ -867,3 +867,25 @@ def test_an_older_show_counts_choice_is_the_default_for_cameras_without_their_ow
     assert tile_choice(ui, "door") == (False, False)
     assert tile_choice(ui, "gate") == (True, True)
     assert tile_choice({"tile_plugins": "nonsense"}, "door") == (True, False)
+
+
+def test_the_wall_gets_every_layer_as_its_clock_and_paints_only_the_chosen_ones(win) -> None:
+    """Regression (2026-11-22): the wall was given only the chosen layers, so a
+    quiet scene with only Motion's boxes chosen had no picture clock."""
+    import time
+
+    from neurowatch.models.analytics import CameraPlugin, Drawing
+
+    _load(win, 1)
+    plugin = CameraPlugin("motion", "Motion", "running", wall_layers=frozenset({"detections"}))
+    win._on_analytics_cameras({"cam-0": [plugin]})
+    until = time.monotonic() + 60
+    named = {"frame": 7, "time_us": 700_000, "observed_us": 701_000}
+    boxes = Drawing("cam-0", "motion", "detections", (), until, **named)
+    debug = Drawing("cam-0", "motion", "debug", ({"type": "text", "lines": ["x"]},), until, **named)
+    win._on_analytics_drawings({"cam-0": [boxes, debug]})
+    wall = win._wall
+    assert [d.layer for d in wall._drawings_by_id["cam-0"]] == ["detections"], "only chosen painted"
+    assert {d.layer for d in wall._clock_by_id["cam-0"]} == {"detections", "debug"}, (
+        "every layer, hidden and empty ones included, is the picture clock"
+    )

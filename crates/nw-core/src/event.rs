@@ -57,6 +57,9 @@ pub enum EventKind {
     Vehicle,
     /// An animal in view (an object-detection plugin).
     Animal,
+    /// Something else a detection plugin was asked to find, named by the
+    /// plugin: its class's label is the event's `detail` ("Forklift").
+    Object,
     CameraOffline,
     RecordingFailed,
     DiskLow,
@@ -80,7 +83,7 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 19] = [
+    pub const ALL: [EventKind; 20] = [
         Self::Motion,
         Self::Intrusion,
         Self::LineCrossing,
@@ -90,6 +93,7 @@ impl EventKind {
         Self::Person,
         Self::Vehicle,
         Self::Animal,
+        Self::Object,
         Self::CameraOffline,
         Self::RecordingFailed,
         Self::DiskLow,
@@ -113,6 +117,7 @@ impl EventKind {
             Self::Person => "person",
             Self::Vehicle => "vehicle",
             Self::Animal => "animal",
+            Self::Object => "object",
             Self::CameraOffline => "camera_offline",
             Self::RecordingFailed => "recording_failed",
             Self::DiskLow => "disk_low",
@@ -141,12 +146,13 @@ impl EventKind {
                 | Self::Person
                 | Self::Vehicle
                 | Self::Animal
+                | Self::Object
         )
     }
 
     /// [`Self::is_activity`] kinds as an SQL list: `('motion', …)`.
     pub const ACTIVITY_SQL: &'static str =
-        "('motion','intrusion','line_crossing','person','vehicle','animal')";
+        "('motion','intrusion','line_crossing','person','vehicle','animal','object')";
 }
 
 /// Who reported an event.
@@ -224,6 +230,10 @@ pub struct EventRecord {
     /// footage it covers, and the bookmark never expires.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kept: bool,
+    /// A plugin marked it a detection: recorded and listed, never fires
+    /// alert rules. `false` (alert) for every other event.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detection: bool,
 }
 
 /// What changed about an event.
@@ -258,6 +268,16 @@ mod tests {
             );
         }
         assert_eq!(EventKind::parse("nope"), None);
+    }
+
+    #[test]
+    fn the_activity_sql_list_is_the_activity_kinds() {
+        let names: Vec<String> = EventKind::ALL
+            .into_iter()
+            .filter(|kind| kind.is_activity())
+            .map(|kind| format!("'{}'", kind.as_str()))
+            .collect();
+        assert_eq!(EventKind::ACTIVITY_SQL, format!("({})", names.join(",")));
     }
 
     #[test]

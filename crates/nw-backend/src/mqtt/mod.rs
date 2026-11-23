@@ -1,5 +1,5 @@
 //! MQTT and Home Assistant: NeuroWatch publishes its cameras' sensors
-//! (motion, person, vehicle, animal, online), the latest event picture, a
+//! (motion, person, vehicle, animal, object, online), the latest event picture, a
 //! recorder problem sensor and every event to an MQTT broker, and announces
 //! them to Home Assistant through MQTT discovery. Topics are in [`discovery`].
 //!
@@ -430,7 +430,7 @@ impl Publisher {
     }
 }
 
-/// Sensors each camera reported recently (person, vehicle, animal): those
+/// Sensors each camera reported recently (person, vehicle, animal, object): those
 /// are announced at connection even before their next event.
 async fn seen_sensors(
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
@@ -442,7 +442,7 @@ async fn seen_sensors(
         };
         let Ok(mut statement) = conn.prepare(
             "SELECT DISTINCT camera_id, event_type FROM events \
-             WHERE camera_id IS NOT NULL AND event_type IN ('person','vehicle','animal') AND ts >= ?1",
+             WHERE camera_id IS NOT NULL AND event_type IN ('person','vehicle','animal','object') AND ts >= ?1",
         ) else {
             return BTreeSet::new();
         };

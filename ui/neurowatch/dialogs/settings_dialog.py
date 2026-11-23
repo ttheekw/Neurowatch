@@ -5,7 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, QTime, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -65,6 +65,8 @@ from neurowatch.theme import (
     set_status_tone,
     style_button_box,
 )
+from neurowatch.utils.dialogs import run_dialog
+from neurowatch.utils.screens import screen_of
 from neurowatch.utils.threads import Worker, retire
 from neurowatch.widgets.form_parts import Segmented, settings_card
 from neurowatch.widgets.window_chrome import install_dialog_chrome, resize_window
@@ -183,9 +185,7 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        screen = (parent.screen() if parent is not None else None) or (
-            QGuiApplication.primaryScreen()
-        )
+        screen = screen_of(parent)
         available = screen.availableGeometry() if screen is not None else None
         minimum = _MIN_WIDTH
         self._opening_size = QSize(_MIN_WIDTH, _MIN_PAGE_HEIGHT + 140)
@@ -1135,7 +1135,7 @@ class SettingsDialog(QDialog):
         if self._scan is None:
             return
         picker = DrivePickerDialog(self._scan, self._rec_storage.text().strip(), self)
-        if picker.exec() != QDialog.DialogCode.Accepted:
+        if run_dialog(picker) != QDialog.DialogCode.Accepted:
             return
         drive = picker.chosen_drive()
         if drive is not None:

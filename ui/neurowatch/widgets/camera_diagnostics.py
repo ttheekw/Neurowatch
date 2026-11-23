@@ -139,6 +139,7 @@ _BOX_COLORS = {
     "stream": "#dbe7f4",
     "buffer": "#7dd3fc",
     "decoder": "#fbbf24",
+    "transcode": "#f59e0b",
     "plugin": "#c4b5fd",
     "consumer": "#64748b",
 }
@@ -283,7 +284,11 @@ class _FlowBox(QFrame):
             title_color = "#a5b4c9"
         self.title.setStyleSheet(
             f"background:transparent; border:none; color:{title_color}; font-size:11px;"
-            + ("font-weight:600;" if node.kind in ("stream", "buffer", "decoder") else "")
+            + (
+                "font-weight:600;"
+                if node.kind in ("stream", "buffer", "decoder", "transcode")
+                else ""
+            )
         )
         self.detail.set_full(node.detail)
         self.detail.setVisible(bool(node.detail))

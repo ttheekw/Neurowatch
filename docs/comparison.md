@@ -22,8 +22,8 @@ The same comparison is on the website: [neurowatch.app/compare](https://neurowat
 | **Installs like a desktop app** | ✅ Installer, or .deb, .rpm and Arch packages | ❌ Docker, set up with a configuration file | ❌ Install script on a Linux server | 🟡 Server packages plus client apps | ❌ Server packages and a web server | ✅ Installer | ❌ Docker | 🟡 Desktop app for the hub | ✅ Installer |
 | **Desktop video wall** | ✅ Multi-monitor walls with drag-and-drop layouts, paging and hardware decoding | ❌ Web interface | ❌ Web interface | ✅ Desktop client | ❌ Web interface | ❌ Web interface | ❌ Web interface | 🟡 Through its apps and smart-home apps | ✅ Windows console |
 | **Watch from anywhere without opening ports** | ✅ Optional cloud portal; the recorder connects out | 🟡 Your own VPN or reverse proxy, or Home Assistant's remote access | 🟡 Remote access is yours to set up | 🟡 Clients reach the server through a forwarded port or VPN | 🟡 Remote access is yours to set up | ✅ With a subscription | 🟡 Remote access is yours to set up | ✅ Through its cloud and smart-home apps | 🟡 A forwarded port or VPN |
-| **AI object detection** | 🟡 People, cars and animals with the free Detect plugin, on the processor. It runs as its own program, so recording never waits on it; no face recognition | ✅ Its main feature, with many accelerators, plus face recognition | 🟡 Through plugins | ❌ Motion detection | 🟡 Through an add-on | 🟡 Through a separate AI server | ✅ Objects and faces | 🟡 Through plugins | 🟡 Through a separate AI server |
-| **Home Assistant or MQTT** | ✅ MQTT with Home Assistant discovery: sensors for motion, people, cars and animals, camera status and event pictures | ✅ Built for it | 🟡 Through add-ons | ❌ No | 🟡 Through add-ons | ✅ MQTT | ✅ Home Assistant and MQTT | ✅ Home Assistant, Apple Home, Google Home, Alexa | ✅ MQTT |
+| **AI object detection** | 🟡 People, cars, dogs and the other everyday objects its model knows (80 kinds), with the free Detect plugin, on the processor, each kind with its own confidence. It runs as its own program, so recording never waits on it; no face recognition | ✅ Its main feature, with many accelerators, plus face recognition | 🟡 Through plugins | ❌ Motion detection | 🟡 Through an add-on | 🟡 Through a separate AI server | ✅ Objects and faces | 🟡 Through plugins | 🟡 Through a separate AI server |
+| **Home Assistant or MQTT** | ✅ MQTT with Home Assistant discovery: Motion and Object sensors, camera status and event pictures | ✅ Built for it | 🟡 Through add-ons | ❌ No | 🟡 Through add-ons | ✅ MQTT | ✅ Home Assistant and MQTT | ✅ Home Assistant, Apple Home, Google Home, Alexa | ✅ MQTT |
 | **Mobile app** | ❌ A web portal that works on phones; no app store app yet | 🟡 Web interface, or through the Home Assistant app | 🟡 Paid app | ✅ Yes | ✅ zmNinja | ✅ Yes | ❌ Web interface | ✅ Yes | ✅ Yes |
 | **Maturity** | New, in beta since 2026 | Since 2019, very active | Since 2016 | Many years; open source since 2019 | Since 2002 | Successor to iSpy | Since 2020 | Several years | Many years |
 
@@ -33,8 +33,8 @@ The same comparison is on the website: [neurowatch.app/compare](https://neurowat
 - **A real video wall.** Watch every camera in a desktop window, across several monitors, with layouts you arrange with the mouse, paging and auto-scroll. Most open-source recorders show cameras only in a browser.
 - **It keeps recording on its own.** Recording carries on after you close the window, starts with the computer, reconnects cameras that drop and restarts itself if it ever stops unexpectedly. A tray icon shows when something needs attention.
 - **Recording comes first.** Recording is the one job that must never fail, so detection runs beside it, not inside it. Motion and object detection are separate programs: if one crashes, falls behind or is updated, recording carries on, and a detector that falls behind skips pictures instead of holding up the camera. Detection can even run on another computer.
-- **Works with Home Assistant.** Point it at your MQTT broker and every camera appears in Home Assistant by itself, with motion, people, cars and animals, whether it is online and its latest event picture. Other automation systems can read the same MQTT topics.
-- **Light on the computer.** Recording, watching in a browser and exporting clips never decode the video. The recorder decodes only the cameras on screen, on the graphics card where it can, and motion analysis reuses those pictures instead of decoding again.
+- **Works with Home Assistant.** Point it at your MQTT broker and every camera appears in Home Assistant by itself, with Motion and Object sensors, whether it is online and its latest event picture. Other automation systems can read the same MQTT topics.
+- **Light on the computer.** Recording, watching in a browser and exporting clips never decode the video, except to convert H.265 for a browser that can't play it. The recorder decodes only the cameras on screen, on the graphics card where it can, and motion analysis reuses those pictures instead of decoding again.
 - **Watch from anywhere, if you want to.** Link the recorder to NeuroWatch Cloud with a one-time code and watch live or recorded video in a browser, H.264 and H.265 alike. The recorder connects out, so no ports are opened, and camera passwords are sealed for the recorder.
 - **Your footage stays safe.** It refuses to record into an empty folder when a drive or network share is missing, archives older footage to a NAS and checks every copy, keeps bookmarked footage from cleanup, and can back cameras up off-site with a key only you hold.
 - **Open source with a permissive licence.** Apache-2.0, business use included, with no contributor agreement. Free for up to 16 cameras, and the Unlimited edition is currently free with sign-up.
@@ -47,7 +47,7 @@ The same comparison is on the website: [neurowatch.app/compare](https://neurowat
 
 Choose Frigate if advanced AI detection is the main reason you want a recorder: many accelerators, face recognition, trainable classification and descriptions of what happened go well beyond NeuroWatch's detection, and you are comfortable with Docker and a configuration file.
 
-Choose NeuroWatch if you want to install a recorder on a Windows or Linux PC like any other app, watch a video wall on your own monitors, and reach your cameras from a browser without a VPN or reverse proxy. It works with Home Assistant over MQTT too, and its Detect plugin reports people, cars and animals as a separate program, so detection never holds up recording.
+Choose NeuroWatch if you want to install a recorder on a Windows or Linux PC like any other app, watch a video wall on your own monitors, and reach your cameras from a browser without a VPN or reverse proxy. It works with Home Assistant over MQTT too, and its Detect plugin reports people, cars and the other objects you choose as a separate program, so detection never holds up recording.
 
 ### NeuroWatch vs Shinobi
 
@@ -87,7 +87,7 @@ Choose NeuroWatch if you want an open-source recorder that businesses can use fo
 
 Choose Viseron if you want a small, MIT-licensed recorder in Docker focused on object and face detection.
 
-Choose NeuroWatch if you want a desktop app with a video wall, recording schedules, playback with a timeline and browser access without your own server setup, with people, cars and animals reported by its Detect plugin.
+Choose NeuroWatch if you want a desktop app with a video wall, recording schedules, playback with a timeline and browser access without your own server setup, with people, cars and other objects reported by its Detect plugin.
 
 ### NeuroWatch vs Scrypted
 
@@ -113,11 +113,11 @@ Most open-source recorders, such as Frigate, Shinobi, ZoneMinder and Viseron, ar
 
 ### Is NeuroWatch an alternative to Frigate?
 
-For many people, yes, but they suit different needs. Frigate is the stronger choice for advanced AI object detection, with face recognition, accelerators and trainable models. NeuroWatch is the easier choice if you want an installed app on Windows or Linux, a desktop video wall and browser access without setting up a VPN. Both work with Home Assistant over MQTT, and NeuroWatch's free Detect plugin reports people, cars and animals, running beside the recorder so recording never depends on it.
+For many people, yes, but they suit different needs. Frigate is the stronger choice for advanced AI object detection, with face recognition, accelerators and trainable models. NeuroWatch is the easier choice if you want an installed app on Windows or Linux, a desktop video wall and browser access without setting up a VPN. Both work with Home Assistant over MQTT, and NeuroWatch's free Detect plugin reports people, cars and the other objects you choose, running beside the recorder so recording never depends on it.
 
 ### Does NeuroWatch work with Home Assistant?
 
-Yes. In Settings → Home Assistant, enter your MQTT broker (for example the Mosquitto add-on) and each camera appears in Home Assistant by itself: motion, people, cars and animals, whether the camera is online, and its latest event picture, plus a problem sensor for the recorder. Any other MQTT system can read the same topics, including every event as JSON.
+Yes. In Settings → Home Assistant, enter your MQTT broker (for example the Mosquitto add-on) and each camera appears in Home Assistant by itself: Motion and Object sensors, whether the camera is online, and its latest event picture, plus a problem sensor for the recorder. Any other MQTT system can read the same topics, including every event as JSON.
 
 ### Why is object detection a separate plugin in NeuroWatch?
 
@@ -141,7 +141,7 @@ With NeuroWatch, yes: link the recorder to NeuroWatch Cloud with a one-time code
 
 ### What can't NeuroWatch do that others can?
 
-Its object detection is basic: the Detect plugin reports people, cars and animals on the processor, with no face recognition, trainable models or AI accelerators (Frigate and Viseron lead there). It has no app store mobile app, no macOS version and no email alerts, and Home Assistant cannot yet control it, only read its sensors and events. It is also new and in beta, while ZoneMinder, Bluecherry and Blue Iris have been used for many years.
+Its object detection is basic: the Detect plugin reports people, cars and the other everyday objects its model knows, on the processor, with no face recognition, trainable models or AI accelerators (Frigate and Viseron lead there). It has no app store mobile app, no macOS version and no email alerts, and Home Assistant cannot yet control it, only read its sensors and events. It is also new and in beta, while ZoneMinder, Bluecherry and Blue Iris have been used for many years.
 
 ### Who wrote this comparison?
 

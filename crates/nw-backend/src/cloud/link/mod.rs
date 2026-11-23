@@ -47,8 +47,8 @@ pub use exports::{ExportSource, SegmentLookup, EXPORT_PULL_OPERATION, EXPORT_REP
 #[cfg(test)]
 pub use inventory::camera_inventory;
 pub use inventory::{
-    camera_coverage, camera_inventory_with_live, reported_camera_ids, CameraCoverage,
-    CameraSnapshot, StreamVideo, MAX_COVERAGE_RANGES,
+    camera_coverage, camera_inventory_with_live, report_transcode, reported_camera_ids,
+    CameraCoverage, CameraSnapshot, StreamVideo, TranscodeSupport, MAX_COVERAGE_RANGES,
 };
 
 /// Supplies the current allowlisted camera inventory to the scheduler.

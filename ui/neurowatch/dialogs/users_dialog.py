@@ -37,6 +37,7 @@ from neurowatch.theme import (
     set_status_tone,
     style_button_box,
 )
+from neurowatch.utils.dialogs import run_dialog
 from neurowatch.utils.threads import Worker
 from neurowatch.widgets.window_chrome import install_dialog_chrome
 
@@ -374,20 +375,18 @@ class UsersDialog(QDialog):
 
     def _add(self) -> None:
         dialog = UserDialog(self._endpoint, self._cameras, None, self)
-        if dialog.exec() and dialog.saved is not None:
+        if run_dialog(dialog) and dialog.saved is not None:
             self._loaded({**dialog.saved, "enabled": self._enabled})
             self._note("User added.", "success")
-        dialog.deleteLater()
 
     def _edit(self) -> None:
         row = self.users.currentRow()
         if not 0 <= row < len(self._users):
             return
         dialog = UserDialog(self._endpoint, self._cameras, self._users[row], self)
-        if dialog.exec() and dialog.saved is not None:
+        if run_dialog(dialog) and dialog.saved is not None:
             self._loaded({**dialog.saved, "enabled": self._enabled})
             self._note("User saved.", "success")
-        dialog.deleteLater()
 
     def _remove(self) -> None:
         row = self.users.currentRow()

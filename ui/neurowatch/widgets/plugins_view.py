@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -76,6 +77,7 @@ from neurowatch.models.plugins import (
     PluginConnectionNotice,
     PluginsConfig,
     PluginServer,
+    binding_decoding,
     binding_text,
     connection_notices,
     parse_status,
@@ -88,6 +90,7 @@ from neurowatch.theme import (
     set_label_role,
     set_status_tone,
 )
+from neurowatch.utils.dialogs import run_dialog
 from neurowatch.widgets.analytics_paint import marker_pixmap
 from neurowatch.widgets.form_parts import settings_card
 
@@ -234,6 +237,9 @@ class PluginsView(QWidget):
         self.tree.setIndentation(18)
         self.tree.setIconSize(QSize(12, 12))
         self.tree.currentItemChanged.connect(self._on_tree_selection)
+        # Right-click: a camera's Open / Unbind, a plugin's Bind Camera.
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_tree_menu)
         side.addWidget(self.tree, 1)
         root.addWidget(self.side)
 
@@ -355,9 +361,18 @@ class PluginsView(QWidget):
         self.camera_status = QLabel("")
         self.camera_status.setWordWrap(True)
         titles.addWidget(self.camera_status)
+        # Who decodes its pictures and who scales them down, while it runs.
+        self.camera_decoding = QLabel("")
+        self.camera_decoding.setObjectName("pluginDecoding")
+        self.camera_decoding.setWordWrap(True)
+        set_label_role(self.camera_decoding, "hint")
+        self.camera_decoding.setVisible(False)
+        titles.addWidget(self.camera_decoding)
         header.addLayout(titles, 1)
-        self.unbind_button = QPushButton("Stop Analysing…")
-        self.unbind_button.setToolTip("Unbind this camera from the plugin")
+        self.unbind_button = QPushButton("Unbind Camera…")
+        self.unbind_button.setToolTip(
+            "Stop this plugin analysing this camera and remove its settings for it"
+        )
         set_button_variant(self.unbind_button, "secondary")
         self.unbind_button.clicked.connect(self._on_unbind_selected)
         header.addWidget(self.unbind_button, 0, Qt.AlignmentFlag.AlignTop)
@@ -975,6 +990,17 @@ class PluginsView(QWidget):
                 lambda _c=False, p=plugin, c=binding.camera_id: self.select(p, c)
             )
             line.addWidget(open_button)
+            if not hosted:
+                unbind = QPushButton("Unbind…")
+                unbind.setObjectName("pluginUnbind")
+                unbind.setToolTip(
+                    "Stop this plugin analysing this camera and remove its settings for it"
+                )
+                set_button_variant(unbind, "ghost")
+                unbind.clicked.connect(
+                    lambda _c=False, s=server, c=binding.camera_id: self._unbind(s, c)
+                )
+                line.addWidget(unbind)
             rows.addWidget(row)
         body.addLayout(rows)
         layout.addWidget(card)
@@ -1083,7 +1109,7 @@ class PluginsView(QWidget):
         plugin = self._selection[0] if self._selection is not None else ""
         mine = [d for d in self._drawings.get(camera_id, []) if d.plugin == plugin]
         shown = self._layers.shown(mine)
-        self.live_wall.set_drawings({camera_id: shown})
+        self.live_wall.set_drawings({camera_id: shown}, {camera_id: mine})
         self._marking_hold.update({f"{plugin}/{camera_id}": shown}, time.monotonic())
         self._show_figures()
 
@@ -1270,7 +1296,7 @@ class PluginsView(QWidget):
             return
         taken = [s.id for s in self._snapshot.config.servers]
         dialog = AddPluginDialog(taken, self, rpc=self._rpc)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if run_dialog(dialog) != QDialog.DialogCode.Accepted:
             return
         server = dialog.server()
         self._selection = (server.id, None)
@@ -1285,7 +1311,7 @@ class PluginsView(QWidget):
 
     def _credential(self, server: PluginServer) -> None:
         dialog = CredentialDialog(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if run_dialog(dialog) != QDialog.DialogCode.Accepted:
             return
         credential = dialog.credential()
 
@@ -1335,7 +1361,7 @@ class PluginsView(QWidget):
             endpoint=self._endpoint,
             parent=self,
         )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if run_dialog(dialog) != QDialog.DialogCode.Accepted:
             return
         binding = dialog.binding(server.id)
         self._selection = (server.id, binding.camera_id)
@@ -1343,21 +1369,61 @@ class PluginsView(QWidget):
 
     def _on_unbind_selected(self) -> None:
         selected = self._selected_binding()
-        if selected is None or self._snapshot is None:
+        if selected is None:
             return
         server, binding = selected
-        name = self._camera_name(binding.camera_id)
+        self._unbind(server, binding.camera_id)
+
+    def _unbind(self, server: PluginServer, camera_id: str) -> None:
+        """Unbind `camera_id` from `server`, after asking (a local plugin only:
+        a hosted plugin's cameras are chosen in NeuroWatch Cloud)."""
+        if self._snapshot is None or server.managed is not None:
+            return
+        if self._snapshot.config.binding(server.id, camera_id) is None:
+            return
+        name = self._camera_name(camera_id)
         if ask(
             self,
-            "Stop analysing camera",
-            f"Stop sending {name} to {self._title(server)}? Its settings for this camera "
-            "are removed.",
-            yes_text="Stop",
+            "Unbind camera",
+            f"Stop {self._title(server)} analysing {name}? Its settings for this camera "
+            "are removed. Events already recorded stay.",
+            yes_text="Unbind",
             no_text="Cancel",
             destructive=True,
         ):
             self._selection = (server.id, None)
-            self._apply(self._snapshot.config.without_binding(server.id, binding.camera_id))
+            self._apply(self._snapshot.config.without_binding(server.id, camera_id))
+
+    def _tree_menu(self, item: QTreeWidgetItem | None) -> QMenu | None:
+        """The right-click menu of a tree row: a camera's Open and Unbind, a
+        plugin's Bind Camera (local plugins only)."""
+        if item is None or self._snapshot is None:
+            return None
+        plugin, camera_id = item.data(0, Qt.ItemDataRole.UserRole)
+        server = self._server(plugin)
+        if server is None:
+            return None
+        menu = QMenu(self.tree)
+        if camera_id is not None:
+            menu.addAction("Open", lambda p=plugin, c=camera_id: self.select(p, c))
+            if server.managed is None:
+                menu.addSeparator()
+                menu.addAction("Unbind Camera…", lambda s=server, c=camera_id: self._unbind(s, c))
+        elif server.managed is None:
+            bound = {b.camera_id for b in self._snapshot.config.bindings_of(plugin)}
+            bind = menu.addAction("Bind Camera…", lambda s=server: self._on_bind(s))
+            bind.setEnabled(any(c.id not in bound for c in self._snapshot.cameras))
+        if menu.isEmpty():
+            menu.deleteLater()
+            return None
+        return menu
+
+    def _on_tree_menu(self, pos: Any) -> None:
+        menu = self._tree_menu(self.tree.itemAt(pos))
+        if menu is None:
+            return
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+        menu.deleteLater()
 
     # ------------------------------------------------------------------
     # Status
@@ -1407,14 +1473,31 @@ class PluginsView(QWidget):
         selected = self._selected_binding()
         if selected is not None:
             server, binding = selected
-            text, tone = self._binding_text(server, binding)
             status = snapshot.status.get(server.id)
             view = status.bindings.get(binding.camera_id) if status is not None else None
+            connected = status is not None and status.state == "connected"
+            # The decoding has lines of its own here, not the row's short words.
+            text, tone = binding_text(binding, view, connected, decoding=False)
+            plugin_name = self._title(server)
+            lines = (
+                binding_decoding(view, plugin_name)
+                if connected and binding.enabled and not binding.withdrawn
+                else None
+            )
+            decoding = (
+                "\n".join(
+                    [f"Decoding: {lines.decoding}"]
+                    + ([f"Scaling to analysis size: {lines.scaling}"] if lines.scaling else [])
+                )
+                if lines is not None
+                else ""
+            )
+            self.camera_decoding.setText(decoding)
+            self.camera_decoding.setVisible(bool(decoding))
             details = []
             if view is not None and view.format:
                 stream = {"sub": "sub stream", "main": "main stream"}.get(view.stream, "")
                 details.append(f"{stream} {view.format}".strip())
-            plugin_name = self._title(server)
             line = f"{plugin_name} · {text}"
             if details:
                 line += " · " + " · ".join(details)

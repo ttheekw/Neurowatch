@@ -127,6 +127,7 @@ pub fn label(kind: EventKind) -> &'static str {
         EventKind::Person => "Person detected",
         EventKind::Vehicle => "Vehicle detected",
         EventKind::Animal => "Animal detected",
+        EventKind::Object => "Object detected",
         EventKind::Tamper => "Camera tampering",
         EventKind::DigitalInput => "Alarm input",
         EventKind::CameraEvent => "Camera event",
@@ -182,13 +183,21 @@ fn local_offset(_at: time::OffsetDateTime) -> Option<time::UtcOffset> {
 
 /// The alert an event sends.
 pub fn alert_for(event: &EventRecord, camera_name: Option<&str>, rule: Option<&str>) -> Alert {
-    let what = label(event.kind);
+    // A plugin's own class names the event: "Forklift detected".
+    let named = (event.kind == EventKind::Object)
+        .then_some(event.detail.as_deref())
+        .flatten()
+        .filter(|d| !d.is_empty());
+    let what = match named {
+        Some(class) => format!("{class} detected"),
+        None => label(event.kind).to_owned(),
+    };
     let place = camera_name.unwrap_or("Recorder");
     let mut message = format!("{what} on {place} at {}", local_time(event.start_ms));
     if let Some(detail) = event
         .detail
         .as_deref()
-        .filter(|d| !d.is_empty() && Some(*d) != camera_name)
+        .filter(|d| named.is_none() && !d.is_empty() && Some(*d) != camera_name)
     {
         message.push_str(&format!(": {detail}"));
     }
@@ -329,6 +338,10 @@ impl AlertService {
         local: Option<(u8, usize)>,
         now: Instant,
     ) -> Vec<(AlertChannel, Alert)> {
+        // A detection is recorded and listed, never alerted.
+        if event.detection {
+            return Vec::new();
+        }
         let camera = event.camera_id.as_deref();
         let mut out: Vec<(AlertChannel, Alert)> = Vec::new();
         for rule in &config.rules {
@@ -407,6 +420,7 @@ impl AlertService {
             detail: None,
             acknowledged: false,
             kept: false,
+            detection: false,
         };
         let alert = Alert {
             title: format!("Test alert · {site}"),
@@ -454,11 +468,12 @@ impl AlertService {
             })
         };
         let mut notices = hub.subscribe();
+        let mut detections = DetectionWatch::default();
         loop {
             tokio::select! {
                 _ = shutdown.recv() => break,
                 notice = notices.recv() => match notice {
-                    Ok(notice) if notice.phase == EventPhase::Start => {
+                    Ok(notice) if detections.should_route(&notice) => {
                         let (config, names, headless) = {
                             let st = state.read().await;
                             let names = st.config.cameras.iter().map(|c| (c.id.clone(), c.name.clone())).collect();
@@ -501,6 +516,41 @@ impl AlertService {
             .send_http(&job.channel.target, &job.alert, picture.as_deref())
             .await;
         self.record(Self::delivery(&job.channel, &job.alert, result));
+    }
+}
+
+/// Most detections followed at once while they may be upgraded to alerts.
+const MAX_WATCHED_DETECTIONS: usize = 4096;
+
+/// Decides which hub notices the alert rules look at: an event's start, and
+/// the update that upgrades a detection to an alert (once, as if it had just
+/// started). A detection that never upgrades, and an alert that already
+/// fired, never route again.
+#[derive(Debug, Default)]
+struct DetectionWatch {
+    detections: std::collections::HashSet<i64>,
+}
+
+impl DetectionWatch {
+    fn should_route(&mut self, notice: &nw_core::event::EventNotice) -> bool {
+        let event = &notice.event;
+        match notice.phase {
+            EventPhase::Start => {
+                if event.detection {
+                    if self.detections.len() < MAX_WATCHED_DETECTIONS {
+                        self.detections.insert(event.id);
+                    }
+                    false
+                } else {
+                    true
+                }
+            }
+            EventPhase::Update => !event.detection && self.detections.remove(&event.id),
+            EventPhase::End => {
+                self.detections.remove(&event.id);
+                false
+            }
+        }
     }
 }
 
@@ -558,6 +608,7 @@ mod tests {
             detail: None,
             acknowledged: false,
             kept: false,
+            detection: false,
         }
     }
 
@@ -577,6 +628,59 @@ mod tests {
             ]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_detection_never_fires_a_rule() {
+        let service = AlertService::default();
+        let config = config();
+        let mut found = event(EventKind::Motion, Some("cam-1"));
+        found.detection = true;
+        let sent = service.route(&config, &HashMap::new(), &found, None, Instant::now());
+        assert!(sent.is_empty());
+        found.detection = false;
+        let sent = service.route(&config, &HashMap::new(), &found, None, Instant::now());
+        assert!(!sent.is_empty(), "the same event as an alert does fire");
+    }
+
+    fn notice(phase: EventPhase, id: i64, detection: bool) -> nw_core::event::EventNotice {
+        let mut found = event(EventKind::Person, Some("cam-1"));
+        found.id = id;
+        found.detection = detection;
+        nw_core::event::EventNotice {
+            seq: 1,
+            phase,
+            event: found,
+        }
+    }
+
+    #[test]
+    fn an_upgrade_fires_once_and_an_alert_start_fires_once() {
+        let mut watch = DetectionWatch::default();
+        // A detection stays quiet, then upgrades: one firing, never two.
+        assert!(!watch.should_route(&notice(EventPhase::Start, 1, true)));
+        assert!(!watch.should_route(&notice(EventPhase::Update, 1, true)));
+        assert!(watch.should_route(&notice(EventPhase::Update, 1, false)));
+        assert!(!watch.should_route(&notice(EventPhase::Update, 1, false)));
+        // An alert fires on its start, not on its updates.
+        assert!(watch.should_route(&notice(EventPhase::Start, 2, false)));
+        assert!(!watch.should_route(&notice(EventPhase::Update, 2, false)));
+        // A detection that ends is forgotten and never fires.
+        assert!(!watch.should_route(&notice(EventPhase::Start, 3, true)));
+        assert!(!watch.should_route(&notice(EventPhase::End, 3, true)));
+        assert!(!watch.should_route(&notice(EventPhase::Update, 3, false)));
+    }
+
+    #[test]
+    fn a_plugins_object_is_named_by_its_class() {
+        let mut found = event(EventKind::Object, Some("cam-1"));
+        found.detail = Some("Forklift".into());
+        let alert = alert_for(&found, Some("Yard"), None);
+        assert_eq!(alert.title, "Forklift detected · Yard");
+        assert!(alert.message.starts_with("Forklift detected on Yard at "));
+        assert!(!alert.message.ends_with(": Forklift"), "{}", alert.message);
+        let unnamed = alert_for(&event(EventKind::Object, Some("cam-1")), Some("Yard"), None);
+        assert_eq!(unnamed.title, "Object detected · Yard");
     }
 
     #[test]

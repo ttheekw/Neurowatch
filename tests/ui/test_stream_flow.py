@@ -4,16 +4,25 @@ from neurowatch.models.stream_flow import codec_text, flatten, stream_flow
 
 
 def _flow(row, plugins=(), **kwargs):
-    return stream_flow({"state": "streaming", "stream": "main", **row}, list(plugins),
-                       bitrate="2 Mbps", **kwargs)
+    return stream_flow(
+        {"state": "streaming", "stream": "main", **row}, list(plugins), bitrate="2 Mbps", **kwargs
+    )
 
 
 def test_buffer_feeds_consumers_and_decoding_is_its_own_box():
-    root = _flow({"roles": {"recording": 1, "desktop": 2, "browser": 1, "plugin": 1},
-                  "codec": "h264", "buffer_bytes": 1536, "buffer_units": 7, "queue_drops": 0,
-                  "fps": 25},
-                 [{"name": "Counting", "pictures": "compressed", "decoder": "NVIDIA NVDEC"}],
-                 desktop_decoder="VA-API", desktop_fps=25)
+    root = _flow(
+        {
+            "roles": {"recording": 1, "desktop": 2, "browser": 1, "plugin": 1},
+            "codec": "h264",
+            "buffer_bytes": 1536,
+            "buffer_units": 7,
+            "queue_drops": 0,
+            "fps": 25,
+        },
+        [{"name": "Counting", "pictures": "compressed", "decoder": "NVIDIA NVDEC"}],
+        desktop_decoder="VA-API",
+        desktop_fps=25,
+    )
     assert (root.kind, root.chip, root.detail) == ("stream", "H.264", "In 2 Mbps · 25.0 fps")
     (buffer,) = root.children
     assert (buffer.title, buffer.detail) == ("Frame buffer", "1.5 KiB · 7 frames · 0 drops")
@@ -31,9 +40,17 @@ def test_buffer_feeds_consumers_and_decoding_is_its_own_box():
 
 
 def test_a_shared_plugin_hangs_off_the_wall_decoder_dashed():
-    root = _flow({"roles": {"desktop": 1, "plugin": 1}},
-                 [{"name": "Motion", "pictures": "shared", "shared_fps": 9.5,
-                   "decoder": "Video wall pictures (no decoding here)"}])
+    root = _flow(
+        {"roles": {"desktop": 1, "plugin": 1}},
+        [
+            {
+                "name": "Motion",
+                "pictures": "shared",
+                "shared_fps": 9.5,
+                "decoder": "Video wall pictures (no decoding here)",
+            }
+        ],
+    )
     wall = root.children[0].children[0]
     assert wall.kind == "decoder"
     video_wall, motion = wall.children
@@ -41,17 +58,30 @@ def test_a_shared_plugin_hangs_off_the_wall_decoder_dashed():
     assert motion.detail == "Uses these decoded pictures · 9.5 fps", "the measured shared rate"
     assert not video_wall.dashed
     # Without a wall decoder on this stream it borrows another stream's.
-    root = _flow({"roles": {"plugin": 1}}, [{"name": "Motion", "pictures": "shared"}],
-                 shared_elsewhere="Main")
+    root = _flow(
+        {"roles": {"plugin": 1}},
+        [{"name": "Motion", "pictures": "shared"}],
+        shared_elsewhere="Main",
+    )
     (motion,) = root.children[0].children
     assert motion.dashed and motion.detail.endswith("(Main)")
 
 
 def test_an_always_on_decoder_feeds_the_plugins_and_the_wall_keeps_its_own():
-    plugins = [{"name": "Motion", "pictures": "shared", "shared_fps": 5.0},
-               {"name": "Counting", "pictures": "compressed", "decoder": "CPU (software)"}]
-    root = _flow({"roles": {"desktop": 1, "plugin": 2, "recording": 1}, "codec": "h264",
-                  "always_decoded": True}, plugins, desktop_decoder="VA-API", desktop_fps=9)
+    plugins = [
+        {"name": "Motion", "pictures": "shared", "shared_fps": 5.0},
+        {"name": "Counting", "pictures": "compressed", "decoder": "CPU (software)"},
+    ]
+    root = _flow(
+        {
+            "roles": {"desktop": 1, "plugin": 2, "recording": 1},
+            "codec": "h264",
+            "always_decoded": True,
+        },
+        plugins,
+        desktop_decoder="VA-API",
+        desktop_fps=9,
+    )
     buffer = root.children[0]
     assert [(n.kind, n.title, [c.title for c in n.children]) for n in buffer.children] == [
         ("consumer", "Recording", []),
@@ -65,17 +95,27 @@ def test_an_always_on_decoder_feeds_the_plugins_and_the_wall_keeps_its_own():
     # Nobody on a wall, nobody sharing yet: the decoder runs, and says so.
     idle = _flow({"roles": {}, "always_decoded": True}).children[0].children
     assert [(n.title, [c.title for c in n.children]) for n in idle] == [
-        ("Decoder · always on", ["Nothing uses these pictures yet"])]
+        ("Decoder · always on", ["Nothing uses these pictures yet"])
+    ]
     # A wall showing the stream uses the always-on pictures: no decoder of its own.
-    shared = _flow({"roles": {"plugin": 1}, "always_decoded": True, "shared_views": 2},
-                   [{"name": "Motion", "pictures": "shared"}]).children[0].children
+    shared = (
+        _flow(
+            {"roles": {"plugin": 1}, "always_decoded": True, "shared_views": 2},
+            [{"name": "Motion", "pictures": "shared"}],
+        )
+        .children[0]
+        .children
+    )
     assert [(n.title, [c.title for c in n.children]) for n in shared] == [
-        ("Decoder · always on", ["Video wall ×2", "Motion"])]
+        ("Decoder · always on", ["Video wall ×2", "Motion"])
+    ]
 
 
 def test_plugin_names_never_exceed_the_measured_count_and_unknowns_stay_unknown():
-    root = _flow({"roles": {"plugin": 1}}, [{"name": "A", "pictures": "compressed"},
-                                            {"name": "B", "pictures": "compressed"}])
+    root = _flow(
+        {"roles": {"plugin": 1}},
+        [{"name": "A", "pictures": "compressed"}, {"name": "B", "pictures": "compressed"}],
+    )
     titles = [r.node.title for r in flatten(root)[2:]]
     assert "B" not in " ".join(titles)
     assert _flow({"roles": {"plugin": 3}}).children[0].children[0].title == "Plugins ×3"
@@ -104,10 +144,15 @@ def test_flatten_gives_the_guides_a_tree_connector_needs():
 
 
 def test_words_for_no_decoder_of_its_own_are_never_shown_as_a_decoder():
-    for words in ("NeuroWatch's pictures (no decoding here)",
-                  "Video wall pictures (no decoding here)", "desktop (shared)"):
-        root = _flow({"roles": {"plugin": 1}},
-                     [{"name": "Motion", "pictures": "compressed", "decoder": words}])
+    for words in (
+        "NeuroWatch's pictures (no decoding here)",
+        "Video wall pictures (no decoding here)",
+        "desktop (shared)",
+    ):
+        root = _flow(
+            {"roles": {"plugin": 1}},
+            [{"name": "Motion", "pictures": "compressed", "decoder": words}],
+        )
         decoder = root.children[0].children[0]
         assert decoder.detail == "", words
 
@@ -120,3 +165,53 @@ def test_a_stream_cloud_backup_copies_shows_it_beside_the_recording():
     ]
     alone = _flow({"roles": {}, "cloud_backup": True})
     assert [n.title for n in alone.children[0].children] == ["Cloud backup"]
+
+
+def test_the_scaling_words_are_a_note_on_the_plugin_not_part_of_the_decoder():
+    root = _flow(
+        {"roles": {"plugin": 1}, "codec": "h265"},
+        [
+            {
+                "name": "Counting",
+                "pictures": "compressed",
+                "decoder": "VA-API (Intel, AMD) · scaled down on the GPU",
+            }
+        ],
+    )
+    (box,) = root.children[0].children
+    assert (box.title, box.detail) == ("H.265 decoder · in Counting", "VA-API (Intel, AMD)")
+    (plugin,) = box.children
+    assert (plugin.title, plugin.detail) == ("Counting", "Scales down on the GPU")
+    assert "scales the pictures down on the GPU" in box.description
+    # Shared pictures: the plugin decodes nothing, but still scales.
+    root = _flow(
+        {"roles": {"desktop": 1, "plugin": 1}},
+        [
+            {
+                "name": "Motion",
+                "pictures": "shared",
+                "shared_fps": 5.0,
+                "decoder": "NeuroWatch's pictures (no decoding here) · scaled down on the CPU",
+            }
+        ],
+    )
+    motion = root.children[0].children[0].children[1]
+    assert motion.detail == "Uses these decoded pictures · 5.0 fps · scales down on the CPU"
+
+
+def test_a_borrowed_decoder_is_named_with_its_hardware():
+    plugin = {
+        "name": "Motion",
+        "pictures": "shared",
+        "shared_fps": 5.0,
+        "shared_source": {"by": "always_on", "decoder": "VA-API"},
+    }
+    root = _flow({"roles": {"plugin": 1}}, [plugin], shared_elsewhere="Main")
+    (motion,) = root.children[0].children
+    assert motion.detail == "Uses the always-on decoder's pictures (Main) · VA-API · 5.0 fps"
+    wall = {**plugin, "shared_source": {"by": "video_wall", "decoder": "CPU"}}
+    (motion,) = _flow({"roles": {"plugin": 1}}, [wall]).children[0].children
+    assert motion.detail == "Uses the video wall's decoded pictures · CPU · 5.0 fps"
+    # A decoder box without the recorder's label takes the hardware from the plugin's row.
+    root = _flow({"roles": {"plugin": 1}, "always_decoded": True}, [plugin])
+    assert root.children[0].children[0].detail == "VA-API"

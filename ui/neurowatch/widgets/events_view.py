@@ -44,6 +44,7 @@ from neurowatch.theme import (
     set_label_role,
     set_status_tone,
 )
+from neurowatch.utils.dialogs import run_dialog
 from neurowatch.utils.threads import Worker, retire
 from neurowatch.widgets.event_list import EventImageLoader, EventListView
 from neurowatch.widgets.event_preview import EventPreview
@@ -738,8 +739,7 @@ class EventsView(QWidget):
         dialog = BookmarkDialog(self._endpoint, cameras, event.start_ms, self, event=event)
         # The recorder's change notice updates the row; show it at once too.
         dialog.saved.connect(lambda saved: self.add_notices([{"event": _as_dict(saved)}]))
-        dialog.exec()
-        dialog.deleteLater()
+        run_dialog(dialog)
 
     def _delete_bookmark(self, event: Event) -> None:
         from neurowatch.dialogs.confirm import confirm_action

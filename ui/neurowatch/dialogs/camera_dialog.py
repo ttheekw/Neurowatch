@@ -78,6 +78,7 @@ from neurowatch.theme import (
     set_status_tone,
     style_button_box,
 )
+from neurowatch.utils.screens import screen_of
 from neurowatch.utils.threads import Worker, retire
 from neurowatch.widgets.recording_policy import RecordingPolicyEditor
 from neurowatch.widgets.window_chrome import (
@@ -685,8 +686,7 @@ class AddEditCameraDialog(QDialog):
         self._body.invalidate()
 
     def _available_height(self) -> int:
-        parent = self.parentWidget()
-        screen = (parent.window().screen() if parent is not None else None) or self.screen()
+        screen = screen_of(self.parentWidget() or self)
         return screen.availableGeometry().height() if screen is not None else 10_000
 
     def showEvent(self, event: QShowEvent) -> None:
@@ -1156,8 +1156,9 @@ class AddEditCameraDialog(QDialog):
             return  # Wayland's card overlay centres the card itself
         parent = self.parentWidget()
         area = parent.window().frameGeometry() if parent is not None else None
-        if area is None and self.screen() is not None:
-            area = self.screen().availableGeometry()
+        screen = screen_of(self) if area is None else None
+        if screen is not None:
+            area = screen.availableGeometry()
         if area is not None:
             frame = self.frameGeometry()
             frame.moveCenter(area.center())

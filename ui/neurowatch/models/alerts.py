@@ -23,6 +23,7 @@ KIND_CHOICES: tuple[tuple[str, str], ...] = (
     ("person", "Person detected"),
     ("vehicle", "Vehicle detected"),
     ("animal", "Animal detected"),
+    ("object", "Object detected by a plugin"),
     ("tamper", "Camera tampering"),
     ("digital_input", "Alarm input"),
     ("camera_event", "Other camera events"),

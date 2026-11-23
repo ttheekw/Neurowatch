@@ -363,6 +363,10 @@ pub struct EventStart {
     /// The frame it started on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+    /// `Some(false)`: a detection (recorded and listed, never fires alert rules).
+    /// `Some(true)` or absent: an alert, as every plugin event was before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert: Option<bool>,
 }
 
 /// `event.update` (plugin → node): what the event covers so far.
@@ -377,6 +381,11 @@ pub struct EventUpdate {
     pub bbox: Option<[f32; 4]>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub zones: Vec<String>,
+    /// `Some(true)` upgrades an event that started as a detection to an
+    /// alert (an object entered an alert area later); an alert never goes
+    /// back to a detection. `Some(false)` and absent change nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert: Option<bool>,
 }
 
 /// `event.end` (plugin → node).
@@ -461,6 +470,37 @@ mod tests {
         assert_eq!(manifest.media.video.stream, StreamChoice::Sub);
         assert!(!manifest.media.video.keyframes_only);
         assert!(manifest.event_kinds.is_empty());
+    }
+
+    #[test]
+    fn events_carry_an_optional_alert_flag() {
+        // Old plugins send nothing: absent stays absent, both ways.
+        let start: EventStart =
+            serde_json::from_value(json!({"binding": 1, "event": 2, "kind": "person"})).unwrap();
+        assert_eq!(start.alert, None);
+        assert!(serde_json::to_value(&start).unwrap().get("alert").is_none());
+        let update: EventUpdate =
+            serde_json::from_value(json!({"binding": 1, "event": 2})).unwrap();
+        assert_eq!(update.alert, None);
+        assert!(serde_json::to_value(&update)
+            .unwrap()
+            .get("alert")
+            .is_none());
+        // The flag round-trips, and unknown fields are still ignored.
+        for flag in [false, true] {
+            let start: EventStart = serde_json::from_value(
+                json!({"binding": 1, "event": 2, "kind": "person", "alert": flag, "later": 1}),
+            )
+            .unwrap();
+            assert_eq!(start.alert, Some(flag));
+            let again: EventStart =
+                serde_json::from_value(serde_json::to_value(&start).unwrap()).unwrap();
+            assert_eq!(again, start);
+            let update: EventUpdate =
+                serde_json::from_value(json!({"binding": 1, "event": 2, "alert": flag})).unwrap();
+            assert_eq!(update.alert, Some(flag));
+            assert_eq!(serde_json::to_value(&update).unwrap()["alert"], json!(flag));
+        }
     }
 
     #[test]

@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
 )
 
 from neurowatch.theme import active_colors
+from neurowatch.utils.screens import screen_of
 from neurowatch.widgets.chrome_glyphs import GlyphButton
 
 logger = logging.getLogger(__name__)
@@ -669,7 +670,7 @@ class CardOverlay(QObject):
 
     def _cover_screen(self) -> None:
         parent = self._dialog.parentWidget()
-        screen = parent.window().screen() if parent is not None else None
+        screen = screen_of(parent) if parent is not None else None
         screen = (
             screen or QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
         )

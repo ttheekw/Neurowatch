@@ -508,6 +508,9 @@ impl RpcHandler {
                 .offline(&st.config.plugins.servers, crate::plugin_host::OFFLINE_AFTER),
             // Cloud Backup at a glance (the status bar's and the tray's symbol).
             "backup": backup_summary(&st),
+            // H.265 streams being converted for browsers that cannot play
+            // them (from, to, decoder, encoder, viewers); empty when none.
+            "transcodes": st.streams.transcodes(),
         }))
     }
 
@@ -1545,6 +1548,11 @@ mod tests {
         assert!(response["result"]["version"].is_string());
         assert!(response["result"]["uptime_sec"].is_u64());
         assert_eq!(response["result"]["headless"], false);
+        assert_eq!(
+            response["result"]["transcodes"],
+            serde_json::json!([]),
+            "no browser is being served a converted stream"
+        );
     }
 
     #[tokio::test]

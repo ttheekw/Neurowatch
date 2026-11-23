@@ -530,3 +530,386 @@ def test_a_tile_with_plugin_drawings_shows_only_the_analysed_pictures(qtbot) -> 
     wall.set_drawings({"c1": [_analysed(13)]})
     arrive(15)
     assert cell._frame_identity[0] == 15
+
+
+def _motion_wall(qtbot):
+    from neurowatch.models.camera import CameraConfig
+    from neurowatch.widgets.video_wall import VideoWallWidget
+
+    wall = VideoWallWidget()
+    qtbot.addWidget(wall)
+    wall.set_grid(1, 1)
+    wall.set_cameras([CameraConfig(id="c1", name="Road", url="rtsp://x/1")])
+    wall.set_analytics({"c1": ("Analysed by Motion (running)", True)})
+    return wall
+
+
+class _Clock:
+    now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _replay_sparse(qtbot, monkeypatch, *, layers: str, picture=(1920, 1080), delay_frames=37):
+    """Motion at 25 fps with an analysis every 5th picture (5 fps), results
+    ``delay_frames`` later, each living 1.5 s from its arrival."""
+    import types
+
+    from neurowatch.models.analytics import Drawing
+    from neurowatch.widgets import cell_widget, video_wall
+
+    clock = _Clock()
+    fake = types.SimpleNamespace(monotonic=clock.monotonic, time=video_wall.time.time)
+    monkeypatch.setattr(video_wall, "time", fake)
+    monkeypatch.setattr(cell_widget, "time", fake)
+    wall = _motion_wall(qtbot)
+    cell = wall._cells[0]
+    pw, ph = picture
+    size = pw * ph * 3
+    step = 40_000
+    quiet, burst = 250, 100
+    got: list[int] = []
+    for n in range(1, quiet + burst + delay_frames + 60):
+        clock.now += step / 1e6
+        us = n * step
+        wall._on_identified_frame_ready("c1", bytes([n % 250 + 1]) * size, pw, ph, "rgb", n, us, us)
+        wall._flush_pending_frames()
+        d = n - delay_frames
+        if d >= 1 and d % 5 == 0:
+            dus = d * step
+            items = []
+            until = clock.now + 1.5
+            if layers == "both":
+                items.append(
+                    Drawing("c1", "motion", "debug", ({"n": 1},), until, d, dus, 1500, dus)
+                )
+            if quiet < d <= quiet + burst:
+                items.append(
+                    Drawing("c1", "motion", "detections", ({"n": 2},), until, d, dus, 1500, dus)
+                )
+            wall.set_drawings({"c1": items} if items else {})
+        if n > quiet + delay_frames:
+            drawn = cell._drawing_history.shown(cell._frame_identity, clock.now)
+            if (
+                cell._drawings
+                and not cell._drawings_paused
+                and any(
+                    x.layer == "detections" and x.frame == cell._frame_identity[0] for x in drawn
+                )
+            ):
+                got.append(n)
+    return got
+
+
+def test_motion_boxes_alone_find_their_pictures_from_the_first_result(qtbot, monkeypatch) -> None:
+    """Reported: with only the plugin's boxes layer chosen the wall showed
+    nothing (with its analysis layer too, it did). The boxes come only during
+    motion, so no result had been seen to measure the delay by, and the byte
+    budget held every picture of a large stream: the first results of a burst
+    described pictures already dropped. Each of the burst's 100 pictures shows
+    its boxes, with or without the analysis layer."""
+    for picture, delay_frames in (((1920, 1080), 50), ((3840, 2160), 37)):
+        both = _replay_sparse(
+            qtbot, monkeypatch, layers="both", picture=picture, delay_frames=delay_frames
+        )
+        only = _replay_sparse(
+            qtbot, monkeypatch, layers="boxes", picture=picture, delay_frames=delay_frames
+        )
+        assert len(both) == 100, f"{picture}: both layers {both[:3]}"
+        assert len(only) == 100, f"{picture}: boxes only, first at {only[:3]}"
+
+
+def _replay_steady(qtbot, monkeypatch, *, results: str, delay_frames: int = 37):
+    """Motion at 25 fps, an analysis of every 5th picture, results
+    ``delay_frames`` later (each living 1.5 s from arrival), the user showing
+    only the boxes layer: 10 s quiet, a 4 s burst, 6 s quiet. ``results``:
+
+    - ``every``: the plugin answers every picture on every layer, an empty
+      boxes layer in the quiet (the newer contract).
+    - ``hidden``: the older plugin: the debug layer (not chosen) every
+      picture, the boxes layer only in the burst.
+
+    Returns, per tick after the first result, the picture shown and whether
+    boxes are painted on it."""
+    import types
+
+    from neurowatch.models.analytics import Drawing
+    from neurowatch.widgets import cell_widget, video_wall
+
+    clock = _Clock()
+    fake = types.SimpleNamespace(monotonic=clock.monotonic, time=video_wall.time.time)
+    monkeypatch.setattr(video_wall, "time", fake)
+    monkeypatch.setattr(cell_widget, "time", fake)
+    wall = _motion_wall(qtbot)
+    cell = wall._cells[0]
+    step = 40_000
+    quiet, burst = 250, 100
+    box = {"type": "box", "rect": [0.2, 0.3, 0.1, 0.1], "label": "Motion"}
+    shown: list[tuple[int, bool]] = []
+    started = False
+    for n in range(1, quiet + burst + 150 + delay_frames):
+        clock.now += step / 1e6
+        us = n * step
+        wall._on_identified_frame_ready(
+            "c1", bytes([n % 250 + 1]) * (64 * 36 * 3), 64, 36, "rgb", n, us, us
+        )
+        d = n - delay_frames
+        if d >= 1 and d % 5 == 0:
+            started = True
+            dus = d * step
+            until = clock.now + 1.5
+            in_burst = quiet < d <= quiet + burst
+
+            def result(layer: str, items: tuple, d=d, dus=dus, until=until) -> Drawing:
+                return Drawing("c1", "motion", layer, items, until, d, dus, 1500, dus)
+
+            boxes = (box,) if in_burst else ()
+            if results == "every":
+                chosen = [result("detections", boxes)]
+                wall.set_drawings(
+                    {"c1": chosen}, {"c1": [result("debug", ({"type": "text"},)), *chosen]}
+                )
+            else:
+                chosen = [result("detections", boxes)] if in_burst else []
+                clock_all = [result("debug", ({"type": "text"},)), *chosen]
+                wall.set_drawings({"c1": chosen} if chosen else {}, {"c1": clock_all})
+        wall._flush_pending_frames()
+        if started:
+            seen = cell._drawing_history.shown(cell._frame_identity, clock.now)
+            painted = bool(
+                cell._drawings
+                and not cell._drawings_paused
+                and any(x.items and x.frame == cell._frame_identity[0] for x in seen)
+            )
+            shown.append((cell._frame_identity[0], painted))
+    return shown
+
+
+def test_a_tile_with_plugin_drawings_keeps_the_plugins_rate_in_the_quiet_too(
+    qtbot, monkeypatch
+) -> None:
+    """Reported: with only Motion's boxes chosen the tile was live until
+    motion started, then dropped to the analysed pictures (5 fps, behind
+    live), which showed as lag. With a result for every analysed picture, also
+    the empty ones and the layers not chosen, the tile shows only analysed
+    pictures from the first result on, and the boxes sit on their pictures."""
+    for results in ("every", "hidden"):
+        shown = _replay_steady(qtbot, monkeypatch, results=results)
+        assert len(shown) > 400, results
+        assert all(n % 5 == 0 for n, _p in shown), f"{results}: a live picture in {shown[:50]}"
+        for second in range(0, len(shown) - 25, 25):
+            window = shown[second : second + 25]
+            assert len({n for n, _p in window}) <= 6, f"{results}: {window}"
+        painted = {n for n, p in shown if p}
+        burst = {n for n in range(255, 355) if n % 5 == 0}
+        assert painted == burst, f"{results}: boxes on their own pictures only: {sorted(painted)}"
+
+
+def test_empty_results_with_a_picture_are_results_without_drawing_anything() -> None:
+    from neurowatch.models.analytics import (
+        CameraPlugin,
+        analysed_target,
+        analysing_clock,
+        markings_drawn,
+        on_wall,
+        parse_overlays,
+    )
+
+    def entry(layer: str, items: list, **extra) -> dict:
+        return {
+            "camera_id": "c",
+            "plugin": "motion",
+            "layer": layer,
+            "items": items,
+            "ttl_ms": 1500,
+            "lifetime_ms": 1500,
+            **extra,
+        }
+
+    named = {"frame": 7, "time_us": 700_000, "observed_us": 701_000}
+    parsed = parse_overlays(
+        {
+            "overlays": [
+                entry("detections", [], **named),
+                entry("debug", [{"type": "text", "lines": ["x"]}], **named),
+                entry("lines", []),  # no picture named: cleared, as before
+            ]
+        },
+        10.0,
+    )["c"]
+    assert [(d.layer, d.items == ()) for d in parsed] == [("detections", True), ("debug", False)]
+    assert analysed_target(parsed[:1], 10.0) is not None, "an empty result is a current result"
+    assert markings_drawn(parsed[:1]) == ()
+    plugin = CameraPlugin("motion", "Motion", "running", wall_layers=frozenset({"detections"}))
+    shown = on_wall({"c": parsed}, {"c": [plugin]}, "chosen")["c"]
+    assert [d.layer for d in shown] == ["detections"]
+    clock = analysing_clock({"c": parsed}, {"c": [plugin]}, "chosen")["c"]
+    assert {d.layer for d in clock} == {"detections", "debug"}, "hidden layers pace the tile"
+    assert analysing_clock({"c": parsed}, {"c": []}, "chosen") == {}
+    assert analysing_clock({"c": parsed}, {"c": [plugin]}, "off") == {}
+
+
+def test_every_layer_of_a_result_is_drawn_on_a_main_stream_tile(qtbot, monkeypatch) -> None:
+    """Reported: on a main-stream (1080p) tile parts of a drawing were missing.
+    Layers of the same analysed picture reach the tile at different moments
+    (the boxes first, the zones and score text a few ticks later, or the other
+    way round); once both are here the picture carries both, and a layer that
+    was missing never shows one of an earlier picture instead."""
+    import types
+
+    from neurowatch.models.analytics import Drawing
+    from neurowatch.widgets import cell_widget, video_wall
+
+    clock = _Clock()
+    fake = types.SimpleNamespace(monotonic=clock.monotonic, time=video_wall.time.time)
+    monkeypatch.setattr(video_wall, "time", fake)
+    monkeypatch.setattr(cell_widget, "time", fake)
+    wall = _motion_wall(qtbot)
+    cell = wall._cells[0]
+    step = 40_000
+    size = 1920 * 1080 * 3
+    pending: list[tuple[int, list[Drawing]]] = []  # (arrives at picture, results)
+    results: dict[str, Drawing] = {}
+    complete: list[int] = []
+    for n in range(1, 400):
+        clock.now += step / 1e6
+        us = n * step
+        wall._on_identified_frame_ready(
+            "c1", bytes([n % 250 + 1]) * size, 1920, 1080, "rgb", n, us, us
+        )
+        d = n - 30
+        if d >= 1 and d % 5 == 0:
+            dus = d * step
+            until = clock.now + 1.5
+            box = {"type": "box", "rect": [0.2, 0.3, 0.1, 0.1], "label": "Motion"}
+            zone = {"type": "polygon", "points": [[0, 0], [1, 0], [1, 1]], "label": "Zone"}
+            text = {"type": "text", "anchor": "bottom_left", "lines": ["Score"]}
+            first = Drawing("c1", "motion", "detections", (box,), until, d, dus, 1500, dus)
+            rest = Drawing("c1", "motion", "debug", (zone, text), until, d, dus, 1500, dus)
+            order = (first, rest) if (d // 5) % 2 else (rest, first)
+            pending.append((n, [order[0]]))
+            pending.append((n + 3, [order[1]]))
+        for _due, layers in [p for p in pending if p[0] <= n]:
+            for layer in layers:
+                results[layer.layer] = layer
+        pending = [p for p in pending if p[0] > n]
+        if results:
+            wall.set_drawings({"c1": list(results.values())})
+        wall._flush_pending_frames()
+        if n > 100:
+            seen = cell._drawing_history.shown(cell._frame_identity, clock.now)
+            on_picture = {x.layer for x in seen if x.frame == cell._frame_identity[0] and x.items}
+            if len(on_picture) == 2:
+                complete.append(cell._frame_identity[0])
+    pictures = {n for n in range(105, 370) if n % 5 == 0}
+    assert pictures <= set(complete), (
+        f"pictures without both layers: {sorted(pictures - set(complete))}"
+    )
+
+
+def _replay_main_tile(qtbot, monkeypatch, *, offset_us: int, chosen: frozenset[str]):
+    """Motion on the sub stream (its own sequence numbers and capture clock,
+    25 fps, every 5th picture analysed, results 0.3-1.5 s late, every layer
+    each time: the zones and score always, the box in a 4 s burst), the tile on
+    the main stream (1080p, 25 fps, its pictures reaching the recorder
+    ``offset_us`` after the sub's, decoded 60 ms later). Returns, per 10 ms
+    tick showing an analysed picture, its receipt time and the layers painted."""
+    import random
+    import types
+
+    from neurowatch.models.analytics import CameraPlugin, Drawing, analysing_clock, on_wall
+    from neurowatch.widgets import cell_widget, video_wall
+
+    clock = _Clock()
+    fake = types.SimpleNamespace(monotonic=clock.monotonic, time=video_wall.time.time)
+    monkeypatch.setattr(video_wall, "time", fake)
+    monkeypatch.setattr(cell_widget, "time", fake)
+    wall = _motion_wall(qtbot)
+    cell = wall._cells[0]
+    cameras = {"c1": [CameraPlugin("motion", "Motion", "running", wall_layers=chosen)]}
+    rng = random.Random(7)
+    box = {"type": "box", "rect": [0.2, 0.3, 0.1, 0.1], "label": "Motion"}
+    zone = {"type": "polygon", "points": [[0.1, 0.1], [0.9, 0.1], [0.9, 0.9]], "label": "ROI"}
+    text = {"type": "text", "anchor": "bottom_left", "lines": ["Score"]}
+    base = 1_000_000_000
+    size = 1920 * 1080 * 3
+    seq = 0
+    sub_pictures = 0
+    results: list[tuple[int, list[Drawing]]] = []  # (arrives at, layers)
+    tile: list[tuple[int, tuple[int, int, int]]] = []  # (decoded at, identity)
+    store: dict[str, Drawing] = {}
+    arrived_last = 0
+    shown: list[tuple[int, set[str]]] = []
+    for t in range(0, 16_000_000, 10_000):
+        clock.now = 1000.0 + t / 1e6
+        if t % 40_000 == 0:  # a sub picture: the plugin analyses every 5th
+            seq += 1
+            sub_pictures += 1
+            if sub_pictures % 5 == 0:
+                observed = base + t
+                arrives = max(arrived_last + 1, t + rng.randint(300_000, 1_500_000))
+                arrived_last = arrives
+                moving = 6_000_000 <= t < 10_000_000
+
+                def result(layer: str, items: tuple, n=seq, at=observed) -> Drawing:
+                    return Drawing("c1", "motion", layer, items, 0, n, at - 5_000_000, 1500, at)
+
+                boxes = (box,) if moving else ()
+                results.append(
+                    (arrives, [result("detections", boxes), result("debug", (zone, text))])
+                )
+        if t % 40_000 == 20_000:  # a main picture, numbered among the camera's
+            seq += 1
+            observed = base + t + offset_us
+            tile.append((t + offset_us + 60_000, (seq, observed + 3_000_000, observed)))
+        for _due, identity in [p for p in tile if p[0] <= t]:
+            wall._on_identified_frame_ready(
+                "c1", bytes([identity[0] % 250 + 1]) * size, 1920, 1080, "rgb", *identity
+            )
+        tile = [p for p in tile if p[0] > t]
+        due = [r for r in results if r[0] <= t]
+        results = [r for r in results if r[0] > t]
+        for arrives, layers in due:
+            for layer in layers:
+                store[layer.layer] = dataclasses.replace(layer, until=1000.0 + arrives / 1e6 + 1.5)
+        if due:
+            current = {"c1": [d for d in store.values() if d.until > clock.now]}
+            wall.set_drawings(
+                on_wall(current, cameras, "chosen"), analysing_clock(current, cameras, "chosen")
+            )
+        wall._flush_pending_frames()
+        pictures = wall._analysed.get("c1")
+        if pictures is not None and pictures.shown is not None and cell._frame_size == (1920, 1080):
+            seen = cell._drawing_history.shown(cell._frame_identity, clock.now)
+            painted = (
+                {d.layer for d in seen if d.items}
+                if cell._drawings and not cell._drawings_paused
+                else set()
+            )
+            shown.append((cell._frame_identity[2] - base, painted))
+    return shown
+
+
+def test_a_main_stream_tile_shows_the_boxes_of_a_plugin_on_the_sub_stream(
+    qtbot, monkeypatch
+) -> None:
+    """Reported: the boxes showed on the sub stream's tile, only the zone (the
+    analysis layer) on the main stream's. The wall is not why: a 1080p main
+    tile shows sub-stream results (other sequence numbers, another capture
+    clock, matched on the receipt clock) with their boxes on every picture of
+    the burst, whatever the delay between the streams. (The cause was the
+    plugin being moved to the desktop's main pictures: Motion's manifest.)"""
+    for offset_us in (0, 150_000, 300_000):
+        for chosen in (frozenset({"detections", "debug"}), frozenset({"detections"})):
+            shown = _replay_main_tile(qtbot, monkeypatch, offset_us=offset_us, chosen=chosen)
+            what = f"main {offset_us // 1000} ms later, {sorted(chosen)}"
+            assert len(shown) > 1000, f"{what}: analysed pictures shown ({len(shown)})"
+            burst = [layers for at, layers in shown if 6_200_000 <= at < 9_800_000]
+            assert len(burst) > 300, what
+            missing = sum("detections" not in layers for layers in burst)
+            assert missing == 0, f"{what}: {missing} of {len(burst)} burst ticks without the box"
+            quiet = [layers for at, layers in shown if at < 5_900_000 or at >= 10_100_000]
+            assert all("detections" not in layers for layers in quiet), what
+            if "debug" in chosen:
+                assert all("debug" in layers for _at, layers in shown), f"{what}: the zone"
